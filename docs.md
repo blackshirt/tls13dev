@@ -17,6 +17,13 @@ crypto — no OpenSSL bindings, no third-party dependencies.
 > [!WARNING]
 > **Status: experimental.** Not audited; do not ship in production.
 
+> [!NOTE]
+> **Visual conventions** — <span style="color:#2ea44f">green</span> marks safety
+> and robustness guarantees, <span style="color:#cf222e">red</span> marks
+> dangerous options and rejected/error outcomes, amber marks cautions. Colors
+> render fully in IDE Markdown preview; where inline styles are stripped, the
+> badges and tinted callout boxes carry the same palette.
+
 ## Contents
 
 - [1. Module architecture](#1-module-architecture)
@@ -96,7 +103,7 @@ with the authoritative description of its role; this table summarizes it.
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| Wire codec | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, never a panic. |
+| Wire codec | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
 | Record layer | `record.v`, `alert.v`, `cipher_state.v`, `aead.v` | Record framing and reassembly (§5), alert protocol enums + wire encoding (§6), per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. |
 | Handshake messaging | `messages.v`, `transcript.v` | RFC 8446 §4 structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history. |
 | Key schedule | `key_schedule.v`, `handshake_keys.v` | HKDF-Extract/Expand ladder over (EC)DHE and traffic-secret stages (§7.1); `handshake_keys.v` adapts those pure derivations plus the offered-group policy to the handshake flow — it never touches the transcript or advances state. |
@@ -200,9 +207,9 @@ Behavior and guarantees:
 - **Trust anchors, by precedence** — explicit `config.root_cas` is used as-is;
   else the system CA bundle is loaded (a load failure is a dial error), unless
   `insecure_skip_verify` is set, in which case an empty store suffices.
-- **No fd leaks** — any handshake failure closes the socket it opened before
+- <span style="color:#2ea44f">**No fd leaks**</span> — any handshake failure closes the socket it opened before
   returning the error; a half-connected `Conn` is never returned.
-- **Forward secrecy of retained secrets** — the handshake-stage traffic secrets
+- <span style="color:#2ea44f">**Forward secrecy of retained secrets**</span> — the handshake-stage traffic secrets
   and the ephemeral X25519 / P-256 private keys are released the instant the
   state machine reaches `.connected` (nothing reads them again), and the
   application traffic secrets are released at `close()` or on a fatal alert, so
@@ -244,7 +251,8 @@ clean end of stream (peer `close_notify` or connection already closed).
 - A decrypted record larger than `buf` is buffered internally; subsequent calls
   drain the remainder before reading new records — no plaintext is dropped or reordered.
 - Zero-length (padding-only) records are skipped transparently.
-- A **plaintext outer alert after the handshake is rejected**, and so is a
+- A **plaintext outer alert after the handshake is
+  <span style="color:#2ea44f">rejected</span>**, and so is a
   plaintext ChangeCipherSpec record — RFC 8446 §5/§6 make both fatal
   (`unexpected_message`) once keys exist, preventing record injection.
 - The receive side aborts if the peer exceeds the §5.5 per-key record limit
@@ -281,7 +289,7 @@ pub fn (mut c Conn) close() !
 
 Sends `close_notify` (encrypted with application keys when they exist, per
 §6.1/§A.4), zeroizes the retained application traffic secrets, and closes the
-TCP socket. **Idempotent**: a second `close()` neither re-sends `close_notify`
+TCP socket. <span style="color:#2ea44f">**Idempotent**</span>: a second `close()` neither re-sends `close_notify`
 nor double-closes the socket, and never errors. Use it in a `defer` block.
 
 #### `negotiated_alpn`
@@ -486,41 +494,41 @@ verification binds the entire two-round exchange.
 All fallible operations return `!` (V option/result errors); there are
 <span style="color:#2ea44f">**no panics on malformed input**</span> — bad framing, oversized records, duplicate or
 unpermitted extensions, truncated certificates, and bad share sizes are
-handshake errors, never memory-safety events.
+<span style="color:#2ea44f">handshake errors, never memory-safety events</span>.
 
 ### 4.1 Connection lifecycle
 
 | Situation | Result |
 |---|---|
-| DNS / TCP connect failure | `dial()` error |
+| DNS / TCP connect failure | <span style="color:#cf222e">`dial()` error</span> |
 | Socket timeout (read or write) | `dial()` / `read()` / `write()` error after `Config.timeout` |
-| Peer sends a fatal alert during handshake | `dial()` error carrying the alert description |
-| Peer `close_notify` while reading | `read()` returns `0` (clean EOF) |
-| Peer fatal alert (encrypted, post-handshake) | `read()` error carrying the alert description |
+| Peer sends a fatal alert during handshake | <span style="color:#cf222e">`dial()` error</span> carrying the alert description |
+| Peer `close_notify` while reading | <span style="color:#2ea44f">`read()` returns `0` (clean EOF)</span> |
+| Peer fatal alert (encrypted, post-handshake) | <span style="color:#cf222e">`read()` error</span> carrying the alert description |
 | `write()` after `close()` or before handshake | error, nothing sent |
-| `close()` twice | no-op, no error, `close_notify` sent at most once |
+| `close()` twice | <span style="color:#2ea44f">no-op, no error, `close_notify` sent at most once</span> |
 | Handshake failure inside `dial()` | error; the socket is closed — no fd leak |
 
 ### 4.2 Wire & handshake protocol violations
 
 | Situation | Result |
 |---|---|
-| Handshake message declaring > 1 MiB | `dial()` error (reassembly cap) |
-| Plaintext alert or ChangeCipherSpec post-handshake | `read()` error (fatal `unexpected_message`; injection rejected) |
-| Peer exceeds §5.5 per-key record limit without rekeying | `read()` error |
-| `Certificate` list with more than 32 entries | `dial()` error (rejected at parse, before decoding) |
-| `NewSessionTicket` with trailing bytes after its extensions | `dial()` error (decode_error) |
-| X25519 shared secret of small order (0, 1, or p−1) | `dial()` error (illegal_parameter) |
+| Handshake message declaring > 1 MiB | <span style="color:#cf222e">`dial()` error</span> (reassembly cap) |
+| Plaintext alert or ChangeCipherSpec post-handshake | <span style="color:#cf222e">`read()` error</span> (fatal `unexpected_message`; injection rejected) |
+| Peer exceeds §5.5 per-key record limit without rekeying | <span style="color:#cf222e">`read()` error</span> |
+| `Certificate` list with more than 32 entries | <span style="color:#cf222e">`dial()` error</span> (rejected at parse, before decoding) |
+| `NewSessionTicket` with trailing bytes after its extensions | <span style="color:#cf222e">`dial()` error</span> (decode_error) |
+| X25519 shared secret of small order (0, 1, or p−1) | <span style="color:#cf222e">`dial()` error</span> (illegal_parameter) |
 
 ### 4.3 Certificate & trust-policy rejections
 
 | Situation | Result |
 |---|---|
-| Certificate chain / hostname / signature verification failure | `dial()` error |
-| Leaf/CA `keyUsage` present but forbidding its required use | `dial()` error (digitalSignature / keyCertSign) |
-| `basicConstraints` pathLenConstraint exceeded | `dial()` error |
-| CA RSA key < 2048 bits in the chain | `dial()` error |
-| Unparseable certificate validity time | `dial()` error (decode fails; expiry always enforced) |
-| Non-minimal DER length or invalid RSA public exponent (`e` = 0, degenerate 1, or any even value such as 2) | `dial()` error (decode rejected) |
-| `TBSCertificate` missing mandatory fields — with or without the optional `version [0]` element | `dial()` error (post-version element-count guard; a truncated v3 certificate fails the decode cleanly instead of indexing past the element array) |
-| CertificateVerify scheme paired with the wrong leaf key type, or an ECDSA scheme with the wrong curve | `dial()` error (§4.2.3 curve/scheme binding checked before any key material) |
+| Certificate chain / hostname / signature verification failure | <span style="color:#cf222e">`dial()` error</span> |
+| Leaf/CA `keyUsage` present but forbidding its required use | <span style="color:#cf222e">`dial()` error</span> (digitalSignature / keyCertSign) |
+| `basicConstraints` pathLenConstraint exceeded | <span style="color:#cf222e">`dial()` error</span> |
+| CA RSA key < 2048 bits in the chain | <span style="color:#cf222e">`dial()` error</span> |
+| Unparseable certificate validity time | <span style="color:#cf222e">`dial()` error</span> (decode fails; expiry always enforced) |
+| Non-minimal DER length or invalid RSA public exponent (`e` = 0, degenerate 1, or any even value such as 2) | <span style="color:#cf222e">`dial()` error</span> (decode rejected) |
+| `TBSCertificate` missing mandatory fields — with or without the optional `version [0]` element | <span style="color:#cf222e">`dial()` error</span> (post-version element-count guard; a truncated v3 certificate fails the decode cleanly instead of indexing past the element array) |
+| CertificateVerify scheme paired with the wrong leaf key type, or an ECDSA scheme with the wrong curve | <span style="color:#cf222e">`dial()` error</span> (§4.2.3 curve/scheme binding checked before any key material) |
