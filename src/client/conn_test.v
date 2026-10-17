@@ -1,10 +1,9 @@
-module client
-
 // Socket-free tests for the Conn read-side plumbing: read_raw_record exists to
 // reassemble TLS records from a TCP byte stream (glued or split frames), and
 // those paths are exercised here by pre-staging recv_buf — a populated buffer
 // never reaches the nil sock. The write path and the real handshake loop need
 // a live socket; dial_example.v is their end-to-end coverage.
+module client
 
 import record
 

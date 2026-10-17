@@ -1,0 +1,24 @@
+# V build output
+/.tls
+/tls
+tls.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# V caches / generated files
+.vcache/
+*.vdb
+*.c
+*.log
+*.o
+
+# Test binaries compiled from *_test.v (keep the .v sources tracked)
+src/**/*_test
+!src/**/*_test.v
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

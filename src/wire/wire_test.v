@@ -1,8 +1,7 @@
-module wire
-
 // Wire codec tests: big-endian primitives and length-prefixed vectors must read
 // back exactly what was written, and truncated reads must fail with the bounds
 // error instead of indexing past the buffer.
+module wire
 
 fn test_wire_roundtrip_primitives() ! {
 	mut w := new_writer(64)

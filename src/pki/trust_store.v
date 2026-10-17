@@ -24,10 +24,8 @@ pub fn (mut ts TrustStore) add_der(der []u8) ! {
 
 // add_pem parses and appends all certificates from a PEM string into the store.
 // PEM is just a base64-of-DER wrapper, so the real parsing target is the decoded
-// DER between the BEGIN/END markers. Unparseable blocks are skipped rather than
-// failing the whole bundle: system bundles occasionally contain legacy or
-// unsupported formats (e.g. old key types), and losing every root because one
-// entry is undecodable would break all connections.
+// DER between the markers. Unparseable blocks are skipped rather than failing the
+// whole bundle, since system bundles occasionally contain unsupported formats.
 pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
 	mut count := 0
 	lines := pem_content.split_into_lines()
@@ -58,11 +56,9 @@ pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
 	return count
 }
 
-// load_system_ca_bundle attempts to load trusted root CAs from standard system paths.
-// There is no portable trust-store API across Linux distributions, so each known
-// bundle location is probed and the first one that yields certificates wins —
-// distros maintain exactly one authoritative bundle, and loading several would
-// double-count roots whose contents overlap.
+// load_system_ca_bundle attempts to load trusted root CAs from standard system
+// paths. There is no portable trust-store API across Linux distributions, so each
+// known bundle location is probed and the first that yields certificates wins.
 pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 	paths := [
 		'/etc/ssl/certs/ca-certificates.crt', // Debian/Ubuntu/Gentoo

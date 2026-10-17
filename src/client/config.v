@@ -5,18 +5,16 @@ import pki
 
 // Config holds TLS client connection options.
 pub struct Config {
-	// server_name is used for SNI and certificate hostname verification.
 pub:
+	// server_name is used for SNI and certificate hostname verification.
 	server_name string
 	// alpn is the list of application protocols to offer (e.g. ['h2', 'http/1.1']).
-	// The server's pick is verified against this list (RFC 7301 §3.1): an
-	// unoffered selection aborts the handshake, and an empty list means the
-	// server may send no ALPN at all.
+	// The server's pick is verified against this list (RFC 7301 §3.1): an unoffered
+	// selection aborts the handshake, and an empty list forbids an ALPN response.
 	alpn []string
 	// insecure_skip_verify disables certificate chain and hostname validation.
-	// This removes all authentication the handshake provides — a MITM sees the
-	// traffic in cleartext-equivalent form. Intended for tests and pinned lab
-	// environments only; never ship it enabled.
+	// This removes all authentication the handshake provides; intended for tests
+	// and pinned lab environments only, never shipped enabled.
 	insecure_skip_verify bool
 	// root_cas, when set, is used instead of the system trust store — e.g. for
 	// private CAs in enterprise or testing setups.

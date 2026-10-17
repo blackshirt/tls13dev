@@ -1,11 +1,10 @@
+// Record layer tests: wire framing round-trips through serialize/parse, the
+// AEAD cipher state encrypts and decrypts in sequence-number lockstep across
+// records, and a single flipped ciphertext byte must fail the tag check.
 module record
 
 import crypto.aes
 import wire
-
-// Record layer tests: wire framing round-trips through serialize/parse, the
-// AEAD cipher state encrypts and decrypts in sequence-number lockstep across
-// records, and a single flipped ciphertext byte must fail the tag check.
 
 fn test_record_serialization_roundtrip() ! {
 	payload := [u8(1), 2, 3, 4, 5]

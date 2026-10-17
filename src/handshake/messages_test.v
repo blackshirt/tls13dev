@@ -1,14 +1,13 @@
-module handshake
-
-import encoding.hex
-import wire
-
 // Codec tests for the handshake message layer: ClientHello construction is
 // re-parsed field by field, server-side messages decode from small hand-built
 // payloads plus the RFC 8448 §3 ServerHello worked example, the §4.4.3
 // CertificateVerify signed-content layout is checked byte by byte, and the
 // shared extensions-block framing (parse_extensions) is exercised including its
 // §4.2 duplicate-rejection rule.
+module handshake
+
+import encoding.hex
+import wire
 
 fn test_build_client_hello() ! {
 	cfg := ClientHelloConfig{
@@ -67,6 +66,21 @@ fn test_parse_encrypted_extensions_extension_policy() ! {
 	// extensions vector (len 5) = renegotiation_info (0xff01), 1 byte of data
 	ok := [u8(0x00), 0x05, 0xff, 0x01, 0x00, 0x01, 0x00]
 	assert parse_encrypted_extensions(ok)! == ''
+}
+
+// test_parse_encrypted_extensions_server_name_ack pins the RFC 6066 §3 SNI
+// acknowledgment a §4.2-registered EncryptedExtensions entry: an empty
+// server_name extension is accepted as a harmless ack, while a non-empty one
+// (the server asserting a hostname we never chose) must be rejected.
+fn test_parse_encrypted_extensions_server_name_ack() ! {
+	// extensions vector (len 4) = server_name (0x0000) with zero-length data
+	empty := [u8(0x00), 0x04, 0x00, 0x00, 0x00, 0x00]
+	assert parse_encrypted_extensions(empty)! == ''
+	// extensions vector (len 5) = server_name (0x0000) with 1 byte of data
+	bad := [u8(0x00), 0x05, 0x00, 0x00, 0x00, 0x01, 0x00]
+	if _ := parse_encrypted_extensions(bad) {
+		assert false // a non-empty server_name in EncryptedExtensions must be rejected
+	}
 }
 
 // test_parse_encrypted_extensions_single_alpn pins the happy path of the

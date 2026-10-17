@@ -1,16 +1,14 @@
 // key_schedule.v adapts the handshake module to the kdf module: the pure §7.1
 // secret derivations (handshake and application phases) and the group policy
-// the ClientHello offers. state_machine.v sequences these calls and owns the
-// resulting state; nothing here touches the transcript or advances protocol
-// state, which is what makes each derivation independently testable.
-
+// the ClientHello offers. state_machine.v sequences these calls; nothing here
+// touches the transcript or advances protocol state.
 module handshake
 
 import kdf
 
 // TrafficSecrets groups one key-schedule stage's output: the handshake phase
-// fills all three (handshake_secret is needed again for the Master Secret),
-// the application phase leaves handshake_secret empty.
+// fills all three (handshake_secret is needed again for the Master Secret), the
+// application phase leaves handshake_secret empty.
 struct TrafficSecrets {
 mut:
 	handshake_secret []u8
@@ -24,13 +22,13 @@ fn is_supported_group(g NamedGroup) bool {
 	return g == .x25519 || g == .secp256r1
 }
 
-// derive_hs_secrets runs the §7.1 handshake phase: Early Secret is the fixed
-// zero-PSK extraction, the Handshake Secret mixes in the ECDHE shared secret,
-// and the two client/server handshake traffic secrets bind to the transcript
-// through ServerHello (th_ch_sh).
+// derive_hs_secrets runs the §7.1 handshake phase: the fixed zero-PSK Early
+// Secret, the Handshake Secret mixing in the ECDHE shared secret, and the
+// client/server handshake traffic secrets bound to the transcript through
+// ServerHello (th_ch_sh).
 fn derive_hs_secrets(hash_algo kdf.HashAlgorithm, shared_secret []u8, th_ch_sh []u8) !TrafficSecrets {
-	// Early Secret = HKDF-Extract(0, 0). Without a PSK the IKM is empty, but it
-	// is still mixed in via Derive-Secret so the schedule matches the RFC.
+	// Early Secret = HKDF-Extract(0, 0). Without a PSK the IKM is empty but is
+	// still mixed in via Derive-Secret so the schedule matches the RFC.
 	early_secret := kdf.hkdf_extract(hash_algo, []u8{}, []u8{len: hash_algo.hash_len()})
 	derived_early := kdf.derive_secret(hash_algo, early_secret, 'derived', kdf.empty_transcript_hash(hash_algo))!
 	// Handshake Secret = HKDF-Extract(Derive-Secret(Early, "derived"), ECDHE)
@@ -47,10 +45,10 @@ fn derive_hs_secrets(hash_algo kdf.HashAlgorithm, shared_secret []u8, th_ch_sh [
 }
 
 // derive_app_secrets runs the §7.1 application phase from the Handshake Secret:
-// Master Secret, then the client/server application traffic secrets bound to
-// the transcript including server Finished (th_sfin). The traffic secrets are
-// the reusable state (KeyUpdate ratchets them, §7.2); the caller keeps them and
-// feeds derive_traffic_keys/new_cipher only locally.
+// the Master Secret, then the client/server application traffic secrets bound
+// to the transcript including server Finished (th_sfin). The traffic secrets
+// are the reusable state (KeyUpdate ratchets them, §7.2); callers derive keys
+// and ciphers from them locally.
 fn derive_app_secrets(hash_algo kdf.HashAlgorithm, handshake_secret []u8, th_sfin []u8) !TrafficSecrets {
 	derived_hs := kdf.derive_secret(hash_algo, handshake_secret, 'derived', kdf.empty_transcript_hash(hash_algo))!
 	master_secret := kdf.hkdf_extract(hash_algo, derived_hs, []u8{len: hash_algo.hash_len()})

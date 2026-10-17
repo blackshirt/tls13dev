@@ -65,9 +65,9 @@ pub fn parse_certificate(der []u8) !Certificate {
 	tbs_start := inner.cursor
 	tbs_elem := read_asn1_element(mut inner)!
 	tbs_raw := cert_seq.data[tbs_start..inner.cursor].clone()
-	_ := read_asn1_element(mut inner)! // outer signatureAlgorithm: RFC 5280 §4.1.2.2
-	// requires it to equal the copy inside the TBS, and the TBS copy is the one used
-	// for verification — only that one is covered by the signature itself.
+	// Skip the outer signatureAlgorithm: RFC 5280 §4.1.2.2 requires it to equal the
+	// TBS copy, and only the TBS copy is covered by the signature.
+	_ := read_asn1_element(mut inner)!
 	sig_val_elem := read_asn1_element(mut inner)!
 
 	tbs_elements := parse_sequence(tbs_elem.data)!
@@ -102,11 +102,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut tbs_sig_hash_oid := ''
 	if sig_alg_inner.len > 0 {
 		tbs_sig_algo_oid = parse_oid(sig_alg_inner[0].data)
-		// For id-RSASSA-PSS (1.2.840.113549.1.1.10), extract hash OID from parameters.
-		// RSASSA-PSS-params ::= SEQUENCE {
-		//   hashAlgorithm  [0] AlgorithmIdentifier OPTIONAL,  -- default SHA-1
-		//   ...
-		// }
+		// For id-RSASSA-PSS (1.2.840.113549.1.1.10), extract the hash OID from the
+		// RSASSA-PSS-params SEQUENCE's hashAlgorithm [0] field.
 		if tbs_sig_algo_oid == '1.2.840.113549.1.1.10' && sig_alg_inner.len >= 2 {
 			pss_params := parse_sequence(sig_alg_inner[1].data) or { []Asn1Element{} }
 			for param in pss_params {
@@ -291,16 +288,14 @@ pub fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	if c.public_key_raw.len == 0 {
 		return error('x509: empty ECDSA public key')
 	}
-	// public_key_raw is the SPKI BIT STRING contents verbatim, which for EC keys is
-	// already the uncompressed 0x04||X||Y point this constructor expects — the curve
-	// NID stored at parse time is the only extra input needed to rebuild the key.
+	// For EC keys public_key_raw is already the uncompressed 0x04||X||Y point this
+	// constructor expects; the curve NID stored at parse time completes the input.
 	return ecdsa.PublicKey.from_uncompressed_bytes(c.public_key_raw, nid: c.ecdsa_curve)!
 }
 
-// parse_asn1_time parses UTCTime (tag 0x17) or GeneralizedTime (tag 0x18) to unix seconds.
-// RFC 5280 §4.1.2.5 mandates UTCTime for 1950–2049 and GeneralizedTime outside
-// that window, so both forms must be accepted; the two-digit UTCTime year uses
-// the RFC 5280 pivot rule (YY ≥ 50 ⇒ 19xx, else 20xx).
+// parse_asn1_time parses UTCTime (tag 0x17) or GeneralizedTime (tag 0x18) to unix
+// seconds. RFC 5280 §4.1.2.5 mandates both forms across the 1950–2049 boundary;
+// the two-digit UTCTime year uses the RFC 5280 pivot (YY ≥ 50 ⇒ 19xx, else 20xx).
 fn parse_asn1_time(el Asn1Element) !i64 {
 	s := el.data.bytestr()
 	// UTCTime YYMMDDhhmmssZ: 13 chars = six 2-digit fields + trailing 'Z' (UTC)
@@ -317,10 +312,9 @@ fn parse_asn1_time(el Asn1Element) !i64 {
 }
 
 // unwrap_octet_string returns the contents of an OCTET STRING TLV, or the input
-// unchanged when it is not OCTET STRING-wrapped.
-// Extension bodies arrive either way: RFC 5280 encodes extnValue as an OCTET
-// STRING containing the extension's DER, but some parsers hand us the inner
-// bytes directly, so accept both forms.
+// unchanged when not wrapped. RFC 5280 encodes extnValue as an OCTET STRING
+// containing the extension's DER, but some callers hand us the inner bytes
+// directly, so both forms are accepted.
 fn unwrap_octet_string(data []u8) []u8 {
 	if data.len > 0 && data[0] == 0x04 {
 		mut r := wire.new_reader(data)

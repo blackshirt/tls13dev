@@ -1,13 +1,12 @@
+// Client state-machine tests focused on the HelloRetryRequest path: hand-built
+// HRR bodies are parsed and fed through process_server_hello to exercise the
+// RFC 8446 §4.1.2/§4.1.4 validation rules (single HRR only, must-change-something,
+// group reselection rejection) plus the second-ClientHello follow-ups.
 module handshake
 
 import encoding.hex
 import record
 import wire
-
-// Client state-machine tests focused on the HelloRetryRequest path: hand-built
-// HRR bodies are parsed and fed through process_server_hello to exercise the
-// RFC 8446 §4.1.2/§4.1.4 validation rules (single HRR only, must-change-something,
-// group reselection rejection) plus the second-ClientHello follow-ups.
 
 // build_hrr_body assembles a HelloRetryRequest message body for tests. Pass a
 // group to include a key_share extension (group change request) and/or non-empty
@@ -358,7 +357,6 @@ fn test_process_hrr_cookie_only_echos_cookie_in_ch2() ! {
 	body := build_hrr_body(sid, none, [u8(1), 2, 3, 4])!
 	followups, _ := h.process_server_hello(hrr_record(body))!
 	ch2 := followups[0].payload
-	// The cookie extension is 00 0a || len 00 06 || vector 00 04 || 01 02 03 04.
 	// cookie extension: type 44 (0x002c) || data_len 00 06 || vector 00 04 || 01 02 03 04
 	cookie_type := u16(ExtensionType.cookie)
 	needle := [

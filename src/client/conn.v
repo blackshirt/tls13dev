@@ -1,4 +1,4 @@
-// module client is the public entry point of this TLS stack: dial() opens a
+// The client module is the public entry point of this TLS stack: dial() opens a
 // connection, runs the TLS 1.3 handshake (driving handshake/pki/kdf), and Conn
 // exposes the protected stream via read/write/close. config.v holds the
 // caller-facing options; dial_example.v shows the whole flow.
@@ -11,10 +11,9 @@ import record
 import wire
 import pki
 
-// recv_buf_compact_threshold bounds how many already-consumed bytes may remain
-// in recv_buf before its unconsumed tail is shifted to the front. Keeping the
-// wasted prefix below this bound makes compaction amortized O(1) per byte while
-// keeping memory usage bounded.
+// recv_buf_compact_threshold bounds the consumed prefix recv_buf may retain
+// before its unconsumed tail is shifted to the front, making compaction
+// amortized O(1) per byte while keeping memory bounded.
 const recv_buf_compact_threshold = 16384
 
 // recv_read_size is the number of bytes requested from the socket per read.
@@ -40,8 +39,7 @@ pub mut:
 // verification still work when dialed by "host:port" alone.
 pub fn dial(address string, config Config) !&Conn {
 	// Prefer an explicit server_name; otherwise derive it from the dial address so
-	// a bare "host:port" still supplies SNI and the certificate hostname, rather
-	// than connecting with no authentication context to verify against (§4.3.1).
+	// a bare "host:port" still supplies SNI and the hostname to verify against.
 	server_name := if config.server_name.len > 0 {
 		config.server_name
 	} else {
@@ -51,9 +49,8 @@ pub fn dial(address string, config Config) !&Conn {
 	// Open the TCP transport first: every later failure path must close the socket
 	// it just acquired, so the handshake/validator steps below guard on `sock`.
 	mut sock := net.dial_tcp(address)!
-	// Apply one bounded timeout to both directions (caller's value, else a 30s
-	// default): a handshake that never completes would otherwise hang forever on a
-	// stalled or unreachable peer.
+	// Apply one bounded timeout to both directions (caller's value, else 30s) so a
+	// stalled peer cannot hang the handshake forever.
 	timeout := if config.timeout > 0 { config.timeout } else { 30 * time.second }
 	sock.set_read_timeout(timeout)
 	sock.set_write_timeout(timeout)
@@ -63,9 +60,9 @@ pub fn dial(address string, config Config) !&Conn {
 		return err
 	}
 
-	// Resolve the trust anchors by precedence: an explicit root_cas override wins,
-	// else the system bundle is loaded — unless verification is being skipped, in
-	// which case an empty store is fine because the validator never consults it.
+	// Resolve trust anchors by precedence: an explicit root_cas wins, else the
+	// system bundle is loaded — unless verification is skipped, where an empty
+	// store is fine because the validator never consults it.
 	mut store := pki.new_trust_store()
 	if roots := config.root_cas {
 		store = roots
@@ -87,29 +84,25 @@ pub fn dial(address string, config Config) !&Conn {
 		server_name: server_name
 	}
 
-	// Run the full client flight. On any handshake failure close the socket (so an
-	// aborted connection does not leak the fd) and propagate the error rather than
-	// handing back a half-connected Conn that would silently misbehave on read.
+	// Run the full client flight; on failure close the socket (so an aborted
+	// connection does not leak the fd) and propagate the error rather than
+	// returning a half-connected Conn that would misbehave on read.
 	conn.do_handshake(validator) or {
 		sock.close() or {}
 		return err
 	}
-	// Copy the ALPN pick onto the public Conn field only now that the handshake
-	// has proven the server's choice was one we offered (RFC 7301 §3.1 check lives
-	// in the state machine, not here).
+	// Copy the ALPN pick onto the public field only now the handshake has proven
+	// the server's choice was offered (RFC 7301 §3.1 check lives in the state machine).
 	conn.negotiated_alpn = conn.hs.negotiated_alpn
 	return conn
 }
 
 // host_from_address extracts the host part of a dial address ("host:port" or
-// "[ipv6]:port") so a bare address can still supply the SNI name and the
-// hostname that the peer certificate is verified against.
+// "[ipv6]:port") so a bare address can still supply the SNI name and hostname
+// against which the peer certificate is verified.
 fn host_from_address(address string) string {
-	// Bracketed form is an IPv6 literal: the address itself contains ':', so the
-	// port (if any) is whatever follows the closing ']'. Return only the inner
-	// address; a missing ']' means it was not really bracketed, so hand the string
-	// back unchanged rather than slicing to a bogus index.
-	// Strip [ipv6]:port or host:port
+	// Bracketed form is an IPv6 literal: return the inner address, or the string
+	// unchanged when there is no closing ']' (it was not really bracketed).
 	if address.starts_with('[') {
 		end := address.index(']') or { return address }
 		return address[1..end]
@@ -124,10 +117,9 @@ fn host_from_address(address string) string {
 }
 
 // do_handshake drives the full client flight: send ClientHello (+dummy CCS),
-// then feed every incoming record into the handshake state machine until it
-// reports .connected. A loop rather than straight-line code because the server
-// flight can interleave dummy CCS records, alerts, or a whole HelloRetryRequest
-// round trip at any point.
+// then feed every incoming record into the state machine until it reports
+// .connected. A loop, because the server flight can interleave dummy CCS records,
+// alerts, or a whole HelloRetryRequest round trip at any point.
 fn (mut c Conn) do_handshake(validator pki.Validator) ! {
 	ch_recs, _ := c.hs.create_client_hello()!
 	c.write_records(ch_recs)!
@@ -158,10 +150,9 @@ fn (mut c Conn) do_handshake(validator pki.Validator) ! {
 			}
 			.application_data {
 				// Once the server installs its handshake keys, everything it sends —
-				// including the rest of the handshake flight — is wrapped with outer
-				// type application_data, so "handshake" never appears again here;
-				// the true type is recovered from the inner plaintext when decrypted
-				// (RFC 8446 §5.1/§5.2).
+				// including the rest of the flight — is wrapped with outer type
+				// application_data; the true type is recovered from the inner
+				// plaintext when decrypted (RFC 8446 §5.1/§5.2).
 				c.hs.feed_encrypted_record(rec)!
 				fins := c.hs.process_reassembled_messages(&validator)!
 				if fins.len > 0 {
@@ -189,15 +180,14 @@ fn (mut c Conn) write_records(recs []record.Record) ! {
 
 // read_raw_record blocks until one complete TLS record (header + full payload)
 // has been buffered, then slices that frame off recv_buf and parses it. TCP may
-// deliver a record in pieces or several records glued together, so the frame is
-// only consumed once its declared length is actually available.
+// deliver a record in pieces or several glued together, so the frame is only
+// consumed once its declared length is actually available.
 fn (mut c Conn) read_raw_record() !record.Record {
 	for {
 		avail := c.recv_buf.len - c.recv_pos
 		if avail >= record.record_header_len {
-			// Peek the length field (2 bytes at offset 3) without consuming it.
-			// We must not parse until a whole header+payload frame is buffered:
-			// TCP is a byte stream, so records can arrive split across reads.
+			// Peek the length field (2 bytes at offset 3) without consuming it; do
+			// not parse until a whole frame is buffered, since TCP can split records.
 			payload_len := int(u16(c.recv_buf[c.recv_pos + 3]) << 8 | u16(c.recv_buf[c.recv_pos + 4]))
 			if payload_len > record.max_ciphertext_record_len {
 				return error('record: record length ${payload_len} exceeds maximum allowed ${record.max_ciphertext_record_len}')
@@ -226,31 +216,25 @@ fn (mut c Conn) read_raw_record() !record.Record {
 	return error('tls: unreachable')
 }
 
-// compact_recv_buf reclaims the already-consumed prefix of recv_buf. When the
-// buffer is fully drained its capacity is retained (clear keeps cap); otherwise
-// the unconsumed tail is shifted to the front once the wasted prefix exceeds
-// recv_buf_compact_threshold. This avoids the O(n) re-slice clone that used to
-// run on every record while keeping memory bounded.
+// compact_recv_buf reclaims the already-consumed prefix of recv_buf: a fully
+// drained buffer keeps its capacity (clear retains cap), otherwise the tail is
+// shifted to the front once the wasted prefix exceeds recv_buf_compact_threshold.
 fn (mut c Conn) compact_recv_buf() {
 	if c.recv_pos == c.recv_buf.len {
-		// Fully drained: clear() drops the consumed prefix but keeps the allocated
-		// capacity, so subsequent reads reuse the buffer without reallocating and
-		// recv_pos resets to frame the next record at the front.
+		// Fully drained: clear() drops the prefix but keeps capacity, so later reads
+		// reuse the buffer and recv_pos resets to frame the next record at the front.
 		c.recv_buf.clear()
 		c.recv_pos = 0
 	} else if c.recv_pos >= recv_buf_compact_threshold {
-		// Unread data still remains but the already-consumed prefix has grown past
-		// the bound: shift the live tail down once. Amortizing the reclaim (instead
-		// of re-slicing on every record) keeps per-byte cost O(1) while capping
-		// memory at roughly the threshold plus a single record.
+		// Consumed prefix exceeded the bound: shift the live tail down once,
+		// amortizing reclaim to O(1) per byte while capping memory near the threshold.
 		c.recv_buf = c.recv_buf[c.recv_pos..].clone()
 		c.recv_pos = 0
 	}
 }
 
 // handle_alert processes an alert received after the handshake. It marks the
-// connection closed and returns 0 for a clean close_notify, or an error for any
-// other alert.
+// connection closed and returns 0 for a clean close_notify, else an error.
 fn (mut c Conn) handle_alert(payload []u8) !int {
 	// Any alert is terminal for this direction, so mark closed before decoding —
 	// even a malformed alert body must not leave the Conn looking usable.
@@ -261,8 +245,7 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	if a.description == .close_notify {
 		return 0
 	}
-	// Every other description is fatal per RFC 8446 §6 (all alerts are fatal
-	// except close_notify and user_canceled); surface the peer's code verbatim.
+	// Every other description is fatal per RFC 8446 §6; surface the peer's code verbatim.
 	return error('tls: received alert ${a.description}')
 }
 
@@ -271,8 +254,8 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 	if buf.len == 0 {
 		return 0
 	}
-	// A decrypted record can hold more than the caller's buffer; leftovers from
-	// the previous record are drained first so no plaintext is dropped or reordered.
+	// A decrypted record can hold more than the caller's buffer; leftovers are
+	// drained first so no plaintext is dropped or reordered.
 	if c.app_buf.len > 0 {
 		n := copy(mut buf, c.app_buf)
 		if n == c.app_buf.len {
@@ -293,10 +276,9 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				continue
 			}
 			.alert {
-				// RFC 8446 §6: All alerts after handshake keys are established MUST
-				// be encrypted under application traffic keys. Receiving an unencrypted
-				// outer alert post-handshake is illegal and must be rejected to prevent
-				// plaintext alert injection attacks.
+				// RFC 8446 §6: alerts after handshake keys are established MUST be
+				// encrypted; a plaintext outer alert here is illegal and rejected to
+				// prevent plaintext alert injection.
 				return error('tls: received unencrypted alert post-handshake (must be encrypted)')
 			}
 			.application_data {
@@ -315,9 +297,8 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 						return n
 					}
 					.alert {
-						// Post-handshake alerts are encrypted like everything else
-						// (RFC 8446 §5.1/§6): the alert arrives as the inner content
-						// type of an application_data record, not an outer .alert.
+						// Post-handshake alerts are encrypted, arriving as the inner
+						// content type of an application_data record (RFC 8446 §5.1/§6).
 						return c.handle_alert(dec.plaintext)
 					}
 					.handshake {
@@ -339,13 +320,13 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 	return error('tls: unreachable')
 }
 
+// handle_post_handshake consumes NewSessionTicket and KeyUpdate messages from a
+// decrypted post-handshake plaintext.
 fn (mut c Conn) handle_post_handshake(data []u8) ! {
-	// Loop while complete 4-byte-headered messages remain in this plaintext.
-	// Unlike the handshake phase there is no reassembly buffer carried across
-	// records, so a message split over two records would surface as a
-	// 'truncated post-handshake message' error — acceptable because NewSessionTicket
-	// and KeyUpdate are sent one-per-record in practice (RFC 8446 §5.2 permits
-	// splitting, it does not require it).
+	// Loop while complete 4-byte-headered messages remain. Unlike the handshake
+	// phase there is no reassembly buffer across records, so a message split over
+	// two records surfaces as a truncation error — acceptable because these
+	// messages are sent one-per-record in practice (§5.2 permits, not requires, splitting).
 	mut buf := data.clone()
 	for buf.len >= 4 {
 		mut r := wire.new_reader(buf)
@@ -362,14 +343,12 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 			}
 			.key_update {
 				// §4.6.3: a recipient always advances its read keys on receiving a
-				// KeyUpdate; the request_update flag only decides whether a response
-				// is owed back to the sender.
+				// KeyUpdate; request_update only decides whether a response is owed.
 				request_update := handshake.parse_key_update(body)!
 				c.hs.update_read_traffic_keys()!
 				if request_update {
-					// RFC 8446 §4.6.3: the KeyUpdate response is protected under the
-					// current (old) write keys; the sender switches to the next keys
-					// only after the message has been sent.
+					// §4.6.3: the response is protected under the current (old) write
+					// keys; the sender updates only after the message has been sent.
 					msg := handshake.build_key_update(false)
 					enc := c.hs.client_app_cipher.encrypt_record(.handshake, msg)!
 					c.write_records([enc])!
@@ -397,9 +376,8 @@ pub fn (mut c Conn) write(data []u8) !int {
 	if c.closed {
 		return error('tls: connection closed')
 	}
-	// Application keys exist only once the handshake reaches .connected; writing
-	// any earlier would drive an uninitialized cipher state, so gate on the state
-	// machine rather than trusting caller ordering.
+	// Application keys exist only once connected; gate on the state machine rather
+	// than trusting caller ordering.
 	if c.hs.state != .connected {
 		return error('tls: handshake not complete')
 	}
@@ -423,17 +401,15 @@ pub fn (mut c Conn) write(data []u8) !int {
 // close sends a close_notify alert and closes the underlying TCP connection.
 pub fn (mut c Conn) close() ! {
 	// Idempotent teardown: a second close() must not re-send close_notify or
-	// double-close the socket, so the already-closed path just ensures the fd is
-	// gone and returns without touching the alert state again.
+	// double-close the socket.
 	if c.closed {
 		if c.sock != unsafe { nil } {
 			c.sock.close() or {}
 		}
 		return
 	}
-	// Emit close_notify at most once; this is guarded separately from `closed` so a
-	// failure inside send_close_notify still marks the connection closed below
-	// instead of leaving it eligible to re-alert.
+	// Emit close_notify at most once; guarded separately from `closed` so a failure
+	// inside send_close_notify still leaves the connection closed below.
 	if !c.close_notify_sent {
 		c.close_notify_sent = true
 		c.send_close_notify()
@@ -448,8 +424,8 @@ pub fn (mut c Conn) close() ! {
 
 // send_close_notify writes a close_notify alert, encrypted with the application
 // keys once the handshake has completed (falling back to a plaintext record if
-// encryption fails). RFC 8446 §6.1/§A.4: alerts after the server Finished MUST
-// be encrypted; plaintext close_notify is only correct when keys are not yet up.
+// encryption fails). RFC 8446 §6.1/§A.4: alerts after the server Finished MUST be
+// encrypted; plaintext close_notify is only correct when keys are not yet up.
 fn (mut c Conn) send_close_notify() {
 	if c.sock == unsafe { nil } {
 		return

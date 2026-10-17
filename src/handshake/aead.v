@@ -7,9 +7,8 @@ import x.crypto.chacha20
 import kdf
 
 // suite_hash_algo returns the HKDF hash for a cipher suite.
-// Each TLS 1.3 suite names its own hash (…_sha256 / …_sha384) and the key
-// schedule must use exactly that one (RFC 8446 §7.1). The match is exhaustive
-// on purpose — like suite_key_len below, adding a new suite must force a
+// Each TLS 1.3 suite names its own hash and the key schedule must use exactly
+// that one (RFC 8446 §7.1). The match is exhaustive so a new suite forces a
 // decision here rather than silently inheriting SHA-256.
 fn suite_hash_algo(suite CipherSuite) kdf.HashAlgorithm {
 	return match suite {
@@ -20,8 +19,7 @@ fn suite_hash_algo(suite CipherSuite) kdf.HashAlgorithm {
 }
 
 // suite_key_len returns the AEAD key length for a cipher suite, fixed by the
-// cipher itself (AES-128/256, ChaCha20) — the key schedule must extract exactly
-// this many bytes via HKDF-Expand-Label (RFC 8446 §7.1).
+// cipher itself (RFC 8446 §7.1).
 fn suite_key_len(suite CipherSuite) int {
 	return match suite {
 		.tls_aes_128_gcm_sha256 { 16 }
@@ -31,12 +29,10 @@ fn suite_key_len(suite CipherSuite) int {
 }
 
 // new_aead_for_suite constructs the AEAD cipher for the negotiated suite.
-// The same key material also feeds the record layer, so both handshake and
-// application phases share this factory. ChaCha20-Poly1305 is configured with
-// its standard 12-byte (nonce_size) nonce, matching TLS 1.3's nonce construction
-// (RFC 8446 §5.3 / RFC 8439 §2.0). Key length is not re-checked here: both
-// constructors reject wrong-sized keys themselves, and every key reaching this
-// point was expanded to suite_key_len bytes by the key schedule.
+// ChaCha20-Poly1305 uses its standard 12-byte nonce, matching TLS 1.3's nonce
+// construction (RFC 8446 §5.3 / RFC 8439 §2.8). Key length is not re-checked:
+// both constructors reject wrong-sized keys, and every key reaching this point
+// was expanded to suite_key_len bytes by the key schedule.
 fn new_aead_for_suite(suite CipherSuite, key []u8) !cipher.AEAD {
 	return match suite {
 		.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384 {

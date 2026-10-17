@@ -71,11 +71,9 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 }
 
 // rsa_verify_raw computes m = s^e mod n — the raw textbook RSA public-key
-// primitive (RFC 8017 §5.1.1). It performs no padding validation itself;
-// structural checks belong to the PKCS#1 v1.5 / PSS callers below.
-// The result is left-zero-padded back to key size because hex-encoding the
-// integer silently drops leading 0x00 octets that the EMS/EM padding schemes
-// position-dependently require.
+// primitive (RFC 8017 §5.2.1, RSAVP1) with no padding validation, which belongs
+// to the PKCS#1 v1.5 / PSS callers. The result is left-zero-padded back to key
+// size because hex-encoding drops leading 0x00 octets the padding needs.
 fn (k &RsaPublicKey) rsa_verify_raw(sig []u8) ![]u8 {
 	if sig.len != k.size_bytes {
 		return error('rsa: signature length (${sig.len}) does not match key size (${k.size_bytes})')
@@ -88,9 +86,8 @@ fn (k &RsaPublicKey) rsa_verify_raw(sig []u8) ![]u8 {
 		return error('rsa: signature representative out of range')
 	}
 
-	// RFC 8017 §5.1.1OSP: m = s^e mod n. No blinding/constant-time concern here:
-	// every input (s, e, n) is public in a verification — the private key never
-	// touches this code path.
+	// RFC 8017 §5.2.1 (RSAVP1): m = s^e mod n. No constant-time concern: every
+	// input is public in a verification, and the private key never touches here.
 	m := s.mod_pow(k.e, k.n)
 	mut m_hex := m.radix_str(16)
 	if m_hex.len % 2 != 0 {
@@ -111,9 +108,8 @@ fn (k &RsaPublicKey) rsa_verify_raw(sig []u8) ![]u8 {
 }
 
 // mgf1 implements Mask Generation Function 1 (RFC 8017 Appendix B.2.1),
-// parameterized by the hash function so it can serve SHA-256/384/512 PSS.
-// Hash(seed || counter) is iterated with an incrementing big-endian counter to
-// stretch a short hash output into a mask as long as the masked field requires.
+// parameterized by the hash so it can serve SHA-256/384/512 PSS: Hash(seed ||
+// counter) is iterated with an incrementing counter to fill mask_len bytes.
 fn mgf1(seed []u8, mask_len int, hash_fn fn ([]u8) []u8) []u8 {
 	mut out := []u8{cap: mask_len}
 	mut counter := u32(0)
@@ -137,8 +133,7 @@ fn mgf1(seed []u8, mask_len int, hash_fn fn ([]u8) []u8) []u8 {
 }
 
 // digest_bytes hashes data with the named digest ("sha256"/"sha384"/"sha512"),
-// the only schemes TLS certificates actually use; shared by PSS verification here
-// and chain-signature verification in validator.v.
+// the only schemes TLS certificates use; shared with validator.v.
 fn digest_bytes(digest_type string, data []u8) ![]u8 {
 	return match digest_type {
 		'sha256' { sha256.sum256(data) }
@@ -148,9 +143,8 @@ fn digest_bytes(digest_type string, data []u8) ![]u8 {
 	}
 }
 
-// mgf1_for runs MGF1 under the hash named by digest_type: RSASSA-PSS requires
-// the mask generation hash to match the signature hash (RFC 8017 §9.1.1/§A.2.3),
-// so the choice is always driven by the same string the caller validated.
+// mgf1_for runs MGF1 under the hash named by digest_type: RSASSA-PSS requires the
+// mask-generation hash to match the signature hash (RFC 8017 §9.1.1/§A.2.3).
 fn mgf1_for(digest_type string, seed []u8, mask_len int) ![]u8 {
 	mask := match digest_type {
 		'sha256' { mgf1(seed, mask_len, sha256.sum256) }
@@ -163,12 +157,10 @@ fn mgf1_for(digest_type string, seed []u8, mask_len int) ![]u8 {
 	return mask
 }
 
-// verify_pss verifies an RSASSA-PSS signature (RFC 8017 §8.1.2 & §9.1.2).
-// TLS 1.3 prefers PSS over PKCS#1 v1.5 for certificate signatures (RFC 8446
-// §4.2.3 lists it first): its randomized encoding has a provable security
-// reduction and avoids the implementation pitfalls of v1.5's deterministic
-// padding. The 0xbc trailer and strict structure checks exist so no
-// alternate encoding can decode to the same EM (encoding uniqueness).
+// verify_pss verifies an RSASSA-PSS signature (RFC 8017 §8.1.2 & §9.1.2). TLS
+// 1.3 lists PSS first (RFC 8446 §4.2.3); its randomized encoding has a provable
+// reduction and avoids v1.5's deterministic-padding pitfalls. The strict
+// structure checks enforce encoding uniqueness.
 pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool {
 	h_len := match digest_type {
 		'sha256' { 32 }
@@ -179,12 +171,10 @@ pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !
 		}
 	}
 	s_len := h_len // In TLS 1.3, salt length matches hash output length (RFC 8446 §4.2.3)
-	// Note this hard-codes the saltLen == hLen convention: RFC 4055 §5.1 permits
-	// any salt length, so an exotic CA cert using a shorter salt would fail
-	// verification here. Acceptable — essentially every TLS-era RSA-PSS signer
-	// (CAs included) uses salt == hash length.
-	// rsa_verify_raw gives the encoded message EM = maskedDB || H || 0xbc, where
-	// maskedDB is emLen - hLen - 1 bytes and H is the hLen-byte hash.
+	// Hard-codes the saltLen == hLen convention (RFC 4055 §5.1 permits any length);
+	// essentially every TLS-era RSA-PSS signer uses salt == hash length.
+	// rsa_verify_raw gives EM = maskedDB || H || 0xbc, maskedDB being emLen - hLen
+	// - 1 bytes and H the hLen-byte hash.
 	em := k.rsa_verify_raw(sig)!
 	em_len := em.len
 
@@ -201,10 +191,9 @@ pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !
 	masked_db := em[..em_len - h_len - 1].clone()
 	h := em[em_len - h_len - 1..em_len - 1].clone()
 
-	// 3. Top bits check: top bit of EM must be 0
-	// RFC 8017 §9.2 uses emBits = modBits − 1 (the −1 because m < n forces the top
-	// bit clear), so the count of forced zero bits in maskedDB[0] is
-	// 8*emLen − (modBits − 1); when that lands in 1..8, mask exactly those bits.
+	// 3. Top bits check: top bit of EM must be 0.
+	// RFC 8017 §9.2 uses emBits = modBits − 1 (m < n forces the top bit clear), so
+	// the count of forced zero bits in maskedDB[0] is 8*emLen − (modBits − 1).
 	mod_bits := k.size_bytes * 8
 	top_zero_bits := 8 * em_len - (mod_bits - 1)
 	if top_zero_bits > 0 && top_zero_bits <= 8 {
@@ -243,9 +232,9 @@ pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !
 	// 7. Extract salt
 	salt := db[db.len - s_len..].clone()
 
-	// 8. Compute H_prime = Hash(0x00 * 8 || mHash || salt)
-	// The 8 zero octets are EMSA-PSS's fixed "length mask" prefix (RFC 8017 §9.2);
-	// they domain-separate this hash from any plain message hash of the same bytes.
+	// 8. Compute H_prime = Hash(0x00 * 8 || mHash || salt).
+	// The 8 zero octets are EMSA-PSS's fixed "length mask" prefix (RFC 8017 §9.2),
+	// domain-separating this hash from a plain message hash.
 	mut m_prime := []u8{cap: 8 + m_hash.len + salt.len}
 	for _ in 0 .. 8 {
 		m_prime << 0x00
@@ -265,10 +254,9 @@ pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !
 }
 
 // verify_pkcs1_v1_5 verifies an RSASSA-PKCS1-v1_5 signature (RFC 8017 §8.2.2).
-// DigestInfo is matched as one whole expected byte string (DER prefix + hash)
-// rather than parsed: permissive ASN.1 handling of the prefix was the enabler of
-// Bleichenbacher-style forgeries, so the exact canonical encoding must appear
-// byte-for-byte or the signature is rejected.
+// DigestInfo is matched as one whole byte string (DER prefix + hash) rather than
+// parsed: permissive prefix handling enabled Bleichenbacher-style forgeries, so
+// the exact canonical encoding must appear byte-for-byte or be rejected.
 pub fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig []u8) !bool {
 	em := k.rsa_verify_raw(sig)!
 	if em.len < 11 {
@@ -280,8 +268,7 @@ pub fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig 
 
 	// Canonical DER DigestInfo prefix: SEQUENCE{ SEQUENCE{ OID(digest), NULL },
 	// OCTET STRING(hLen) } per RFC 8017 §2.3.1 — the last byte (0x20/0x30/0x40) is
-	// the hash length. Appending m_hash yields the whole expected EM tail; nothing
-	// here parses the peer's encoding (see function doc: exact match or reject).
+	// the hash length. Appending m_hash yields the expected EM tail verbatim.
 	prefix := match digest_type {
 		'sha256' {
 			[u8(0x30), 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
@@ -321,9 +308,8 @@ pub fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig 
 		}
 	}
 
-	// Also catches sep_idx == -1 (no separator byte anywhere in EM).
-	// Separator at index ≥ 10 ⇒ PS length = sep_idx - 2 ≥ 8 (RFC 8017 §8.2.2
-	// step 3: EM length must be at least 11).
+	// Also catches sep_idx == -1 (no separator). Separator at index ≥ 10 ⇒ PS
+	// length = sep_idx - 2 ≥ 8 (RFC 8017 §8.2.2 step 3: EM length ≥ 11).
 	if sep_idx < 10 {
 		return error('rsa-pkcs1: PS padding too short (must be at least 8 bytes)')
 	}

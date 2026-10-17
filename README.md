@@ -52,6 +52,23 @@ and `insecure_skip_verify` (test/lab only; it removes all authentication).
 Layering is strict: `wire` knows nothing of TLS, `record` knows nothing of
 handshake messages, and `handshake` owns no socket — `client` drives it all.
 
+## Repository layout
+
+```
+src/
+  dial_example.v    runnable end-to-end demo (handshake + HTTP GET over TLS)
+  client/           public API: dial(), Conn, Config (+ conn_test.v)
+  handshake/        message codecs, state machine, AEAD, cert-verify, §7.1 adapter
+  record/           record layer, alerts, per-direction cipher state
+  kdf/              HKDF key schedule and running transcript hash
+  pki/              X.509/ASN.1 parsing, chain validation, hostname matching, trust store
+  wire/             bounds-checked byte reader / length-prefixed writer
+```
+
+The demo lives under `src/` (not a top-level `example/`) because V resolves this
+library's bare sibling imports (`client`, `record`, …) relative to the executable's
+own directory — a runnable that imports them must sit beside them.
+
 ## What is implemented
 
 - **Cipher suites**: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,

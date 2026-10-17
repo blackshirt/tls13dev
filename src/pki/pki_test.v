@@ -1,8 +1,7 @@
-module pki
-
 // PKI tests: RFC 6125 hostname/wildcard matching including the SAN-vs-CN
 // precedence rule, ASN.1 OID decoding, raw iPAddress SAN comparison, and
 // loading the host's system trust bundle.
+module pki
 
 fn test_hostname_matching() {
 	// Exact matches

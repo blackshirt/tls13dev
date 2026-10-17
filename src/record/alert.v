@@ -2,7 +2,7 @@ module record
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).
 // In TLS 1.3 the warning level exists only for close_notify; every other alert
-// must be sent as fatal, since a recoverable error signal was removed from 1.2's design.
+// must be fatal, since a recoverable error signal was removed from 1.2's design.
 pub enum AlertLevel as u8 {
 	warning = 1
 	fatal   = 2
@@ -63,10 +63,9 @@ pub fn parse_alert(data []u8) !Alert {
 			return error('record: invalid alert level ${data[0]}')
 		}
 	}
-	// The cast is unsafe on purpose: the received byte may be a description value
-	// this enum does not enumerate. RFC 6367 §2.2 requires unknown alert values to
-	// be tolerated rather than rejected, so we preserve the raw byte and let the
-	// caller act on the alert (is_fatal() already treats any non-close_notify as fatal).
+	// The cast is unsafe on purpose: the received byte may be a description this
+	// enum does not enumerate. RFC 8446 §6 treats unknown alert types as error
+	// alerts, so the raw byte is preserved and is_fatal() classifies it.
 	desc := unsafe { AlertDescription(data[1]) }
 	return Alert{
 		level:       level
@@ -76,13 +75,12 @@ pub fn parse_alert(data []u8) !Alert {
 
 // is_fatal reports whether the alert must terminate the connection.
 // Per RFC 8446 §6, all alerts are fatal except close_notify and user_canceled.
-fn (a Alert) is_fatal() bool {
+pub fn (a Alert) is_fatal() bool {
 	return a.description != .close_notify && a.description != .user_canceled
 }
 
-// new_close_notify builds a warning close_notify alert — the only alert allowed
-// at warning level (RFC 8446 §6.1). It signals orderly shutdown: the sender has
-// closed its write side and will not accept further application data.
+// new_close_notify builds the warning close_notify alert, the only alert allowed
+// at warning level (RFC 8446 §6.1). It signals orderly shutdown.
 pub fn new_close_notify() Alert {
 	return Alert{
 		level:       .warning
@@ -91,7 +89,7 @@ pub fn new_close_notify() Alert {
 }
 
 // new_fatal_alert builds a fatal alert with the given description.
-fn new_fatal_alert(desc AlertDescription) Alert {
+pub fn new_fatal_alert(desc AlertDescription) Alert {
 	return Alert{
 		level:       .fatal
 		description: desc
@@ -100,7 +98,7 @@ fn new_fatal_alert(desc AlertDescription) Alert {
 
 // alert_record wraps an alert in an unencrypted TLS record. Alerts sent before
 // the cipher keys take effect travel in plaintext; post-handshake alerts are
-// encrypted via the cipher state instead, though their inner content type remains 21.
+// encrypted via the cipher state instead, with inner content type 21.
 pub fn alert_record(a Alert) Record {
 	return new_record(.alert, a.encode())
 }

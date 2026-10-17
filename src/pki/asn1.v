@@ -9,11 +9,9 @@ struct Asn1Element {
 	data         []u8 // value octets; children for constructed, raw bytes for primitive
 }
 
-// read_asn1_element parses a single ASN.1 TLV (Tag-Length-Value) from the wire
-// reader. Only definite-length encodings are supported, which DER mandates.
-//   - bit 0x20 of the tag marks a constructed value (its data holds child TLVs)
-//   - length short form: 1 byte, high bit clear
-//   - length long form:  high bit set; low 7 bits give the number of length bytes
+// read_asn1_element parses a single ASN.1 TLV (Tag-Length-Value). Only
+// definite-length encodings are supported, which DER mandates; bit 0x20 of the
+// tag marks a constructed value, and length uses the short or long form.
 fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 	if r.remaining() < 2 {
 		return error('asn1: truncated element header')
@@ -31,9 +29,8 @@ fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 		// Long form: low 7 bits count the big-endian length octets that follow.
 		num_len_bytes := int(len_byte & 0x7f)
 		if num_len_bytes == 0 || num_len_bytes > 4 {
-			// 0 is reserved (indefinite length — not allowed in DER); >4 would
-			// overflow the u32 accumulator, and no real certificate ever needs it:
-			// an attacker-controlled huge length here must fail, not wrap.
+			// 0 is reserved (indefinite length, illegal in DER); >4 would overflow
+			// the u32 accumulator, and no real certificate needs it.
 			return error('asn1: invalid or unsupported length octets (${num_len_bytes})')
 		}
 		if r.remaining() < num_len_bytes {
@@ -68,14 +65,10 @@ fn parse_sequence(data []u8) ![]Asn1Element {
 	return elements
 }
 
-// parse_oid decodes an ASN.1 object identifier into dotted-decimal form.
-// Certificates are identified entirely by OID strings (algorithms, extensions,
-// attributes), so decoding to canonical dotted form gives a stable key for the
-// string matches in x509/validator.
-//
-// The first subidentifier packs the first two arcs as (arc1 * 40 + arc2). Like
-// every other subidentifier, it is a base-128 varint and may span several bytes
-// (RFC 5280 §A.1).
+// parse_oid decodes an ASN.1 object identifier into canonical dotted-decimal
+// form, giving a stable key for the string matches in x509/validator. The first
+// subidentifier packs the first two arcs as (arc1 * 40 + arc2); like every other
+// subidentifier it is a base-128 varint and may span several bytes (RFC 5280 §A.1).
 fn parse_oid(data []u8) string {
 	if data.len == 0 {
 		return ''
