@@ -51,3 +51,23 @@ fn test_host_from_address() ! {
 	assert host_from_address('[2001:db8::1]:443') == '2001:db8::1'
 	assert host_from_address('localhost') == 'localhost'
 }
+
+// test_read_raw_record_oversized_payload verifies immediate rejection of records
+// with declared length > max_ciphertext_record_len before allocating/reading.
+fn test_read_raw_record_oversized_payload() ! {
+	mut c := &Conn{}
+	// Header declaring 20000 bytes payload (> max_ciphertext_record_len 16640)
+	c.recv_buf << [u8(0x17), 0x03, 0x03, 0x4e, 0x20]
+	if _ := c.read_raw_record() {
+		assert false
+	}
+}
+
+// test_conn_nil_safety verifies that calling close() and read(empty) on a
+// Conn with nil socket does not crash or panic.
+fn test_conn_nil_safety() ! {
+	mut c := &Conn{}
+	c.close()!
+	mut empty_buf := []u8{}
+	assert c.read(mut empty_buf)! == 0
+}

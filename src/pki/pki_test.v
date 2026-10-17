@@ -1,7 +1,8 @@
 module pki
 
-// PKI tests: RFC 6125 hostname/wildcard matching, ASN.1 OID decoding, raw
-// iPAddress SAN comparison, and loading the host's system trust bundle.
+// PKI tests: RFC 6125 hostname/wildcard matching including the SAN-vs-CN
+// precedence rule, ASN.1 OID decoding, raw iPAddress SAN comparison, and
+// loading the host's system trust bundle.
 
 fn test_hostname_matching() {
 	// Exact matches
@@ -20,6 +21,43 @@ fn test_hostname_matching() {
 	assert !match_hostname('*.example.com', 'sub.api.example.com') // Cannot cross label boundaries
 
 	assert !match_hostname('*.example.com', 'foo.badexample.com')
+
+	// Only a leftmost full-label '*' is special (CA/Browser Baseline profile):
+	// a bare '*', a partial-label '*x', or an inner '.*.' must never wildcard.
+	assert !match_hostname('*', 'example.com')
+	assert !match_hostname('*x.example.com', 'ax.example.com')
+	assert !match_hostname('foo.*.com', 'foo.bar.com')
+
+	// Wildcards must never match TLDs (RFC 6125 §6.4.3)
+	assert !match_hostname('*.com', 'example.com')
+	assert !match_hostname('*.org', 'site.org')
+
+	// Wildcards must never match IP addresses (RFC 6125 §6.4.3)
+	assert !match_hostname('*.1.1.1', '1.1.1.1')
+	assert !match_hostname('*.168.1.1', '192.168.1.1')
+}
+
+// test_verify_hostnames pins the SAN-vs-CN precedence rule of RFC 6125 §6.4.4:
+// the presence of ANY dNSName SAN disables CN checking entirely; the CN is only
+// consulted for legacy certs with no SAN list at all.
+fn test_verify_hostnames() {
+	// SAN list present but non-matching while the CN WOULD match: must still
+	// fail — this is the exact confused-deputy case that deprecated CN checks.
+	assert !verify_hostnames(['a.example'], 'example.com', 'example.com')
+
+	// Any matching SAN wins; non-matching siblings and the CN are irrelevant.
+	assert verify_hostnames(['a.example', 'b.example'], 'wrong.cn', 'b.example')
+
+	// Wildcards inside the SAN list follow the matcher's rules.
+	assert verify_hostnames(['*.example.com'], '', 'api.example.com')
+	assert !verify_hostnames(['*.example.com'], '', 'a.b.example.com')
+
+	// No SANs: legacy CN fallback, wildcard included.
+	assert verify_hostnames([], 'example.com', 'example.com')
+	assert verify_hostnames([], '*.example.com', 'api.example.com')
+
+	// Neither SANs nor CN: nothing can authorize the name.
+	assert !verify_hostnames([], '', 'example.com')
 }
 
 fn test_asn1_oid_parsing() {
@@ -35,6 +73,10 @@ fn test_asn1_oid_parsing() {
 	// (81 34), followed by 03.
 	multi_byte_first := [u8(0x81), 0x34, 0x03]
 	assert parse_oid(multi_byte_first) == '2.100.3'
+
+	// Unterminated varint in OID must return empty string
+	truncated_oid := [u8(0x2a), 0x86, 0x48, 0x86]
+	assert parse_oid(truncated_oid) == ''
 }
 
 fn test_ip_san_matching() {

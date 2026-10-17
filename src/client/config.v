@@ -1,5 +1,6 @@
 module client
 
+import time
 import pki
 
 // Config holds TLS client connection options.
@@ -20,6 +21,8 @@ pub:
 	// root_cas, when set, is used instead of the system trust store — e.g. for
 	// private CAs in enterprise or testing setups.
 	root_cas ?pki.TrustStore
+	// timeout sets the socket read and write timeouts. Defaults to 30 seconds if 0.
+	timeout time.Duration
 }
 
 // default_config builds a Config for the given hostname that trusts the system
@@ -31,5 +34,6 @@ pub fn default_config(server_name string) Config {
 		server_name:          server_name
 		alpn:                 []string{}
 		insecure_skip_verify: false
+		timeout:              30 * time.second
 	}
 }

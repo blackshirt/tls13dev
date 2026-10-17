@@ -35,15 +35,25 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	if chain.len == 0 {
 		return error('pki: empty certificate chain')
 	}
+	if chain.len > 32 {
+		return error('pki: certificate chain too long (${chain.len} > 32)')
+	}
 
 	now := time.now().unix()
 	leaf := chain[0]
 
 	// Hostname validation against the leaf certificate. IP literals are matched
-	// against iPAddress SANs instead of via DNS-style hostname matching.
-	if hostname != '' && !verify_hostnames(leaf.sans, leaf.subject_cn, hostname)
-		&& !ip_san_matches(leaf.ip_sans, hostname) {
-		return error('pki: leaf certificate does not match hostname "${hostname}" (SANs: ${leaf.sans}, CN: "${leaf.subject_cn}")')
+	// exclusively against iPAddress SANs per RFC 6125 §6.4.3 / RFC 2818 §3.1.
+	if hostname != '' {
+		if is_ip_literal(hostname) {
+			if !ip_san_matches(leaf.ip_sans, hostname) {
+				return error('pki: leaf certificate does not match IP address "${hostname}" (iPAddress SANs: ${leaf.ip_sans})')
+			}
+		} else {
+			if !verify_hostnames(leaf.sans, leaf.subject_cn, hostname) {
+				return error('pki: leaf certificate does not match hostname "${hostname}" (SANs: ${leaf.sans}, CN: "${leaf.subject_cn}")')
+			}
+		}
 	}
 
 	// Validity period. The '> 0' guards treat an unparseable time (x509.v stores 0
@@ -100,6 +110,12 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		if top_cert.issuer_dn != root.subject_dn {
 			continue // name pair first: cheap string test that filters most roots out
 		}
+		if root.not_before_unix > 0 && now < root.not_before_unix {
+			continue // skip not-yet-valid root
+		}
+		if root.not_after_unix > 0 && now > root.not_after_unix {
+			continue // skip expired root
+		}
 		// A failed signature under this root is not fatal: another stored root can
 		// share the subject (rotated/cross-signed copies of the same CA), so the
 		// loop keeps trying remaining candidates.
@@ -119,7 +135,7 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 }
 
 // verify_cert_signature verifies that `child` was signed by `parent`.
-pub fn verify_cert_signature(child Certificate, parent Certificate) !bool {
+fn verify_cert_signature(child Certificate, parent Certificate) !bool {
 	match parent.public_key_algo {
 		.rsa {
 			rsa_key := parent.rsa_public_key or {

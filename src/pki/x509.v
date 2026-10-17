@@ -168,14 +168,13 @@ pub fn parse_certificate(der []u8) !Certificate {
 					// Parse the named curve OID from AlgorithmIdentifier.parameters
 					if alg_seq.len >= 2 {
 						curve_oid := parse_oid(alg_seq[1].data)
-						ecdsa_curve = match curve_oid {
-							'1.2.840.10045.3.1.7' { ecdsa.Nid.prime256v1 } // P-256 / secp256r1
-							'1.3.132.0.34' { ecdsa.Nid.secp384r1 } // P-384 / secp384r1
-							// Unknown curves (P-521, Brainpool, …) fall back to P-256: the
-							// wrong-size point then fails in ecdsa_public_key()/verification with a
-							// signature error rather than a clear "unsupported curve" here — known
-							// trade-off, acceptable since issuers use P-256/P-384 in practice.
-							else { ecdsa.Nid.prime256v1 }
+						if curve_oid == '1.2.840.10045.3.1.7' {
+							ecdsa_curve = ecdsa.Nid.prime256v1 // P-256 / secp256r1
+						} else if curve_oid == '1.3.132.0.34' {
+							ecdsa_curve = ecdsa.Nid.secp384r1 // P-384 / secp384r1
+						} else {
+							// Unsupported curve (P-521, Brainpool, etc.): fail clearly
+							pk_algo = .unknown
 						}
 					}
 				}
@@ -368,7 +367,12 @@ fn extract_cn_from_name(name_bytes []u8) string {
 			if attr_parts.len >= 2 {
 				oid := parse_oid(attr_parts[0].data)
 				if oid == '2.5.4.3' { // commonName
-					return attr_parts[1].data.bytestr()
+					val := attr_parts[1].data
+					// Disallow null bytes (CVE-2009-2408 null byte injection attack)
+					if val.contains(0) {
+						return ''
+					}
+					return val.bytestr()
 				}
 			}
 		}
@@ -393,10 +397,16 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 		gn := read_asn1_element(mut general_names_r) or { break }
 		match gn.tag & 0x1f {
 			2 { // [2] dNSName
-				dns << gn.data.bytestr()
+				// Disallow null bytes (CVE-2009-2408)
+				if !gn.data.contains(0) {
+					dns << gn.data.bytestr()
+				}
 			}
 			7 { // [7] iPAddress
-				ip << gn.data.clone()
+				// Valid iPAddress must be 4 bytes (IPv4) or 16 bytes (IPv6)
+				if gn.data.len == 4 || gn.data.len == 16 {
+					ip << gn.data.clone()
+				}
 			}
 			else {}
 		}

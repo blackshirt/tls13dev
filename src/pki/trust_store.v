@@ -16,6 +16,12 @@ pub fn new_trust_store() TrustStore {
 	}
 }
 
+// add_der parses and appends a single DER-encoded certificate into the store.
+pub fn (mut ts TrustStore) add_der(der []u8) ! {
+	cert := parse_certificate(der)!
+	ts.certs << cert
+}
+
 // add_pem parses and appends all certificates from a PEM string into the store.
 // PEM is just a base64-of-DER wrapper, so the real parsing target is the decoded
 // DER between the BEGIN/END markers. Unparseable blocks are skipped rather than
@@ -30,12 +36,12 @@ pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
 
 	for line in lines {
 		trimmed := line.trim_space()
-		if trimmed == '-----BEGIN CERTIFICATE-----' {
+		if trimmed.starts_with('-----BEGIN ') && trimmed.ends_with('CERTIFICATE-----') {
 			in_cert = true
 			b64_buf = ''
 			continue
 		}
-		if trimmed == '-----END CERTIFICATE-----' {
+		if trimmed.starts_with('-----END ') && trimmed.ends_with('CERTIFICATE-----') {
 			in_cert = false
 			der := base64.decode(b64_buf)
 			cert := parse_certificate(der) or {
@@ -61,8 +67,10 @@ pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 	paths := [
 		'/etc/ssl/certs/ca-certificates.crt', // Debian/Ubuntu/Gentoo
 		'/etc/pki/tls/certs/ca-bundle.crt', // Fedora/RHEL/CentOS
+		'/etc/ca-certificates/extracted/tls-ca-bundle.pem', // Arch Linux
 		'/etc/ssl/ca-bundle.pem', // OpenSUSE
 		'/etc/pki/tls/cacert.pem', // OpenELEC
+		'/usr/local/share/certs/ca-root-nss.crt', // FreeBSD
 		'/etc/ssl/cert.pem', // Alpine / macOS
 	]
 

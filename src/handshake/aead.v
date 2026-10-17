@@ -11,7 +11,7 @@ import kdf
 // schedule must use exactly that one (RFC 8446 §7.1). The match is exhaustive
 // on purpose — like suite_key_len below, adding a new suite must force a
 // decision here rather than silently inheriting SHA-256.
-pub fn suite_hash_algo(suite CipherSuite) kdf.HashAlgorithm {
+fn suite_hash_algo(suite CipherSuite) kdf.HashAlgorithm {
 	return match suite {
 		.tls_aes_128_gcm_sha256 { .sha256 }
 		.tls_aes_256_gcm_sha384 { .sha384 }
@@ -22,7 +22,7 @@ pub fn suite_hash_algo(suite CipherSuite) kdf.HashAlgorithm {
 // suite_key_len returns the AEAD key length for a cipher suite, fixed by the
 // cipher itself (AES-128/256, ChaCha20) — the key schedule must extract exactly
 // this many bytes via HKDF-Expand-Label (RFC 8446 §7.1).
-pub fn suite_key_len(suite CipherSuite) int {
+fn suite_key_len(suite CipherSuite) int {
 	return match suite {
 		.tls_aes_128_gcm_sha256 { 16 }
 		.tls_aes_256_gcm_sha384 { 32 }
@@ -37,7 +37,7 @@ pub fn suite_key_len(suite CipherSuite) int {
 // (RFC 8446 §5.3 / RFC 8439 §2.0). Key length is not re-checked here: both
 // constructors reject wrong-sized keys themselves, and every key reaching this
 // point was expanded to suite_key_len bytes by the key schedule.
-pub fn new_aead_for_suite(suite CipherSuite, key []u8) !cipher.AEAD {
+fn new_aead_for_suite(suite CipherSuite, key []u8) !cipher.AEAD {
 	return match suite {
 		.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384 {
 			aes.new_aes_gcm(key)!

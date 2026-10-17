@@ -39,23 +39,43 @@ pub mut:
 // The server name falls back to the address host so SNI and certificate hostname
 // verification still work when dialed by "host:port" alone.
 pub fn dial(address string, config Config) !&Conn {
+	// Prefer an explicit server_name; otherwise derive it from the dial address so
+	// a bare "host:port" still supplies SNI and the certificate hostname, rather
+	// than connecting with no authentication context to verify against (§4.3.1).
 	server_name := if config.server_name.len > 0 {
 		config.server_name
 	} else {
 		host_from_address(address)
 	}
 
+	// Open the TCP transport first: every later failure path must close the socket
+	// it just acquired, so the handshake/validator steps below guard on `sock`.
 	mut sock := net.dial_tcp(address)!
-	sock.set_read_timeout(30 * time.second)
-	sock.set_write_timeout(30 * time.second)
+	// Apply one bounded timeout to both directions (caller's value, else a 30s
+	// default): a handshake that never completes would otherwise hang forever on a
+	// stalled or unreachable peer.
+	timeout := if config.timeout > 0 { config.timeout } else { 30 * time.second }
+	sock.set_read_timeout(timeout)
+	sock.set_write_timeout(timeout)
 
-	mut hs := handshake.new_client_handshake(server_name, config.alpn)!
+	mut hs := handshake.new_client_handshake(server_name, config.alpn) or {
+		sock.close() or {}
+		return err
+	}
 
+	// Resolve the trust anchors by precedence: an explicit root_cas override wins,
+	// else the system bundle is loaded — unless verification is being skipped, in
+	// which case an empty store is fine because the validator never consults it.
 	mut store := pki.new_trust_store()
 	if roots := config.root_cas {
 		store = roots
 	} else if !config.insecure_skip_verify {
-		store.load_system_ca_bundle()!
+		// Loading the OS bundle can fail (missing file); that is fatal, but the
+		// socket we already opened must be closed so a dial error leaks no fd.
+		store.load_system_ca_bundle() or {
+			sock.close() or {}
+			return err
+		}
 	}
 	validator := pki.new_validator(store, config.insecure_skip_verify)
 
@@ -67,7 +87,16 @@ pub fn dial(address string, config Config) !&Conn {
 		server_name: server_name
 	}
 
-	conn.do_handshake(validator)!
+	// Run the full client flight. On any handshake failure close the socket (so an
+	// aborted connection does not leak the fd) and propagate the error rather than
+	// handing back a half-connected Conn that would silently misbehave on read.
+	conn.do_handshake(validator) or {
+		sock.close() or {}
+		return err
+	}
+	// Copy the ALPN pick onto the public Conn field only now that the handshake
+	// has proven the server's choice was one we offered (RFC 7301 §3.1 check lives
+	// in the state machine, not here).
 	conn.negotiated_alpn = conn.hs.negotiated_alpn
 	return conn
 }
@@ -76,14 +105,21 @@ pub fn dial(address string, config Config) !&Conn {
 // "[ipv6]:port") so a bare address can still supply the SNI name and the
 // hostname that the peer certificate is verified against.
 fn host_from_address(address string) string {
+	// Bracketed form is an IPv6 literal: the address itself contains ':', so the
+	// port (if any) is whatever follows the closing ']'. Return only the inner
+	// address; a missing ']' means it was not really bracketed, so hand the string
+	// back unchanged rather than slicing to a bogus index.
 	// Strip [ipv6]:port or host:port
 	if address.starts_with('[') {
 		end := address.index(']') or { return address }
 		return address[1..end]
 	}
+	// host:port — split on the LAST colon so the port separator is removed while
+	// any earlier structure in the string is preserved as part of the host.
 	if colon := address.last_index(':') {
 		return address[..colon]
 	}
+	// No colon at all: the entire string is already just a host (e.g. "localhost").
 	return address
 }
 
@@ -142,6 +178,9 @@ fn (mut c Conn) do_handshake(validator pki.Validator) ! {
 // write_records serializes records and sends them to the peer in order; one
 // socket write per record keeps record framing intact on the TCP stream.
 fn (mut c Conn) write_records(recs []record.Record) ! {
+	if c.sock == unsafe { nil } {
+		return error('tls: socket is nil')
+	}
 	for rec in recs {
 		bytes := rec.serialize()
 		c.sock.write(bytes)!
@@ -160,6 +199,9 @@ fn (mut c Conn) read_raw_record() !record.Record {
 			// We must not parse until a whole header+payload frame is buffered:
 			// TCP is a byte stream, so records can arrive split across reads.
 			payload_len := int(u16(c.recv_buf[c.recv_pos + 3]) << 8 | u16(c.recv_buf[c.recv_pos + 4]))
+			if payload_len > record.max_ciphertext_record_len {
+				return error('record: record length ${payload_len} exceeds maximum allowed ${record.max_ciphertext_record_len}')
+			}
 			total := record.record_header_len + payload_len
 			if avail >= total {
 				frame := c.recv_buf[c.recv_pos..c.recv_pos + total].clone()
@@ -168,6 +210,9 @@ fn (mut c Conn) read_raw_record() !record.Record {
 				mut r := wire.new_reader(frame)
 				return record.parse_record(mut r)!
 			}
+		}
+		if c.sock == unsafe { nil } {
+			return error('tls: connection closed (no socket available to read further records)')
 		}
 		mut tmp := []u8{len: recv_read_size}
 		n := c.sock.read(mut tmp) or {
@@ -188,9 +233,16 @@ fn (mut c Conn) read_raw_record() !record.Record {
 // run on every record while keeping memory bounded.
 fn (mut c Conn) compact_recv_buf() {
 	if c.recv_pos == c.recv_buf.len {
+		// Fully drained: clear() drops the consumed prefix but keeps the allocated
+		// capacity, so subsequent reads reuse the buffer without reallocating and
+		// recv_pos resets to frame the next record at the front.
 		c.recv_buf.clear()
 		c.recv_pos = 0
 	} else if c.recv_pos >= recv_buf_compact_threshold {
+		// Unread data still remains but the already-consumed prefix has grown past
+		// the bound: shift the live tail down once. Amortizing the reclaim (instead
+		// of re-slicing on every record) keeps per-byte cost O(1) while capping
+		// memory at roughly the threshold plus a single record.
 		c.recv_buf = c.recv_buf[c.recv_pos..].clone()
 		c.recv_pos = 0
 	}
@@ -200,25 +252,38 @@ fn (mut c Conn) compact_recv_buf() {
 // connection closed and returns 0 for a clean close_notify, or an error for any
 // other alert.
 fn (mut c Conn) handle_alert(payload []u8) !int {
+	// Any alert is terminal for this direction, so mark closed before decoding —
+	// even a malformed alert body must not leave the Conn looking usable.
 	c.closed = true
 	a := record.parse_alert(payload)!
+	// close_notify is the one clean-shutdown signal: return 0, the same value a
+	// normal EOF read yields, so callers treat it as orderly end-of-stream.
 	if a.description == .close_notify {
 		return 0
 	}
+	// Every other description is fatal per RFC 8446 §6 (all alerts are fatal
+	// except close_notify and user_canceled); surface the peer's code verbatim.
 	return error('tls: received alert ${a.description}')
 }
 
 // read decrypts application data into buf. Returns bytes read (0 on clean close).
 pub fn (mut c Conn) read(mut buf []u8) !int {
-	if c.closed {
-		return error('tls: connection closed')
+	if buf.len == 0 {
+		return 0
 	}
 	// A decrypted record can hold more than the caller's buffer; leftovers from
 	// the previous record are drained first so no plaintext is dropped or reordered.
 	if c.app_buf.len > 0 {
 		n := copy(mut buf, c.app_buf)
-		c.app_buf = c.app_buf[n..].clone()
+		if n == c.app_buf.len {
+			c.app_buf.clear()
+		} else {
+			c.app_buf = c.app_buf[n..].clone()
+		}
 		return n
+	}
+	if c.closed {
+		return 0
 	}
 
 	for {
@@ -228,9 +293,11 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				continue
 			}
 			.alert {
-				// Unencrypted alert: only possible before keys are installed; handled
-				// directly since there is no inner content type to inspect.
-				return c.handle_alert(rec.payload)
+				// RFC 8446 §6: All alerts after handshake keys are established MUST
+				// be encrypted under application traffic keys. Receiving an unencrypted
+				// outer alert post-handshake is illegal and must be rejected to prevent
+				// plaintext alert injection attacks.
+				return error('tls: received unencrypted alert post-handshake (must be encrypted)')
 			}
 			.application_data {
 				dec := c.hs.server_app_cipher.decrypt_record(rec)!
@@ -309,17 +376,32 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 					c.hs.update_write_traffic_keys()!
 				}
 			}
+			.certificate_request {
+				// Client authentication: recognized, not answered by this client
+			}
 			else {
-				// Ignore unrecognized post-handshake messages
+				// RFC 8446 §4.6: any other message is a fatal unexpected_message error
+				return error('tls: unexpected post-handshake message ${msg_type} (unexpected_message)')
 			}
 		}
+	}
+	if buf.len > 0 {
+		return error('tls: truncated post-handshake message header (${buf.len} bytes)')
 	}
 }
 
 // write encrypts and sends application data.
 pub fn (mut c Conn) write(data []u8) !int {
+	// Refuse to encrypt onto a finished connection: writing after close_notify
+	// would hand the peer data it has already promised to stop reading.
 	if c.closed {
 		return error('tls: connection closed')
+	}
+	// Application keys exist only once the handshake reaches .connected; writing
+	// any earlier would drive an uninitialized cipher state, so gate on the state
+	// machine rather than trusting caller ordering.
+	if c.hs.state != .connected {
+		return error('tls: handshake not complete')
 	}
 	// Chunk to max_plaintext_record_len (2^14): TLS forbids larger plaintext
 	// records (RFC 8446 §5.1), so one write() may emit many encrypted records.
@@ -340,16 +422,28 @@ pub fn (mut c Conn) write(data []u8) !int {
 
 // close sends a close_notify alert and closes the underlying TCP connection.
 pub fn (mut c Conn) close() ! {
+	// Idempotent teardown: a second close() must not re-send close_notify or
+	// double-close the socket, so the already-closed path just ensures the fd is
+	// gone and returns without touching the alert state again.
 	if c.closed {
-		c.sock.close() or {}
+		if c.sock != unsafe { nil } {
+			c.sock.close() or {}
+		}
 		return
 	}
+	// Emit close_notify at most once; this is guarded separately from `closed` so a
+	// failure inside send_close_notify still marks the connection closed below
+	// instead of leaving it eligible to re-alert.
 	if !c.close_notify_sent {
 		c.close_notify_sent = true
 		c.send_close_notify()
 	}
 	c.closed = true
-	c.sock.close() or {}
+	// Best-effort socket close: errors are swallowed because we are already tearing
+	// down and the caller has nothing left to act on.
+	if c.sock != unsafe { nil } {
+		c.sock.close() or {}
+	}
 }
 
 // send_close_notify writes a close_notify alert, encrypted with the application
@@ -357,6 +451,9 @@ pub fn (mut c Conn) close() ! {
 // encryption fails). RFC 8446 §6.1/§A.4: alerts after the server Finished MUST
 // be encrypted; plaintext close_notify is only correct when keys are not yet up.
 fn (mut c Conn) send_close_notify() {
+	if c.sock == unsafe { nil } {
+		return
+	}
 	plaintext_alert := record.alert_record(record.new_close_notify())
 	if c.hs.state != .connected {
 		c.write_records([plaintext_alert]) or {}

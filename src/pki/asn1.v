@@ -3,8 +3,7 @@ module pki
 import wire
 
 // Asn1Element represents a parsed ASN.1 DER tag, length, and content bytes.
-pub struct Asn1Element {
-pub:
+struct Asn1Element {
 	tag          u8   // identifier octet, including class/constructed bits
 	is_construct bool // bit 0x20 of the tag: data holds child TLVs rather than raw bytes
 	data         []u8 // value octets; children for constructed, raw bytes for primitive
@@ -15,7 +14,7 @@ pub:
 //   - bit 0x20 of the tag marks a constructed value (its data holds child TLVs)
 //   - length short form: 1 byte, high bit clear
 //   - length long form:  high bit set; low 7 bits give the number of length bytes
-pub fn read_asn1_element(mut r wire.Reader) !Asn1Element {
+fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 	if r.remaining() < 2 {
 		return error('asn1: truncated element header')
 	}
@@ -59,7 +58,7 @@ pub fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 }
 
 // parse_sequence decodes an ASN.1 SEQUENCE into its child elements.
-pub fn parse_sequence(data []u8) ![]Asn1Element {
+fn parse_sequence(data []u8) ![]Asn1Element {
 	mut r := wire.new_reader(data)
 	mut elements := []Asn1Element{}
 	for r.remaining() > 0 {
@@ -77,8 +76,12 @@ pub fn parse_sequence(data []u8) ![]Asn1Element {
 // The first subidentifier packs the first two arcs as (arc1 * 40 + arc2). Like
 // every other subidentifier, it is a base-128 varint and may span several bytes
 // (RFC 5280 §A.1).
-pub fn parse_oid(data []u8) string {
+fn parse_oid(data []u8) string {
 	if data.len == 0 {
+		return ''
+	}
+	// The final byte of an ASN.1 OID must have bit 7 clear (indicating termination)
+	if (data[data.len - 1] & 0x80) != 0 {
 		return ''
 	}
 

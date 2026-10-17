@@ -53,8 +53,8 @@ pub fn (a Alert) encode() []u8 {
 
 // parse_alert decodes a 2-byte alert payload.
 pub fn parse_alert(data []u8) !Alert {
-	if data.len < 2 {
-		return error('record: alert payload too short (${data.len})')
+	if data.len != 2 {
+		return error('record: alert payload must be exactly 2 bytes, got ${data.len}')
 	}
 	level := match data[0] {
 		1 { AlertLevel.warning }
@@ -76,7 +76,7 @@ pub fn parse_alert(data []u8) !Alert {
 
 // is_fatal reports whether the alert must terminate the connection.
 // Per RFC 8446 §6, all alerts are fatal except close_notify and user_canceled.
-pub fn (a Alert) is_fatal() bool {
+fn (a Alert) is_fatal() bool {
 	return a.description != .close_notify && a.description != .user_canceled
 }
 
@@ -91,7 +91,7 @@ pub fn new_close_notify() Alert {
 }
 
 // new_fatal_alert builds a fatal alert with the given description.
-pub fn new_fatal_alert(desc AlertDescription) Alert {
+fn new_fatal_alert(desc AlertDescription) Alert {
 	return Alert{
 		level:       .fatal
 		description: desc

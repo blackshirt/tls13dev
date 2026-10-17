@@ -16,7 +16,7 @@ pub enum ContentType as u8 {
 }
 
 // content_type_from_u8 decodes a 1-byte record content type.
-pub fn content_type_from_u8(b u8) !ContentType {
+fn content_type_from_u8(b u8) !ContentType {
 	return match b {
 		0 { .invalid }
 		20 { .change_cipher_spec }
@@ -30,7 +30,7 @@ pub fn content_type_from_u8(b u8) !ContentType {
 // Legacy record version mandated by RFC 8446 §5.1 to preserve middlebox compatibility.
 // TLS 1.3 always writes 0x0303 (TLS 1.2) in the record header regardless of the
 // negotiated version; the real version lives inside the handshake.
-pub const legacy_record_version = u16(0x0303) // TLS 1.2
+const legacy_record_version = u16(0x0303) // TLS 1.2
 
 // Wire-size limits for a single record (RFC 8446 §5.2).
 // A plaintext record carries at most 2^14 bytes of content; a ciphertext record
@@ -40,7 +40,7 @@ pub const record_header_len = 5
 pub const max_plaintext_record_len = 16384 // 2^14 bytes
 // max_record_overhead is the 256-byte allowance for the inner content type byte,
 // the AEAD tag, and any padding a sender adds (RFC 8446 §5.2).
-pub const max_record_overhead = 256
+const max_record_overhead = 256
 pub const max_ciphertext_record_len = max_plaintext_record_len + max_record_overhead
 
 // Record represents a raw TLS record frame on the wire: the 5-byte header plus
@@ -75,10 +75,16 @@ pub fn change_cipher_spec() Record {
 // chunks plaintext at max_plaintext_record_len, handshake messages are far
 // smaller), so a truncating oversized payload would be a bug above, not input.
 pub fn (r &Record) serialize() []u8 {
+	// Preallocate the exact frame size so header and payload land in one contiguous
+	// buffer with no growth-copy on the hot send path.
 	mut w := wire.new_writer(record_header_len + r.payload.len)
+	// Header fields go out in the fixed §5.2 order — type, legacy version, length —
+	// mirroring parse_record's reads so encode and decode stay exact inverses.
 	w.write_u8(u8(r.content_type))
 	w.write_u16(r.legacy_version)
 	w.write_u16(u16(r.payload.len))
+	// Payload is copied verbatim; AEAD framing happened before this call, so
+	// serialize is a pure transport encoder that adds no structure of its own.
 	w.write_bytes(r.payload)
 	return w.bytes()
 }

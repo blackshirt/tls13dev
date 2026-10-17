@@ -48,7 +48,7 @@ pub fn new_record_cipher_state(aead cipher.AEAD, iv []u8) !RecordCipherState {
 // - The seq number occupies only the low 64 bits, so the loop XORs into nonce[4..12]
 //   and leaves the first 4 bytes of the IV untouched (the leading zero-padding of
 //   the 12-byte big-endian sequence number XORs to nothing).
-pub fn (s &RecordCipherState) compute_nonce(seq u64) []u8 {
+fn (s &RecordCipherState) compute_nonce(seq u64) []u8 {
 	mut nonce := s.iv.clone()
 	// Walk the 64-bit sequence number big-endian: byte 0 is its most-significant
 	// byte, landing at nonce[4] where the zero-padded prefix ends.
@@ -162,7 +162,13 @@ pub fn (mut s RecordCipherState) decrypt_record(rec Record) !DecryptedRecord {
 	}
 
 	inner_type := content_type_from_u8(inner_plaintext[end])!
+	if inner_type == .invalid {
+		return error('record: invalid inner content type (unexpected_message)')
+	}
 	plaintext := inner_plaintext[..end].clone()
+	if plaintext.len > max_plaintext_record_len {
+		return error('record: decrypted plaintext length ${plaintext.len} exceeds maximum allowed ${max_plaintext_record_len} (record_overflow)')
+	}
 
 	return DecryptedRecord{
 		content_type: inner_type

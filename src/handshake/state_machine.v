@@ -1,16 +1,15 @@
 // module handshake implements the TLS 1.3 client protocol machinery per RFC
 // 8446: messages.v encodes/decodes each handshake message (including the §4.2
-// extension framing and placement policy), aead.v supplies the AEAD primitives
-// that protect handshake and application records, and state_machine.v drives
-// the message flow, key-schedule integration, and CertificateVerify checks.
+// extension framing, placement policy, and ServerHello semantic checks),
+// aead.v supplies the AEAD primitives, key_schedule.v holds the pure §7.1
+// secret derivations, certificate_verify.v checks the server signature, and
+// state_machine.v drives the message flow and wires those pieces together.
 // conn.v in the client module owns the socket; this module is pure protocol
 // state.
 module handshake
 
 import crypto.ecdsa
-import crypto.ed25519
 import crypto.rand
-import crypto.sha512
 import crypto.subtle
 import x.crypto.curve25519
 import wire
@@ -36,8 +35,7 @@ pub enum HandshakeState {
 
 // ClientHandshake orchestrates the TLS 1.3 client handshake state machine.
 pub struct ClientHandshake {
-pub mut:
-	state             HandshakeState
+mut:
 	config            ClientHelloConfig // inputs echoed/replayed when rebuilding the second ClientHello
 	transcript        kdf.Transcript    // running hash of all handshake messages (RFC 8446 §4.4.1)
 	hash_algo         kdf.HashAlgorithm // hash of the negotiated suite; drives every key derivation
@@ -45,30 +43,34 @@ pub mut:
 	key_len           int               // AEAD key length of that suite (16 or 32 bytes)
 	ecdhe_group       NamedGroup        // group of our key share; may change on HelloRetryRequest
 	priv_x25519       &curve25519.PrivateKey = unsafe { nil } // private half of the X25519 share
-	priv_p256         ?ecdsa.PrivateKey        // private half of the P-256 share, set when that group is used
-	client_hello1     []u8                     // full first ClientHello, kept for the HRR message_hash substitution (§4.4.1)
-	handshake_secret  []u8                     // Early Secret → Handshake Secret stage (§7.1)
-	client_hs_traffic []u8                     // client handshake traffic secret (§7.1)
-	server_hs_traffic []u8                     // server handshake traffic secret (§7.1)
-	client_hs_keys    kdf.TrafficKeys          // client write keys derived from client_hs_traffic
-	server_hs_keys    kdf.TrafficKeys          // server write keys derived from server_hs_traffic
-	client_app_keys   kdf.TrafficKeys          // client write keys for application data
-	server_app_keys   kdf.TrafficKeys          // server write keys for application data
+	priv_p256         ?ecdsa.PrivateKey // private half of the P-256 share, set when that group is used
+	client_hello1     []u8              // full first ClientHello, kept for the HRR message_hash substitution (§4.4.1)
+	handshake_secret  []u8              // Early Secret → Handshake Secret stage (§7.1)
+	client_hs_traffic []u8              // client handshake traffic secret (§7.1)
+	server_hs_traffic []u8              // server handshake traffic secret (§7.1)
+	// Traffic keys are never stored: they are derived into locals and live on
+	// only inside the RecordCipherStates below, which are the sole consumers —
+	// the reusable state is the traffic *secrets* (next fields + ap_traffic),
+	// per RFC 8446 §7.2 rekeying.
 	client_ap_traffic []u8                     // client application traffic secret (§7.1), kept for KeyUpdate
 	server_ap_traffic []u8                     // server application traffic secret (§7.1), kept for KeyUpdate
 	server_hs_cipher  record.RecordCipherState // AEAD state for records the server sends under handshake keys
 	client_hs_cipher  record.RecordCipherState // AEAD state for records we send under handshake keys
-	server_app_cipher record.RecordCipherState // AEAD state for records the server sends under app keys
-	client_app_cipher record.RecordCipherState // AEAD state for records we send under app keys
 	// Handshake messages may be split across records or coalesced within one
 	// (RFC 8446 §5.2), so decrypted plaintext accumulates here and complete
 	// messages are consumed from the front as they become available.
 	reassembly_buf   []u8
-	server_certs     []pki.Certificate  // chain sent by the server, leaf first, once Certificate is parsed
-	negotiated_alpn  string             // server's ALPN pick, '' if none; the RFC 7301 §3.1 check guarantees it was one of config.alpn
-	session_tickets  []NewSessionTicket // tickets received post-handshake; currently collected, not resumable
-	hrr_received     bool               // set after a HelloRetryRequest so the second CH is validated as such
-	hrr_cipher_suite ?CipherSuite       // suite selected in the HelloRetryRequest; the final ServerHello must reuse it (§4.1.4)
+	server_certs     []pki.Certificate // chain sent by the server, leaf first, once Certificate is parsed
+	hrr_received     bool              // set after a HelloRetryRequest so the second CH is validated as such
+	hrr_cipher_suite ?CipherSuite      // suite selected in the HelloRetryRequest; the final ServerHello must reuse it (§4.1.4)
+pub mut:
+	// Only the members conn.v actually reads stay public; everything above is
+	// handshake-internal and hidden from the client module.
+	state             HandshakeState
+	negotiated_alpn   string                   // server's ALPN pick, '' if none; the RFC 7301 §3.1 check guarantees it was one of config.alpn
+	server_app_cipher record.RecordCipherState // AEAD state for records the server sends under app keys
+	client_app_cipher record.RecordCipherState // AEAD state for records we send under app keys
+	session_tickets   []NewSessionTicket       // tickets received post-handshake; currently collected, not resumable
 }
 
 // new_client_handshake creates a new ClientHandshake with an X25519 key share.
@@ -79,12 +81,23 @@ pub mut:
 // derivation that matters. The 32-byte session_id satisfies the middlebox
 // compatibility recommendation (RFC 8446 App. D.4).
 pub fn new_client_handshake(server_name string, alpn []string) !ClientHandshake {
-	mut priv_key := curve25519.PrivateKey.new()!
-	pub_key := priv_key.public_key()!
-	raw_pub := pub_key.bytes()!
-	session_id := rand.bytes(legacy_session_id_len)!
-	random := rand.bytes(client_hello_random_len)!
+	// Generate the ephemeral X25519 key pair up front so the very first ClientHello
+	// can already carry a key_share: TLS 1.3 has no separate key-exchange round
+	// trip, so the public share must ride in the initial hello (§4.2.8).
+	mut priv_key := curve25519.PrivateKey.new()! // fresh 32-byte X25519 scalar
+	pub_key := priv_key.public_key()! // base-point multiplication of the scalar
+	raw_pub := pub_key.bytes()! // 32-byte encoding placed verbatim in key_exchange
+	// Draw the two randoms that must stay stable for the whole connection: the
+	// legacy session id (echoed by the server, re-used after an HRR) and
+	// ClientHello.random. Keeping them in config lets the retry hello reproduce
+	// them byte-identically, as §4.1.4 requires.
+	session_id := rand.bytes(legacy_session_id_len)! // 32 bytes for middlebox compatibility (App. D.4)
+	random := rand.bytes(client_hello_random_len)! // 32-byte ClientHello.random
 
+	// Assemble the initial hello inputs. The key-share group is pinned to X25519
+	// — mandatory to implement (§9.1) — and cookie is left empty until a
+	// HelloRetryRequest supplies one; cipher_suites defaults elsewhere to the three
+	// TLS 1.3 AEAD suites.
 	cfg := ClientHelloConfig{
 		server_name:  server_name
 		alpn:         alpn
@@ -140,16 +153,26 @@ pub fn (mut h ClientHandshake) create_client_hello() !([]record.Record, []u8) {
 // On a normal ServerHello it returns an empty record list after deriving HS keys.
 pub fn (mut h ClientHandshake) process_server_hello(sh_record record.Record) !([]record.Record, ServerHello) {
 	if h.state != .wait_server_hello {
+		// Strict ordering: a ServerHello/HelloRetryRequest is only legal while we
+		// are waiting for it. Any other state means the peer delivered a message out
+		// of turn (§4.4.1), so reject before parsing rather than acting on a possible
+		// reordering/truncation attack.
 		return error('handshake: unexpected ServerHello in state ${h.state}')
 	}
 
+	// Peel the 4-byte handshake header (type || 3-byte length) off the record
+	// payload. We read it here to both confirm the message type and know exactly
+	// how many bytes form the body that parse_server_hello then decodes (§4).
 	mut r := wire.new_reader(sh_record.payload)
 	msg_type, length := parse_handshake_header(mut r)!
 	if msg_type != .server_hello {
+		// HelloRetryRequest reuses the ServerHello type value (2) and is told apart
+		// only by the sentinel random later in the parser; anything other than 2 is
+		// unexpected in this slot (§4.1.3).
 		return error('handshake: expected ServerHello (2), got ${msg_type}')
 	}
-	body := r.read_bytes(length)!
-	sh := parse_server_hello(body)!
+	body := r.read_bytes(length)! // body only; the header is re-added for the transcript below
+	sh := parse_server_hello(body)! // §4.1.3 field decode plus the §4.2 extension allowlist
 	// Re-frame header + body for the transcript: hashing must cover the exact
 	// 4-byte-message-type || 3-byte-length || body layout sent on the wire, and
 	// wrap_handshake_message reproduces it byte-identically from the parsed body.
@@ -158,7 +181,7 @@ pub fn (mut h ClientHandshake) process_server_hello(sh_record record.Record) !([
 	if sh.is_hello_retry_req {
 		// RFC 8446 §4.1.4: validate the shared ServerHello fields, reject a second
 		// HelloRetryRequest, and require that the request actually changes something.
-		h.validate_server_hello_common(sh)!
+		sh.validate(&h.config)!
 		if h.hrr_received {
 			return error('handshake: received second HelloRetryRequest (unexpected_message)')
 		}
@@ -193,7 +216,7 @@ pub fn (mut h ClientHandshake) process_server_hello(sh_record record.Record) !([
 	// Normal ServerHello. Validate the echoed fields and that the server selected
 	// a key share for the group we offered; with only (EC)DHE key exchange a
 	// missing key_share leaves us unable to derive the handshake keys.
-	h.validate_server_hello_common(sh)!
+	sh.validate(&h.config)!
 	// RFC 8446 §4.1.4: after a HelloRetryRequest the ServerHello cipher suite
 	// must match the one the HRR selected, otherwise abort with illegal_parameter.
 	if hrr_suite := h.hrr_cipher_suite {
@@ -220,65 +243,25 @@ pub fn (mut h ClientHandshake) process_server_hello(sh_record record.Record) !([
 	// traffic secrets, then expand each into an AEAD key + IV.
 	shared_secret := h.compute_shared_secret(sh.server_share)!
 
-	// Early Secret = HKDF-Extract(0, 0). Without a PSK the IKM is empty, but it
-	// is still mixed in via Derive-Secret so the schedule matches the RFC.
-	early_secret := kdf.hkdf_extract(h.hash_algo, []u8{}, []u8{len: h.hash_algo.hash_len()})
-	derived_early := kdf.derive_secret(h.hash_algo, early_secret, 'derived', kdf.empty_transcript_hash(h.hash_algo))!
-	// Handshake Secret = HKDF-Extract(Derive-Secret(Early, "derived"), ECDHE)
-	h.handshake_secret = kdf.hkdf_extract(h.hash_algo, derived_early, shared_secret)
-
-	// Handshake traffic secrets are bound to the transcript through ServerHello.
+	// The handshake secret is retained because the Master Secret (application
+	// phase, after server Finished) derives from it; the traffic secrets feed the
+	// handshake write keys below.
 	th_ch_sh := h.transcript.current_hash()
-	h.client_hs_traffic = kdf.derive_secret(h.hash_algo, h.handshake_secret, 'c hs traffic', th_ch_sh)!
-	h.server_hs_traffic = kdf.derive_secret(h.hash_algo, h.handshake_secret, 's hs traffic', th_ch_sh)!
+	hs := derive_hs_secrets(h.hash_algo, shared_secret, th_ch_sh)!
+	h.handshake_secret = hs.handshake_secret
+	h.client_hs_traffic = hs.client_traffic
+	h.server_hs_traffic = hs.server_traffic
 
-	// Each traffic secret expands into the record-layer AEAD write key and IV.
-	h.client_hs_keys = kdf.derive_traffic_keys(h.hash_algo, h.client_hs_traffic, h.key_len, record.aead_nonce_len)!
-	h.server_hs_keys = kdf.derive_traffic_keys(h.hash_algo, h.server_hs_traffic, h.key_len, record.aead_nonce_len)!
+	// Each traffic secret expands into the record-layer AEAD write key and IV;
+	// the keys themselves exist only as locals feeding new_cipher.
+	client_hs_keys := kdf.derive_traffic_keys(h.hash_algo, h.client_hs_traffic, h.key_len, record.aead_nonce_len)!
+	server_hs_keys := kdf.derive_traffic_keys(h.hash_algo, h.server_hs_traffic, h.key_len, record.aead_nonce_len)!
 
-	h.server_hs_cipher = h.new_cipher(h.server_hs_keys)!
-	h.client_hs_cipher = h.new_cipher(h.client_hs_keys)!
+	h.server_hs_cipher = h.new_cipher(server_hs_keys)!
+	h.client_hs_cipher = h.new_cipher(client_hs_keys)!
 
 	h.state = .wait_encrypted_extensions
 	return []record.Record{}, sh
-}
-
-// validate_server_hello_common performs the ServerHello/HelloRetryRequest checks
-// that do not depend on the message variant (RFC 8446 §4.1.3): the echoed legacy
-// session ID must match the ClientHello, and the selected cipher suite must have
-// been offered by the client.
-fn (h &ClientHandshake) validate_server_hello_common(sh ServerHello) ! {
-	if sh.session_id_echo != h.config.session_id {
-		return error('handshake: legacy_session_id_echo does not match ClientHello (illegal_parameter)')
-	}
-	if !h.is_offered_cipher_suite(sh.cipher_suite) {
-		return error('handshake: server selected unoffered cipher suite ${sh.cipher_suite} (illegal_parameter)')
-	}
-}
-
-// is_offered_cipher_suite reports whether the client advertised the suite.
-fn (h &ClientHandshake) is_offered_cipher_suite(cs CipherSuite) bool {
-	for offered in h.offered_cipher_suites() {
-		if offered == cs {
-			return true
-		}
-	}
-	return false
-}
-
-// offered_cipher_suites returns the suites sent in the ClientHello: the explicit
-// configuration if present, otherwise the built-in default list.
-fn (h &ClientHandshake) offered_cipher_suites() []CipherSuite {
-	if h.config.cipher_suites.len > 0 {
-		return h.config.cipher_suites
-	}
-	return default_cipher_suites()
-}
-
-// is_supported_group reports whether the client advertised support for a group in
-// its supported_groups extension (see build_client_hello).
-fn is_supported_group(g NamedGroup) bool {
-	return g == .x25519 || g == .secp256r1
 }
 
 // set_hash_algo adopts the negotiated suite's hash: the Transcript only stores
@@ -287,8 +270,14 @@ fn is_supported_group(g NamedGroup) bool {
 // already matches (the initial SHA-256 default).
 fn (mut h ClientHandshake) set_hash_algo(algo kdf.HashAlgorithm) {
 	if h.hash_algo == algo {
-		return
+		return // already on the target digest — the common SHA-256 case, no rebuild
 	}
+	// The Transcript persists only the algorithm plus the raw messages, not a
+	// rolling digest, so adopting a suite with a different hash (SHA-384 for
+	// AES-256-GCM) means reconstructing it around the new algorithm while carrying
+	// every byte accumulated so far — otherwise the running hash would keep using
+	// the initial SHA-256 default and every derived secret would diverge from the
+	// server's.
 	h.hash_algo = algo
 	h.transcript = kdf.Transcript{
 		hash_algo: algo
@@ -318,13 +307,19 @@ fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group Na
 		}
 	}
 	// A cookie-only HelloRetryRequest keeps the original key share unchanged.
+	// Stash the server's cookie verbatim so build_client_hello echoes it back as
+	// the cookie extension; every other field of the retried hello must stay
+	// byte-identical to the first except for key_share/cookie (§4.1.4/§4.2.2).
 	h.config.cookie = cookie
 	_, full_ch2 := build_client_hello(h.config)!
+	// Hash the new hello into the already message_hash-rewritten transcript so the
+	// eventual Finished MAC covers the retried flight rather than ClientHello1
+	// (§4.4.1).
 	h.transcript.update(full_ch2)
 
 	ch_rec := record.new_record(.handshake, full_ch2)
-	ccs_rec := record.change_cipher_spec()
-	h.state = .wait_server_hello
+	ccs_rec := record.change_cipher_spec() // repeat the dummy CCS for middlebox compatibility (App. D.4)
+	h.state = .wait_server_hello // rearm: the server now answers with the real ServerHello
 	return [ch_rec, ccs_rec]
 }
 
@@ -383,7 +378,21 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 			if h.priv_x25519 == unsafe { nil } {
 				return error('handshake: missing X25519 private key')
 			}
-			return h.priv_x25519.x25519(server_share.key_exchange)!
+			// RFC 8446 §4.2.8.2 & RFC 7748 §6.1: an all-zero peer u-coordinate is
+			// the small-order subgroup identity, so scalar multiplication would
+			// yield an all-zero shared secret (small-subgroup attack). Gate it
+			// before the backend, which rejects the same input with an opaque
+			// library error, so the abort carries our named protocol error.
+			if subtle.constant_time_compare(server_share.key_exchange, []u8{len: 32, init: 0}) == 1 {
+				return error('handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
+			}
+			secret := h.priv_x25519.x25519(server_share.key_exchange)!
+			// Defence in depth: a non-zero peer point in the same small subgroup
+			// also multiplies to zero, so re-check the backend's result.
+			if subtle.constant_time_compare(secret, []u8{len: 32, init: 0}) == 1 {
+				return error('handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
+			}
+			return secret
 		}
 		.secp256r1 {
 			// Only the uncompressed encoding is legal in TLS 1.3 (§4.2.8.2);
@@ -396,7 +405,11 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 			peer := ecdsa.PublicKey.from_uncompressed_bytes(server_share.key_exchange,
 				nid: .prime256v1
 			)!
-			return priv.derive_shared_secret(peer)!
+			secret := priv.derive_shared_secret(peer)!
+			if subtle.constant_time_compare(secret, []u8{len: secret.len, init: 0}) == 1 {
+				return error('handshake: computed P-256 shared secret is all-zero value (illegal_parameter)')
+			}
+			return secret
 		}
 	}
 	// Unreachable: the match above is exhaustive over NamedGroup and every arm
@@ -406,10 +419,20 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 
 // feed_encrypted_record decrypts a handshake-phase record into the reassembly buffer.
 pub fn (mut h ClientHandshake) feed_encrypted_record(rec record.Record) ! {
+	// Decrypt under the server's handshake traffic keys: everything the server
+	// sends after ServerHello is protected, so a plaintext handshake record never
+	// appears again — the true message type lives inside the inner plaintext
+	// (§5.1/§5.2).
 	decrypted := h.server_hs_cipher.decrypt_record(rec)!
 	if decrypted.content_type != .handshake {
+		// In this phase the only legal inner content type is handshake; an
+		// application_data or alert here is a protocol violation (§5.6), so abort
+		// rather than mis-routing it into the transcript.
 		return error('handshake: unexpected content type in handshake phase: ${decrypted.content_type}')
 	}
+	// Accumulate the recovered plaintext; process_reassembled_messages later walks
+	// this buffer, joining message fragments that span records and splitting
+	// several messages coalesced into one (§5.2).
 	h.reassembly_buf << decrypted.plaintext
 }
 
@@ -502,15 +525,13 @@ pub fn (mut h ClientHandshake) process_reassembled_messages(validator &pki.Valid
 				// With the server Finished verified, advance the key schedule to
 				// the application phase: Master Secret, then the application
 				// traffic secrets bound to the transcript including server Finished.
-				derived_hs := kdf.derive_secret(h.hash_algo, h.handshake_secret, 'derived', kdf.empty_transcript_hash(h.hash_algo))!
-				master_secret := kdf.hkdf_extract(h.hash_algo, derived_hs, []u8{len: h.hash_algo.hash_len()})
-
 				th_sfin := h.transcript.current_hash()
-				h.client_ap_traffic = kdf.derive_secret(h.hash_algo, master_secret, 'c ap traffic', th_sfin)!
-				h.server_ap_traffic = kdf.derive_secret(h.hash_algo, master_secret, 's ap traffic', th_sfin)!
+				ap := derive_app_secrets(h.hash_algo, h.handshake_secret, th_sfin)!
+				h.client_ap_traffic = ap.client_traffic
+				h.server_ap_traffic = ap.server_traffic
 
-				h.client_app_keys = kdf.derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, record.aead_nonce_len)!
-				h.server_app_keys = kdf.derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, record.aead_nonce_len)!
+				client_app_keys := kdf.derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, record.aead_nonce_len)!
+				server_app_keys := kdf.derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, record.aead_nonce_len)!
 
 				// The client Finished is computed with the handshake traffic
 				// secret over the transcript that now includes server Finished,
@@ -522,8 +543,12 @@ pub fn (mut h ClientHandshake) process_reassembled_messages(validator &pki.Valid
 				client_fin_rec := h.client_hs_cipher.encrypt_record(.handshake, client_fin_msg)!
 
 				// Switch the application record ciphers into place for post-handshake traffic.
-				h.server_app_cipher = h.new_cipher(h.server_app_keys)!
-				h.client_app_cipher = h.new_cipher(h.client_app_keys)!
+				h.server_app_cipher = h.new_cipher(server_app_keys)!
+				h.client_app_cipher = h.new_cipher(client_app_keys)!
+
+				if h.reassembly_buf.len > 0 {
+					return error('handshake: unexpected trailing data after server Finished in handshake flight')
+				}
 
 				h.state = .connected
 				return [client_fin_rec]
@@ -536,75 +561,27 @@ pub fn (mut h ClientHandshake) process_reassembled_messages(validator &pki.Valid
 	return []record.Record{}
 }
 
-// hash_for_digest returns Hash(data) for the named digest ("sha256"/"sha384"/"sha512").
-fn hash_for_digest(digest_type string, data []u8) []u8 {
-	return match digest_type {
-		'sha256' { kdf.HashAlgorithm.sha256.compute_hash(data) }
-		'sha384' { kdf.HashAlgorithm.sha384.compute_hash(data) }
-		else { sha512.sum512(data) }
-	}
-}
-
-// verify_certificate_verify checks the server's CertificateVerify signature
-// against the leaf certificate's public key over the §4.4.3 signed content
-// (see certificate_verify_signed_content). Note the digest split: RSA branches
-// hash the content first and verify a digest, while ECDSA/Ed25519 verify APIs
-// take the raw message and hash internally per their own scheme (EdDSA is pure
-// — the key, not the hash, is what binds the signature).
-fn verify_certificate_verify(leaf pki.Certificate, cv ParsedCertificateVerify, signed_content []u8) ! {
-	match cv.algorithm {
-		.rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 {
-			rsa_key := leaf.rsa_public_key or { return error('handshake: missing RSA public key') }
-			digest_type := match cv.algorithm {
-				.rsa_pss_rsae_sha256 { 'sha256' }
-				.rsa_pss_rsae_sha384 { 'sha384' }
-				else { 'sha512' }
-			}
-			hash := hash_for_digest(digest_type, signed_content)
-			ok := rsa_key.verify_pss(digest_type, hash, cv.signature)!
-			if !ok {
-				return error('handshake: RSA-PSS ${digest_type} CertificateVerify failed')
-			}
-		}
-		.rsa_pkcs1_sha256 {
-			rsa_key := leaf.rsa_public_key or { return error('handshake: missing RSA public key') }
-			hash := kdf.HashAlgorithm.sha256.compute_hash(signed_content)
-			ok := rsa_key.verify_pkcs1_v1_5('sha256', hash, cv.signature)!
-			if !ok {
-				return error('handshake: RSA-PKCS1 SHA-256 CertificateVerify failed')
-			}
-		}
-		.ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 {
-			pubkey := leaf.ecdsa_public_key()!
-			ok := pubkey.verify(signed_content, cv.signature)!
-			if !ok {
-				return error('handshake: ECDSA CertificateVerify failed (${cv.algorithm})')
-			}
-		}
-		.ed25519 {
-			if leaf.public_key_raw.len != ed25519.public_key_size {
-				return error('handshake: invalid Ed25519 public key length')
-			}
-			ok := ed25519.verify(ed25519.PublicKey(leaf.public_key_raw), signed_content, cv.signature)!
-			if !ok {
-				return error('handshake: Ed25519 CertificateVerify failed')
-			}
-		}
-	}
-}
-
 // update_read_traffic_keys ratchets the server application traffic secret to its
 // next generation (KeyUpdate, RFC 8446 §7.2) and swaps in the new read cipher.
 pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
+	// Ratchet the server's application traffic secret forward before deriving the
+	// next read keys: new_secret = HKDF-Expand-Label(old, "traffic upd", "", Hash)
+	// (§7.2). Overwriting the old secret means prior keys can no longer open newer
+	// records — the forward-security property KeyUpdate exists to deliver.
 	h.server_ap_traffic = kdf.hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
-	h.server_app_keys = kdf.derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, record.aead_nonce_len)!
-	h.server_app_cipher = h.new_cipher(h.server_app_keys)!
+	new_keys := kdf.derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, record.aead_nonce_len)!
+	h.server_app_cipher = h.new_cipher(new_keys)! // fresh state restarts the record sequence number at 0 (§5.3)
 }
 
 // update_write_traffic_keys ratchets the client application traffic secret to its
 // next generation (KeyUpdate, RFC 8446 §7.2) and swaps in the new write cipher.
 pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
+	// Symmetric to update_read_traffic_keys but for our outgoing direction, and
+	// subject to a stricter ordering rule (§4.6.3): a KeyUpdate response must be
+	// sent under the OLD write keys, so the caller only invokes this AFTER that
+	// message goes out. Ratchet the secret, re-expand key+IV, and install a fresh
+	// cipher whose sequence number restarts at 0 to avoid nonce reuse (§5.3).
 	h.client_ap_traffic = kdf.hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
-	h.client_app_keys = kdf.derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, record.aead_nonce_len)!
-	h.client_app_cipher = h.new_cipher(h.client_app_keys)!
+	new_keys := kdf.derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, record.aead_nonce_len)!
+	h.client_app_cipher = h.new_cipher(new_keys)!
 }

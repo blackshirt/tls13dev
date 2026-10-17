@@ -36,7 +36,7 @@ const sha256_block_size = 64
 const sha384_block_size = 128
 
 // compute_hmac calculates the HMAC of data using key.
-pub fn (h HashAlgorithm) compute_hmac(key []u8, data []u8) []u8 {
+fn (h HashAlgorithm) compute_hmac(key []u8, data []u8) []u8 {
 	return match h {
 		.sha256 { hmac.new(key, data, sha256.sum256, sha256_block_size) }
 		.sha384 { hmac.new(key, data, sha512.sum384, sha384_block_size) }
@@ -57,22 +57,31 @@ pub fn hkdf_extract(hash HashAlgorithm, salt []u8, ikm []u8) []u8 {
 // Output is produced as T(1) || T(2) || … where T(i) = HMAC(PRK, T(i-1) || info || i);
 // the 1-byte iteration counter is why the request limit is 255 * HashLen —
 // asking for more would silently wrap the counter and repeat blocks.
-pub fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
+fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 	hash_len := hash.hash_len()
+	// One HMAC block yields hash_len bytes and the counter is a single octet, so
+	// at most 255 blocks are reachable; asking beyond 255*hash_len would wrap the
+	// counter and silently repeat a block, so reject it up front (RFC 5869 §2.3).
 	if length > 255 * hash_len {
 		return error('hkdf_expand: requested length ${length} exceeds maximum (${255 * hash_len})')
 	}
 	mut out := []u8{cap: length}
-	mut prev := []u8{}
-	mut counter := u8(1)
+	mut prev := []u8{} // T(0) is defined as the empty string, so the first round has no prior block
+	mut counter := u8(1) // blocks are indexed from 1; this byte is appended to every HMAC input
 
 	for out.len < length {
+		// T(i) = HMAC(PRK, T(i-1) || info || i): stitch the previous block, the
+		// shared caller info, and the 1-byte counter into one HMAC input so each
+		// round both depends on all earlier rounds and is unique to its index.
 		mut step_input := []u8{cap: prev.len + info.len + 1}
 		step_input << prev
 		step_input << info
 		step_input << counter
 
 		prev = hash.compute_hmac(prk, step_input)
+		// Append only the bytes still required: the last block is usually consumed
+		// partially, so this truncation lands `out` on exactly `length` and never
+		// overshoots it.
 		needed := length - out.len
 		to_copy := if needed < prev.len { needed } else { prev.len }
 		out << prev[..to_copy]

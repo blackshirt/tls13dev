@@ -133,16 +133,37 @@ fn test_compute_shared_secret_rejects_bad_share_size() ! {
 	}
 }
 
-// test_hrr_helpers sanity-checks the two small predicates HRR handling relies
+// test_compute_shared_secret_rejects_zero_shared_secret pins RFC 8446 §4.2.8.2 / RFC 7748 §6.1:
+// an all-zero shared secret (e.g. from a low-order point) must be rejected with illegal_parameter.
+fn test_compute_shared_secret_rejects_zero_shared_secret() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.create_client_hello()!
+
+	// An all-zero X25519 peer public key computes to an all-zero shared secret
+	zero_x := KeyShareEntry{
+		group:        .x25519
+		key_exchange: []u8{len: 32, init: 0}
+	}
+	h.compute_shared_secret(zero_x) or {
+		assert err.msg().contains('all-zero value')
+		return
+	}
+	assert false
+}
+
+// test_hrr_helpers sanity-checks the predicates ServerHello validation relies
 // on: the set of implemented named groups and the default offered suites.
 fn test_hrr_helpers() ! {
 	assert is_supported_group(.x25519)
 	assert is_supported_group(.secp256r1)
 
 	mut h := new_client_handshake('example.com', [])!
-	assert h.is_offered_cipher_suite(.tls_aes_128_gcm_sha256)
-	assert h.is_offered_cipher_suite(.tls_aes_256_gcm_sha384)
-	assert h.is_offered_cipher_suite(.tls_chacha20_poly1305_sha256)
+	// With no explicit config the offer is the three TLS 1.3 AEAD suites; a
+	// ServerHello selecting anything else is rejected by sh.validate().
+	offered := offered_cipher_suites(&h.config)
+	assert offered.contains(.tls_aes_128_gcm_sha256)
+	assert offered.contains(.tls_aes_256_gcm_sha384)
+	assert offered.contains(.tls_chacha20_poly1305_sha256)
 }
 
 fn test_process_hrr_group_change() ! {

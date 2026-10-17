@@ -21,7 +21,7 @@ pub:
 //	    modulus           INTEGER,  -- n
 //	    publicExponent    INTEGER   -- e
 //	}
-pub fn parse_rsa_public_key(der []u8) !RsaPublicKey {
+fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	// der is the full DER-encoded SEQUENCE (tag 0x30 + length + contents).
 	// Unwrap the outer SEQUENCE to get its contents, then parse the two INTEGERs.
 	mut r := wire.new_reader(der)
@@ -41,6 +41,9 @@ pub fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	if n_bytes.len > 0 && n_bytes[0] == 0 {
 		n_bytes = n_bytes[1..].clone()
 	}
+	if n_bytes.len == 0 {
+		return error('rsa: empty modulus')
+	}
 
 	n_hex := hex.encode(n_bytes)
 	// hex string as intermediate: V's big.Integer consumes radix strings, not raw
@@ -49,13 +52,15 @@ pub fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 		return error('rsa: failed to parse modulus: ${err.msg()}')
 	}
 
+	if e_elem.data.len > 8 {
+		return error('rsa: public exponent exceeds 64 bits')
+	}
 	mut e := u64(0)
-	// Fold the big-endian exponent INTEGER into u64. Real exponents (3, 65537) fit
-	// with room to spare; a hostile >8-byte e would silently wrap, but a wrapped e
-	// only ever fails verification — public exponents are not secrets, so there is
-	// no exploitable direction in accepting the wrap.
 	for b in e_elem.data {
 		e = (e << 8) | u64(b)
+	}
+	if e == 0 {
+		return error('rsa: public exponent must be non-zero')
 	}
 
 	return RsaPublicKey{
@@ -324,7 +329,7 @@ pub fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig 
 	}
 
 	got_digest_info := em[sep_idx + 1..]
-	if subtle.constant_time_compare(got_digest_info, di) != 1 {
+	if got_digest_info.len != di.len || subtle.constant_time_compare(got_digest_info, di) != 1 {
 		return error('rsa-pkcs1: DigestInfo mismatch')
 	}
 	return true

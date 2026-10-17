@@ -1,6 +1,7 @@
 module handshake
 
 import encoding.hex
+import wire
 
 // Codec tests for the handshake message layer: ClientHello construction is
 // re-parsed field by field, server-side messages decode from small hand-built
@@ -66,6 +67,50 @@ fn test_parse_encrypted_extensions_extension_policy() ! {
 	// extensions vector (len 5) = renegotiation_info (0xff01), 1 byte of data
 	ok := [u8(0x00), 0x05, 0xff, 0x01, 0x00, 0x01, 0x00]
 	assert parse_encrypted_extensions(ok)! == ''
+}
+
+// test_parse_encrypted_extensions_single_alpn pins the happy path of the
+// RFC 7301 §3.1 exactly-one rule: a well-formed ALPN extension selecting
+// "http/1.1" is returned verbatim.
+fn test_parse_encrypted_extensions_single_alpn() ! {
+	// ext_block(0x0f) = alpn(0x0010), data len 0x0b = u16 list len 0x09 ||
+	// [len 0x08]"http/1.1"
+	body := [u8(0x00), 0x0f, 0x00, 0x10, 0x00, 0x0b, 0x00, 0x09, 0x08, 0x68, 0x74, 0x74, 0x70,
+		0x2f, 0x31, 0x2e, 0x31]
+	assert parse_encrypted_extensions(body)! == 'http/1.1'
+}
+
+// test_parse_encrypted_extensions_rejects_empty_alpn: an ALPN extension with a
+// zero-length protocol list selects nothing, which RFC 7301 §3.1 forbids.
+fn test_parse_encrypted_extensions_rejects_empty_alpn() ! {
+	body := [u8(0x00), 0x06, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00]
+	if _ := parse_encrypted_extensions(body) {
+		assert false // empty ALPN list must be rejected
+	}
+}
+
+// test_parse_encrypted_extensions_rejects_multi_alpn: RFC 7301 §3.1 says the
+// server picks exactly one protocol; a second entry must not be silently
+// dropped behind the first (it could dodge the offered-list check).
+fn test_parse_encrypted_extensions_rejects_multi_alpn() ! {
+	// list(0x0c) = [2]"h2" [8]"http/1.1"
+	body := [u8(0x00), 0x12, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68,
+		0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31]
+	if _ := parse_encrypted_extensions(body) {
+		assert false // multi-protocol ALPN list must be rejected
+	}
+}
+
+// test_parse_encrypted_extensions_rejects_renegotiation_info_content: the
+// interop tolerance still holds for the empty case, but a non-empty
+// renegotiated_connection asserts a renegotiation that never happened
+// (RFC 5746 §3.4) and is now rejected rather than discarded unseen.
+fn test_parse_encrypted_extensions_rejects_renegotiation_info_content() ! {
+	// renegotiation_info(0xff01), data len 4 = [len 3]"abc"
+	body := [u8(0x00), 0x08, 0xff, 0x01, 0x00, 0x04, 0x03, 0x61, 0x62, 0x63]
+	if _ := parse_encrypted_extensions(body) {
+		assert false // non-empty renegotiated_connection must be rejected
+	}
 }
 
 // test_parse_server_hello_rejects_unpermitted_extension feeds a well-formed
@@ -137,15 +182,66 @@ fn test_parse_server_hello_rejects_trailing_key_share_bytes() ! {
 	}
 }
 
-// KeyUpdate codec tests. The round-trip asserts alone cannot catch an inverted
-// flag mapping (symmetric build/parse still agree), so the literal §4.6.3 wire
-// bytes request_update(0) / update_not_requested(1) are pinned directly.
+// KeyUpdate codec tests: verify §4.6.3 wire bytes update_not_requested(0) / update_requested(1).
 fn test_parse_key_update() ! {
 	assert parse_key_update(build_key_update(true)[4..])! == true
 	assert parse_key_update(build_key_update(false)[4..])! == false
-	assert build_key_update(true)[4] == 0 // request_update(0)
-	assert build_key_update(false)[4] == 1 // update_not_requested(1)
+	assert build_key_update(true)[4] == 1 // update_requested(1)
+	assert build_key_update(false)[4] == 0 // update_not_requested(0)
 	if _ := parse_key_update([]u8{}) {
+		assert false
+	}
+	if _ := parse_key_update([u8(2)]) {
+		assert false
+	}
+}
+
+// test_client_hello_ip_literal_omits_sni verifies RFC 6066 §3: literal IPv4 and
+// IPv6 addresses must not be sent in the server_name (SNI) extension.
+fn test_client_hello_ip_literal_omits_sni() ! {
+	cfg_ipv4 := ClientHelloConfig{
+		server_name:  '192.168.1.1'
+		alpn:         ['http/1.1']
+		client_share: KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+	}
+	_, full_ipv4 := build_client_hello(cfg_ipv4)!
+	assert !full_ipv4.bytestr().contains('192.168.1.1')
+
+	cfg_ipv6 := ClientHelloConfig{
+		server_name:  '2001:db8::1'
+		alpn:         ['http/1.1']
+		client_share: KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+	}
+	_, full_ipv6 := build_client_hello(cfg_ipv6)!
+	assert !full_ipv6.bytestr().contains('2001:db8::1')
+}
+
+// test_parse_certificate_rejects_non_empty_request_context pins RFC 8446 §4.4.2:
+// in the server Certificate message, certificate_request_context MUST be zero-length.
+fn test_parse_certificate_rejects_non_empty_request_context() ! {
+	// request_context of length 1 (value 0x01) followed by a 1-cert list
+	bad_cert_msg := [u8(0x01), 0xaa, 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0xde, 0xad, 0x00, 0x00]
+	if _ := parse_certificate(bad_cert_msg) {
+		assert false
+	}
+}
+
+// test_parse_new_session_ticket_bounds verifies ticket_lifetime limit (RFC 8446 §4.6.1).
+fn test_parse_new_session_ticket_bounds() ! {
+	// ticket_lifetime = 604801 (> 7 days)
+	mut w := wire.new_writer(64)
+	w.write_u32(604801) // lifetime
+	w.write_u32(100) // age_add
+	w.write_vector_u8([u8(1), 2])! // nonce
+	w.write_vector_u16([u8(0xaa), 0xbb])! // ticket
+	w.write_vector_u16([]u8{})! // extensions
+	if _ := parse_new_session_ticket(w.bytes()) {
 		assert false
 	}
 }
