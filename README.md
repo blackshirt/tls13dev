@@ -5,6 +5,8 @@ A **TLS 1.3 client library written in [V](https://vlang.io)**, implementing
 no bindings to OpenSSL — handshake messaging, record protection, key
 schedule, and X.509 path validation are built from V standard/crypto modules.
 
+Full module and API reference documentation lives in [`docs.md`](docs.md).
+
 > **Status: experimental.** The handshake, record layer, and certificate
 > validation are complete and covered by unit tests (handshake vectors from
 > RFC 8448, protocol-state and PKI rules from hand-built fixtures), but
@@ -23,7 +25,6 @@ backward compatibility promise while V itself is pre-1.0.
 ```bash
 v test all                 # unit tests for the tls module
 v run src/example/dial_example.v       # live demo: handshake + HTTP GET over TLS
-v run src/example/dial_hrr_example.v   # live demo: a HelloRetryRequest group-retry round trip
 ```
 
 ```v
@@ -31,14 +32,16 @@ import tls
 
 mut conn := tls.dial('example.com:443', tls.default_config('example.com'))!
 conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.bytes())!
-// conn.read(mut buf), conn.negotiated_alpn, conn.close() ...
+// conn.read(mut buf), conn.negotiated_alpn(), conn.close() ...
 ```
 
 `Config` exposes the caller-facing knobs: `server_name` (SNI + the name the
 certificate is checked against), `alpn` (offered protocols — the server's pick
 is verified against this list), `root_cas` (override the system trust store),
-and `insecure_skip_verify` (test/lab only; it removes all authentication). Those
-fields are read-only; because `Config` is a `@[params]` struct you customise it by
+and `insecure_skip_verify` (test/lab only; it removes all authentication). See
+[`docs.md`](docs.md) for the complete API reference — signatures, defaults,
+behavioral guarantees, and usage recipes. Those fields are read-only; because
+`Config` is a `@[params]` struct you customise it by
 passing named arguments straight to `dial()` — e.g.
 `tls.dial('example.com:443', server_name: 'example.com', alpn: ['h2'])!` — and any
 field you omit keeps the default declared on it (`default_config()` remains an
@@ -53,7 +56,8 @@ implementation detail, not part of the API contract.
 ## Architecture
 
 Everything lives in a single `tls` module (`src/tls/`); the source files are
-grouped by concern, each still owning one layer of the stack:
+grouped by concern, each still owning one layer of the stack (the full layer
+map is in [`docs.md`](docs.md)):
 
 | Source area      | Responsibility                                                               |
 |------------------|-----------------------------------------------------------------------------|
@@ -73,8 +77,7 @@ socket — `conn.v` drives it all.
 ```
 src/
   example/
-    dial_example.v     runnable end-to-end demo (handshake + HTTP GET over TLS)
-    dial_hrr_example.v same flow, against a server that forces a HelloRetryRequest
+    dial_example.v   runnable end-to-end demo (handshake + HTTP GET over TLS)
   tls/              the whole library as one module: wire codec, record layer,
                     handshake state machine, key schedule, PKI validation, and
                     the public client API (with its *_test.v files alongside)
@@ -101,7 +104,8 @@ library's bare sibling import (`tls`) relative to the executable's own directory
 - **ALPN** negotiation with RFC 7301 §3.1 selection checks
 - **Post-handshake**: `NewSessionTicket` collection, `KeyUpdate` handling
   (read keys ratchet on receipt; a response is sent with correct §4.6.3
-  old-key-before-new ordering when the server requests it), `close_notify`
+  old-key-before-new ordering when the server requests it), sender-side
+  automatic rekey at the §5.5 per-key record limit, `close_notify`
 
 ### Hardened parsing
 
@@ -109,8 +113,25 @@ Message decoding is deliberately strict — extensions must appear at most once
 (RFC 8446 §4.2), must belong in the message they appear in (ServerHello /
 EncryptedExtensions allowlists), fixed-format extension data must be exactly
 its defined length, and ECDHE shares are size- and encoding-gated (§4.2.8.2)
-before any crypto backend sees them. Malformed input is a handshake error,
-never a panic.
+before any crypto backend sees them. Resource use is equally bounded: a single
+reassembled handshake message is capped at 1 MiB, a `Certificate` list longer
+than 32 entries is refused at parse time (before each entry is decoded), per-key
+record counts enforce the §5.5 rekeying obligation in both directions, and CA
+certificates with RSA keys below 2048 bits are refused. Malformed input is a
+handshake error, never a panic.
+
+Certificate validation is strict X.509 too: DER must use minimal length
+encodings (X.690 §10.1) and a `keyUsage`/`basicConstraints` extension is honored
+when present — a leaf must assert `digitalSignature`, a signing CA `keyCertSign`,
+and `pathLenConstraint` caps how many intermediates may sit below a CA. TBSCertificate
+fields are element-counted after the optional `version [0]` is consumed, so a
+truncated v3 certificate fails the decode instead of indexing past the array, and
+RSA public keys must carry a non-zero, odd exponent (e=1 and even e are refused).
+The CertificateVerify scheme must match the leaf key type — and ECDSA schemes their
+exact curve (RFC 8446 §4.2.3) — before any key material is read. An
+unparseable validity date fails the whole decode rather than silently disabling
+expiry enforcement, and the X25519 exchange rejects every small-order shared
+secret (0, 1, p−1) not just the all-zero one.
 
 ## Not (yet) implemented
 
@@ -131,19 +152,24 @@ v test all
 covers: wire framing and bounds, record round trips and AEAD tamper
 detection, the RFC 8448 §3 key-schedule and transcript vectors, handshake
 message codecs against RFC 8448's ServerHello plus hand-built malformed
-fixtures (duplicate/unpermitted/trailing-byte extensions, bad share sizes),
-the full HRR state-machine path (group change, cookie echo, cipher-suite
-binding, replay rejection), X.509 name matching including the SAN-vs-CN
-precedence rule, and TCP record (re)framing in the connection layer.
+fixtures (duplicate/unpermitted/trailing-byte extensions, bad share sizes,
+bad CertificateVerify framing), the full HRR state-machine path (group
+change, cookie echo, cipher-suite binding, replay rejection), X.509 decoding
+end to end — a full hand-built v3 certificate with extensions, truncation
+regressions for the element-count guards, and OID edge inputs — plus name
+matching including the SAN-vs-CN precedence rule, RSA exponent policy,
+CertificateVerify scheme-vs-key-type and curve binding, forward-secrecy
+zeroization of handshake and application secrets, and TCP record
+(re)framing in the connection layer.
 
 Coverage honesty: the RFC 8448 worked vectors exercise the AES-128-GCM /
 SHA-256 key-schedule and transcript path from the fixed shared secret
 outward (the ECDHE computation itself is not vector-pinned); AES-256-GCM,
 SHA-384, and ChaCha20-Poly1305 are verified by round trips and
 suite-parameter consistency rather than external vectors, and real-server
-behavior (all suites, HRR retries, interop quirks) is what the runnable demos
-(`v run src/example/dial_example.v`, and `.../dial_hrr_example.v` which exercises
-the HelloRetryRequest retry path) are for.
+behavior (all suites, HRR retries, interop quirks) is what the runnable demo
+(`v run src/example/dial_example.v`) is for — the HRR retry path itself is
+proven by the state-machine tests above.
 
 ## References
 

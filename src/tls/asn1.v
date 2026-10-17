@@ -39,9 +39,23 @@ fn read_asn1_element(mut r Reader) !Asn1Element {
 		if r.remaining() < num_len_bytes {
 			return error('asn1: truncated length octets')
 		}
-		for _ in 0 .. num_len_bytes {
+		mut first_len_byte := u8(0) // X.690 §8.1.3: leading octet must not be 0
+		for i in 0 .. num_len_bytes {
 			b := r.read_u8()!
+			if i == 0 {
+				first_len_byte = b
+			}
 			length = (length << 8) | u32(b)
+		}
+		// DER mandates the minimal length encoding (X.690 §10.1): a long form is
+		// only legal when the value is ≥ 0x80 and carries no leading zero octets.
+		// Accepting non-minimal forms lets one byte stream parse two ways, which
+		// is the classic signature/separation forgery channel.
+		if first_len_byte == 0 {
+			return error('asn1: non-minimal DER length (leading zero octet)')
+		}
+		if length < 0x80 {
+			return error('asn1: non-minimal DER length (long form for ${length})')
 		}
 	}
 

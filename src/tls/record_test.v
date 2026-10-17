@@ -2,7 +2,9 @@
 //
 // Record layer tests: wire framing round-trips through serialize/parse, the
 // AEAD cipher state encrypts and decrypts in sequence-number lockstep across
-// records, and a single flipped ciphertext byte must fail the tag check.
+// records, a single flipped ciphertext byte must fail the tag check, and the
+// §5.5 per-key record limit plus the §5.2 inner-plaintext shape are refused
+// rather than mishandled.
 module tls
 
 import crypto.aes
@@ -145,6 +147,93 @@ fn test_parse_record_rejects_incomplete_payload() ! {
 	mut r := new_reader([u8(0x16), 0x03, 0x03, 0x00, 0xc8, 0xaa, 0xbb])
 	parse_record(mut r) or {
 		assert err.msg().contains('incomplete record payload')
+		return
+	}
+	assert false
+}
+
+// test_decrypt_record_rejects_empty_inner_plaintext: a tag-only record decrypts
+// to zero inner plaintext. The content-type byte search must not run `len - 1`
+// into an integer underflow — malformed input stays a named error, never a
+// panic (RFC 8446 §5.2).
+fn test_decrypt_record_rejects_empty_inner_plaintext() ! {
+	key := [u8(0x31), 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
+		0x3f, 0x40]
+	iv := [u8(0xc0), 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb]
+
+	gcm_dec := aes.new_aes_gcm(key)!
+	mut dec_state := new_record_cipher_state(gcm_dec, iv)!
+
+	// Forge the peer's tag-only record: an empty plaintext encrypted under
+	// nonce 0 with AAD whose length field matches the 16-byte GCM tag.
+	gcm_rogue := aes.new_aes_gcm(key)!
+	aad := record_aad(.application_data, legacy_record_version, 16)
+	ct := gcm_rogue.encrypt([]u8{}, dec_state.compute_nonce(0), aad)!
+	assert ct.len == 16 // ciphertext is nothing but the tag
+	rec := Record{
+		content_type:   .application_data
+		legacy_version: legacy_record_version
+		payload:        ct
+	}
+
+	dec_state.decrypt_record(rec) or {
+		assert err.msg().contains('malformed inner plaintext')
+		return
+	}
+	assert false
+}
+
+// test_record_seq_limit_backstops_sender: at the 2^24 per-key-generation bound
+// (RFC 8446 §5.5) the cipher state must refuse further records instead of
+// wearing out the AEAD key; the round limit itself is pinned literally so a
+// silent widening cannot slip in.
+fn test_record_seq_limit_backstops_sender() ! {
+	assert record_seq_limit == 16777216
+
+	key := [u8(0x41), 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+		0x4f, 0x50]
+	iv := [u8(0xd0), 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb]
+
+	gcm := aes.new_aes_gcm(key)!
+	mut state := new_record_cipher_state(gcm, iv)!
+	state.seq_num = record_seq_limit - 1
+
+	// The final legal record under this key still encrypts.
+	state.encrypt_record(.application_data, 'last'.bytes())!
+
+	state.encrypt_record(.application_data, 'next'.bytes()) or {
+		assert err.msg().contains('sequence limit')
+		return
+	}
+	assert false
+}
+
+// test_record_seq_limit_backstops_receiver: the receive side aborts on the same
+// bound even for a correctly-tagged record — a peer that outlives its key
+// without rekeying is fatal record_overflow territory (§5.5).
+fn test_record_seq_limit_backstops_receiver() ! {
+	key := [u8(0x51), 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e,
+		0x5f, 0x60]
+	iv := [u8(0xe0), 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb]
+
+	gcm_enc := aes.new_aes_gcm(key)!
+	gcm_dec := aes.new_aes_gcm(key)!
+	mut enc_state := new_record_cipher_state(gcm_enc, iv)!
+	mut dec_state := new_record_cipher_state(gcm_dec, iv)!
+	enc_state.seq_num = record_seq_limit - 1
+	dec_state.seq_num = record_seq_limit - 1
+
+	// At limit-1 a well-formed record still decrypts — the bound must not bite
+	// a full record early. This advances dec_state.seq_num to exactly the limit.
+	rec_last := enc_state.encrypt_record(.application_data, 'ok'.bytes())!
+	dec_state.decrypt_record(rec_last)!
+
+	// Now at the limit, the next record the peer sends must be refused outright
+	// by the §5.5 receiver backstop. The guard runs before any tag/nonce work, so
+	// the record's contents are irrelevant — reusing rec_last still trips it. A
+	// peer delivering records past its key budget is fatal record_overflow.
+	dec_state.decrypt_record(rec_last) or {
+		assert err.msg().contains('sequence limit')
 		return
 	}
 	assert false

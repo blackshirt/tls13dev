@@ -11,6 +11,14 @@ import crypto.rand
 import crypto.subtle
 import x.crypto.curve25519
 
+// max_handshake_message_len bounds one reassembled handshake message. The
+// 24-bit length field on the wire permits ~16 MiB, and a server may fragment a
+// message across arbitrarily many records, so without a cap a hostile peer
+// could pin the client into buffering a gigantic "Certificate" piece by piece.
+// Real chains are tens of KiB even at the 32-certificate chain bound the
+// validator enforces, so 1 MiB leaves ample headroom while capping memory.
+const max_handshake_message_len = 1 << 20
+
 // HandshakeState tracks client progress. The wait_* order mirrors the fixed
 // post-ServerHello server flight (EncryptedExtensions → Certificate →
 // CertificateVerify → Finished, RFC 8446 §1/§4.1); each handler asserts its
@@ -339,10 +347,22 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 				return error('handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
 			}
 			secret := h.priv_x25519.x25519(server_share.key_exchange)!
-			// Defense in depth: a non-zero peer point in the same small subgroup
-			// also multiplies to zero, so re-check the backend's result.
-			if subtle.constant_time_compare(secret, []u8{len: 32, init: 0}) == 1 {
-				return error('handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
+			// Defense in depth: peer points of order 2 or 4 (u = 1 and u = p-1,
+			// RFC 7748 §6.1) do not multiply to zero but still land in a tiny
+			// orbit — the secret is predictable, so reject all three small-order
+			// results, not just the all-zero one. u = p-1 is 0xec followed by 30
+			// 0xff bytes and a top byte of 0x7f (little-endian 2^255-20).
+			mut p_minus_1 := [u8(0xec)]
+			for _ in 0 .. 30 {
+				p_minus_1 << u8(0xff)
+			}
+			p_minus_1 << u8(0x7f)
+			mut one := []u8{len: 32}
+			one[0] = 1
+			if subtle.constant_time_compare(secret, []u8{len: 32, init: 0}) == 1
+				|| subtle.constant_time_compare(secret, one) == 1
+				|| subtle.constant_time_compare(secret, p_minus_1) == 1 {
+				return error('handshake: computed X25519 shared secret is a small-order value (illegal_parameter)')
 			}
 			return secret
 		}
@@ -393,6 +413,11 @@ fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![
 		}
 		mut r := new_reader(h.reassembly_buf)
 		msg_type, length := parse_handshake_header(mut r)!
+		// Reject an oversized declared length before buffering any more fragments
+		// toward it — the cap must bite at the header, not at completion.
+		if length > max_handshake_message_len {
+			return error('handshake: handshake message length ${length} exceeds maximum ${max_handshake_message_len} (unexpected_message)')
+		}
 		if h.reassembly_buf.len < 4 + length {
 			return []Record{} // body not fully received yet
 		}
@@ -493,6 +518,10 @@ fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![
 				}
 
 				h.state = .connected
+				// Forward-secrecy cleanup: every ephemeral/handshake secret consumed
+				// to reach this point is now dead, so destroy it here rather than keep
+				// it resident for the whole connection (RFC 8446 §7.5 / §1.3.1).
+				h.zeroize_handshake_secrets()
 				return [client_fin_rec]
 			}
 			else {
@@ -522,4 +551,55 @@ fn (mut h ClientHandshake) update_write_traffic_keys() ! {
 	h.client_ap_traffic = hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
 	new_keys := derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
 	h.client_app_cipher = h.new_cipher(new_keys)! // fresh state restarts the record sequence number at 0 (§5.3)
+}
+
+// zeroize_handshake_secrets destroys the key-schedule inputs and the ephemeral
+// ECDHE private halves that are provably dead once the handshake completes.
+// RFC 8446 §1.3.1/§7.5: without destroying this material a later memory
+// compromise could still recover the secrets that decrypt PAST traffic, which is
+// exactly what forward secrecy is meant to prevent. It runs at the single
+// success choke point (.connected) because the application traffic secrets and
+// instantiated record ciphers already capture everything still needed; KeyUpdate
+// ratchets only *_ap_traffic, never the handshake-stage values cleared here.
+fn (mut h ClientHandshake) zeroize_handshake_secrets() {
+	// Scrub each buffer in place before releasing it: merely reassigning the
+	// slice hands the allocator the original bytes untouched, so the wipe has to
+	// precede the drop. Best-effort against optimizer dead-store elimination, but
+	// the reference releases below always take effect.
+	for i in 0 .. h.handshake_secret.len {
+		h.handshake_secret[i] = 0
+	}
+	for i in 0 .. h.client_hs_traffic.len {
+		h.client_hs_traffic[i] = 0
+	}
+	for i in 0 .. h.server_hs_traffic.len {
+		h.server_hs_traffic[i] = 0
+	}
+	h.handshake_secret = []u8{}
+	h.client_hs_traffic = []u8{}
+	h.server_hs_traffic = []u8{}
+	// Release the ephemeral private keys; compute_shared_secret (their only
+	// consumer) ran during ServerHello processing, so nothing reads them again.
+	h.priv_x25519 = unsafe { nil }
+	h.priv_p256 = none
+}
+
+// zeroize_app_secrets destroys the application traffic secrets once the
+// connection is finished. They are the last retained material from which the
+// record keys protecting application data can be re-derived, so keeping them
+// past teardown would let a later memory compromise decrypt recorded traffic
+// and undo the app-phase forward secrecy the handshake zeroization above is
+// meant to establish (RFC 8446 §1.3.1/§7.5). The live record ciphers keep their
+// own instantiated keys, so this only closes the secret-recovery path; it is
+// safe because read/write refuse once closed and KeyUpdate ratcheting is the
+// sole reader, reachable only while the connection is still open.
+fn (mut h ClientHandshake) zeroize_app_secrets() {
+	for i in 0 .. h.client_ap_traffic.len {
+		h.client_ap_traffic[i] = 0
+	}
+	for i in 0 .. h.server_ap_traffic.len {
+		h.server_ap_traffic[i] = 0
+	}
+	h.client_ap_traffic = []u8{}
+	h.server_ap_traffic = []u8{}
 }

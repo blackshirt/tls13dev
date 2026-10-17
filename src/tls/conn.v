@@ -18,6 +18,12 @@ const recv_buf_compact_threshold = 16384
 // recv_read_size is the number of bytes requested from the socket per read.
 const recv_read_size = 4096
 
+// max_stored_session_tickets bounds the NewSessionTicket backlog kept on the
+// handshake. Resumption is unimplemented, so the queue is only diagnostic;
+// without a cap a malicious server could stream tickets until the process
+// exhausts memory (RFC 8446 §4.6.1 permits any number of tickets).
+const max_stored_session_tickets = 32
+
 // Conn is a TLS 1.3 client connection over TCP. The only way to build one is
 // dial(), which supplies every field; @[noinit] prevents a half-initialized Conn.
 @[noinit]
@@ -134,7 +140,12 @@ fn (mut c Conn) do_handshake(validator Validator) ! {
 		match rec.content_type {
 			.change_cipher_spec {
 				// The peer's middlebox-compatibility dummy CCS carries no protocol
-				// meaning in TLS 1.3 — accept and drop it (RFC 8446 §5).
+				// meaning in TLS 1.3 — accept and drop it (RFC 8446 §5). Compliant
+				// peers send exactly the single byte 0x01 (App. D.4); anything else
+				// is framing garbage, so refusing beats silently swallowing it.
+				if rec.payload.len != 1 || rec.payload[0] != 0x01 {
+					return error('tls: malformed change_cipher_spec during handshake (must be the single byte 0x01)')
+				}
 				continue
 			}
 			.alert {
@@ -243,6 +254,11 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// Any alert is terminal for this direction, so mark closed before decoding —
 	// even a malformed alert body must not leave the Conn looking usable.
 	c.closed = true
+	// Peer-initiated termination is as final as close(): drop the application
+	// traffic secrets so captured application traffic cannot be decrypted later
+	// by a memory compromise (RFC 8446 §1.3.1/§7.5). The triggering record was
+	// already decrypted before this handler ran, so the read cipher is not needed.
+	c.hs.zeroize_app_secrets()
 	a := parse_alert(payload)!
 	// close_notify is the one clean-shutdown signal: return 0, the same value a
 	// normal EOF read yields, so callers treat it as orderly end-of-stream.
@@ -277,7 +293,11 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		rec := c.read_raw_record()!
 		match rec.content_type {
 			.change_cipher_spec {
-				continue
+				// RFC 8446 §5: once application keys are in use, a CCS record is
+				// illegal and the receiver MUST abort with fatal unexpected_message.
+				// Tolerating it post-handshake would let an off-path attacker
+				// inject plaintext records the peer never agreed to receive.
+				return error('tls: received change_cipher_spec record after handshake (unexpected_message)')
 			}
 			.alert {
 				// RFC 8446 §6: alerts after handshake keys are established MUST be
@@ -343,7 +363,13 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 		match msg_type {
 			.new_session_ticket {
 				ticket := parse_new_session_ticket(body)!
-				c.hs.session_tickets << ticket
+				// A server may stream NewSessionTicket messages endlessly; since
+				// resumption is unimplemented the backlog is unusable anyway, so
+				// keep a bounded sample and drop the overflow instead of letting
+				// an unbounded allocation grow over a long-lived connection.
+				if c.hs.session_tickets.len < max_stored_session_tickets {
+					c.hs.session_tickets << ticket
+				}
 			}
 			.key_update {
 				// §4.6.3: a recipient always advances its read keys on receiving a
@@ -389,6 +415,18 @@ pub fn (mut c Conn) write(data []u8) !int {
 	// records (RFC 8446 §5.1), so one write() may emit many encrypted records.
 	mut offset := 0
 	for offset < data.len {
+		// §5.5 sender obligation: a key generation protects at most
+		// record_seq_limit records, and the KeyUpdate that rotates it is itself
+		// one more record encrypted under the old key. Triggering one slot early
+		// reserves that final slot for the KeyUpdate notice: waiting until
+		// seq_num actually reaches the limit would leave force_write_rekey unable
+		// to encrypt its own notice, since encrypt_record's §5.5 guard rejects
+		// seq_num >= record_seq_limit. Checking at every record boundary means
+		// even a single write() spanning the limit rekeys instead of wearing out
+		// the AEAD key.
+		if c.hs.client_app_cipher.seq_num >= record_seq_limit - 1 {
+			c.force_write_rekey()!
+		}
 		end := if data.len - offset > max_plaintext_record_len {
 			offset + max_plaintext_record_len
 		} else {
@@ -400,6 +438,17 @@ pub fn (mut c Conn) write(data []u8) !int {
 		offset = end
 	}
 	return data.len
+}
+
+// force_write_rekey fulfills the §5.5 sender-side record limit: announce a
+// KeyUpdate with update_not_requested under the current (old) write keys, then
+// ratchet — the same send-then-update ordering §4.6.3 requires of a KeyUpdate
+// response, reusing the response-path primitives.
+fn (mut c Conn) force_write_rekey() ! {
+	msg := build_key_update(false)
+	enc := c.hs.client_app_cipher.encrypt_record(.handshake, msg)!
+	c.write_records([enc])!
+	c.hs.update_write_traffic_keys()!
 }
 
 // close sends a close_notify alert and closes the underlying TCP connection.
@@ -419,6 +468,12 @@ pub fn (mut c Conn) close() ! {
 		c.send_close_notify()
 	}
 	c.closed = true
+	// Teardown is terminal: drop the application traffic secrets so a later memory
+	// compromise cannot re-derive the record keys and decrypt captured traffic
+	// (RFC 8446 §1.3.1/§7.5). send_close_notify above already used the live cipher,
+	// so nothing still needs these secrets.
+	c.hs.zeroize_app_secrets()
+
 	// Best-effort socket close: errors are swallowed because we are already tearing
 	// down and the caller has nothing left to act on.
 	if c.sock != unsafe { nil } {

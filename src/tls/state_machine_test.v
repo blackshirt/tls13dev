@@ -3,7 +3,10 @@
 // Client state-machine tests focused on the HelloRetryRequest path: hand-built
 // HRR bodies are parsed and fed through process_server_hello to exercise the
 // RFC 8446 §4.1.2/§4.1.4 validation rules (single HRR only, must-change-something,
-// group reselection rejection) plus the second-ClientHello follow-ups.
+// group reselection rejection) plus the second-ClientHello follow-ups, and the
+// reassembly cap that bounds what a fragmented handshake message can pin in
+// memory, plus the §1.3.1/§7.5 zeroization hygiene that releases handshake and
+// application secrets once they can no longer be needed.
 module tls
 
 import encoding.hex
@@ -379,4 +382,60 @@ fn test_process_hrr_cookie_only_echos_cookie_in_ch2() ! {
 		}
 	}
 	assert found
+}
+
+// test_reassembly_rejects_oversized_message_length: the 24-bit handshake length
+// field permits declaring ~16 MiB, which a fragmenting server could then force
+// the client to buffer. The cap must bite at the header — before any fragments
+// accumulate — so the four-byte header alone triggers the error.
+fn test_reassembly_rejects_oversized_message_length() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.state = .wait_encrypted_extensions
+	// EncryptedExtensions (type 8) with declared length 0x100001 — exactly one
+	// byte past max_handshake_message_len (1 MiB).
+	h.reassembly_buf = [u8(HandshakeType.encrypted_extensions), 0x10, 0x00, 0x01]
+
+	v := new_validator(new_trust_store(), false)
+	h.process_reassembled_messages(&v) or {
+		assert err.msg().contains('exceeds maximum')
+		return
+	}
+	assert false
+}
+
+// test_zeroize_handshake_secrets_releases_material pins the scrub that runs at
+// .connected: the handshake-stage secrets and both ephemeral private keys must
+// be released, so a later memory read or core dump cannot recover the material
+// that decrypts a recorded handshake (RFC 8446 §1.3.1/§7.5 forward secrecy).
+fn test_zeroize_handshake_secrets_releases_material() ! {
+	mut h := new_client_handshake('example.com', [])!
+	// Populate both key halves: the x25519 arm sets priv_x25519, the secp256r1
+	// arm sets priv_p256 and (per generate_key_share) leaves the X25519 key.
+	h.generate_key_share(.x25519)!
+	h.generate_key_share(.secp256r1)!
+	assert h.priv_x25519 != unsafe { nil }
+	assert h.priv_p256 != none
+	h.handshake_secret = []u8{len: 32, init: 0x5a}
+	h.client_hs_traffic = []u8{len: 32, init: 0xa5}
+	h.server_hs_traffic = []u8{len: 32, init: 0x3c}
+
+	h.zeroize_handshake_secrets()
+
+	assert h.handshake_secret.len == 0
+	assert h.client_hs_traffic.len == 0
+	assert h.server_hs_traffic.len == 0
+	assert h.priv_x25519 == unsafe { nil }
+	assert h.priv_p256 == none
+}
+
+// test_zeroize_app_secrets_releases_traffic_secrets pins the close()/alert
+// hygiene: the two §7.1 application traffic secrets must be gone once the
+// connection ends, denying after-the-fact decryption of captured records.
+fn test_zeroize_app_secrets_releases_traffic_secrets() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.client_ap_traffic = []u8{len: 32, init: 0x11}
+	h.server_ap_traffic = []u8{len: 32, init: 0x22}
+	h.zeroize_app_secrets()
+	assert h.client_ap_traffic.len == 0
+	assert h.server_ap_traffic.len == 0
 }

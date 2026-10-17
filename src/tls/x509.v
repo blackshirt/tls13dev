@@ -39,15 +39,22 @@ mut:
 	// Name fields, used to chain a certificate to its issuer.
 	issuer_dn       []u8
 	subject_dn      []u8
-	not_before      string   // validity start, RFC 5280 UTCTime/GeneralizedTime as written
-	not_after       string   // validity end, same encoding as not_before
-	not_before_unix i64      // not_before in Unix seconds, for easy comparison
-	not_after_unix  i64      // not_after in Unix seconds
-	sans            []string // dNSName and rfc822Name SAN entries
+	not_before      string // validity start, RFC 5280 UTCTime/GeneralizedTime as written
+	not_after       string // validity end, same encoding as not_before
+	not_before_unix i64    // not_before in Unix seconds, for easy comparison
+	not_after_unix  i64    // not_after in Unix seconds
+	// sans holds dNSName SAN entries only; rfc822Name is deliberately excluded
+	// because RFC 6125 §2.1 matches TLS server identities against dNSName, not
+	// email names, so accepting rfc822Name would widen the accepted-name set.
+	sans []string
 	// ip_sans holds the raw bytes of each iPAddress SAN (4 bytes for IPv4,
 	// 16 for IPv6), used to verify connections made to an IP literal.
 	ip_sans         [][]u8
+	has_san         bool // the SAN extension was present at all (RFC 6125 §6.4.4 CN precedence)
 	is_ca           bool // basicConstraints CA flag; intermediates must have it
+	max_path_len    int  // basicConstraints pathLenConstraint; -1 when absent (unlimited)
+	has_key_usage   bool // keyUsage extension present (RFC 5280 §4.2.1.3)
+	key_usage       []u8 // BIT STRING contents of keyUsage, big-endian named bits
 	has_eku         bool // an extendedKeyUsage extension was present at all
 	eku_server_auth bool // EKU includes id-kp-serverAuth, required for TLS servers
 	signature       []u8 // BIT STRING contents of signatureValue
@@ -98,6 +105,17 @@ fn parse_certificate(der []u8) !Certificate {
 		idx++
 	}
 
+	// The six mandatory fields that follow the optional version — serial,
+	// signatureAlgorithm, issuer, validity, subject, SPKI — must all be present.
+	// The earlier len<6 check does not cover a v3 certificate: the version element
+	// shifts every index up by one, so a TBS with a version but exactly six
+	// elements is missing SPKI and would index tbs_elements[idx] past the end here,
+	// panicking on attacker-controlled handshake input rather than failing the
+	// decode. Measuring against the post-version idx closes that gap.
+	if tbs_elements.len - idx < 6 {
+		return error('x509: malformed TBSCertificate (need 6 fields after version, have ${tbs_elements.len - idx})')
+	}
+
 	// 2. Serial Number (INTEGER)
 	serial_number := tbs_elements[idx].data.clone()
 	idx++
@@ -134,16 +152,16 @@ fn parse_certificate(der []u8) !Certificate {
 
 	// 5. Validity (SEQUENCE: notBefore, notAfter)
 	val_elems := parse_sequence(tbs_elements[idx].data)!
-	mut not_before := ''
-	mut not_after := ''
-	mut not_before_unix := i64(0)
-	mut not_after_unix := i64(0)
-	if val_elems.len >= 2 {
-		not_before = val_elems[0].data.bytestr()
-		not_after = val_elems[1].data.bytestr()
-		not_before_unix = parse_asn1_time(val_elems[0]) or { 0 }
-		not_after_unix = parse_asn1_time(val_elems[1]) or { 0 }
+	// RFC 5280 §4.1.2.5: both fields are mandatory. An unparseable time is a
+	// fatal decode error rather than a stored 0, so the validator can never
+	// silently skip expiry enforcement on a certificate whose dates are junk.
+	if val_elems.len < 2 {
+		return error('x509: validity must hold notBefore and notAfter (${val_elems.len} elements)')
 	}
+	not_before := val_elems[0].data.bytestr()
+	not_after := val_elems[1].data.bytestr()
+	not_before_unix := parse_asn1_time(val_elems[0])!
+	not_after_unix := parse_asn1_time(val_elems[1])!
 	idx++
 
 	// 6. Subject (Name)
@@ -213,7 +231,11 @@ fn parse_certificate(der []u8) !Certificate {
 	//                             extnValue OCTET STRING }
 	mut sans := []string{}
 	mut ip_sans := [][]u8{}
+	mut has_san := false
 	mut is_ca := false
+	mut max_path_len := -1
+	mut has_key_usage := false
+	mut key_usage := []u8{}
 	mut has_eku := false
 	mut eku_server_auth := false
 
@@ -235,10 +257,19 @@ fn parse_certificate(der []u8) !Certificate {
 
 					match ext_oid {
 						'2.5.29.17' { // Subject Alternative Name (SAN)
+							// Presence of the extension — even with no usable
+							// names — disables the CN fallback (RFC 6125 §6.4.4).
+							has_san = true
 							sans, ip_sans = parse_san_extension(ext_val_bytes)
 						}
+						'2.5.29.15' { // Key Usage
+							key_usage = parse_key_usage(ext_val_bytes)
+							has_key_usage = true
+						}
 						'2.5.29.19' { // Basic Constraints
-							is_ca = parse_basic_constraints(ext_val_bytes)
+							ca, path_len := parse_basic_constraints(ext_val_bytes)
+							is_ca = ca
+							max_path_len = path_len
 						}
 						'2.5.29.37' { // Extended Key Usage
 							has_eku = true
@@ -278,7 +309,11 @@ fn parse_certificate(der []u8) !Certificate {
 		ecdsa_curve:        ecdsa_curve
 		sans:               sans
 		ip_sans:            ip_sans
+		has_san:            has_san
 		is_ca:              is_ca
+		max_path_len:       max_path_len
+		has_key_usage:      has_key_usage
+		key_usage:          key_usage
 		has_eku:            has_eku
 		eku_server_auth:    eku_server_auth
 		signature:          signature_bytes
@@ -414,24 +449,70 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	return dns, ip
 }
 
-// parse_basic_constraints parses the cA boolean from a BasicConstraints extension
-// value (RFC 5280 §4.2.1.9):
+// parse_basic_constraints parses the cA boolean and pathLenConstraint from a
+// BasicConstraints extension value (RFC 5280 §4.2.1.9):
 //
-//	BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
-fn parse_basic_constraints(ext_bytes []u8) bool {
+//	BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+//	                               pathLenConstraint INTEGER (0..MAX) OPTIONAL }
+//
+// The returned path limit is -1 when the INTEGER is absent, meaning unlimited.
+fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := new_reader(inner)
-	seq := read_asn1_element(mut r) or { return false }
+	seq := read_asn1_element(mut r) or { return false, -1 }
 	if seq.tag != 0x30 {
-		return false
+		return false, -1
 	}
-	elements := parse_sequence(seq.data) or { return false }
-	// cA has DEFAULT FALSE, so it can be absent entirely: scanning for the first
-	// BOOLEAN and finding none yields the default "not a CA".
+	elements := parse_sequence(seq.data) or { return false, -1 }
+	mut ca := false
+	mut found_ca := false
+	mut path_len := -1
 	for el in elements {
-		if el.tag == 0x01 && el.data.len > 0 { // BOOLEAN cA
-			return el.data[0] != 0
+		if el.tag == 0x01 && el.data.len > 0 && !found_ca { // BOOLEAN cA
+			ca = el.data[0] != 0
+			found_ca = true
+		} else if el.tag == 0x02 && el.data.len > 0 && el.data.len <= 4 { // INTEGER pathLen
+			// Non-negative by X.500 profile; accumulated unsigned so the byte-wise
+			// shift can never trip a signed overflow, then widened into the int field.
+			mut v := u32(0)
+			for b in el.data {
+				v = (v << 8) | u32(b)
+			}
+			path_len = int(v)
 		}
 	}
-	return false
+	// cA has DEFAULT FALSE, so it can be absent entirely: scanning for the first
+	// BOOLEAN and finding none yields the default "not a CA".
+	return ca, path_len
+}
+
+// parse_key_usage returns the BIT STRING contents of a keyUsage extension
+// (RFC 5280 §4.2.1.3), big-endian named bits with the unused-bits count checked.
+// An empty result means "extension present but asserts no usage".
+fn parse_key_usage(ext_bytes []u8) []u8 {
+	inner := unwrap_octet_string(ext_bytes)
+	mut r := new_reader(inner)
+	seq := read_asn1_element(mut r) or { return []u8{} }
+	if seq.tag != 0x03 || seq.data.len < 1 {
+		return []u8{}
+	}
+	unused_bits := seq.data[0]
+	bits := seq.data[1..]
+	// BIT STRING constraint of X.690 §10.5: unused bits must fit in the last
+	// octet; a violation makes the whole extension untrustworthy.
+	if unused_bits > 7 || (bits.len == 0 && unused_bits != 0) {
+		return []u8{}
+	}
+	return bits.clone()
+}
+
+// key_usage_bit reports whether named bit `n` (0 = digitalSignature, count from
+// the MSB of the first octet per RFC 5280 §4.2.1.3) is asserted. Bits beyond the
+// encoded length are simply not asserted.
+fn key_usage_bit(ku []u8, n int) bool {
+	byte_idx := n >> 3
+	if byte_idx >= ku.len {
+		return false
+	}
+	return (ku[byte_idx] & u8(0x80 >> (n & 7))) != 0
 }

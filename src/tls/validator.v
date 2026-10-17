@@ -8,6 +8,13 @@ module tls
 import crypto.ed25519
 import time
 
+// max_cert_chain_depth bounds how many certificates a peer may place in a single
+// Certificate message. Real webs end up under four; the cap is enforced at
+// parse time (messages.v) so an oversized list cannot force expensive ASN.1
+// decoding of thousands of entries before the chain walk rejects it, and again
+// here as defense in depth. RFC 5280 imposes no hard limit, so we set one.
+const max_cert_chain_depth = 32
+
 // Validator verifies certificate chains against trusted roots and hostnames.
 struct Validator {
 mut:
@@ -34,8 +41,8 @@ fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string)
 	if chain.len == 0 {
 		return error('pki: empty certificate chain')
 	}
-	if chain.len > 32 {
-		return error('pki: certificate chain too long (${chain.len} > 32)')
+	if chain.len > max_cert_chain_depth {
+		return error('pki: certificate chain too long (${chain.len} > ${max_cert_chain_depth})')
 	}
 
 	now := time.now().unix()
@@ -49,20 +56,33 @@ fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string)
 				return error('pki: leaf certificate does not match IP address "${hostname}" (iPAddress SANs: ${leaf.ip_sans})')
 			}
 		} else {
-			if !verify_hostnames(leaf.sans, leaf.subject_cn, hostname) {
-				return error('pki: leaf certificate does not match hostname "${hostname}" (SANs: ${leaf.sans}, CN: "${leaf.subject_cn}")')
+			// RFC 6125 §6.4.4: a present SAN extension disables the CN entirely,
+			// even when it holds no usable names — pass "" to express that.
+			cn := if leaf.has_san { '' } else { leaf.subject_cn }
+			if !verify_hostnames(leaf.sans, cn, hostname) {
+				return error('pki: leaf certificate does not match hostname "${hostname}" (SANs: ${leaf.sans}, CN: "${cn}")')
 			}
 		}
 	}
 
-	// Validity period. The '> 0' guards treat an unparseable time (x509.v stores 0
-	// on decode failure) as "unknown → do not enforce"; RFC 5280 §4.1.2.5 mandates
-	// both fields on well-formed certificates, so this is lenient only on junk.
-	if leaf.not_before_unix > 0 && now < leaf.not_before_unix {
+	// Validity period. parse_certificate now rejects unparseable times (x509.v
+	// fails the whole decode), so a stored value always reflects a real date;
+	// RFC 5280 §4.1.2.5 mandates both fields on well-formed certificates.
+	if now < leaf.not_before_unix {
 		return error('pki: leaf certificate is not yet valid (notBefore=${leaf.not_before})')
 	}
-	if leaf.not_after_unix > 0 && now > leaf.not_after_unix {
+	if now > leaf.not_after_unix {
 		return error('pki: leaf certificate has expired (notAfter=${leaf.not_after})')
+	}
+
+	// Key Usage (RFC 5280 §4.2.1.3): when the leaf asserts a keyUsage bitmap, it
+	// must permit the TLS usage — server authentication consumes the certificate
+	// with digitalSignature (or the non-standard-but-legal keyEncipherment for
+	// RSA key transport); we require digitalSignature, which every modern server
+	// cert sets, only when the extension exists at all (absence is unconstrained
+	// per §4.2.1.3 "should be present" guidance for non-CA certs).
+	if leaf.has_key_usage && !key_usage_bit(leaf.key_usage, 0) { // bit 0 = digitalSignature
+		return error('pki: leaf certificate keyUsage does not permit digitalSignature')
 	}
 
 	// Extended Key Usage: if present it must allow serverAuth; absence is
@@ -83,10 +103,22 @@ fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string)
 		if !parent.is_ca {
 			return error('pki: certificate at chain index ${i + 1} is not a CA (basicConstraints cA=TRUE missing)')
 		}
-		if parent.not_before_unix > 0 && now < parent.not_before_unix {
+		// keyUsage bit 5 = keyCertSign: a CA that asserts a keyUsage bitmap
+		// without it is not authorized to sign the child (RFC 5280 §4.2.1.3).
+		if parent.has_key_usage && !key_usage_bit(parent.key_usage, 5) {
+			return error('pki: CA at chain index ${i + 1} keyUsage does not permit keyCertSign')
+		}
+		// pathLenConstraint (RFC 5280 §4.2.1.9): the number of non-CA certs below
+		// this CA must not exceed the limit. Intermediates strictly below `parent`
+		// in the chain are indices 0 .. i-1, i.e. i of them; leaf-only (i == 0)
+		// always satisfies any limit. A stored -1 means the INTEGER was absent.
+		if parent.max_path_len >= 0 && i > parent.max_path_len {
+			return error('pki: CA at chain index ${i + 1} violates pathLenConstraint (${i} intermediate certs below > limit ${parent.max_path_len})')
+		}
+		if now < parent.not_before_unix {
 			return error('pki: intermediate certificate not yet valid at chain index ${i + 1}')
 		}
-		if parent.not_after_unix > 0 && now > parent.not_after_unix {
+		if now > parent.not_after_unix {
 			return error('pki: intermediate certificate expired at chain index ${i + 1}')
 		}
 		verify_cert_signature(child, parent) or {
@@ -105,10 +137,10 @@ fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string)
 		if top_cert.issuer_dn != root.subject_dn {
 			continue // name pair first: cheap string test that filters most roots out
 		}
-		if root.not_before_unix > 0 && now < root.not_before_unix {
+		if now < root.not_before_unix {
 			continue // skip not-yet-valid root
 		}
-		if root.not_after_unix > 0 && now > root.not_after_unix {
+		if now > root.not_after_unix {
 			continue // skip expired root
 		}
 		// A failed signature under this root is not fatal: another stored root can
@@ -134,6 +166,14 @@ fn verify_cert_signature(child Certificate, parent Certificate) !bool {
 		.rsa {
 			rsa_key := parent.rsa_public_key or {
 				return error('pki: parent certificate missing valid RSA public key')
+			}
+			// A CA/parent RSA key below 2048 bits is refused regardless of trust-store
+			// contents: 1024-bit RSA is inside precomputation reach for well-resourced
+			// attackers, and CA/Browser Forum baselines require CAs to sign with
+			// ≥2048. Only signing parents are floored — leaf keys keep their existing
+			// strength policy so legacy test certificates still connect.
+			if rsa_key.size_bytes < 256 {
+				return error('pki: CA RSA key too short (${rsa_key.size_bytes * 8} bits < 2048)')
 			}
 			// For PKCS#1 v1.5 the OID identifies hash+scheme; for PSS the hash is
 			// encoded in the AlgorithmIdentifier parameters (stored in signature_hash_oid).

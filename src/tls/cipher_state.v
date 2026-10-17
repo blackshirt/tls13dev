@@ -16,6 +16,14 @@ const aead_nonce_len = 12
 // (RFC 8446 §5.3 left-pads the sequence number with 4 zero bytes).
 const nonce_seq_offset = aead_nonce_len - 8
 
+// record_seq_limit bounds how many records one key generation may carry in a
+// direction. RFC 8446 §5.5 sets the tightest AEAD-internal bound (AES-GCM) at
+// 2^24.5 records: senders MUST initiate a KeyUpdate before exceeding it and
+// receivers MUST abort when it is exceeded. This is the round power-of-two
+// lower bound, applied uniformly to every suite — ChaCha20-Poly1305 would
+// tolerate 2^36.5, but one conservative bound avoids per-suite special cases.
+const record_seq_limit = u64(1 << 24)
+
 // RecordCipherState manages encryption, decryption, sequence numbers, and nonces
 // for one direction of a TLS 1.3 connection (RFC 8446 §5.2 & §5.3).
 // Each record's nonce is derived from a static per-direction value plus the
@@ -71,10 +79,12 @@ fn record_aad(content_type ContentType, version u16, length int) []u8 {
 // The outer ContentType is always application_data (23): TLS 1.3 hides the real
 // message type so observers cannot fingerprint handshake or alert traffic.
 fn (mut s RecordCipherState) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
-	if s.seq_num == max_u64 {
-		// RFC 8446 §5.5: a direction must rekey before 2^64-1 records; continuing
-		// would reuse a nonce under the same key.
-		return error('record: sequence number overflow; connection must close')
+	if s.seq_num >= record_seq_limit {
+		// RFC 8446 §5.5: rekeying is mandatory before this bound; reaching the
+		// backstop means the caller skipped its KeyUpdate obligation. Refusing
+		// is the only safe option — continuing would reuse nonces under a worn
+		// key, breaking GCM's uniqueness requirement.
+		return error('record: sequence limit reached; rekey required (§5.5)')
 	}
 	if plaintext.len > max_plaintext_record_len {
 		return error('record: plaintext length ${plaintext.len} exceeds maximum allowed ${max_plaintext_record_len}')
@@ -109,9 +119,12 @@ mut:
 // decrypt_record decrypts an encrypted Record, verifies the AEAD tag, and
 // extracts the true inner ContentType and plaintext (RFC 8446 §5.2).
 fn (mut s RecordCipherState) decrypt_record(rec Record) !DecryptedRecord {
-	if s.seq_num == max_u64 {
-		// Same nonce-uniqueness bound as encrypt_record (RFC 8446 §5.5).
-		return error('record: sequence number overflow; connection must close')
+	if s.seq_num >= record_seq_limit {
+		// Receive-side twin of the §5.5 bound: a peer that sent more than the
+		// limit without rekeying is non-compliant, and processing further
+		// records under a worn key risks an AEAD-fitness break. Fatal per §5.5
+		// (record_overflow), matching the sender-side backstop above.
+		return error('record: sequence limit reached; rekey required (§5.5)')
 	}
 	if rec.content_type != .application_data {
 		return error('record: encrypted record must have outer content type application_data (23), got ${rec.content_type}')
@@ -132,6 +145,11 @@ fn (mut s RecordCipherState) decrypt_record(rec Record) !DecryptedRecord {
 	// type byte is not the last byte: it sits just before a run of 0x00 padding
 	// the sender may add to hide plaintext lengths. Receivers must discard it;
 	// an all-zero result carries no type byte and is a fatal decode error.
+	// The empty case (a tag-only record) must be rejected before `len - 1`, so
+	// malformed input stays an error and never an integer-underflow panic.
+	if inner_plaintext.len == 0 {
+		return error('record: malformed inner plaintext (no content type byte)')
+	}
 	mut end := inner_plaintext.len - 1
 	for end >= 0 && inner_plaintext[end] == 0 {
 		end--

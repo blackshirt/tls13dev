@@ -66,6 +66,20 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	if e == 0 {
 		return error('rsa: public exponent must be non-zero')
 	}
+	// RFC 8017 §5.1.3 / FIPS 186-5: a valid public exponent is odd and >= 3.
+	// e == 1 makes RSAVP1 the identity (m = s^1 mod n = s), so any key-length byte
+	// string would "verify" — a universal forgery. Kept as its own branch so the
+	// distinct rationale stays visible next to its error.
+	if e == 1 {
+		return error('rsa: public exponent 1 is degenerate')
+	}
+	// Any even exponent (e == 2, 4, …) is rejected: an even value is not invertible
+	// mod n (gcd(e, φ(n)) ≠ 1), so it is not a valid RSA public exponent and would
+	// admit malformed keys the policy above promises to refuse. Odd e >= 3 (real
+	// keys use 3 or 65537) passes.
+	if e % 2 == 0 {
+		return error('rsa: public exponent ${e} must be odd')
+	}
 
 	return RsaPublicKey{
 		n:          n

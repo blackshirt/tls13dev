@@ -2,10 +2,11 @@
 //
 // ASN.1 DER reader tests: read_asn1_element must classify constructed vs
 // primitive tags, decode short- and long-form lengths, and reject malformed
-// framing (truncated header, DER-illegal indefinite length, a declared length
-// beyond what is buffered) instead of over-reading; parse_sequence walks child
-// TLVs in order and yields an empty list for empty input. Only parse_oid was
-// covered previously (in pki_test.v); these fill the TLV/length paths.
+// framing (truncated header, DER-illegal indefinite length, non-minimal long
+// form, a declared length beyond what is buffered) instead of over-reading;
+// parse_sequence walks child TLVs in order and yields an empty list for empty
+// input. Only parse_oid was covered previously (in pki_test.v); these fill the
+// TLV/length paths.
 module tls
 
 fn test_asn1_read_element_short_form() ! {
@@ -26,13 +27,35 @@ fn test_asn1_read_element_primitive_flag() ! {
 }
 
 fn test_asn1_read_element_long_form() ! {
-	// OCTET STRING (0x04) with a long-form length: 0x81 => one length octet
-	// (0x03) follows, so exactly 3 value bytes are read.
-	mut r := new_reader([u8(0x04), 0x81, 0x03, 0x01, 0x02, 0x03])
+	// OCTET STRING (0x04) with a minimal long-form length: 0x81 marks "one length
+	// octet follows", whose value is 129. DER only permits long form when the
+	// length is >= 0x80, so a 129-byte payload is the smallest legal 0x81 case.
+	mut payload := []u8{len: 129, init: 0x40}
+	mut data := [u8(0x04), 0x81, u8(129)]
+	data << payload
+	mut r := new_reader(data)
 	el := read_asn1_element(mut r)!
 	assert el.tag == 0x04
 	assert !el.is_construct
-	assert el.data == [u8(0x01), 0x02, 0x03]
+	assert el.data == payload
+}
+
+fn test_asn1_read_element_rejects_nonminimal_length() ! {
+	// 0x81 0x03 spells length 3 in long form, but 3 < 0x80 must use the short
+	// form (X.690 §10.1); tolerating it lets one byte stream parse two ways.
+	mut r := new_reader([u8(0x04), 0x81, 0x03, 0x01, 0x02, 0x03])
+	read_asn1_element(mut r) or {
+		assert err.msg().contains('non-minimal DER length')
+		return
+	}
+	assert false
+	// 0x82 0x00 0x33 uses two length octets with a leading zero — also non-minimal.
+	mut r2 := new_reader([u8(0x04), 0x82, 0x00, 0x33])
+	read_asn1_element(mut r2) or {
+		assert err.msg().contains('non-minimal DER length')
+		return
+	}
+	assert false
 }
 
 fn test_asn1_read_element_truncated_header() ! {
@@ -76,4 +99,16 @@ fn test_asn1_parse_sequence_children() ! {
 	assert els[1].data == [u8(0x14)]
 	// An empty buffer yields an empty list, not an error.
 	assert parse_sequence([]u8{})!.len == 0
+}
+
+fn test_parse_oid_edge_inputs() {
+	// Empty content has no first subidentifier: '' rather than a bogus arc.
+	assert parse_oid([]u8{}) == ''
+	// First-arc packing boundaries (RFC 5280 §A.1): first<40 → arc 0, and
+	// first==80 lands exactly on the arc-2 branch as 2.0 (not 1.40).
+	assert parse_oid([u8(0x04)]) == '0.4'
+	assert parse_oid([u8(0x50)]) == '2.0'
+	// sha256WithRSAEncryption pinned end to end: the multi-byte 840 and 113549
+	// subidentifiers plus the terminating 01 01 0B arcs.
+	assert parse_oid([u8(0x2a), 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]) == '1.2.840.113549.1.1.11'
 }

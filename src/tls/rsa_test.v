@@ -4,8 +4,9 @@
 // modulus' DER sign byte is stripped so size_bytes is exact, the public
 // exponent accumulates from its big-endian INTEGER, and every malformed shape is
 // rejected (non-SEQUENCE outer tag, too few sequence elements, an all-zero
-// modulus that strips to empty, a zero exponent, and an exponent wider than the
-// u64 accumulator).
+// modulus that strips to empty, a zero exponent, the degenerate e=1, any even
+// exponent (they fail RSA's odd-exponent requirement and enable small-order
+// forgeries), and an exponent wider than the u64 accumulator).
 module tls
 
 import crypto.sha256
@@ -78,6 +79,33 @@ fn test_parse_rsa_public_key_rejects_zero_exponent() ! {
 	der := rsa_seq([n_int, e_int])
 	parse_rsa_public_key(der) or {
 		assert err.msg().contains('exponent must be non-zero')
+		return
+	}
+	assert false
+}
+
+fn test_parse_rsa_public_key_rejects_degenerate_exponent() ! {
+	// e = 1 makes RSAVP1 the identity (m = s^1 mod n = s), so any key-length
+	// byte string would "verify" — a universal forgery, hence refused.
+	n_int := [u8(0x02), 0x01, 0x07]
+	e_int := [u8(0x02), 0x01, 0x01]
+	der := rsa_seq([n_int, e_int])
+	parse_rsa_public_key(der) or {
+		assert err.msg().contains('exponent 1 is degenerate')
+		return
+	}
+	assert false
+}
+
+fn test_parse_rsa_public_key_rejects_even_exponent() ! {
+	// RFC 8017 §5: the RSA public exponent must be odd; e=2 (and any other
+	// even value) lives in a small multiplicative subgroup mod n and would
+	// halve the effective security of every signature checked with the key.
+	n_int := [u8(0x02), 0x01, 0x07]
+	e_int := [u8(0x02), 0x01, 0x02]
+	der := rsa_seq([n_int, e_int])
+	parse_rsa_public_key(der) or {
+		assert err.msg().contains('must be odd')
 		return
 	}
 	assert false

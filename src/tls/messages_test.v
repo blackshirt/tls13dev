@@ -211,6 +211,43 @@ fn test_parse_key_update() ! {
 	}
 }
 
+// CertificateVerify codec tests (§4.4.3): body is scheme u16 + signature vector;
+// unknown schemes, empty signatures, and trailing bytes must all be refused.
+fn test_parse_certificate_verify() ! {
+	// ed25519 (0x0807) with a two-byte signature decodes cleanly, pinning both
+	// the scheme mapping and the vector payload.
+	cv := parse_certificate_verify([u8(0x08), 0x07, 0x00, 0x02, 0xaa, 0xbb])!
+	assert cv.algorithm == .ed25519
+	assert cv.signature == [u8(0xaa), 0xbb]
+}
+
+fn test_parse_certificate_verify_rejects_unknown_scheme() ! {
+	// A code outside the client's supported list never reaches the verifier.
+	parse_certificate_verify([u8(0x08), 0x99, 0x00, 0x01, 0x00]) or {
+		assert err.msg().contains('unsupported signature scheme')
+		return
+	}
+	assert false
+}
+
+fn test_parse_certificate_verify_rejects_empty_signature() ! {
+	parse_certificate_verify([u8(0x08), 0x07, 0x00, 0x00]) or {
+		assert err.msg().contains('empty signature')
+		return
+	}
+	assert false
+}
+
+fn test_parse_certificate_verify_rejects_trailing_bytes() ! {
+	// §4.4.3 fixes the body shape; one octet past the signature vector means a
+	// desynced parse and must be rejected rather than silently absorbed.
+	parse_certificate_verify([u8(0x08), 0x07, 0x00, 0x01, 0x42, 0x00]) or {
+		assert err.msg().contains('trailing bytes in CertificateVerify')
+		return
+	}
+	assert false
+}
+
 // test_client_hello_ip_literal_omits_sni verifies RFC 6066 §3: literal IPv4 and
 // IPv6 addresses must not be sent in the server_name (SNI) extension.
 fn test_client_hello_ip_literal_omits_sni() ! {
@@ -259,6 +296,45 @@ fn test_parse_new_session_ticket_bounds() ! {
 	if _ := parse_new_session_ticket(w.bytes()) {
 		assert false
 	}
+}
+
+// test_parse_certificate_message_rejects_overlong_chain pins the parse-time depth
+// cap: a well-framed list of more than max_cert_chain_depth single-byte certs is
+// refused before the state machine ASN.1-parses each entry, closing the
+// amplification where a 1 MiB Certificate message packs thousands of tiny certs.
+fn test_parse_certificate_message_rejects_overlong_chain() ! {
+	mut list := []u8{}
+	for _ in 0 .. 33 {
+		list << [u8(0x00), 0x00, 0x01, 0xab, 0x00, 0x00] // cert_len=1 (0xab) + empty extensions
+	}
+	mut body := []u8{}
+	body << u8(0x00) // empty certificate_request_context
+	body << u8((list.len >> 16) & 0xff)
+	body << u8((list.len >> 8) & 0xff)
+	body << u8(list.len & 0xff)
+	body << list
+	if _ := parse_certificate_message(body) {
+		assert false
+	}
+}
+
+// test_parse_new_session_ticket_rejects_trailing_bytes checks the strict-framing
+// guard: a well-formed ticket with one stray byte past the extension block must
+// not be silently accepted.
+fn test_parse_new_session_ticket_rejects_trailing_bytes() ! {
+	mut w := new_writer(64)
+	w.write_u32(3600) // valid lifetime
+	w.write_u32(100) // age_add
+	w.write_vector_u8([u8(1), 2])! // nonce
+	w.write_vector_u16([u8(0xaa), 0xbb])! // ticket
+	w.write_vector_u16([]u8{})! // extensions
+	mut bytes := w.bytes()
+	bytes << 0xff // one byte beyond the extension vector
+	parse_new_session_ticket(bytes) or {
+		assert err.msg().contains('trailing bytes in NewSessionTicket')
+		return
+	}
+	assert false
 }
 
 fn test_certificate_verify_signed_content() {

@@ -1,14 +1,44 @@
-# tls — Module & API Documentation
+# `tls` — Module & API Documentation
 
-Reference documentation for the `tls` module: its internal architecture and its
-public API surface. For feature scope (cipher suites, what is / isn't implemented)
-and testing notes see [README.md](README.md).
+![V](https://img.shields.io/badge/language-V-2d7dd2) ![TLS&nbsp;1.3](https://img.shields.io/badge/protocol-RFC_8446-2ea44f) ![client--only](https://img.shields.io/badge/role-client--only-6f42c1) ![no%20deps](https://img.shields.io/badge/OpenSSL--free-000000) ![status](https://img.shields.io/badge/status-experimental-e8930c)
 
-A TLS 1.3 **client** library written in [V](https://vlang.io), implementing
+A **<span style="color:#2d7dd2">TLS 1.3 client</span>** library written in [V](https://vlang.io), implementing
 [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) directly on standard-library
-crypto — no OpenSSL bindings.
+crypto — no OpenSSL bindings, no third-party dependencies.
 
+| | |
+|---|---|
+| **Protocol** | TLS 1.3 (RFC 8446) — client only; no TLS 1.2 fallback, resumption, or 0-RTT |
+| **Implementation** | Pure V over the standard-library crypto stack; strict, bounds-checked parsing throughout |
+| **API surface** | `dial()` · `Conn` · `Config` · `default_config()` · `TrustStore` — everything else is module-private |
+| **Trust model** | System CA bundle by default; custom roots via `Config.root_cas`; `insecure_skip_verify` test escape hatch |
+| **Related docs** | [README.md](README.md) — feature scope, hardening notes, and testing coverage |
+
+> [!WARNING]
 > **Status: experimental.** Not audited; do not ship in production.
+
+## Contents
+
+- [1. Module architecture](#1-module-architecture)
+  - [1.1 Public vs. private surface](#11-public-vs-private-surface)
+  - [1.2 Layer map](#12-layer-map)
+  - [1.3 Data flow of `dial()`](#13-data-flow-of-dial)
+  - [1.4 Handshake sequence](#14-handshake-sequence)
+- [2. API reference](#2-api-reference)
+  - [2.1 `dial`](#21-dial)
+  - [2.2 `Conn`](#22-conn)
+  - [2.3 `Config`](#23-config)
+  - [2.4 `default_config`](#24-default_config)
+  - [2.5 `TrustStore`](#25-truststore)
+- [3. Usage](#3-usage)
+  - [3.1 Basic client](#31-basic-client)
+  - [3.2 Private CA / pinned lab roots](#32-private-ca--pinned-lab-roots)
+  - [3.3 Testing escape hatch](#33-testing-escape-hatch)
+  - [3.4 HelloRetryRequest — handled transparently](#34-helloretryrequest--handled-transparently)
+- [4. Error handling summary](#4-error-handling-summary)
+  - [4.1 Connection lifecycle](#41-connection-lifecycle)
+  - [4.2 Wire & handshake protocol violations](#42-wire--handshake-protocol-violations)
+  - [4.3 Certificate & trust-policy rejections](#43-certificate--trust-policy-rejections)
 
 ---
 
@@ -17,7 +47,7 @@ crypto — no OpenSSL bindings.
 Everything lives in a single module, `tls` (`src/tls/`). All files declare
 `module tls`; there are no submodules and no cross-module imports. Internal
 layers are separated **by convention**, not by the compiler: each file owns one
-layer of the stack, and lower layers never reference higher ones.
+layer of the stack, and <span style="color:#2ea44f">lower layers never reference higher ones</span>.
 
 ### 1.1 Public vs. private surface
 
@@ -42,15 +72,37 @@ not part of the API contract. (`TrustStore` stays public only because
 Strict layering, bottom to top. Each file carries a doc preamble in its source
 with the authoritative description of its role; this table summarizes it.
 
+```text
+   caller
+      ▼
+ ┌───────────────────────────────┐
+ │ conn.v · config.v             │  public API: dial() · Conn · Config
+ ├───────────────────────────────┤
+ │ state_machine.v               │  handshake sequencing, key ratchet
+ ├───────────────────────────────┤
+ │ validator · x509 · asn1 ·     │  chain of trust, DER decoding,
+ │ rsa · hostname · trust_store  │  hostname matching, roots
+ ├───────────────────────────────┤
+ │ messages · transcript ·       │  RFC 8446 §4 structures, running
+ │ certificate_verify ·          │  hash, signature verification,
+ │ key_schedule · handshake_keys │  · HKDF §7.1 ladder
+ │ · cipher_state · aead         │  · per-direction AEAD state
+ ├───────────────────────────────┤
+ │ record · alert                │  record framing & reassembly, alerts
+ ├───────────────────────────────┤
+ │ reader.v · writer.v           │  bounds-checked wire codec
+ └───────────────────────────────┘
+```
+
 | Layer | Files | Responsibility |
 |---|---|---|
 | Wire codec | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, never a panic. |
-| Record layer | `record.v`, `alert.v`, `cipher_state.v`, `aead.v` | Record framing and reassembly (§5), alert protocol enums + wire encoding (§6), per-direction AEAD key/IV/sequence state with §5.3 nonce construction, adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. |
+| Record layer | `record.v`, `alert.v`, `cipher_state.v`, `aead.v` | Record framing and reassembly (§5), alert protocol enums + wire encoding (§6), per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. |
 | Handshake messaging | `messages.v`, `transcript.v` | RFC 8446 §4 structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history. |
 | Key schedule | `key_schedule.v`, `handshake_keys.v` | HKDF-Extract/Expand ladder over (EC)DHE and traffic-secret stages (§7.1); `handshake_keys.v` adapts those pure derivations plus the offered-group policy to the handshake flow — it never touches the transcript or advances state. |
 | Signature check | `certificate_verify.v` | Verifies the server's CertificateVerify over the §4.4.3 transcript content; a pure function of (leaf key, signature, content). |
-| State machine | `state_machine.v` | Sequences the client handshake: drives codecs, AEAD, key schedule, and signature verification; owns no socket — `conn.v` feeds records through it. |
-| PKI | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader, X.509 v3 decoding, raw RSA / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. |
+| PKI | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. |
+| State machine | `state_machine.v` | Sequences the client handshake: drives codecs, AEAD, key schedule, signature verification, and the validator; owns no socket — `conn.v` feeds records through it. Scrubs handshake secrets and both ephemeral private keys the moment `.connected` makes them dead weight, and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene). |
 | Public API | `conn.v`, `config.v` | `dial()` + `Conn` (socket I/O, record buffering, post-handshake handling) and `Config` options. |
 
 ### 1.3 Data flow of `dial()`
@@ -71,9 +123,53 @@ HelloRetryRequest round trip (new group, optional cookie echo,
 `message_hash` transcript substitution) is handled transparently inside the
 same loop — callers see a plain `dial()`.
 
+> [!TIP]
+> Every diagram in this section is strict bottom-to-top: a defect in any
+> upper layer can never widen the attack surface of the layer below it.
+
+### 1.4 Handshake sequence
+
+The full exchange one successful `dial()` performs, in wire order:
+
+```text
+        Client                                          Server
+  ─────────►  ClientHello          (key_share · supported_versions
+  ◄─ ─ ─ ─    cipher_suites · SNI · ALPN · supported_groups)
+             HelloRetryRequest?    ── only if the offered group is
+  ─────────►  ClientHello (retry)     rejected; echoes cookie, new share
+  ◄─────────  ServerHello           plaintext; ends the client's waiting
+  ◄─ ─ ─ ─    (dummy ChangeCipherSpec — middlebox compatibility)
+  ◄─────────  EncryptedExtensions   ┐ under handshake keys
+  ◄─────────  Certificate           │ server's chain, in leaf-to-
+  ◄─────────  CertificateVerify     │ issuer order
+  ◄─────────  Finished              ┘ transcript-bound verify_data
+  ─────────►  Finished              client flight; both sides derive
+                                    application keys on success
+  ⇄ ⇄ ⇄ ⇄ ⇄   application_data …    records sealed with traffic keys
+  ◄─────────  NewSessionTicket …    collected (capped at 32), not yet usable
+  ◄─────────  KeyUpdate             read keys ratchet; response sent when
+  ─────────►  KeyUpdate             requested (old-key-before-new order)
+  ─────────►  close_notify          `Conn.close()`, then TCP FIN
+```
+
+Each `◄─ ─ ─` dummy ChangeCipherSpec is accepted and ignored (§5). The
+handshake↔traffic key transition happens inside the state machine as records
+are processed; `dial()` returns only after the client `Finished` is accepted
+by the server and the state reports `.connected`.
+
 ---
 
 ## 2. API reference
+
+Five exported symbols; the whole surface:
+
+| Symbol | One-line summary | Reference |
+|---|---|---|
+| [`dial`](#21-dial) | Open a socket, run the full handshake, return a ready `Conn` | [§2.1](#21-dial) |
+| [`Conn`](#22-conn) | The protected stream: `read` / `write` / `close` | [§2.2](#22-conn) |
+| [`Config`](#23-config) | `@[params]` dial options — SNI, ALPN, trust, timeout | [§2.3](#23-config) |
+| [`default_config`](#24-default_config) | Explicit conservative `Config` constructor | [§2.4](#24-default_config) |
+| [`TrustStore`](#25-truststore) | Custom root-CA set for `Config.root_cas` | [§2.5](#25-truststore) |
 
 ### 2.1 `dial`
 
@@ -106,8 +202,18 @@ Behavior and guarantees:
   `insecure_skip_verify` is set, in which case an empty store suffices.
 - **No fd leaks** — any handshake failure closes the socket it opened before
   returning the error; a half-connected `Conn` is never returned.
+- **Forward secrecy of retained secrets** — the handshake-stage traffic secrets
+  and the ephemeral X25519 / P-256 private keys are released the instant the
+  state machine reaches `.connected` (nothing reads them again), and the
+  application traffic secrets are released at `close()` or on a fatal alert, so
+  a later memory exposure cannot unlock a previously recorded session.
 - **ALPN is enforced** — a server selecting a protocol that wasn't offered aborts
   the handshake (RFC 7301 §3.1); an empty `alpn` list forbids any ALPN response.
+- **Resource bounds** — a handshake message declaring more than 1 MiB is refused
+  at its header before fragments accumulate; a `Certificate` list with more than
+  32 entries is rejected during parsing (before each is ASN.1-decoded), and so are
+  chains that long and CA RSA keys shorter than 2048 bits; the post-handshake
+  `NewSessionTicket` backlog is capped at 32 stored tickets.
 
 ### 2.2 `Conn`
 
@@ -138,13 +244,15 @@ clean end of stream (peer `close_notify` or connection already closed).
 - A decrypted record larger than `buf` is buffered internally; subsequent calls
   drain the remainder before reading new records — no plaintext is dropped or reordered.
 - Zero-length (padding-only) records are skipped transparently.
+- A **plaintext outer alert after the handshake is rejected**, and so is a
+  plaintext ChangeCipherSpec record — RFC 8446 §5/§6 make both fatal
+  (`unexpected_message`) once keys exist, preventing record injection.
+- The receive side aborts if the peer exceeds the §5.5 per-key record limit
+  without rekeying (2²⁴ records per key generation).
 - Post-handshake encrypted records are demultiplexed by inner content type:
   `NewSessionTicket` messages are collected, `KeyUpdate` read-key ratchets are
   applied (a response is sent with the correct §4.6.3 old-key-before-new ordering
   when the server requests one), and encrypted `alert`s end the stream.
-- A **plaintext outer alert after the handshake is rejected** — RFC 8446 §6
-  requires alerts to be encrypted once handshake keys exist, so this prevents
-  plaintext alert injection.
 - Reading with an empty `buf` returns `0` without I/O.
 
 #### `write`
@@ -155,9 +263,15 @@ pub fn (mut c Conn) write(data []u8) !int
 
 Encrypts and sends application data, returning the number of bytes accepted
 (the full `data.len` on success). One call may emit many records: plaintext is
-chunked at 2¹⁴ bytes, the TLS maximum (§5.1). Writing on a closed connection or
-before the handshake completes is an error — the state machine is the gate, not
-caller ordering.
+chunked at 2¹⁴ bytes, the TLS maximum (§5.1). Before a key generation crosses
+the §5.5 record limit the client transparently rekeys — it fires at
+`limit − 1`, reserving the one slot the KeyUpdate notice itself needs (its
+encrypted record goes through the same send-side backstop that guards received
+data, which would otherwise refuse the record at exactly the boundary), then
+sends a `KeyUpdate (update_not_requested)` under the old keys and ratchets the
+write keys, exactly as the §4.6.3 response path does. Writing on a closed
+connection or before the handshake completes is an error — the state machine is
+the gate, not caller ordering.
 
 #### `close`
 
@@ -166,9 +280,9 @@ pub fn (mut c Conn) close() !
 ```
 
 Sends `close_notify` (encrypted with application keys when they exist, per
-§6.1/§A.4) and closes the TCP socket. **Idempotent**: a second `close()` neither
-re-sends `close_notify` nor double-closes the socket, and never errors. Use it
-in a `defer` block.
+§6.1/§A.4), zeroizes the retained application traffic secrets, and closes the
+TCP socket. **Idempotent**: a second `close()` neither re-sends `close_notify`
+nor double-closes the socket, and never errors. Use it in a `defer` block.
 
 #### `negotiated_alpn`
 
@@ -206,6 +320,11 @@ build one up front from `default_config()`).
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
+
+> [!IMPORTANT]
+> <span style="color:#cf222e">`insecure_skip_verify` removes all authentication</span>
+> the handshake provides — chain *and* hostname checks. Tests and pinned lab
+> environments only; it should be impossible to find enabled in shipped code.
 
 ### 2.4 `default_config`
 
@@ -288,7 +407,10 @@ verification is on.
 
 ## 3. Usage
 
-### 3.1 Basic client (handshake → request → read → close)
+Runnable recipes; a full end-to-end demo (`v run src/example/dial_example.v`)
+lives in `src/example/dial_example.v`.
+
+### 3.1 Basic client
 
 ```v
 import tls
@@ -314,13 +436,10 @@ for {
 	if n == 0 {
 		break
 	}
-	print(buf[..n].bystr())
+	print(buf[..n].bytestr())
 }
 println('ALPN: ${conn.negotiated_alpn()}')
 ```
-
-A runnable end-to-end demo lives in `src/example/dial_example.v`
-(`v run src/example/dial_example.v`).
 
 ### 3.2 Private CA / pinned lab roots
 
@@ -337,6 +456,10 @@ mut conn := tls.dial('internal.example:443',
 ```
 
 ### 3.3 Testing escape hatch
+
+> [!WARNING]
+> <span style="color:#cf222e">Skips all certificate verification.</span> The
+> connection is encrypted but unauthenticated — trivially MITM'd. Never ship it.
 
 ```v
 // Disables chain AND hostname validation — never ship enabled.
@@ -360,20 +483,44 @@ verification binds the entire two-round exchange.
 
 ## 4. Error handling summary
 
-All fallible operations return `!` (V option/result errors); there are no
-panics on malformed input — bad framing, oversized records, duplicate or
-unpermitted extensions, and bad share sizes are handshake errors, never
-memory-safety events.
+All fallible operations return `!` (V option/result errors); there are
+<span style="color:#2ea44f">**no panics on malformed input**</span> — bad framing, oversized records, duplicate or
+unpermitted extensions, truncated certificates, and bad share sizes are
+handshake errors, never memory-safety events.
+
+### 4.1 Connection lifecycle
 
 | Situation | Result |
 |---|---|
 | DNS / TCP connect failure | `dial()` error |
 | Socket timeout (read or write) | `dial()` / `read()` / `write()` error after `Config.timeout` |
 | Peer sends a fatal alert during handshake | `dial()` error carrying the alert description |
-| Certificate chain / hostname / signature verification failure | `dial()` error |
 | Peer `close_notify` while reading | `read()` returns `0` (clean EOF) |
 | Peer fatal alert (encrypted, post-handshake) | `read()` error carrying the alert description |
-| Plaintext alert post-handshake | `read()` error (injection rejected) |
 | `write()` after `close()` or before handshake | error, nothing sent |
 | `close()` twice | no-op, no error, `close_notify` sent at most once |
 | Handshake failure inside `dial()` | error; the socket is closed — no fd leak |
+
+### 4.2 Wire & handshake protocol violations
+
+| Situation | Result |
+|---|---|
+| Handshake message declaring > 1 MiB | `dial()` error (reassembly cap) |
+| Plaintext alert or ChangeCipherSpec post-handshake | `read()` error (fatal `unexpected_message`; injection rejected) |
+| Peer exceeds §5.5 per-key record limit without rekeying | `read()` error |
+| `Certificate` list with more than 32 entries | `dial()` error (rejected at parse, before decoding) |
+| `NewSessionTicket` with trailing bytes after its extensions | `dial()` error (decode_error) |
+| X25519 shared secret of small order (0, 1, or p−1) | `dial()` error (illegal_parameter) |
+
+### 4.3 Certificate & trust-policy rejections
+
+| Situation | Result |
+|---|---|
+| Certificate chain / hostname / signature verification failure | `dial()` error |
+| Leaf/CA `keyUsage` present but forbidding its required use | `dial()` error (digitalSignature / keyCertSign) |
+| `basicConstraints` pathLenConstraint exceeded | `dial()` error |
+| CA RSA key < 2048 bits in the chain | `dial()` error |
+| Unparseable certificate validity time | `dial()` error (decode fails; expiry always enforced) |
+| Non-minimal DER length or invalid RSA public exponent (`e` = 0, degenerate 1, or any even value such as 2) | `dial()` error (decode rejected) |
+| `TBSCertificate` missing mandatory fields — with or without the optional `version [0]` element | `dial()` error (post-version element-count guard; a truncated v3 certificate fails the decode cleanly instead of indexing past the element array) |
+| CertificateVerify scheme paired with the wrong leaf key type, or an ECDSA scheme with the wrong curve | `dial()` error (§4.2.3 curve/scheme binding checked before any key material) |

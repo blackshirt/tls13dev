@@ -592,6 +592,13 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 	mut cert_r := new_reader(cert_list_bytes)
 	mut certs := [][]u8{}
 	for cert_r.remaining() > 0 {
+		// Reject an over-long chain here, before the state machine ASN.1-parses
+		// every entry: the list is bounded only by the 1 MiB message cap, so a
+		// peer could otherwise pack thousands of tiny entries and force thousands
+		// of parse_certificate calls before the depth limit is ever consulted.
+		if certs.len >= max_cert_chain_depth {
+			return error('handshake: certificate chain exceeds maximum depth ${max_cert_chain_depth} (illegal_parameter)')
+		}
 		cert_data := cert_r.read_vector_u24()!
 		_ := cert_r.read_vector_u16()! // per-cert extensions (status_request etc.):
 		// ignored, this client uses no optional cert features.
@@ -774,6 +781,11 @@ fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	}
 	_ := r.read_vector_u16()! // extensions (max_early_data, …): unused while
 	// resumption is unimplemented (see ClientHandshake.session_tickets)
+	if r.remaining() != 0 {
+		// Strict framing like every other parser: leftover bytes mean the ticket
+		// was misframed or carries data past the extension block.
+		return error('handshake: trailing bytes in NewSessionTicket (decode_error)')
+	}
 	return NewSessionTicket{
 		ticket_lifetime: lifetime
 		ticket_age_add:  age_add
