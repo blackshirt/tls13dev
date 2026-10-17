@@ -69,6 +69,17 @@ fn test_host_from_address() ! {
 	assert host_from_address('localhost') == 'localhost'
 }
 
+// test_host_from_address_edge_cases pins the remaining dial-address forms that
+// must still yield a usable SNI name when Config.server_name is unset.
+fn test_host_from_address_edge_cases() ! {
+	// Bracketed IPv6 with no trailing port: strip the brackets, keep the address.
+	assert host_from_address('[2001:db8::1]') == '2001:db8::1'
+	// Splits on the LAST colon, so an embedded colon stays part of the host.
+	assert host_from_address('a:b:443') == 'a:b'
+	// A bare, port-less host is returned unchanged.
+	assert host_from_address('example.com') == 'example.com'
+}
+
 // test_read_raw_record_oversized_payload verifies immediate rejection of records
 // with declared length > max_ciphertext_record_len before allocating/reading.
 fn test_read_raw_record_oversized_payload() ! {

@@ -80,3 +80,72 @@ fn test_record_cipher_state_tamper_detection() ! {
 	}
 	assert false
 }
+
+// test_content_type_from_u8 pins the 1-byte record content-type decode: the five
+// defined types map to their enum values and any other byte is a framing error.
+fn test_content_type_from_u8() ! {
+	assert content_type_from_u8(u8(0))! == .invalid
+	assert content_type_from_u8(u8(20))! == .change_cipher_spec
+	assert content_type_from_u8(u8(21))! == .alert
+	assert content_type_from_u8(u8(22))! == .handshake
+	assert content_type_from_u8(u8(23))! == .application_data
+	content_type_from_u8(u8(99)) or {
+		assert err.msg().contains('invalid content type')
+		return
+	}
+	assert false
+}
+
+// test_change_cipher_spec_dummy_record verifies the middlebox-compat CCS record
+// (RFC 8446 App. D.4): content type 20 carrying the single byte 0x01.
+fn test_change_cipher_spec_dummy_record() ! {
+	rec := change_cipher_spec()
+	assert rec.content_type == .change_cipher_spec
+	assert rec.legacy_version == legacy_record_version
+	assert rec.payload == [u8(0x01)]
+}
+
+// test_parse_record_rejects_short_header: fewer than the 5-byte header is a
+// framing error rather than an out-of-bounds read.
+fn test_parse_record_rejects_short_header() ! {
+	mut r := new_reader([u8(0x16), 0x03, 0x03, 0x00])
+	parse_record(mut r) or {
+		assert err.msg().contains('buffer too short')
+		return
+	}
+	assert false
+}
+
+// test_parse_record_rejects_invalid_content_type: correct framing but an
+// undefined content-type byte (0x99) must be rejected before payload handling.
+fn test_parse_record_rejects_invalid_content_type() ! {
+	mut r := new_reader([u8(0x99), 0x03, 0x03, 0x00, 0x01, 0xaa])
+	parse_record(mut r) or {
+		assert err.msg().contains('invalid content type')
+		return
+	}
+	assert false
+}
+
+// test_parse_record_rejects_oversized_length: a declared length above
+// max_ciphertext_record_len (RFC 8446 §5.2) is refused before any allocation.
+fn test_parse_record_rejects_oversized_length() ! {
+	// length field 0x5000 = 20480 > max_ciphertext_record_len 16640
+	mut r := new_reader([u8(0x17), 0x03, 0x03, 0x50, 0x00])
+	parse_record(mut r) or {
+		assert err.msg().contains('exceeds maximum')
+		return
+	}
+	assert false
+}
+
+// test_parse_record_rejects_incomplete_payload: the header declares 200 bytes
+// but only 2 are present, so the record is truncated and must error.
+fn test_parse_record_rejects_incomplete_payload() ! {
+	mut r := new_reader([u8(0x16), 0x03, 0x03, 0x00, 0xc8, 0xaa, 0xbb])
+	parse_record(mut r) or {
+		assert err.msg().contains('incomplete record payload')
+		return
+	}
+	assert false
+}

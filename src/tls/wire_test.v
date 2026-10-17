@@ -49,3 +49,54 @@ fn test_wire_reader_bounds_check() {
 	}
 	assert false
 }
+
+// test_wire_writer_u8_vector_boundary exercises new_writer's capacity<=0 fallback
+// and proves a full 255-byte payload (the largest u8 prefix) round-trips intact.
+fn test_wire_writer_u8_vector_boundary() ! {
+	data := []u8{len: 255, init: 0x7f}
+	mut w := new_writer(0) // cap<=0 → default capacity; growth must still fit 256 bytes
+	w.write_vector_u8(data)!
+
+	mut r := new_reader(w.bytes())
+	got := r.read_vector_u8()!
+	assert got.len == 255
+	assert got[0] == 0x7f
+	assert got[254] == 0x7f
+}
+
+// test_wire_writer_rejects_oversized_u8_vector: a u8-prefixed vector cannot
+// encode more than 255 bytes, and silently truncating the length would corrupt
+// the frame, so it must be rejected outright.
+fn test_wire_writer_rejects_oversized_u8_vector() ! {
+	over := []u8{len: 256}
+	mut w := new_writer(64)
+	w.write_vector_u8(over) or {
+		assert err.msg().contains('exceeds u8 max')
+		return
+	}
+	assert false
+}
+
+// test_wire_reader_read_bytes_negative: a negative count must be rejected as a
+// framing error rather than attempting an invalid slice of the buffer.
+fn test_wire_reader_read_bytes_negative() ! {
+	mut r := new_reader([u8(1), 2, 3])
+	assert r.remaining() == 3
+	r.read_bytes(-1) or {
+		assert err.msg().contains('unexpected EOF')
+		return
+	}
+	assert false
+}
+
+// test_wire_reader_truncated_vector: the 1-byte prefix declares 5 payload bytes
+// but only 2 are present, so the vector read must fail the bounds check instead
+// of returning a short slice.
+fn test_wire_reader_truncated_vector() ! {
+	mut r := new_reader([u8(5), 1, 2])
+	r.read_vector_u8() or {
+		assert err.msg().contains('unexpected EOF')
+		return
+	}
+	assert false
+}

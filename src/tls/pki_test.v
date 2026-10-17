@@ -105,3 +105,27 @@ fn test_system_trust_store_loading() {
 	// On this Linux system, ca-certificates should contain > 50 root CAs
 	assert count > 0
 }
+
+// test_is_ip_literal pins the address/name classifier: valid dotted-quad IPv4
+// (with whitespace trimmed) and any colon-bearing IPv6 are literals, while a
+// wrong label count, an out-of-range octet, a non-numeric label, or an empty
+// string are ordinary DNS names. Wildcard-IP rejection in match_hostname
+// depends on exactly these boundaries.
+fn test_is_ip_literal() {
+	assert is_ip_literal('192.168.1.1')
+	assert is_ip_literal('0.0.0.0')
+	assert is_ip_literal(' 10.0.0.1 ')
+	assert is_ip_literal('::1')
+	assert is_ip_literal('2001:db8::1')
+
+	// Wrong number of dot-separated labels.
+	assert !is_ip_literal('1.2.3')
+	assert !is_ip_literal('1.2.3.4.5')
+	// An octet outside 0..255 is not a valid IPv4 byte.
+	assert !is_ip_literal('300.1.1.1')
+	// A non-numeric label disqualifies the dotted quad.
+	assert !is_ip_literal('1.2.3.x')
+	// Empty host and ordinary names are never addresses.
+	assert !is_ip_literal('')
+	assert !is_ip_literal('example.com')
+}

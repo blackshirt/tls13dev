@@ -27,6 +27,7 @@ enum HandshakeState {
 }
 
 // ClientHandshake orchestrates the TLS 1.3 client handshake state machine.
+@[noinit]
 struct ClientHandshake {
 mut:
 	config            ClientHelloConfig // inputs echoed/replayed when rebuilding the second ClientHello
