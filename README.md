@@ -22,7 +22,8 @@ backward compatibility promise while V itself is pre-1.0.
 
 ```bash
 v test all                 # unit tests for the tls module
-v run src/example/dial_example.v   # live demo: handshake + HTTP GET over TLS
+v run src/example/dial_example.v       # live demo: handshake + HTTP GET over TLS
+v run src/example/dial_hrr_example.v   # live demo: a HelloRetryRequest group-retry round trip
 ```
 
 ```v
@@ -72,7 +73,8 @@ socket — `conn.v` drives it all.
 ```
 src/
   example/
-    dial_example.v    runnable end-to-end demo (handshake + HTTP GET over TLS)
+    dial_example.v     runnable end-to-end demo (handshake + HTTP GET over TLS)
+    dial_hrr_example.v same flow, against a server that forces a HelloRetryRequest
   tls/              the whole library as one module: wire codec, record layer,
                     handshake state machine, key schedule, PKI validation, and
                     the public client API (with its *_test.v files alongside)
@@ -139,8 +141,9 @@ SHA-256 key-schedule and transcript path from the fixed shared secret
 outward (the ECDHE computation itself is not vector-pinned); AES-256-GCM,
 SHA-384, and ChaCha20-Poly1305 are verified by round trips and
 suite-parameter consistency rather than external vectors, and real-server
-behavior (all suites, HRR retries, interop quirks) is what
-`v run src/example/dial_example.v` is for.
+behavior (all suites, HRR retries, interop quirks) is what the runnable demos
+(`v run src/example/dial_example.v`, and `.../dial_hrr_example.v` which exercises
+the HelloRetryRequest retry path) are for.
 
 ## References
 
