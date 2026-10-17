@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// rsa.v implements raw RSA / RSASSA-PKCS1-v1_5 verification over math.big integers,
+// covering the classic RSA signature schemes the crypto standard-library helpers do
+// not expose. ECDSA and PSS paths route through the crypto packages instead.
 module pki
 
 import math.big
@@ -9,7 +15,7 @@ import wire
 
 // RsaPublicKey represents a decoded RSA public key.
 pub struct RsaPublicKey {
-pub:
+mut:
 	n          big.Integer // Modulus
 	e          u64         // Public exponent (usually 65537)
 	size_bytes int         // key size in bytes (modulus length), used to bound signatures

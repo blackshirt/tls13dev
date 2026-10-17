@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // module kdf derives every handshake and application key through the RFC 8446
 // §7.1 schedule: key_schedule.v runs the HKDF-Extract/Expand ladder over the
 // (EC)DHE and traffic-secret stages, transcript.v maintains the running message

@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// trust_store.v loads and indexes trusted root CA certificates, seeding the
+// verifier's chain-of-trust check from the host's system trust bundle so leaf
+// certificates can be anchored back to a known-good root.
 module pki
 
 import encoding.base64
@@ -5,7 +11,7 @@ import os
 
 // TrustStore stores trusted root CA certificates.
 pub struct TrustStore {
-pub mut:
+mut:
 	certs []Certificate // trusted roots, checked against the chain in order
 }
 

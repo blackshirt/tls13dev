@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // The pki module covers the X.509 side of the handshake (RFC 5280): asn1.v and
 // x509.v decode certificates, rsa.v and the crypto libraries verify signature
 // schemes, hostname.v applies RFC 6125 name matching, trust_store.v loads system
@@ -9,7 +12,7 @@ import time
 
 // Validator verifies certificate chains against trusted roots and hostnames.
 pub struct Validator {
-pub:
+mut:
 	store                TrustStore // roots the chain must anchor to
 	insecure_skip_verify bool       // skips chain and hostname checks; testing only
 }

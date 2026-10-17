@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// messages.v encodes and decodes the RFC 8446 §4 handshake structures — ClientHello,
+// ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished and the
+// extension blocks — relying on the wire reader/writer for the framing arithmetic.
 module handshake
 
 import crypto.rand

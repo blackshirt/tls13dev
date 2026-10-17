@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // module wire provides the byte-level primitives every other module parses
 // through: reader.v is a bounds-checked cursor over a message body, writer.v
 // assembles length-prefixed structures. There is no TLS semantics here, only
@@ -8,7 +11,6 @@ module wire
 // Every read validates its length first: parsers face hostile input and must
 // reject truncation or malformed framing rather than panic (RFC 8446 §4).
 pub struct Reader {
-pub:
 	data []u8 // buffer being parsed; never mutated, only walked
 pub mut:
 	cursor int // next unread byte; advanced only after a successful read

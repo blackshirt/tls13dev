@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Record layer tests: wire framing round-trips through serialize/parse, the
 // AEAD cipher state encrypts and decrypts in sequence-number lockstep across
 // records, and a single flipped ciphertext byte must fail the tag check.

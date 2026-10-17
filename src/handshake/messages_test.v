@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Codec tests for the handshake message layer: ClientHello construction is
 // re-parsed field by field, server-side messages decode from small hand-built
 // payloads plus the RFC 8448 §3 ServerHello worked example, the §4.4.3

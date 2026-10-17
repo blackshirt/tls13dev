@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// x509.v decodes DER-encoded X.509 v3 certificates into a Cert, pulling out the
+// subject/issuer names, validity window, public key, signature algorithm, and the
+// SAN/basic-constraints extensions that validator.v and hostname.v consume.
 module pki
 
 import crypto.ecdsa
@@ -15,6 +21,14 @@ pub enum PublicKeyAlgorithm {
 // Certificate represents a decoded X.509 certificate (RFC 5280).
 pub struct Certificate {
 pub:
+	// Only the public-key fields read across the module boundary by the handshake's
+	// CertificateVerify check (handshake/certificate_verify.v) are public; everything
+	// else is consumed solely by the chain/hostname validation inside this module.
+	public_key_algo PublicKeyAlgorithm
+	public_key_raw  []u8          // SubjectPublicKeyInfo BIT STRING contents
+	rsa_public_key  ?RsaPublicKey // set when public_key_algo is .rsa
+	ecdsa_curve     ecdsa.Nid     // curve of the EC key, NID form
+mut:
 	raw                []u8   // full DER-encoded certificate as received
 	tbs_raw            []u8   // DER of the TBSCertificate — exactly the bytes the issuer signed
 	version            int    // X.509 version (3 = v3); encoded value is version-1
@@ -29,15 +43,11 @@ pub:
 	// Name fields, used to chain a certificate to its issuer.
 	issuer_dn       []u8
 	subject_dn      []u8
-	not_before      string // validity start, RFC 5280 UTCTime/GeneralizedTime as written
-	not_after       string // validity end, same encoding as not_before
-	not_before_unix i64    // not_before in Unix seconds, for easy comparison
-	not_after_unix  i64    // not_after in Unix seconds
-	public_key_algo PublicKeyAlgorithm
-	public_key_raw  []u8          // SubjectPublicKeyInfo BIT STRING contents
-	rsa_public_key  ?RsaPublicKey // set when public_key_algo is .rsa
-	ecdsa_curve     ecdsa.Nid     // curve of the EC key, NID form
-	sans            []string      // dNSName and rfc822Name SAN entries
+	not_before      string   // validity start, RFC 5280 UTCTime/GeneralizedTime as written
+	not_after       string   // validity end, same encoding as not_before
+	not_before_unix i64      // not_before in Unix seconds, for easy comparison
+	not_after_unix  i64      // not_after in Unix seconds
+	sans            []string // dNSName and rfc822Name SAN entries
 	// ip_sans holds the raw bytes of each iPAddress SAN (4 bytes for IPv4,
 	// 16 for IPv6), used to verify connections made to an IP literal.
 	ip_sans         [][]u8

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Wire codec tests: big-endian primitives and length-prefixed vectors must read
 // back exactly what was written, and truncated reads must fail with the bounds
 // error instead of indexing past the buffer.

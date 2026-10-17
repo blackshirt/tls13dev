@@ -1,10 +1,16 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// writer.v appends TLS wire data to an in-memory buffer, emitting big-endian integers
+// and length-prefixed vectors for the handshake and record encoders. Every multi-byte
+// value is network order regardless of the host's native endianness.
 module wire
 
 // Writer appends TLS wire data to an in-memory buffer.
 // All multi-byte integers use network byte order (big-endian, RFC 8446 §2),
 // regardless of the host's native endianness.
 pub struct Writer {
-pub mut:
+mut:
 	buf []u8 // bytes accumulated for the frame currently being built
 }
 

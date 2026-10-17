@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// cipher_state.v carries one direction's AEAD key, IV, and sequence number across the
+// handshake→application key transition, building each record nonce per §5.3 and
+// enforcing the record limit that forces a KeyUpdate.
 module record
 
 import crypto.cipher
@@ -16,7 +22,7 @@ const nonce_seq_offset = aead_nonce_len - 8
 // Each record's nonce is derived from a static per-direction value plus the
 // sequence number, so no per-record IV is ever transmitted.
 pub struct RecordCipherState {
-pub mut:
+mut:
 	aead    cipher.AEAD // AEAD primitive for this direction (AES-GCM or ChaCha20-Poly1305)
 	iv      []u8        // 12-byte nonce base from the key schedule ("iv" label), not a per-record IV
 	seq_num u64         // record counter for this direction; implicitly part of every nonce

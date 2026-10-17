@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// asn1.v is a minimal DER reader for the ASN.1 subset x509.v needs: tag/length/value
+// elements, object-identifier decoding, and integer payload extraction. It performs no
+// validation of the certificate semantics layered on top.
 module pki
 
 import wire

@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// transcript.v owns the running handshake transcript that the §7.1 key schedule and
+// CertificateVerify both hash over; it records raw messages so history can be rewritten
+// at the HelloRetryRequest checkpoint rather than maintained as a rolling digest.
 module kdf
 
 // Transcript maintains the running handshake transcript and computes

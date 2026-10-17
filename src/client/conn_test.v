@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Socket-free tests for the Conn read-side plumbing: read_raw_record exists to
 // reassemble TLS records from a TCP byte stream (glued or split frames), and
 // those paths are exercised here by pre-staging recv_buf — a populated buffer

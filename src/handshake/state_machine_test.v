@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Client state-machine tests focused on the HelloRetryRequest path: hand-built
 // HRR bodies are parsed and fed through process_server_hello to exercise the
 // RFC 8446 §4.1.2/§4.1.4 validation rules (single HRR only, must-change-something,

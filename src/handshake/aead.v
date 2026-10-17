@@ -1,3 +1,10 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// aead.v adapts the AEAD cipher suites (AES-128/256-GCM and ChaCha20-Poly1305) to
+// the single seal/open interface the record layer needs, hiding the distinct crypto
+// backends behind one type. Nonce construction and record limits live in
+// record/cipher_state.v, not here.
 module handshake
 
 import crypto.aes

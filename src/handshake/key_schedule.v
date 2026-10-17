@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // key_schedule.v adapts the handshake module to the kdf module: the pure §7.1
 // secret derivations (handshake and application phases) and the group policy
 // the ClientHello offers. state_machine.v sequences these calls; nothing here

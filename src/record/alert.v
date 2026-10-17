@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// alert.v models the RFC 8446 §6 alert protocol: the AlertLevel/AlertDescription
+// enums and their wire encoding, used to signal close_notify and fatal errors that
+// the record layer frames and conn.v surfaces to the caller.
 module record
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).
@@ -65,18 +71,12 @@ pub fn parse_alert(data []u8) !Alert {
 	}
 	// The cast is unsafe on purpose: the received byte may be a description this
 	// enum does not enumerate. RFC 8446 §6 treats unknown alert types as error
-	// alerts, so the raw byte is preserved and is_fatal() classifies it.
+	// alerts, so the raw byte is preserved and classified by the receiving caller.
 	desc := unsafe { AlertDescription(data[1]) }
 	return Alert{
 		level:       level
 		description: desc
 	}
-}
-
-// is_fatal reports whether the alert must terminate the connection.
-// Per RFC 8446 §6, all alerts are fatal except close_notify and user_canceled.
-pub fn (a Alert) is_fatal() bool {
-	return a.description != .close_notify && a.description != .user_canceled
 }
 
 // new_close_notify builds the warning close_notify alert, the only alert allowed
@@ -85,14 +85,6 @@ pub fn new_close_notify() Alert {
 	return Alert{
 		level:       .warning
 		description: .close_notify
-	}
-}
-
-// new_fatal_alert builds a fatal alert with the given description.
-pub fn new_fatal_alert(desc AlertDescription) Alert {
-	return Alert{
-		level:       .fatal
-		description: desc
 	}
 }
 

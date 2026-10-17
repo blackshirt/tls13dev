@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// config.v holds the caller-facing options passed to client.dial(): the SNI /
+// verification server_name, ALPN protocols to negotiate, the insecure_skip_verify
+// escape hatch, and the handshake/read timeouts. conn.v consumes it at dial time.
 module client
 
 import time

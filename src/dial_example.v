@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Minimal end-to-end demo of the client API: TLS 1.3 handshake → plaintext HTTP
 // request/response → orderly close_notify. Run with `v run src/dial_example.v`.
 module main

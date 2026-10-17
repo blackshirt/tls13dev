@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // module record implements the TLS 1.3 record layer (RFC 8446 §5): record.v
 // frames and (re)assembles plaintext and protected records, alert.v models the
 // §6 alert protocol, and cipher_state.v carries per-direction AEAD sequence

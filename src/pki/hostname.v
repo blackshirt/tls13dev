@@ -1,3 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
+// hostname.v applies RFC 6125 presentation-identifier matching, comparing the peer's
+// SAN/CN entries against the dial target with wildcard and IP-literal rules. The
+// SAN-over-CN precedence rule is enforced here, not by the caller.
 module pki
 
 import net

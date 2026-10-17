@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // The client module is the public entry point of this TLS stack: dial() opens a
 // connection, runs the TLS 1.3 handshake (driving handshake/pki/kdf), and Conn
 // exposes the protected stream via read/write/close. config.v holds the

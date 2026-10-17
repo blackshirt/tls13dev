@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // Known-answer tests for the TLS 1.3 key schedule against the RFC 8448 §3
 // worked example (SHA-256/PSK-less branch). The rfc8448_* constants are that
 // example's intermediate secrets, hex-encoded, in schedule order; inline hex

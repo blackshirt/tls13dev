@@ -1,3 +1,6 @@
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // The handshake module implements the TLS 1.3 client protocol machinery of RFC
 // 8446: message codec (messages.v), AEAD primitives (aead.v), §7.1 key schedule
 // (key_schedule.v), server-signature check (certificate_verify.v), and the

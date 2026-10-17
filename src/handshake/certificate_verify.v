@@ -1,9 +1,11 @@
-module handshake
-
+// Copyright (c) 2026 blackshirt.
+// SPDX-License-Identifier: MIT
+//
 // certificate_verify.v checks the server's CertificateVerify signature over the
 // §4.4.3 transcript content. It is separate from state_machine.v because
 // verification is a pure function of (leaf key, signature, content) that never
 // advances protocol state.
+module handshake
 
 import crypto.ed25519
 import crypto.sha512
