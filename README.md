@@ -21,14 +21,14 @@ backward compatibility promise while V itself is pre-1.0.
 ## Quick start
 
 ```bash
-v test all                 # unit tests (wire, record, handshake, kdf, pki, client)
-v run src/dial_example.v   # live demo: handshake + HTTP GET over TLS
+v test all                 # unit tests for the tls module
+v run src/example/dial_example.v   # live demo: handshake + HTTP GET over TLS
 ```
 
 ```v
-import client
+import tls
 
-mut conn := client.dial('example.com:443', client.default_config('example.com'))!
+mut conn := tls.dial('example.com:443', tls.default_config('example.com'))!
 conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.bytes())!
 // conn.read(mut buf), conn.negotiated_alpn, conn.close() ...
 ```
@@ -36,38 +36,51 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 `Config` exposes the caller-facing knobs: `server_name` (SNI + the name the
 certificate is checked against), `alpn` (offered protocols — the server's pick
 is verified against this list), `root_cas` (override the system trust store),
-and `insecure_skip_verify` (test/lab only; it removes all authentication).
+and `insecure_skip_verify` (test/lab only; it removes all authentication). Those
+fields are read-only; because `Config` is a `@[params]` struct you customise it by
+passing named arguments straight to `dial()` — e.g.
+`tls.dial('example.com:443', server_name: 'example.com', alpn: ['h2'])!` — and any
+field you omit keeps the default declared on it (`default_config()` remains an
+explicit way to build the same value).
+
+The module deliberately exports only this surface: `Conn`, `dial()`, `Config`
+(plus the `default_config()` helper) and the `TrustStore` used to populate
+`Config.root_cas`. Everything else — the record layer, wire codec, key schedule,
+handshake state machine, and X.509/ASN.1 parsing — is module-private
+implementation detail, not part of the API contract.
 
 ## Architecture
 
-| Module         | Responsibility                                                              |
-|----------------|-----------------------------------------------------------------------------|
-| `client`       | Public API: `dial()`, `Conn` (read/write/close), `Config`                    |
-| `handshake`    | Message codecs, the handshake state machine, AEAD primitives                 |
-| `record`       | Record layer (RFC 8446 §5), alerts (§6), per-direction cipher state          |
-| `kdf`          | HKDF key schedule (§7.1) and the running transcript hash                     |
-| `pki`          | X.509/ASN.1 parsing, chain validation, hostname matching, trust store        |
-| `wire`         | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)       |
+Everything lives in a single `tls` module (`src/tls/`); the source files are
+grouped by concern, each still owning one layer of the stack:
 
-Layering is strict: `wire` knows nothing of TLS, `record` knows nothing of
-handshake messages, and `handshake` owns no socket — `client` drives it all.
+| Source area      | Responsibility                                                               |
+|------------------|-----------------------------------------------------------------------------|
+| `conn`, `config` | The **entire public API**: `dial()`, `Conn` (read/write/close, `server_name`/`negotiated_alpn`), `Config` + `default_config()`, `TrustStore` — all else is module-private |
+| `messages`, `state_machine`, `handshake_keys`, `aead`, `certificate_verify` | Message codecs, the handshake state machine, §7.1 adapter, AEAD primitives |
+| `record`, `alert`, `cipher_state` | Record layer (RFC 8446 §5), alerts (§6), per-direction cipher state |
+| `key_schedule`, `transcript` | HKDF key schedule (§7.1) and the running transcript hash                     |
+| `x509`, `asn1`, `validator`, `hostname`, `trust_store`, `rsa` | X.509/ASN.1 parsing, chain validation, hostname matching, trust store |
+| `reader`, `writer` | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)       |
+
+Layering is still strict by convention: the wire codec knows nothing of TLS, the
+record layer knows nothing of handshake messages, and the handshake owns no
+socket — `conn.v` drives it all.
 
 ## Repository layout
 
 ```
 src/
-  dial_example.v    runnable end-to-end demo (handshake + HTTP GET over TLS)
-  client/           public API: dial(), Conn, Config (+ conn_test.v)
-  handshake/        message codecs, state machine, AEAD, cert-verify, §7.1 adapter
-  record/           record layer, alerts, per-direction cipher state
-  kdf/              HKDF key schedule and running transcript hash
-  pki/              X.509/ASN.1 parsing, chain validation, hostname matching, trust store
-  wire/             bounds-checked byte reader / length-prefixed writer
+  example/
+    dial_example.v    runnable end-to-end demo (handshake + HTTP GET over TLS)
+  tls/              the whole library as one module: wire codec, record layer,
+                    handshake state machine, key schedule, PKI validation, and
+                    the public client API (with its *_test.v files alongside)
 ```
 
-The demo lives under `src/` (not a top-level `example/`) because V resolves this
-library's bare sibling imports (`client`, `record`, …) relative to the executable's
-own directory — a runnable that imports them must sit beside them.
+The demo lives under `src/` (not a top-level `example/`) because V resolves the
+library's bare sibling import (`tls`) relative to the executable's own directory
+— a runnable that imports it must sit beside it.
 
 ## What is implemented
 
@@ -119,7 +132,7 @@ message codecs against RFC 8448's ServerHello plus hand-built malformed
 fixtures (duplicate/unpermitted/trailing-byte extensions, bad share sizes),
 the full HRR state-machine path (group change, cookie echo, cipher-suite
 binding, replay rejection), X.509 name matching including the SAN-vs-CN
-precedence rule, and TCP record (re)framing in `client`.
+precedence rule, and TCP record (re)framing in the connection layer.
 
 Coverage honesty: the RFC 8448 worked vectors exercise the AES-128-GCM /
 SHA-256 key-schedule and transcript path from the fixed shared secret
@@ -127,7 +140,7 @@ outward (the ECDHE computation itself is not vector-pinned); AES-256-GCM,
 SHA-384, and ChaCha20-Poly1305 are verified by round trips and
 suite-parameter consistency rather than external vectors, and real-server
 behavior (all suites, HRR retries, interop quirks) is what
-`v run src/dial_example.v` is for.
+`v run src/example/dial_example.v` is for.
 
 ## References
 
@@ -143,7 +156,7 @@ behavior (all suites, HRR retries, interop quirks) is what
 
 The codebase has a documentation convention worth keeping: comments explain
 *why*, cite the governing RFC section inline (e.g. `§4.2.8.2`), and call out
-deliberate trade-offs rather than hiding them. Each module carries a doc
-preamble describing its role in the stack.
+deliberate trade-offs rather than hiding them. Each source file carries a doc
+preamble describing its layer's role in the stack.
 
 MIT licensed — see `v.mod`.
