@@ -3,12 +3,14 @@
 // messages.v encodes and decodes the RFC 8446 §4 handshake structures — ClientHello,
 // ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished and the
 // extension blocks — relying on the wire reader/writer for the framing arithmetic.
-module tls
+module handshake
 
 import crypto.rand
+import tls.pki
+import tls.wire
 
 // HandshakeType identifies TLS 1.3 handshake messages (RFC 8446 §4).
-enum HandshakeType as u8 {
+pub enum HandshakeType as u8 {
 	client_hello         = 1
 	server_hello         = 2
 	new_session_ticket   = 4
@@ -78,7 +80,7 @@ enum SignatureScheme as u16 {
 }
 
 // CipherSuite defines TLS 1.3 cipher suites (RFC 8446 §B.4).
-enum CipherSuite as u16 {
+pub enum CipherSuite as u16 {
 	tls_aes_128_gcm_sha256       = 0x1301
 	tls_aes_256_gcm_sha384       = 0x1302
 	tls_chacha20_poly1305_sha256 = 0x1303
@@ -172,7 +174,7 @@ mut:
 // wrap_handshake_message frames a handshake body with its 1-byte HandshakeType
 // and 3-byte big-endian length.
 fn wrap_handshake_message(typ HandshakeType, body []u8) []u8 {
-	mut w := new_writer(4 + body.len)
+	mut w := wire.new_writer(4 + body.len)
 	w.write_u8(u8(typ))
 	w.write_u24(u32(body.len))
 	w.write_bytes(body)
@@ -183,7 +185,7 @@ fn wrap_handshake_message(typ HandshakeType, body []u8) []u8 {
 // 2-byte-length-prefixed data. It does not de-duplicate — build_client_hello
 // writes each extension at most once, and §4.2 forbids repeats (the parser
 // enforces that).
-fn write_extension(mut w Writer, typ ExtensionType, data []u8) ! {
+fn write_extension(mut w wire.Writer, typ ExtensionType, data []u8) ! {
 	w.write_u16(u16(typ))
 	w.write_vector_u16(data)!
 }
@@ -210,7 +212,7 @@ mut:
 // is rejected, since §4.2 forbids repeats and a later instance could otherwise
 // overwrite a validated value. Unknown types are returned verbatim.
 fn parse_extensions(ext_bytes []u8) ![]WireExtension {
-	mut r := new_reader(ext_bytes)
+	mut r := wire.new_reader(ext_bytes)
 	mut out := []WireExtension{}
 	mut seen_types := []u16{}
 	for r.remaining() > 0 {
@@ -230,8 +232,11 @@ fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	return out
 }
 
-// parse_handshake_header reads the 4-byte header from a reader.
-fn parse_handshake_header(mut r Reader) !(HandshakeType, int) {
+// parse_handshake_header reads the 4-byte header from a reader. Pub so the
+// record-layer adapter can dispatch post-handshake messages through the same
+// framing the core uses; the bytes it reads are handshake-message framing,
+// which both transports share.
+pub fn parse_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
 	if r.remaining() < 4 {
 		return error('handshake: message header truncated')
 	}
@@ -301,7 +306,7 @@ fn (sh ServerHello) is_offered_cipher_suite(cfg &ClientHelloConfig) bool {
 // build_client_hello generates the ClientHello of RFC 8446 §4.1.2, returning the
 // message body followed by the full handshake message (header + body).
 fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
-	mut body := new_writer(512)
+	mut body := wire.new_writer(512)
 
 	// Legacy version 0x0303 (TLS 1.2): TLS 1.3 pins this field so version-sensitive
 	// middleboxes keep parsing; the real version is negotiated via the
@@ -333,7 +338,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	} else {
 		default_cipher_suites()
 	}
-	mut cs_writer := new_writer(suites.len * 2)
+	mut cs_writer := wire.new_writer(suites.len * 2)
 	for cs in suites {
 		cs_writer.write_u16(u16(cs))
 	}
@@ -343,14 +348,14 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	body.write_vector_u8([u8(0x00)])!
 
 	// Extensions
-	mut ext_writer := new_writer(256)
+	mut ext_writer := wire.new_writer(256)
 
 	// server_name (SNI, RFC 6066 §3): literal IP addresses are forbidden.
-	if cfg.server_name.len > 0 && !is_ip_literal(cfg.server_name) {
-		mut sni_w := new_writer(cfg.server_name.len + 5)
+	if cfg.server_name.len > 0 && !pki.is_ip_literal(cfg.server_name) {
+		mut sni_w := wire.new_writer(cfg.server_name.len + 5)
 		// Two nested u16 vectors per RFC 6066 §3: ServerNameList and, inside it,
 		// the per-entry host_name length.
-		mut snl_w := new_writer(cfg.server_name.len + 3)
+		mut snl_w := wire.new_writer(cfg.server_name.len + 3)
 		snl_w.write_u8(0x00) // HostName type
 		snl_w.write_vector_u16(cfg.server_name.bytes())!
 		sni_w.write_vector_u16(snl_w.bytes())!
@@ -360,15 +365,15 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// supported_versions (RFC 8446 §4.2.1)
 	{
-		mut sv_w := new_writer(3)
+		mut sv_w := wire.new_writer(3)
 		sv_w.write_vector_u8([u8(0x03), 0x04])! // TLS 1.3
 		write_extension(mut ext_writer, .supported_versions, sv_w.bytes())!
 	}
 
 	// supported_groups (RFC 8446 §4.2.7)
 	{
-		mut sg_w := new_writer(5)
-		mut groups_w := new_writer(4)
+		mut sg_w := wire.new_writer(5)
+		mut groups_w := wire.new_writer(4)
 		groups_w.write_u16(u16(NamedGroup.x25519))
 		groups_w.write_u16(u16(NamedGroup.secp256r1))
 		sg_w.write_vector_u16(groups_w.bytes())!
@@ -387,8 +392,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 			u16(SignatureScheme.ed25519),
 			u16(SignatureScheme.rsa_pkcs1_sha256),
 		]
-		mut sa_w := new_writer(schemes.len * 2 + 2)
-		mut slist_w := new_writer(schemes.len * 2)
+		mut sa_w := wire.new_writer(schemes.len * 2 + 2)
+		mut slist_w := wire.new_writer(schemes.len * 2)
 		for s in schemes {
 			slist_w.write_u16(s)
 		}
@@ -400,8 +405,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	// key_share (RFC 8446 §4.2.8): client_shares is a u16 vector of entries, each
 	// a group (u16) plus a u16-length-prefixed key_exchange.
 	{
-		mut ks_w := new_writer(cfg.client_share.key_exchange.len + 6)
-		mut entry_w := new_writer(cfg.client_share.key_exchange.len + 4)
+		mut ks_w := wire.new_writer(cfg.client_share.key_exchange.len + 6)
+		mut entry_w := wire.new_writer(cfg.client_share.key_exchange.len + 4)
 		entry_w.write_u16(u16(cfg.client_share.group))
 		entry_w.write_vector_u16(cfg.client_share.key_exchange)!
 		ks_w.write_vector_u16(entry_w.bytes())!
@@ -411,8 +416,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// ALPN (RFC 7301)
 	if cfg.alpn.len > 0 {
-		mut alpn_w := new_writer(32)
-		mut protocols_w := new_writer(30)
+		mut alpn_w := wire.new_writer(32)
+		mut protocols_w := wire.new_writer(30)
 		for p in cfg.alpn {
 			protocols_w.write_vector_u8(p.bytes())!
 		}
@@ -423,7 +428,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// cookie (RFC 8446 §4.2.2) — echoed after HelloRetryRequest
 	if cfg.cookie.len > 0 {
-		mut cookie_w := new_writer(cfg.cookie.len + 2)
+		mut cookie_w := wire.new_writer(cfg.cookie.len + 2)
 		cookie_w.write_vector_u16(cfg.cookie)!
 		write_extension(mut ext_writer, .cookie, cookie_w.bytes())!
 	}
@@ -442,7 +447,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 fn parse_server_hello(body []u8) !ServerHello {
 	// The body follows §4.1.3's fixed field order; each read advances the cursor,
 	// so any reordering or length mismatch desyncs the rest and is caught here.
-	mut r := new_reader(body)
+	mut r := wire.new_reader(body)
 	// legacy_version is pinned to 0x0303 (TLS 1.2); the real version is in
 	// supported_versions and is confirmed below (§4.2.1).
 	legacy_version := r.read_u16()!
@@ -474,7 +479,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 
 	exts := parse_extensions(ext_bytes)!
 	for ext in exts {
-		mut data_r := new_reader(ext.data)
+		mut data_r := wire.new_reader(ext.data)
 
 		match ext.typ {
 			u16(ExtensionType.supported_versions) {
@@ -551,9 +556,9 @@ fn parse_server_hello(body []u8) !ServerHello {
 
 // parse_certificate_message decodes the Certificate message body (RFC 8446 §4.4.2)
 // and returns the DER-encoded certificate chain. It is distinct from
-// parse_certificate, which decodes a single X.509 DER certificate.
+// pki.parse_certificate, which decodes a single X.509 DER certificate.
 fn parse_certificate_message(body []u8) ![][]u8 {
-	mut r := new_reader(body)
+	mut r := wire.new_reader(body)
 	req_ctx := r.read_vector_u8()!
 	// §4.4.2: in a server Certificate, certificate_request_context SHALL be zero
 	// length; a nonzero value is illegal_parameter.
@@ -563,15 +568,15 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 	// u24 list length: full chains can exceed 64 KiB, which a u16 could not frame.
 	cert_list_bytes := r.read_vector_u24()!
 
-	mut cert_r := new_reader(cert_list_bytes)
+	mut cert_r := wire.new_reader(cert_list_bytes)
 	mut certs := [][]u8{}
 	for cert_r.remaining() > 0 {
 		// Reject an over-long chain here, before the state machine ASN.1-parses
 		// every entry: the list is bounded only by the 1 MiB message cap, so a
 		// peer could otherwise pack thousands of tiny entries and force thousands
 		// of parse_certificate calls before the depth limit is ever consulted.
-		if certs.len >= max_cert_chain_depth {
-			return error('handshake: certificate chain exceeds maximum depth ${max_cert_chain_depth} (illegal_parameter)')
+		if certs.len >= pki.max_cert_chain_depth {
+			return error('handshake: certificate chain exceeds maximum depth ${pki.max_cert_chain_depth} (illegal_parameter)')
 		}
 		cert_data := cert_r.read_vector_u24()!
 		_ := cert_r.read_vector_u16()! // per-cert extensions (status_request etc.):
@@ -590,7 +595,7 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 
 // parse_certificate_verify decodes the CertificateVerify body (RFC 8446 §4.4.3).
 fn parse_certificate_verify(body []u8) !ParsedCertificateVerify {
-	mut r := new_reader(body)
+	mut r := wire.new_reader(body)
 	algo_u16 := r.read_u16()!
 	algo := signature_scheme_from_u16(algo_u16)!
 	signature := r.read_vector_u16()!
@@ -647,19 +652,19 @@ fn build_finished(verify_data []u8) []u8 {
 // actually offered is the caller's check — only the state machine knows the
 // config.
 fn parse_encrypted_extensions(body []u8) !string {
-	mut r := new_reader(body)
+	mut r := wire.new_reader(body)
 	ext_bytes := r.read_vector_u16()!
 	mut alpn := ''
 
 	exts := parse_extensions(ext_bytes)!
 	for ext in exts {
 		if ext.typ == u16(ExtensionType.alpn) {
-			mut data_r := new_reader(ext.data)
+			mut data_r := wire.new_reader(ext.data)
 			proto_list := data_r.read_vector_u16()!
 			if data_r.remaining() != 0 {
 				return error('handshake: trailing bytes after ALPN protocol_list')
 			}
-			mut pl_r := new_reader(proto_list)
+			mut pl_r := wire.new_reader(proto_list)
 			if pl_r.remaining() == 0 {
 				// RFC 7301 §3.1: an ALPN extension asserts a single protocol.
 				return error('handshake: ALPN extension carried no protocol')
@@ -691,7 +696,7 @@ fn parse_encrypted_extensions(body []u8) !string {
 			// so it must not be rejected. RFC 5746 §3.4 fixes its TLS 1.3 content to
 			// the empty renegotiated_connection case; a non-empty value asserts a
 			// renegotiation this single-shot client never performed.
-			mut ri_r := new_reader(ext.data)
+			mut ri_r := wire.new_reader(ext.data)
 			if ri_r.remaining() > 0 {
 				renegotiated := ri_r.read_vector_u8()!
 				if renegotiated.len != 0 || ri_r.remaining() != 0 {
@@ -712,8 +717,10 @@ fn parse_encrypted_extensions(body []u8) !string {
 
 // parse_key_update decodes a KeyUpdate body (RFC 8446 §4.6.3) and reports
 // whether the sender requested that we also update our keys.
-// Wire enum: update_not_requested(0), update_requested(1).
-fn parse_key_update(body []u8) !bool {
+// Wire enum: update_not_requested(0), update_requested(1). Pub so the record
+// adapter can parse the post-handshake message its transport decrypted; the
+// ratchet itself is the core's (update_read/write_traffic_keys).
+pub fn parse_key_update(body []u8) !bool {
 	if body.len != 1 {
 		return error('handshake: KeyUpdate body must be 1 byte')
 	}
@@ -724,14 +731,16 @@ fn parse_key_update(body []u8) !bool {
 }
 
 // build_key_update creates a KeyUpdate handshake message carrying the §4.6.3
-// request_update byte (1 = update_requested, 0 = update_not_requested).
-fn build_key_update(request_update bool) []u8 {
+// request_update byte (1 = update_requested, 0 = update_not_requested). Pub for
+// the same reason as parse_key_update: sending the notice is adapter policy,
+// the message body is shared codec.
+pub fn build_key_update(request_update bool) []u8 {
 	val := if request_update { u8(1) } else { u8(0) }
 	return wrap_handshake_message(.key_update, [val])
 }
 
 // NewSessionTicket holds a parsed NewSessionTicket (fields needed for storage).
-struct NewSessionTicket {
+pub struct NewSessionTicket {
 mut:
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
 	ticket_age_add  u32  // random value for obfuscating ticket age in early_data (§4.6.1)
@@ -740,8 +749,10 @@ mut:
 }
 
 // parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1).
-fn parse_new_session_ticket(body []u8) !NewSessionTicket {
-	mut r := new_reader(body)
+// Pub so the record adapter can collect tickets; whether to keep them at all
+// is adapter policy (a QUIC engine discards them, RFC 9001 §4.2).
+pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
+	mut r := wire.new_reader(body)
 	lifetime := r.read_u32()!
 	// RFC 8446 §4.6.1: servers MUST NOT use a value greater than 604800 seconds.
 	if lifetime > 604800 {
@@ -754,7 +765,7 @@ fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 		return error('handshake: empty ticket in NewSessionTicket (decode_error)')
 	}
 	_ := r.read_vector_u16()! // extensions (max_early_data, …): unused while
-	// resumption is unimplemented (see ClientHandshake.session_tickets)
+	// resumption is unimplemented (see Conn.session_tickets on the tls side)
 	if r.remaining() != 0 {
 		// Strict framing like every other parser: leftover bytes mean the ticket
 		// was misframed or carries data past the extension block.

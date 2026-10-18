@@ -4,10 +4,11 @@
 // §4.4.3 transcript content. It is separate from state_machine.v because
 // verification is a pure function of (leaf key, signature, content) that never
 // advances protocol state.
-module tls
+module handshake
 
 import crypto.ed25519
 import crypto.sha512
+import tls.pki
 
 // hash_for_digest returns Hash(data) for the named digest ("sha256"/"sha384"/"sha512").
 // RSA-PSS verifies over a pre-computed digest; the else arm handles sha512.
@@ -24,7 +25,7 @@ fn hash_for_digest(digest_type string, data []u8) []u8 {
 // (see certificate_verify_signed_content). RSA branches hash the content first
 // and verify a digest, while the ECDSA/Ed25519 APIs take the raw message and
 // hash internally per their own scheme.
-fn verify_certificate_verify(leaf Certificate, cv ParsedCertificateVerify, signed_content []u8) ! {
+fn verify_certificate_verify(leaf pki.Certificate, cv ParsedCertificateVerify, signed_content []u8) ! {
 	match cv.algorithm {
 		.rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 {
 			if leaf.public_key_algo != .rsa {

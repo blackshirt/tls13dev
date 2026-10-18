@@ -3,7 +3,7 @@
 // Wire codec tests: big-endian primitives and length-prefixed vectors must read
 // back exactly what was written, and truncated reads must fail with the bounds
 // error instead of indexing past the buffer.
-module tls
+module wire
 
 fn test_wire_roundtrip_primitives() ! {
 	mut w := new_writer(64)
@@ -99,4 +99,19 @@ fn test_wire_reader_truncated_vector() ! {
 		return
 	}
 	assert false
+}
+
+// test_wire_reader_pos tracks the walked distance as reads succeed: the X.509
+// TBS extraction (tls.pki) slices regions relative to pos(), so it must equal
+// bytes consumed from the front of the buffer, not the remainder.
+fn test_wire_reader_pos() ! {
+	mut r := new_reader([u8(1), 2, 3, 4, 5, 6, 7, 8])
+	assert r.pos() == 0
+	r.read_u16()!
+	assert r.pos() == 2
+	r.read_u64() or { 0 } // only 6 bytes remain: bounds error must not advance
+	assert r.pos() == 2
+	r.read_bytes(6)!
+	assert r.pos() == 8
+	assert r.remaining() == 0
 }

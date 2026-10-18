@@ -1,12 +1,16 @@
 // Copyright (c) 2026 blackshirt.
 //
 // record.v frames and (re)assembles plaintext and protected records of the TLS 1.3
-// record layer (RFC 8446 §5); alert.v models the §6 alert protocol, and
-// cipher_state.v carries per-direction AEAD sequence state across the
-// handshake-to-application key transition. It also owns the recordless
-// QUIC passthrough framing of RFC 9001 §4 — the one place where both
-// "how TLS bytes become transport units" framings live side by side.
+// record layer (RFC 8446 §5); alert.v frames the §6 alert protocol into records,
+// and cipher_state.v carries per-direction AEAD sequence state across the
+// handshake-to-application key transition. The recordless QUIC CRYPTO-stream
+// reassembly (RFC 9001 §4) lives in tls.handshake's passthrough framing; this
+// module keeps only the ContentType-tagged record plumbing the TLS transport
+// owns.
 module tls
+
+import tls.wire
+import tls.handshake
 
 // ContentType identifies the type of message in a TLS record (RFC 8446 §5.1).
 enum ContentType as u8 {
@@ -41,15 +45,6 @@ const record_header_len = 5
 const max_plaintext_record_len = 16384 // 2^14 bytes
 const max_record_overhead = 256 // inner type byte + AEAD tag + padding (§5.2)
 const max_ciphertext_record_len = max_plaintext_record_len + max_record_overhead
-
-// max_handshake_message_len bounds one reassembled handshake message. The
-// 24-bit length field on the wire permits ~16 MiB, and a server may fragment a
-// message across arbitrarily many records (or, over QUIC, many CRYPTO frames),
-// so without a cap a hostile peer could pin the client into buffering a
-// gigantic "Certificate" piece by piece. Real chains are tens of KiB even at
-// the 32-certificate chain bound the validator enforces, so 1 MiB leaves ample
-// headroom while capping memory.
-const max_handshake_message_len = 1 << 20
 
 // Record is a raw TLS record frame: the 5-byte header plus its opaque payload.
 struct Record {
@@ -100,7 +95,7 @@ fn (r &Record) serialize() []u8 {
 // parse_record reads a single TLS record: a 5-byte header (content type, legacy
 // version, payload length) followed by `length` payload bytes. It rejects
 // undersized buffers and oversized length fields (RFC 8446 §5.2).
-fn parse_record(mut r Reader) !Record {
+fn parse_record(mut r wire.Reader) !Record {
 	if r.remaining() < record_header_len {
 		return error('record: buffer too short for TLS record header (${r.remaining()} < ${record_header_len})')
 	}
@@ -129,47 +124,9 @@ fn parse_record(mut r Reader) !Record {
 	}
 }
 
-// ---- QUIC passthrough framing (RFC 9001 §4.1) --------------------------------
-// QUIC has no TLS record layer: handshake messages travel as plaintext inside
-// CRYPTO frames, self-framed by their own 4-byte handshake header (type ||
-// u24 length). These helpers keep every "how TLS bytes become transport units"
-// framing rule in the record module, so a QUIC adapter reuses this plumbing
-// instead of duplicating the header arithmetic next to the record code.
-
-// passthrough_wrap is the recordless counterpart of new_record: over QUIC a
-// handshake message's bytes are handed to CRYPTO frames unchanged. No other
-// content type has a CRYPTO carrier (application data rides STREAM frames,
-// alerts become connection_close, ChangeCipherSpec is never sent — RFC 9001
-// §4), so anything else is refused rather than silently misrouted.
-fn passthrough_wrap(content_type ContentType, msg []u8) ![]u8 {
-	if content_type != .handshake {
-		return error('record: content type ${content_type} does not travel in QUIC CRYPTO frames (RFC 9001 §4)')
-	}
-	return msg
-}
-
-// next_passthrough_message extracts one complete handshake message from the
-// front of a CRYPTO byte stream — the recordless analogue of parse_record.
-// The declared length is capped at max_handshake_message_len from the header
-// alone, before further fragments can be buffered toward it (same DoS bound
-// parse_record's §5.2 length check enforces for TCP records). Returns an
-// empty slice when the buffer does not yet hold a full message — a complete
-// handshake message is never empty (4-byte header minimum), so the caller can
-// distinguish "await more bytes" from data. On success the message bytes
-// (header included) are consumed from `buf`.
-fn next_passthrough_message(mut buf []u8) ![]u8 {
-	if buf.len < 4 {
-		return []u8{} // even the handshake header has not fully arrived
-	}
-	msg_len := (int(buf[1]) << 16) | (int(buf[2]) << 8) | int(buf[3])
-	if msg_len > max_handshake_message_len {
-		return error('record: handshake message length ${msg_len} exceeds maximum ${max_handshake_message_len}')
-	}
-	total := 4 + msg_len
-	if buf.len < total {
-		return []u8{} // body not fully received yet
-	}
-	msg := buf[..total].clone()
-	buf.delete_many(0, total) // in-place consumption; the caller's buffer keeps its identity
-	return msg
+// alert_record wraps an alert in an unencrypted TLS record. Alerts sent before
+// the cipher keys take effect travel in plaintext; post-handshake alerts are
+// encrypted via the cipher state instead, with inner content type 21.
+fn alert_record(a handshake.Alert) Record {
+	return new_record(.alert, a.encode())
 }

@@ -8,7 +8,7 @@
 // parsed-bundle cache (cached_system_roots) below. V rejects __global in
 // normal files, so the attribute opts this file in explicitly.
 @[has_globals]
-module tls
+module pki
 
 import encoding.base64
 import os
@@ -114,7 +114,7 @@ __global cached_system_roots []Certificate
 // load_system_ca_bundle() so an application that opens many connections pays
 // the bundle parse once per process rather than once per connection. The
 // returned store is a private clone, safe for the caller to mutate.
-fn system_root_cas() !TrustStore {
+pub fn system_root_cas() !TrustStore {
 	if cached_system_roots.len == 0 {
 		mut loader := new_trust_store()
 		loader.load_system_ca_bundle()!

@@ -3,20 +3,22 @@
 // rsa.v implements raw RSA / RSASSA-PKCS1-v1_5 verification over math.big integers,
 // covering the classic RSA signature schemes the crypto standard-library helpers do
 // not expose. ECDSA and PSS paths route through the crypto packages instead.
-module tls
+module pki
 
 import math.big
 import encoding.hex
 import crypto.sha256
 import crypto.sha512
 import crypto.subtle
+import tls.wire
 
 // RsaPublicKey represents a decoded RSA public key.
-struct RsaPublicKey {
+pub struct RsaPublicKey {
 mut:
-	n          big.Integer // Modulus
-	e          u64         // Public exponent (usually 65537)
-	size_bytes int         // key size in bytes (modulus length), used to bound signatures
+	n big.Integer // Modulus
+	e u64         // Public exponent (usually 65537)
+pub mut:
+	size_bytes int // key size in bytes (modulus length), used to bound signatures
 }
 
 // max_rsa_modulus_bytes bounds the accepted RSA modulus (8192 bits). Verifying a
@@ -34,7 +36,7 @@ const max_rsa_modulus_bytes = 1024
 fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	// der is the full DER-encoded SEQUENCE (tag 0x30 + length + contents).
 	// Unwrap the outer SEQUENCE to get its contents, then parse the two INTEGERs.
-	mut r := new_reader(der)
+	mut r := wire.new_reader(der)
 	seq_elem := read_asn1_element(mut r)!
 	if seq_elem.tag != 0x30 {
 		return error('rsa: expected SEQUENCE tag 0x30, got 0x${seq_elem.tag:02x}')
@@ -191,7 +193,7 @@ fn mgf1_for(digest_type string, seed []u8, mask_len int) ![]u8 {
 // 1.3 lists PSS first (RFC 8446 §4.2.3); its randomized encoding has a provable
 // reduction and avoids v1.5's deterministic-padding pitfalls. The strict
 // structure checks enforce encoding uniqueness.
-fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool {
+pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool {
 	h_len := match digest_type {
 		'sha256' { 32 }
 		'sha384' { 48 }
@@ -202,7 +204,7 @@ fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool
 	}
 	s_len := h_len // In TLS 1.3, salt length matches hash output length (RFC 8446 §4.2.3)
 	// Hard-codes the saltLen == hLen convention (RFC 4055 §5.1 permits any length);
-	// essentially every TLS-era RSA-PSS signer uses salt == hash length.
+	// essentially every TLS-era TLS signer uses salt == hash length.
 	// rsa_verify_raw gives EM = maskedDB || H || 0xbc, maskedDB being emLen - hLen
 	// - 1 bytes and H the hLen-byte hash.
 	em := k.rsa_verify_raw(sig)!
@@ -287,7 +289,7 @@ fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool
 // DigestInfo is matched as one whole byte string (DER prefix + hash) rather than
 // parsed: permissive prefix handling enabled Bleichenbacher-style forgeries, so
 // the exact canonical encoding must appear byte-for-byte or be rejected.
-fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig []u8) !bool {
+pub fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig []u8) !bool {
 	em := k.rsa_verify_raw(sig)!
 	if em.len < 11 {
 		return error('rsa-pkcs1: message too short')

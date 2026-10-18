@@ -2,13 +2,15 @@
 //
 // Record layer tests: wire framing round-trips through serialize/parse, the
 // AEAD cipher state encrypts and decrypts in sequence-number lockstep across
-// records, a single flipped ciphertext byte must fail the tag check, the
+// records, a single flipped ciphertext byte must fail the tag check, and the
 // §5.5 per-key record limit plus the §5.2 inner-plaintext shape are refused
-// rather than mishandled, and the recordless QUIC passthrough framing
-// (RFC 9001 §4) reassembles CRYPTO streams to the same bounds.
+// rather than mishandled. The QUIC CRYPTO passthrough framing is tested in
+// tls.handshake's passthrough_test.v.
 module tls
 
 import crypto.aes
+import tls.wire
+import tls.handshake
 
 fn test_record_serialization_roundtrip() ! {
 	payload := [u8(1), 2, 3, 4, 5]
@@ -22,7 +24,7 @@ fn test_record_serialization_roundtrip() ! {
 	assert raw[3] == 0x00
 	assert raw[4] == 0x05
 
-	mut r := new_reader(raw)
+	mut r := wire.new_reader(raw)
 	parsed := parse_record(mut r)!
 	assert parsed.content_type == .handshake
 	assert parsed.legacy_version == legacy_record_version
@@ -111,7 +113,7 @@ fn test_change_cipher_spec_dummy_record() ! {
 // test_parse_record_rejects_short_header: fewer than the 5-byte header is a
 // framing error rather than an out-of-bounds read.
 fn test_parse_record_rejects_short_header() ! {
-	mut r := new_reader([u8(0x16), 0x03, 0x03, 0x00])
+	mut r := wire.new_reader([u8(0x16), 0x03, 0x03, 0x00])
 	parse_record(mut r) or {
 		assert err.msg().contains('buffer too short')
 		return
@@ -122,7 +124,7 @@ fn test_parse_record_rejects_short_header() ! {
 // test_parse_record_rejects_invalid_content_type: correct framing but an
 // undefined content-type byte (0x99) must be rejected before payload handling.
 fn test_parse_record_rejects_invalid_content_type() ! {
-	mut r := new_reader([u8(0x99), 0x03, 0x03, 0x00, 0x01, 0xaa])
+	mut r := wire.new_reader([u8(0x99), 0x03, 0x03, 0x00, 0x01, 0xaa])
 	parse_record(mut r) or {
 		assert err.msg().contains('invalid content type')
 		return
@@ -134,7 +136,7 @@ fn test_parse_record_rejects_invalid_content_type() ! {
 // max_ciphertext_record_len (RFC 8446 §5.2) is refused before any allocation.
 fn test_parse_record_rejects_oversized_length() ! {
 	// length field 0x5000 = 20480 > max_ciphertext_record_len 16640
-	mut r := new_reader([u8(0x17), 0x03, 0x03, 0x50, 0x00])
+	mut r := wire.new_reader([u8(0x17), 0x03, 0x03, 0x50, 0x00])
 	parse_record(mut r) or {
 		assert err.msg().contains('exceeds maximum')
 		return
@@ -145,7 +147,7 @@ fn test_parse_record_rejects_oversized_length() ! {
 // test_parse_record_rejects_incomplete_payload: the header declares 200 bytes
 // but only 2 are present, so the record is truncated and must error.
 fn test_parse_record_rejects_incomplete_payload() ! {
-	mut r := new_reader([u8(0x16), 0x03, 0x03, 0x00, 0xc8, 0xaa, 0xbb])
+	mut r := wire.new_reader([u8(0x16), 0x03, 0x03, 0x00, 0xc8, 0xaa, 0xbb])
 	parse_record(mut r) or {
 		assert err.msg().contains('incomplete record payload')
 		return
@@ -262,75 +264,10 @@ fn test_record_uninitialized_cipher_state_fails_closed() ! {
 	assert false
 }
 
-// ---- QUIC passthrough framing (RFC 9001 §4) --------------------------------
-
-// test_passthrough_wrap_handshake_identity: over QUIC the handshake message
-// bytes reach CRYPTO frames unchanged — passthrough_wrap must be the identity
-// for .handshake (contrast new_record, which prepends a 5-byte record header).
-fn test_passthrough_wrap_handshake_identity() ! {
-	msg := [u8(0x14), 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd] // Finished, len 4
-	out := passthrough_wrap(.handshake, msg)!
-	assert out == msg
-}
-
-// test_passthrough_wrap_rejects_non_crypto_content: only handshake bytes have
-// a CRYPTO carrier; application data rides STREAM frames, alerts become
-// connection_close, and CCS is never sent — none may be misrouted onto the
-// CRYPTO path.
-fn test_passthrough_wrap_rejects_non_crypto_content() ! {
-	passthrough_wrap(.application_data, [u8(0x01)]) or {
-		assert err.msg().contains('does not travel in QUIC CRYPTO frames')
-		return
-	}
-	assert false
-}
-
-// test_next_passthrough_message_reassembles_fragments: a handshake message
-// split across CRYPTO-frame arrivals yields empty ("await more") until the
-// final fragment lands, then exactly the full message (header included) is
-// consumed and nothing else is touched.
-fn test_next_passthrough_message_reassembles_fragments() ! {
-	mut buf := [u8(0x08), 0x00, 0x00] // EncryptedExtensions, declared len 5; header short
-	assert next_passthrough_message(mut buf)!.len == 0
-	assert buf.len == 3
-
-	buf << u8(0x05) // header complete, body missing
-	assert next_passthrough_message(mut buf)!.len == 0
-	assert buf.len == 4
-
-	buf << [u8(0x01), 0x02, 0x03, 0x04, 0x05]
-	msg := next_passthrough_message(mut buf)!
-	assert msg.len == 9
-	assert msg[0] == u8(0x08)
-	assert msg[8] == u8(0x05)
-	assert buf.len == 0
-}
-
-// test_next_passthrough_message_splits_coalesced: two messages delivered in
-// one run of CRYPTO bytes are extracted one at a time, the remainder staying
-// buffered — the recordless twin of records coalesced into one TCP read.
-fn test_next_passthrough_message_splits_coalesced() ! {
-	mut buf := [u8(0x08), 0x00, 0x00, 0x01, 0xaa, 0x14, 0x00, 0x00, 0x02, 0xbb, 0xcc]
-
-	first := next_passthrough_message(mut buf)!
-	assert first.len == 5
-	assert first[0] == u8(0x08)
-	assert buf.len == 6
-
-	second := next_passthrough_message(mut buf)!
-	assert second.len == 6
-	assert second[0] == u8(0x14)
-	assert buf.len == 0
-}
-
-// test_next_passthrough_message_rejects_oversized_length: the declared length
-// must fail at the header, before further fragments can be buffered toward a
-// gigantic message — the same DoS cap parse_record enforces for TCP records.
-fn test_next_passthrough_message_rejects_oversized_length() ! {
-	mut buf := [u8(0x08), 0xff, 0xff, 0xff, 0x00] // declares ~16 MiB
-	next_passthrough_message(mut buf) or {
-		assert err.msg().contains('exceeds maximum')
-		return
-	}
-	assert false
+fn test_alert_record_framing() ! {
+	// alert_record wraps the 2-byte payload in a plaintext .alert record.
+	rec := alert_record(handshake.new_close_notify())
+	assert rec.content_type == .alert
+	assert rec.legacy_version == legacy_record_version
+	assert rec.payload == [u8(0x01), 0x00]
 }

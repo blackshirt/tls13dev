@@ -26,7 +26,7 @@ measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
 ## Quick start
 
 ```bash
-v test all                 # unit tests for the tls module
+v test all                 # unit tests across all four modules
 v run src/example/dial_example.v       # live demo: handshake + HTTP GET over TLS
 ```
 
@@ -50,30 +50,65 @@ passing named arguments straight to `dial()` — e.g.
 field you omit keeps the default declared on it (`default_config()` remains an
 explicit way to build the same value).
 
-The module deliberately exports only this surface: `Conn`, `dial()`, `Config`
-(plus the `default_config()` helper) and the `TrustStore` used to populate
-`Config.root_cas`. Everything else — the record layer, wire codec, key
-schedule, handshake state machine, and X.509/ASN.1 parsing — is
-module-private implementation detail, not part of the API contract.
+For a TLS-over-TCP client the entry point is the `tls` module, which
+deliberately exports only `Conn`, `dial()`, `Config` (plus the
+`default_config()` helper) and the `pki.TrustStore` (from `tls.pki`) used to
+populate `Config.root_cas`. The record layer, cipher state, and TCP transport
+stay `tls`-private. The handshake core itself is not hidden: it is a separate,
+deliberately importable module (`tls.handshake`) whose `pub` surface is the
+adapter contract below, so a non-TCP transport (QUIC) can drive it directly
+without ever importing `tls`.
 
 ## Architecture
 
-Everything lives in a single `tls` module (`src/tls/`); the source files are
-grouped by concern, each still owning one layer of the stack (the full layer
-map is in [`docs.md`](docs.md)):
+The library is split into four V modules under `src/tls/`, each owning one
+layer of the stack, with a strictly downward dependency graph (no cycles — a
+child never imports its parent):
 
-| Source area      | Responsibility                                                               |
-|------------------|-----------------------------------------------------------------------------|
-| `conn`, `config` | The **public API** for TCP: `dial()`, `Conn` (read/write/close, `server_name`/`negotiated_alpn`), `Config` + `default_config()`, `TrustStore` |
-| `messages`, `state_machine`, `handshake_keys`, `aead`, `certificate_verify` | Message codecs, the handshake state machine, §7.1 adapter, AEAD primitives |
-| `record`, `alert`, `cipher_state` | Record layer (RFC 8446 §5) including minimal QUIC passthrough framing (RFC 9001 §4), alerts (§6), per-direction cipher state |
-| `key_schedule`, `transcript` | HKDF key schedule (§7.1) and the running transcript hash                     |
-| `x509`, `asn1`, `validator`, `hostname`, `trust_store`, `rsa` | X.509/ASN.1 parsing, chain validation, hostname matching, trust store |
-| `reader`, `writer` | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)       |
+```
+tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
+  └───────────────────────────────────────────┘
+```
 
-Layering is still strict by convention: the wire codec knows nothing of TLS, the
-record layer knows nothing of handshake messages, and the handshake owns no
-socket — `conn.v` drives it all.
+| Module          | Responsibility                                                                              |
+|-----------------|---------------------------------------------------------------------------------------------|
+| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `alert`, `cipher_state`, `tcp_transport` |
+| `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC passthrough framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
+| `tls.pki`       | Trust & parsing: `asn1`, `x509`, `validator`, `hostname`, `trust_store`, `rsa`              |
+| `tls.wire`      | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)                       |
+
+Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
+only of certificates, and `tls.handshake` owns **no record, cipher, or socket
+concept** — a grep gate over `src/tls/handshake/` (`Record`, `RecordCipherState`,
+`ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
+`conn.v` in the `tls` module is the reference adapter that drives the core.
+
+### Adapter contract
+
+Both the TCP record layer and an external QUIC engine drive `tls.handshake`
+through the same small `pub` API on `ClientHandshake`; every framing and
+encryption decision stays adapter-side:
+
+```v
+new_client_handshake(server_name, alpn, pki.Validator) !ClientHandshake
+create_client_hello() ![]u8
+feed(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
+buffered_bytes(level SecretLevel) int                     // §5.1 boundary hook
+traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
+exported_secrets(level SecretLevel) !([]u8, []u8)         // RFC 9001 §5.1 expansions
+update_read_traffic_keys() !  /  update_write_traffic_keys() !  // §7.2 ratchet
+confirm_handshake()                                       // drop handshake-stage material
+state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
+```
+
+`SecretLevel` (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags both
+`feed()` and the returned `HandshakeMessage`s. `feed()` appends level-tagged
+bytes to a per-level reassembly buffer and consumes as many complete messages
+as are available, returning outbound messages ready to send. The TCP `Conn`
+encrypts each returned message under the cipher matching its level; a QUIC
+adapter maps the same levels onto Initial/Handshake/Application packet-number
+spaces. All security checks (size caps, HRR rules, transcript binding) live in
+the core, so both transports inherit them.
 
 ## Repository layout
 
@@ -81,14 +116,18 @@ socket — `conn.v` drives it all.
 src/
   example/
     dial_example.v   runnable end-to-end demo (handshake + HTTP GET over TLS)
-  tls/              the whole library as one module: wire codec, record layer,
-                    handshake state machine, key schedule, PKI validation, and
-                    the public client API (with its *_test.v files alongside)
+  tls/              module `tls`: record layer + public TCP client API
+    handshake/      module `tls.handshake`: transport-neutral handshake core
+    pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation
+    wire/           module `tls.wire`: bounds-checked byte reader/writer
 ```
 
-The demo lives under `src/` (not a top-level `example/`) because V resolves the
-library's bare sibling import (`tls`) relative to the executable's own directory
-— a runnable that imports it must sit beside it.
+Each module keeps its `*_test.v` files alongside its sources. V resolves
+submodules by directory path, so `v.mod` stays rooted at `tls` and the child
+directories become `tls.handshake`, `tls.pki`, and `tls.wire`. The demo lives
+under `src/` (not a top-level `example/`) because V resolves the library's bare
+sibling import (`tls`) relative to the executable's own directory — a runnable
+that imports it must sit beside it.
 
 ## What is implemented
 
@@ -152,8 +191,12 @@ the all-zero one.
   NewSessionTicket/KeyUpdate, which servers send one-per-record)
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A QUIC transport stack (RFC 9001) — packet building, header protection,
-  number spaces, and `connection_close` signaling are out of scope; the record
-  module only carries the passthrough framing helpers a QUIC adapter needs
+  number spaces, and `connection_close` signaling are out of scope. The
+  handshake core is nonetheless built to be driven over QUIC: it lives in the
+  importable `tls.handshake` module (with the passthrough framing helpers, the
+  level-tagged `feed`/`traffic_keys`/`exported_secrets` seam, and the
+  `AlertDescription → tls_alert(n)` mapping), so a QUIC engine needs only
+  `tls.handshake` + `tls.pki` and never imports `tls`
 - A server mode — this crate is client-only
 
 ## Testing
@@ -190,7 +233,7 @@ proven by the state-machine tests above.
 
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) — TLS 1.3
 - [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448) — test vectors
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (§4 framing helpers only)
+- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 framing helpers, §4.1 secret levels, §4.2 alert→error mapping)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
 - [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017) — RSA (PKCS#1 v1.5 / PSS)

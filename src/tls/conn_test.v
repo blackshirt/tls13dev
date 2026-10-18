@@ -8,12 +8,14 @@
 module tls
 
 import sync
+import tls.handshake
+import tls.pki
 
 // new_test_conn builds a fully-initialized Conn for the socket-free tests below.
 // Conn is @[noinit], so a bare &Conn{} would leave every field as garbage; this
 // helper supplies a real (but unused) handshake and zeroed buffers instead.
 fn new_test_conn() !&Conn {
-	mut hs := new_client_handshake('', []string{})!
+	mut hs := handshake.new_client_handshake('', []string{}, pki.new_validator(pki.new_trust_store(), false))!
 	return &Conn{
 		sock:              unsafe { nil }
 		hs:                hs

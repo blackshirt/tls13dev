@@ -6,9 +6,10 @@
 // CertificateVerify signed-content layout is checked byte by byte, and the
 // shared extensions-block framing (parse_extensions) is exercised including its
 // §4.2 duplicate-rejection rule.
-module tls
+module handshake
 
 import encoding.hex
+import tls.wire
 
 fn test_build_client_hello() ! {
 	cfg := ClientHelloConfig{
@@ -287,7 +288,7 @@ fn test_parse_certificate_rejects_non_empty_request_context() ! {
 // test_parse_new_session_ticket_bounds verifies ticket_lifetime limit (RFC 8446 §4.6.1).
 fn test_parse_new_session_ticket_bounds() ! {
 	// ticket_lifetime = 604801 (> 7 days)
-	mut w := new_writer(64)
+	mut w := wire.new_writer(64)
 	w.write_u32(604801) // lifetime
 	w.write_u32(100) // age_add
 	w.write_vector_u8([u8(1), 2])! // nonce
@@ -322,7 +323,7 @@ fn test_parse_certificate_message_rejects_overlong_chain() ! {
 // guard: a well-formed ticket with one stray byte past the extension block must
 // not be silently accepted.
 fn test_parse_new_session_ticket_rejects_trailing_bytes() ! {
-	mut w := new_writer(64)
+	mut w := wire.new_writer(64)
 	w.write_u32(3600) // valid lifetime
 	w.write_u32(100) // age_add
 	w.write_vector_u8([u8(1), 2])! // nonce

@@ -3,7 +3,9 @@
 // asn1.v is a minimal DER reader for the ASN.1 subset x509.v needs: tag/length/value
 // elements, object-identifier decoding, and integer payload extraction. It performs no
 // validation of the certificate semantics layered on top.
-module tls
+module pki
+
+import tls.wire
 
 // Asn1Element represents a parsed ASN.1 DER tag, length, and content bytes.
 struct Asn1Element {
@@ -15,7 +17,7 @@ struct Asn1Element {
 // read_asn1_element parses a single ASN.1 TLV (Tag-Length-Value). Only
 // definite-length encodings are supported, which DER mandates; bit 0x20 of the
 // tag marks a constructed value, and length uses the short or long form.
-fn read_asn1_element(mut r Reader) !Asn1Element {
+fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 	if r.remaining() < 2 {
 		return error('asn1: truncated element header')
 	}
@@ -73,7 +75,7 @@ fn read_asn1_element(mut r Reader) !Asn1Element {
 
 // parse_sequence decodes an ASN.1 SEQUENCE into its child elements.
 fn parse_sequence(data []u8) ![]Asn1Element {
-	mut r := new_reader(data)
+	mut r := wire.new_reader(data)
 	mut elements := []Asn1Element{}
 	for r.remaining() > 0 {
 		el := read_asn1_element(mut r)!

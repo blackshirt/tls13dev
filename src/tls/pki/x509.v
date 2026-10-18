@@ -3,13 +3,14 @@
 // x509.v decodes DER-encoded X.509 v3 certificates into a Cert, pulling out the
 // subject/issuer names, validity window, public key, signature algorithm, and the
 // SAN/basic-constraints extensions that validator.v and hostname.v consume.
-module tls
+module pki
 
 import crypto.ecdsa
 import time
+import tls.wire
 
 // PublicKeyAlgorithm identifies the type of public key in a certificate.
-enum PublicKeyAlgorithm {
+pub enum PublicKeyAlgorithm {
 	rsa
 	ecdsa
 	ed25519
@@ -17,10 +18,10 @@ enum PublicKeyAlgorithm {
 }
 
 // Certificate represents a decoded X.509 certificate (RFC 5280).
-struct Certificate {
-mut:
-	// These fields are read by the CertificateVerify check and the chain/hostname
-	// validation, all inside this module.
+pub struct Certificate {
+pub mut:
+	// These fields are read by the CertificateVerify check (tls module) and the
+	// chain/hostname validation inside this module.
 	public_key_algo    PublicKeyAlgorithm
 	public_key_raw     []u8          // SubjectPublicKeyInfo BIT STRING contents
 	rsa_public_key     ?RsaPublicKey // set when public_key_algo is .rsa
@@ -66,8 +67,8 @@ mut:
 //	    tbsCertificate       TBSCertificate,
 //	    signatureAlgorithm   AlgorithmIdentifier,
 //	    signatureValue       BIT STRING }
-fn parse_certificate(der []u8) !Certificate {
-	mut r := new_reader(der)
+pub fn parse_certificate(der []u8) !Certificate {
+	mut r := wire.new_reader(der)
 	cert_seq := read_asn1_element(mut r)!
 	if cert_seq.tag != 0x30 {
 		return error('x509: certificate must begin with SEQUENCE (0x30), got 0x${cert_seq.tag:02x}')
@@ -77,14 +78,14 @@ fn parse_certificate(der []u8) !Certificate {
 	}
 	// Re-parse the contents to capture the TBSCertificate's exact DER encoding
 	// (tag + length + value); this byte range is the message that was signed.
-	mut inner := new_reader(cert_seq.data)
-	tbs_start := inner.cursor
+	mut inner := wire.new_reader(cert_seq.data)
+	tbs_start := inner.pos()
 	tbs_elem := read_asn1_element(mut inner)!
 	// This element should be a sequence-d tag
 	if tbs_elem.tag != 0x30 {
 		return error('x509: TBSCertificate must be a SEQUENCE')
 	}
-	tbs_raw := cert_seq.data[tbs_start..inner.cursor].clone()
+	tbs_raw := cert_seq.data[tbs_start..inner.pos()].clone()
 	// RFC 5280 §4.1.2.3: the outer signatureAlgorithm must match
 	// TBSCertificate.signature.
 	outer_sig_alg_elem := read_asn1_element(mut inner)!
@@ -113,7 +114,7 @@ fn parse_certificate(der []u8) !Certificate {
 	// default), so only consume it when the first element carries context tag 0.
 	mut version := 1
 	if (tbs_elements[0].tag & 0x1f) == 0 {
-		mut version_r := new_reader(tbs_elements[0].data)
+		mut version_r := wire.new_reader(tbs_elements[0].data)
 		version_elem := read_asn1_element(mut version_r)!
 		if version_elem.data.len > 0 {
 			// Encoded 0-based (v1 = 0, v3 = 2); expose the human value.
@@ -372,7 +373,7 @@ fn parse_certificate(der []u8) !Certificate {
 
 // ecdsa_public_key reconstructs an ECDSA public key from the SPKI bit string
 // using the curve stored during certificate parsing.
-fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
+pub fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	if c.public_key_algo != .ecdsa {
 		return error('x509: certificate public key is not ECDSA')
 	}
@@ -430,7 +431,7 @@ fn parse_asn1_time(el Asn1Element) !i64 {
 // directly, so both forms are accepted.
 fn unwrap_octet_string(data []u8) []u8 {
 	if data.len > 0 && data[0] == 0x04 {
-		mut r := new_reader(data)
+		mut r := wire.new_reader(data)
 		elem := read_asn1_element(mut r) or { return data }
 		return elem.data
 	}
@@ -442,7 +443,7 @@ fn unwrap_octet_string(data []u8) []u8 {
 // id-kp-serverAuth or the wildcard anyExtendedKeyUsage.
 fn parse_eku_server_auth(ext_bytes []u8) bool {
 	data := unwrap_octet_string(ext_bytes)
-	mut r := new_reader(data)
+	mut r := wire.new_reader(data)
 	seq := read_asn1_element(mut r) or { return false }
 	if seq.tag != 0x30 {
 		return false
@@ -496,9 +497,9 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	// May be wrapped in an OCTET STRING or directly GeneralNames
 	inner := unwrap_octet_string(ext_bytes)
 
-	mut r := new_reader(inner)
+	mut r := wire.new_reader(inner)
 	seq := read_asn1_element(mut r) or { return dns, ip }
-	mut general_names_r := new_reader(seq.data)
+	mut general_names_r := wire.new_reader(seq.data)
 
 	for general_names_r.remaining() > 0 {
 		gn := read_asn1_element(mut general_names_r) or { break }
@@ -566,7 +567,7 @@ fn parse_path_len_constraint(data []u8) int {
 // unlimited; a present-but-malformed one yields 0 (see parse_path_len_constraint).
 fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	inner := unwrap_octet_string(ext_bytes)
-	mut r := new_reader(inner)
+	mut r := wire.new_reader(inner)
 	seq := read_asn1_element(mut r) or { return false, -1 }
 	if seq.tag != 0x30 {
 		return false, -1
@@ -595,7 +596,7 @@ fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 // An empty result means "extension present but asserts no usage".
 fn parse_key_usage(ext_bytes []u8) []u8 {
 	inner := unwrap_octet_string(ext_bytes)
-	mut r := new_reader(inner)
+	mut r := wire.new_reader(inner)
 	seq := read_asn1_element(mut r) or { return []u8{} }
 	if seq.tag != 0x03 || seq.data.len < 1 {
 		return []u8{}

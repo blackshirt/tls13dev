@@ -3,7 +3,7 @@
 // validator.v chains a server certificate back to a trusted root, applying the X.509
 // rules (RFC 5280) that asn1.v/x509.v decode, rsa.v and the crypto libraries verify,
 // hostname.v matches (RFC 6125) and trust_store.v seeds from system roots.
-module tls
+module pki
 
 import crypto.ed25519
 import time
@@ -13,17 +13,18 @@ import time
 // parse time (messages.v) so an oversized list cannot force expensive ASN.1
 // decoding of thousands of entries before the chain walk rejects it, and again
 // here as defense in depth. RFC 5280 imposes no hard limit, so we set one.
-const max_cert_chain_depth = 32
+pub const max_cert_chain_depth = 32
 
 // Validator verifies certificate chains against trusted roots and hostnames.
-struct Validator {
+@[noinit]
+pub struct Validator {
 mut:
 	store                TrustStore // roots the chain must anchor to
 	insecure_skip_verify bool       // skips chain and hostname checks; testing only
 }
 
 // new_validator creates a Validator.
-fn new_validator(store TrustStore, insecure bool) Validator {
+pub fn new_validator(store TrustStore, insecure bool) Validator {
 	return Validator{
 		store:                store
 		insecure_skip_verify: insecure
@@ -32,7 +33,7 @@ fn new_validator(store TrustStore, insecure bool) Validator {
 
 // verify_certificate_chain validates a server's certificate list against the hostname
 // and trusted root store (RFC 5280 & RFC 6125).
-fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string) ! {
+pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string) ! {
 	if v.insecure_skip_verify {
 		// Deliberate no-op: the escape hatch skips *every* check below, which is why
 		// it is dangerous and reserved for testing (see Config).

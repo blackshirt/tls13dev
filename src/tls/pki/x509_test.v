@@ -10,7 +10,7 @@
 // and parse_certificate's structural rejection of non-SEQUENCE/truncated input,
 // including the post-version element-count guards that turn a v3 truncation into
 // a clean decode error instead of an out-of-bounds panic.
-module tls
+module pki
 
 import crypto.ecdsa
 

@@ -4,7 +4,7 @@
 // phases) and the group policy the ClientHello offers to the handshake flow.
 // state_machine.v sequences these calls; nothing here touches the transcript or
 // advances protocol state.
-module tls
+module handshake
 
 // TrafficSecrets groups one key-schedule stage's output: the handshake phase
 // fills all three (handshake_secret is needed again for the Master Secret), the

@@ -10,6 +10,8 @@
 // record layer.
 module tls
 
+import tls.wire
+
 // recv_buf_compact_threshold bounds the consumed prefix recv_buf may retain
 // before its unconsumed tail is shifted to the front, making compaction
 // amortized O(1) per byte while keeping memory bounded.
@@ -110,7 +112,7 @@ fn (mut c Conn) read_raw_record() !Record {
 				// already copies out, so no intermediate frame clone is needed.
 				// The frame is consumed and compacted only after parsing, so the
 				// aliased slice is never invalidated while the reader walks it.
-				mut r := new_reader(c.recv_buf[c.recv_pos..c.recv_pos + total])
+				mut r := wire.new_reader(c.recv_buf[c.recv_pos..c.recv_pos + total])
 				c.recv_pos += total
 				rec := parse_record(mut r)!
 				c.compact_recv_buf()

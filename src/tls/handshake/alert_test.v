@@ -1,11 +1,13 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Alert protocol tests: the RFC 8446 §6.2 2-byte alert payload round-trips
-// through encode/parse_alert with its wire bytes pinned literally, malformed
-// framing (wrong length, unknown level) is rejected, and an unenumerated
-// description byte is preserved verbatim — §6 treats unknown alerts as errors
-// the receiving caller must still see, so the raw byte must survive the decode.
-module tls
+// Alert vocabulary tests, now against the transport-neutral home of the enums
+// (tls.handshake): the RFC 8446 §6.2 2-byte alert payload round-trips through
+// encode/parse_alert with its wire bytes pinned literally, malformed framing
+// (wrong length, unknown level) is rejected, an unenumerated description byte
+// is preserved verbatim, and the QUIC mapping turns a description into its
+// tls_alert(n) connection-close code (RFC 9001 §4.20). The record framing of an
+// alert (a TLS-only concern) is tested in tls' alert_test.v.
+module handshake
 
 fn test_alert_close_notify_roundtrip() ! {
 	a := new_close_notify()
@@ -17,14 +19,6 @@ fn test_alert_close_notify_roundtrip() ! {
 	parsed := parse_alert(enc)!
 	assert parsed.level == .warning
 	assert parsed.description == .close_notify
-}
-
-fn test_alert_record_framing() ! {
-	// alert_record wraps the 2-byte payload in a plaintext .alert record.
-	rec := alert_record(new_close_notify())
-	assert rec.content_type == .alert
-	assert rec.legacy_version == legacy_record_version
-	assert rec.payload == [u8(0x01), 0x00]
 }
 
 fn test_parse_alert_rejects_bad_length() ! {
@@ -55,4 +49,12 @@ fn test_parse_alert_preserves_unknown_description() ! {
 	a := parse_alert([u8(0x02), 0xfe])!
 	assert a.level == .fatal
 	assert a.encode() == [u8(0x02), 0xfe]
+}
+
+fn test_quic_connection_error_mapping() ! {
+	// RFC 9001 §4.20: an alert surfaces over QUIC as 0x100 + the description
+	// byte. close_notify(0) → 0x100, handshake_failure(40) → 0x128.
+	assert AlertDescription.close_notify.quic_connection_error() == u32(0x100)
+	assert AlertDescription.handshake_failure.quic_connection_error() == u32(0x128)
+	assert AlertDescription.decode_error.quic_connection_error() == 0x100 + u32(AlertDescription.decode_error)
 }

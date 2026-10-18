@@ -6,10 +6,14 @@
 module tls
 
 import crypto.cipher
+import tls.handshake
 
 // aead_nonce_len is the fixed 12-byte AEAD nonce size for every TLS 1.3 cipher
-// suite (AES-GCM and ChaCha20-Poly1305, RFC 8446 §5.3 / RFC 8439 §2.8).
-const aead_nonce_len = 12
+// suite (AES-GCM and ChaCha20-Poly1305, RFC 8446 §5.3 / RFC 8439 §2.8). The
+// canonical value now lives in tls.handshake (the key schedule derives the nonce
+// base to it); this local alias keeps the single source of truth while letting
+// the record layer's `${aead_nonce_len}` messages interpolate by local name.
+const aead_nonce_len = handshake.aead_nonce_len
 
 // nonce_seq_offset is where the 64-bit sequence number lands in the nonce: the
 // trailing 8 bytes, leaving the leading bytes of the IV untouched when XORed

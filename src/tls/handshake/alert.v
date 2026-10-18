@@ -1,20 +1,23 @@
 // Copyright (c) 2026 blackshirt.
 //
-// alert.v models the RFC 8446 §6 alert protocol: the AlertLevel/AlertDescription
-// enums and their wire encoding, used to signal close_notify and fatal errors that
-// the record layer frames and conn.v surfaces to the caller.
-module tls
+// alert.v models the RFC 8446 §6 alert protocol vocabulary: the
+// AlertLevel/AlertDescription enums and their wire encoding. The enums are
+// shared transport vocabulary — the TLS record layer frames alerts as records
+// (that framing lives in tls' alert_record), while QUIC never carries an alert
+// on the handshake stream and instead maps the description to a
+// tls_alert(n) connection-close code via quic_connection_error (RFC 9001 §4.20).
+module handshake
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).
 // In TLS 1.3 the warning level exists only for close_notify; every other alert
 // must be fatal, since a recoverable error signal was removed from 1.2's design.
-enum AlertLevel as u8 {
+pub enum AlertLevel as u8 {
 	warning = 1
 	fatal   = 2
 }
 
 // AlertDescription identifies the alert reason (RFC 8446 §6.2).
-enum AlertDescription as u8 {
+pub enum AlertDescription as u8 {
 	close_notify                    = 0
 	unexpected_message              = 10
 	bad_record_mac                  = 20
@@ -45,19 +48,19 @@ enum AlertDescription as u8 {
 }
 
 // Alert is the 2-byte TLS alert payload.
-struct Alert {
-mut:
+pub struct Alert {
+pub mut:
 	level       AlertLevel       // warning (1) or fatal (2)
 	description AlertDescription // what went wrong (RFC 8446 §6.2)
 }
 
 // encode serializes the alert to 2 bytes.
-fn (a Alert) encode() []u8 {
+pub fn (a Alert) encode() []u8 {
 	return [u8(a.level), u8(a.description)]
 }
 
 // parse_alert decodes a 2-byte alert payload.
-fn parse_alert(data []u8) !Alert {
+pub fn parse_alert(data []u8) !Alert {
 	if data.len != 2 {
 		return error('record: alert payload must be exactly 2 bytes, got ${data.len}')
 	}
@@ -78,18 +81,22 @@ fn parse_alert(data []u8) !Alert {
 	}
 }
 
+// quic_connection_error maps an alert to the QUIC tls_alert(n) application
+// error code (RFC 9001 §4.20): a peer closing a connection because of this
+// alert signals 0x100 plus the alert description byte. Over QUIC alerts never
+// travel on the handshake stream — the record layer's job of decrypting and
+// routing an inner alert simply does not exist — so this mapping is the whole
+// surface the shared AlertDescription vocabulary needs to be usable by a QUIC
+// adapter while the core stays transport-neutral.
+pub fn (d AlertDescription) quic_connection_error() u32 {
+	return 0x100 + u32(d)
+}
+
 // new_close_notify builds the warning close_notify alert, the only alert allowed
 // at warning level (RFC 8446 §6.1). It signals orderly shutdown.
-fn new_close_notify() Alert {
+pub fn new_close_notify() Alert {
 	return Alert{
 		level:       .warning
 		description: .close_notify
 	}
-}
-
-// alert_record wraps an alert in an unencrypted TLS record. Alerts sent before
-// the cipher keys take effect travel in plaintext; post-handshake alerts are
-// encrypted via the cipher state instead, with inner content type 21.
-fn alert_record(a Alert) Record {
-	return new_record(.alert, a.encode())
 }

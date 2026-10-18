@@ -1,23 +1,26 @@
 // Copyright (c) 2026 blackshirt.
 //
-// The tls module derives every handshake and application key through the RFC 8446
-// §7.1 schedule: key_schedule.v runs the HKDF-Extract/Expand ladder over the
-// (EC)DHE and traffic-secret stages, transcript.v maintains the running message
-// hash the schedule and CertificateVerify both consume.
-module tls
+// The handshake core derives every handshake and application key through the
+// RFC 8446 §7.1 schedule: key_schedule.v runs the HKDF-Extract/Expand ladder
+// over the (EC)DHE and traffic-secret stages, transcript.v maintains the
+// running message hash the schedule and CertificateVerify both consume.
+module handshake
 
 import crypto.hmac
 import crypto.sha256
 import crypto.sha512
 
 // HashAlgorithm specifies the hash function used by the negotiated cipher suite.
-enum HashAlgorithm {
+// Pub because the hkdf_expand_label seam is only callable with it: a QUIC
+// engine expands the RFC 9001 §5.1 labels over exported secrets itself and must
+// name the negotiated suite's hash to do so.
+pub enum HashAlgorithm {
 	sha256
 	sha384
 }
 
 // hash_len returns the digest length in bytes.
-fn (h HashAlgorithm) hash_len() int {
+pub fn (h HashAlgorithm) hash_len() int {
 	return match h {
 		.sha256 { 32 }
 		.sha384 { 48 }
@@ -25,7 +28,7 @@ fn (h HashAlgorithm) hash_len() int {
 }
 
 // compute_hash calculates the hash of data.
-fn (h HashAlgorithm) compute_hash(data []u8) []u8 {
+pub fn (h HashAlgorithm) compute_hash(data []u8) []u8 {
 	return match h {
 		.sha256 { sha256.sum256(data) }
 		.sha384 { sha512.sum384(data) }
@@ -98,8 +101,11 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 //	} HkdfLabel;
 //
 // The "tls13 " prefix domain-separates these derivations from HKDF use by other
-// protocols and from older TLS versions.
-fn hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context []u8, length int) ![]u8 {
+// protocols and from older TLS versions. Exported because a QUIC engine
+// performs its own labelled expansions over the exported level secrets (the
+// RFC 9001 §5.1 "quic key"/"quic iv"/"quic hp" derivations) with this exact
+// primitive.
+pub fn hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context []u8, length int) ![]u8 {
 	full_label := 'tls13 ' + label
 	if full_label.len > 255 {
 		return error('hkdf_expand_label: label too long')
@@ -133,16 +139,21 @@ fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 	return hash.compute_hash([]u8{})
 }
 
-// TrafficKeys holds derived traffic write/read key and IV for AEAD record encryption.
-struct TrafficKeys {
-mut:
+// TrafficKeys holds the derived AEAD key and IV for one traffic direction at
+// one encryption level. The core caches them and hands copies out through
+// ClientHandshake.traffic_keys(); each adapter instantiates its own protection
+// from them (the TLS record layer builds cipher states, QUIC expands the same
+// material into packet keys), which is why the fields are the seam's public
+// payload.
+pub struct TrafficKeys {
+pub mut:
 	key []u8 // AEAD key, suite-length bytes (16 for AES-128-GCM, 32 for the others)
 	iv  []u8 // 12-byte nonce base; per-record nonces XOR in the sequence number
 }
 
 // derive_traffic_keys expands a traffic secret into an AEAD key and IV (RFC 8446
-// §7.1, "key"/"iv" labels). The IV is the static nonce base consumed by
-// RecordCipherState; per-record nonces then XOR in the sequence number
+// §7.1, "key"/"iv" labels). The IV is the static nonce base the adapter's
+// protection consumes; per-record nonces then XOR in the sequence number
 // (§5.3), so no IV travels on the wire.
 fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int) !TrafficKeys {
 	key := hkdf_expand_label(hash, secret, 'key', []u8{}, key_len)!

@@ -7,11 +7,13 @@
 // parse_sequence walks child TLVs in order and yields an empty list for empty
 // input. Only parse_oid was covered previously (in pki_test.v); these fill the
 // TLV/length paths.
-module tls
+module pki
+
+import tls.wire
 
 fn test_asn1_read_element_short_form() ! {
 	// SEQUENCE (0x30, constructed bit set) with a short-form 2-byte length.
-	mut r := new_reader([u8(0x30), 0x02, 0xaa, 0xbb])
+	mut r := wire.new_reader([u8(0x30), 0x02, 0xaa, 0xbb])
 	el := read_asn1_element(mut r)!
 	assert el.tag == 0x30
 	assert el.is_construct
@@ -20,7 +22,7 @@ fn test_asn1_read_element_short_form() ! {
 
 fn test_asn1_read_element_primitive_flag() ! {
 	// INTEGER (0x02) is primitive: the constructed bit (0x20) is clear.
-	mut r := new_reader([u8(0x02), 0x01, 0x05])
+	mut r := wire.new_reader([u8(0x02), 0x01, 0x05])
 	el := read_asn1_element(mut r)!
 	assert !el.is_construct
 	assert el.data == [u8(0x05)]
@@ -33,7 +35,7 @@ fn test_asn1_read_element_long_form() ! {
 	mut payload := []u8{len: 129, init: 0x40}
 	mut data := [u8(0x04), 0x81, u8(129)]
 	data << payload
-	mut r := new_reader(data)
+	mut r := wire.new_reader(data)
 	el := read_asn1_element(mut r)!
 	assert el.tag == 0x04
 	assert !el.is_construct
@@ -43,14 +45,14 @@ fn test_asn1_read_element_long_form() ! {
 fn test_asn1_read_element_rejects_nonminimal_length() ! {
 	// 0x81 0x03 spells length 3 in long form, but 3 < 0x80 must use the short
 	// form (X.690 §10.1); tolerating it lets one byte stream parse two ways.
-	mut r := new_reader([u8(0x04), 0x81, 0x03, 0x01, 0x02, 0x03])
+	mut r := wire.new_reader([u8(0x04), 0x81, 0x03, 0x01, 0x02, 0x03])
 	read_asn1_element(mut r) or {
 		assert err.msg().contains('non-minimal DER length')
 		return
 	}
 	assert false
 	// 0x82 0x00 0x33 uses two length octets with a leading zero — also non-minimal.
-	mut r2 := new_reader([u8(0x04), 0x82, 0x00, 0x33])
+	mut r2 := wire.new_reader([u8(0x04), 0x82, 0x00, 0x33])
 	read_asn1_element(mut r2) or {
 		assert err.msg().contains('non-minimal DER length')
 		return
@@ -60,7 +62,7 @@ fn test_asn1_read_element_rejects_nonminimal_length() ! {
 
 fn test_asn1_read_element_truncated_header() ! {
 	// Fewer than 2 bytes cannot form a tag+length header.
-	mut r := new_reader([u8(0x30)])
+	mut r := wire.new_reader([u8(0x30)])
 	read_asn1_element(mut r) or {
 		assert err.msg().contains('truncated element header')
 		return
@@ -71,7 +73,7 @@ fn test_asn1_read_element_truncated_header() ! {
 fn test_asn1_read_element_indefinite_length() ! {
 	// 0x80 declares zero following length octets — the indefinite-length marker
 	// that DER forbids — and must be rejected.
-	mut r := new_reader([u8(0x30), 0x80, 0x01])
+	mut r := wire.new_reader([u8(0x30), 0x80, 0x01])
 	read_asn1_element(mut r) or {
 		assert err.msg().contains('invalid or unsupported length octets')
 		return
@@ -81,7 +83,7 @@ fn test_asn1_read_element_indefinite_length() ! {
 
 fn test_asn1_read_element_length_exceeds_remaining() ! {
 	// Short-form length 0x10 (16) but only 1 payload byte is buffered.
-	mut r := new_reader([u8(0x02), 0x10, 0x01])
+	mut r := wire.new_reader([u8(0x02), 0x10, 0x01])
 	read_asn1_element(mut r) or {
 		assert err.msg().contains('exceeds remaining bytes')
 		return

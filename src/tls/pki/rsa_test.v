@@ -7,7 +7,7 @@
 // modulus that strips to empty, a zero exponent, the degenerate e=1, any even
 // exponent (they fail RSA's odd-exponent requirement and enable small-order
 // forgeries), and an exponent wider than the u64 accumulator).
-module tls
+module pki
 
 import crypto.sha256
 import encoding.hex

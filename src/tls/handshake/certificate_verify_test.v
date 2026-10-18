@@ -5,16 +5,17 @@
 // curve (RFC 8446 §4.2.3). These policy checks run before any key material is
 // consumed, so keyless dummy leaves pin every rejection message — they are the
 // guards an attacker presenting a mismatched CertificateVerify hits first.
-module tls
+module handshake
 
 import crypto.ecdsa
+import tls.pki
 
 fn test_verify_certificate_verify_requires_matching_key_type() ! {
 	content := 'x'.bytes()
 	sig := [u8(0x01)]
 
 	// RSA leaf offered an ECDSA scheme: refused before touching the key.
-	rsa_leaf := Certificate{
+	rsa_leaf := pki.Certificate{
 		public_key_algo: .rsa
 		ecdsa_curve:     ecdsa.Nid.prime256v1
 	}
@@ -25,7 +26,7 @@ fn test_verify_certificate_verify_requires_matching_key_type() ! {
 	assert false
 
 	// ECDSA leaf offered an RSA-PSS scheme.
-	ecdsa_leaf := Certificate{
+	ecdsa_leaf := pki.Certificate{
 		public_key_algo: .ecdsa
 		ecdsa_curve:     ecdsa.Nid.prime256v1
 	}
@@ -50,7 +51,7 @@ fn test_verify_certificate_verify_binds_ecdsa_curve() ! {
 	content := 'x'.bytes()
 	sig := [u8(0x30), 0x03, 0x02, 0x01, 0x01]
 
-	p256_leaf := Certificate{
+	p256_leaf := pki.Certificate{
 		public_key_algo: .ecdsa
 		ecdsa_curve:     ecdsa.Nid.prime256v1
 	}
@@ -60,7 +61,7 @@ fn test_verify_certificate_verify_binds_ecdsa_curve() ! {
 	}
 	assert false
 
-	p384_leaf := Certificate{
+	p384_leaf := pki.Certificate{
 		public_key_algo: .ecdsa
 		ecdsa_curve:     ecdsa.Nid.secp384r1
 	}
@@ -77,7 +78,7 @@ fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 
 	// .rsa leaf whose SPKI parse never produced an RsaPublicKey: the optional
 	// unwrap must name the missing key, not panic on a nil dereference.
-	rsa_leaf := Certificate{
+	rsa_leaf := pki.Certificate{
 		public_key_algo: .rsa
 	}
 	verify_certificate_verify(rsa_leaf, ParsedCertificateVerify{ algorithm: .rsa_pss_rsae_sha256, signature: sig }, content) or {
@@ -88,7 +89,7 @@ fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 
 	// Ed25519 keys are exactly 32 bytes; a short raw must be refused before the
 	// fixed-size ed25519.PublicKey cast.
-	short_leaf := Certificate{
+	short_leaf := pki.Certificate{
 		public_key_algo: .ed25519
 		public_key_raw:  []u8{len: 31, init: 0xaa}
 	}
@@ -106,7 +107,7 @@ fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 // key material is touched, so a keyless RSA leaf is enough to pin the rejection.
 fn test_verify_certificate_verify_rejects_rsa_pkcs1() ! {
 	content := 'x'.bytes()
-	rsa_leaf := Certificate{
+	rsa_leaf := pki.Certificate{
 		public_key_algo: .rsa
 	}
 	verify_certificate_verify(rsa_leaf, ParsedCertificateVerify{

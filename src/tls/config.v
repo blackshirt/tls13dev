@@ -6,6 +6,7 @@
 module tls
 
 import time
+import tls.pki
 
 // Config holds TLS client connection options, consumed by dial(). It is marked
 // @[params] so dial — whose last parameter is a Config — can be called with the
@@ -28,7 +29,7 @@ pub:
 	insecure_skip_verify bool
 	// root_cas, when set, is used instead of the system trust store — e.g. for
 	// private CAs in enterprise or testing setups.
-	root_cas ?TrustStore
+	root_cas ?pki.TrustStore
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }

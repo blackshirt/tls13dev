@@ -3,7 +3,7 @@
 // transcript.v owns the running handshake transcript that the §7.1 key schedule and
 // CertificateVerify both hash over; it records raw messages so history can be rewritten
 // at the HelloRetryRequest checkpoint rather than maintained as a rolling digest.
-module tls
+module handshake
 
 // Transcript maintains the running handshake transcript and computes
 // Transcript-Hash per RFC 8446 §4.4.1.
@@ -14,7 +14,7 @@ module tls
 struct Transcript {
 mut:
 	hash_algo HashAlgorithm // digest the transcript is hashed with; follows the negotiated suite
-	messages  []u8          // concatenation of full handshake messages, record framing excluded
+	messages  []u8          // concatenation of full handshake messages, transport framing excluded
 }
 
 // new_transcript initializes an empty handshake transcript.
@@ -26,7 +26,7 @@ fn new_transcript(hash_algo HashAlgorithm) Transcript {
 }
 
 // update appends a raw handshake message (HandshakeType || 3-byte Length || Body)
-// to the transcript, excluding record-layer framing (RFC 8446 §4.4.1).
+// to the transcript, excluding the transport's framing (RFC 8446 §4.4.1).
 fn (mut t Transcript) update(handshake_msg []u8) {
 	t.messages << handshake_msg
 }

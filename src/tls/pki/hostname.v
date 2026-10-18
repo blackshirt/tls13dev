@@ -3,12 +3,12 @@
 // hostname.v applies RFC 6125 presentation-identifier matching, comparing the peer's
 // SAN/CN entries against the dial target with wildcard and IP-literal rules. The
 // SAN-over-CN precedence rule is enforced here, not by the caller.
-module tls
+module pki
 
 import net
 
 // is_ip_literal reports whether host is an IPv4 or IPv6 address.
-fn is_ip_literal(host string) bool {
+pub fn is_ip_literal(host string) bool {
 	// Trim surrounding whitespace; an empty result is trivially not an address.
 	h := host.trim_space()
 	if h.len == 0 {
