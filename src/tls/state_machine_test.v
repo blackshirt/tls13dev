@@ -505,10 +505,7 @@ fn test_feed_encrypted_record_surfaces_handshake_alert() ! {
 	assert false
 }
 
-// test_feed_encrypted_record_rejects_other_levels: RFC 9001 §4.9 puts the
-// post-ServerHello flight on the Handshake encryption level only. A QUIC
-// adapter mis-routing Initial- or Application-level bytes into the flight
-// parser must be refused by the level tag before any cipher state is touched.
+// Non-.handshake levels (RFC 9001 §4.9) must be refused before cipher state is touched.
 fn test_feed_encrypted_record_rejects_other_levels() ! {
 	mut h := new_client_handshake('example.com', [])!
 	dummy := new_record(.application_data, [u8(0x01)])
@@ -521,10 +518,7 @@ fn test_feed_encrypted_record_rejects_other_levels() ! {
 	}
 }
 
-// test_exported_secrets_rejects_initial_level: QUIC Initial keys extract from
-// the destination connection ID (RFC 9001 §5.2), outside the TLS key schedule,
-// so the export must refuse the level rather than answer with material from the
-// wrong derivation.
+// .initial derives from the destination connection ID (RFC 9001 §5.2), not the TLS schedule.
 fn test_exported_secrets_rejects_initial_level() ! {
 	mut h := new_client_handshake('example.com', [])!
 	h.exported_secrets(.initial) or {
@@ -534,10 +528,7 @@ fn test_exported_secrets_rejects_initial_level() ! {
 	assert false
 }
 
-// test_exported_secrets_requires_available_secrets: before process_server_hello
-// installs the handshake traffic secrets there is nothing to export, and the
-// application secrets only exist once the server Finished drove the schedule to
-// the application phase — both empty cases must error, not hand out empty slices.
+// Both secret sets must error while empty, not hand out empty slices.
 fn test_exported_secrets_requires_available_secrets() ! {
 	mut h := new_client_handshake('example.com', [])!
 	h.exported_secrets(.handshake) or {
@@ -551,9 +542,7 @@ fn test_exported_secrets_requires_available_secrets() ! {
 	assert false
 }
 
-// test_exported_secrets_returns_independent_copies: a QUIC adapter zeroizes
-// its own key material on teardown; handing out clones rather than aliases
-// keeps that wipe on the correct side of the boundary in both directions.
+// Exports are clones: scrubbing the core's secrets leaves the exported copies intact.
 fn test_exported_secrets_returns_independent_copies() ! {
 	mut h := new_client_handshake('example.com', [])!
 	h.client_hs_traffic = []u8{len: 32, init: 0xa5}
@@ -563,8 +552,7 @@ fn test_exported_secrets_returns_independent_copies() ! {
 	assert server.len == 32
 	assert client[0] == 0xa5
 	assert server[0] == 0x3c
-	// Scrub the core's secrets; the exported copies must keep their bytes —
-	// the export is a clone, not an alias into the key-schedule state.
+	// Scrub the core's secrets; the exported clones must keep their bytes.
 	h.client_hs_traffic[0] = 0
 	h.server_hs_traffic[0] = 0
 	assert client[0] == 0xa5
