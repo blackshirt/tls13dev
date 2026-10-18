@@ -198,7 +198,7 @@ fn (mut c Conn) do_handshake(validator Validator) ! {
 				if c.hs.state == .start || c.hs.state == .wait_server_hello {
 					return error('tls: unexpected encrypted record before ServerHello (unexpected_message)')
 				}
-				c.hs.feed_encrypted_record(rec)!
+				c.hs.feed_encrypted_record(.handshake, rec)!
 				fins := c.hs.process_reassembled_messages(&validator)!
 				if fins.len > 0 {
 					// The only handshake-phase message the client sends once the server

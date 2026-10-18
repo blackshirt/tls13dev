@@ -498,9 +498,85 @@ fn test_feed_encrypted_record_surfaces_handshake_alert() ! {
 
 	// A fatal (level 2) internal_error (80) alert, encrypted under the handshake keys.
 	alert_rec := enc_state.encrypt_record(.alert, [u8(2), 80])!
-	h.feed_encrypted_record(alert_rec) or {
+	h.feed_encrypted_record(.handshake, alert_rec) or {
 		assert err.msg().contains('received alert')
 		return
 	}
 	assert false
+}
+
+// test_feed_encrypted_record_rejects_other_levels: RFC 9001 §4.9 puts the
+// post-ServerHello flight on the Handshake encryption level only. A QUIC
+// adapter mis-routing Initial- or Application-level bytes into the flight
+// parser must be refused by the level tag before any cipher state is touched.
+fn test_feed_encrypted_record_rejects_other_levels() ! {
+	mut h := new_client_handshake('example.com', [])!
+	dummy := new_record(.application_data, [u8(0x01)])
+	for level in [SecretLevel.initial, .application] {
+		h.feed_encrypted_record(level, dummy) or {
+			assert err.msg().contains('encryption level')
+			continue
+		}
+		assert false
+	}
+}
+
+// test_exported_secrets_rejects_initial_level: QUIC Initial keys extract from
+// the destination connection ID (RFC 9001 §5.2), outside the TLS key schedule,
+// so the export must refuse the level rather than answer with material from the
+// wrong derivation.
+fn test_exported_secrets_rejects_initial_level() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.exported_secrets(.initial) or {
+		assert err.msg().contains('destination connection ID')
+		return
+	}
+	assert false
+}
+
+// test_exported_secrets_requires_available_secrets: before process_server_hello
+// installs the handshake traffic secrets there is nothing to export, and the
+// application secrets only exist once the server Finished drove the schedule to
+// the application phase — both empty cases must error, not hand out empty slices.
+fn test_exported_secrets_requires_available_secrets() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.exported_secrets(.handshake) or {
+		assert err.msg().contains('handshake traffic secrets unavailable')
+		h.exported_secrets(.application) or {
+			assert err.msg().contains('application traffic secrets unavailable')
+			return
+		}
+		assert false
+	}
+	assert false
+}
+
+// test_exported_secrets_returns_independent_copies: a QUIC adapter zeroizes
+// its own key material on teardown; handing out clones rather than aliases
+// keeps that wipe on the correct side of the boundary in both directions.
+fn test_exported_secrets_returns_independent_copies() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.client_hs_traffic = []u8{len: 32, init: 0xa5}
+	h.server_hs_traffic = []u8{len: 32, init: 0x3c}
+	client, server := h.exported_secrets(.handshake)!
+	assert client.len == 32
+	assert server.len == 32
+	assert client[0] == 0xa5
+	assert server[0] == 0x3c
+	// Scrub the core's secrets; the exported copies must keep their bytes —
+	// the export is a clone, not an alias into the key-schedule state.
+	h.client_hs_traffic[0] = 0
+	h.server_hs_traffic[0] = 0
+	assert client[0] == 0xa5
+	assert server[0] == 0x3c
+
+	h.client_ap_traffic = []u8{len: 32, init: 0x11}
+	h.server_ap_traffic = []u8{len: 32, init: 0x22}
+	c2, s2 := h.exported_secrets(.application)!
+	assert c2.len == 32
+	assert s2.len == 32
+	assert c2[0] == 0x11
+	assert s2[0] == 0x22
+	h.client_ap_traffic[0] = 0
+	assert c2[0] == 0x11
 }

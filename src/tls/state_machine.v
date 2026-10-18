@@ -4,9 +4,11 @@
 // message codec (messages.v), AEAD primitives (aead.v), §7.1 key schedule
 // (handshake_keys.v) and server-signature check (certificate_verify.v). It is
 // transport-neutral: the core emits raw handshake messages and the transport
-// (conn.v / tcp_transport.v) frames them into TLS records over TCP; the record
-// module's QUIC passthrough helpers (record.v, RFC 9001 §4) are the alternate
-// framing a future QUIC adapter would reuse.
+// (conn.v / tcp_transport.v) frames them into TLS records over TCP. A QUIC
+// adapter (RFC 9001) reuses the record module's passthrough framing (record.v
+// §4), tags inbound flight bytes with a SecretLevel in feed_encrypted_record,
+// and pulls the key schedule out through exported_secrets — the core itself
+// stays free of CRYPTO framing and packet protection.
 module tls
 
 import crypto.ecdsa
@@ -40,6 +42,19 @@ mut:
 	msg          []u8
 }
 
+// SecretLevel names one encryption level of a QUIC connection's TLS handshake
+// (RFC 9001 §4.1/§4.9). QUIC has no record layer, so the handshake messages
+// that ride TCP records under one key set instead travel in CRYPTO streams —
+// one independent ordered byte stream per level. The level tells the core which
+// stream inbound bytes arrived on (driving reassembly routing) and which traffic
+// secrets a QUIC packet-protection engine must consume. The TCP transport has a
+// single ordered stream and always uses .handshake.
+enum SecretLevel {
+	initial
+	handshake
+	application
+}
+
 // ClientHandshake orchestrates the TLS 1.3 client handshake state machine.
 @[noinit]
 struct ClientHandshake {
@@ -64,6 +79,9 @@ mut:
 	client_hs_cipher  RecordCipherState // AEAD state for records we send under handshake keys
 	// Handshake messages may be split across records or coalesced within one
 	// (RFC 8446 §5.2), so decrypted plaintext accumulates here for reassembly.
+	// It carries the Handshake-level flight only: Initial-level streams hold
+	// ServerHello-class messages, which the transport feeds to
+	// process_server_hello directly (RFC 9001 §4.9), never to this buffer.
 	reassembly_buf   []u8
 	server_certs     []Certificate // chain sent by the server, leaf first, once Certificate is parsed
 	hrr_received     bool          // set after a HelloRetryRequest so the second CH is validated as such
@@ -424,7 +442,17 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 }
 
 // feed_encrypted_record decrypts a handshake-phase record into the reassembly buffer.
-fn (mut h ClientHandshake) feed_encrypted_record(rec Record) ! {
+// level tags the encryption level the bytes arrived at (RFC 9001 §4.1). Only the
+// Handshake level carries the reassembled EncryptedExtensions → Finished flight
+// this method feeds (§4.9): Initial-level streams hold ServerHello-class
+// messages, which the transport routes to process_server_hello directly, and
+// application-level post-handshake messages are the transport's own concern —
+// so any other level here is a mis-routed call, refused before it can touch
+// cipher state. The TCP transport always passes .handshake.
+fn (mut h ClientHandshake) feed_encrypted_record(level SecretLevel, rec Record) ! {
+	if level != .handshake {
+		return error('handshake: encryption level ${level} carries no reassembled flight (RFC 9001 §4.9; only .handshake does)')
+	}
 	// Decrypt under the server handshake keys; the true content type lies inside
 	// the inner plaintext (§5.1/§5.2).
 	decrypted := h.server_hs_cipher.decrypt_record(rec)!
@@ -446,6 +474,38 @@ fn (mut h ClientHandshake) feed_encrypted_record(rec Record) ! {
 	// Accumulate plaintext; process_reassembled_messages joins fragments that span
 	// records and splits several messages coalesced into one (§5.2).
 	h.reassembly_buf << decrypted.plaintext
+}
+
+// exported_secrets hands a QUIC packet-protection engine the TLS traffic secrets
+// for one encryption level and both directions, as (client, server) clones of the
+// §7.1 secrets. RFC 9001 §5.1 expands these — with the "quic key" / "quic iv" /
+// "quic hp" labels, not the TLS record "key" / "iv" — into QUIC packet and
+// header-protection keys; that expansion is QUIC's job, so the TLS side exports
+// secrets, never TrafficKeys. Timing matters at the handshake level: those
+// secrets exist only between process_server_hello and the .connected
+// zeroization (zeroize_handshake_secrets), so a QUIC adapter must pull them
+// right after the ServerHello is processed; application secrets appear at the
+// server Finished and live until close. The .initial level is not in the TLS
+// schedule at all — its keys extract from the destination connection ID
+// (RFC 9001 §5.2) — and is rejected rather than answered with wrong material.
+fn (h &ClientHandshake) exported_secrets(level SecretLevel) !([]u8, []u8) {
+	match level {
+		.initial {
+			return error('handshake: initial secrets derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
+		}
+		.handshake {
+			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
+				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, zeroized at .connected)')
+			}
+			return h.client_hs_traffic.clone(), h.server_hs_traffic.clone()
+		}
+		.application {
+			if h.client_ap_traffic.len == 0 || h.server_ap_traffic.len == 0 {
+				return error('handshake: application traffic secrets unavailable before the server Finished')
+			}
+			return h.client_ap_traffic.clone(), h.server_ap_traffic.clone()
+		}
+	}
 }
 
 // process_reassembled_messages processes EncryptedExtensions → Certificate →
