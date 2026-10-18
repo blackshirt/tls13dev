@@ -63,17 +63,27 @@ fn change_cipher_spec() Record {
 	return new_record(.change_cipher_spec, [u8(0x01)])
 }
 
-// serialize encodes the record into wire format:
-// [1 byte ContentType] [2 bytes Legacy Version] [2 bytes Length] [Payload].
-// The payload length is cast to u16 without a re-check: every caller bounds it
-// by construction, so an oversized payload would be a bug above, not input.
+// serialize_into appends the record's wire form —
+// [1 byte ContentType] [2 bytes Legacy Version] [2 bytes Length] [Payload] —
+// directly onto the end of `out`. It is the single encoding used by all
+// senders; callers batching several records append through it instead of
+// allocating and cloning one owned buffer per record via serialize().
+fn (r &Record) serialize_into(mut out []u8) {
+	out << u8(r.content_type)
+	out << u8((r.legacy_version >> 8) & 0xff)
+	out << u8(r.legacy_version & 0xff)
+	out << u8((r.payload.len >> 8) & 0xff)
+	out << u8(r.payload.len & 0xff)
+	out << r.payload
+}
+
+// serialize encodes the record into its own wire-format byte slice; the length
+// is cast without a re-check because every caller bounds the payload by
+// construction, so an oversized payload would be a bug above, not input.
 fn (r &Record) serialize() []u8 {
-	mut w := new_writer(record_header_len + r.payload.len)
-	w.write_u8(u8(r.content_type))
-	w.write_u16(r.legacy_version)
-	w.write_u16(u16(r.payload.len))
-	w.write_bytes(r.payload)
-	return w.bytes()
+	mut buf := []u8{cap: record_header_len + r.payload.len}
+	r.serialize_into(mut buf)
+	return buf
 }
 
 // parse_record reads a single TLS record: a 5-byte header (content type, legacy

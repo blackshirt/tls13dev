@@ -17,7 +17,17 @@ import time
 const recv_buf_compact_threshold = 16384
 
 // recv_read_size is the number of bytes requested from the socket per read.
-const recv_read_size = 4096
+// Sized to the largest plaintext record so a full TLS record (plus header)
+// typically arrives in one read(2) instead of four; the framing loop still
+// copes with whatever fewer bytes the kernel actually returns.
+const recv_read_size = max_plaintext_record_len
+
+// write_batch_threshold caps how much ciphertext Conn.write() accumulates in
+// memory before pushing it out, so a large write costs roughly one write(2)
+// syscall per 128 KiB of records instead of one per 16 KiB record. The bound
+// stays well below typical SO_SNDBUF, so a full batch almost always leaves in
+// a single syscall; small writes flush on the last chunk and never wait.
+const write_batch_threshold = 131072
 
 // max_stored_session_tickets bounds the NewSessionTicket backlog kept on the
 // handshake. Resumption is unimplemented, so the queue is only diagnostic;
@@ -40,9 +50,9 @@ const max_compat_ccs_records = 2
 // Concurrency: read() and write() are each guarded by their own mutex, so one
 // goroutine may read while another writes (the Go crypto/tls model). The read
 // path also mutates the write cipher when answering a KeyUpdate request, so that
-// one write-side action takes write_mut before touching client_app_cipher; the
-// lock order is always read_mut → write_mut (close() follows the same order),
-// which keeps the pair deadlock-free. Any other method is not safe to call
+// one write-side action takes wlock before touching client_app_cipher; the
+// lock order is always rlock → wlock (close() follows the same order), which
+// keeps the pair deadlock-free. Any other method is not safe to call
 // concurrently with a close().
 @[noinit]
 pub struct Conn {
@@ -52,11 +62,12 @@ mut:
 	recv_buf          []u8            // raw bytes read from the socket, framing not yet applied
 	recv_pos          int             // start of unconsumed data in recv_buf (prefix is already parsed)
 	app_buf           []u8            // decrypted application bytes that didn't fit the caller's buffer
+	app_pos           int             // start of undrained bytes in app_buf (mirrors recv_pos: draining advances the index instead of re-cloning the tail)
 	closed            bool            // set once the connection is finished (close or fatal alert)
 	close_notify_sent bool            // guards against sending close_notify twice
 	fatal_error       string          // non-empty once a fatal alert/error closed the connection; re-surfaced by read()
-	read_mut          &sync.Mutex     // serializes read() (and every mutation of the read cipher/recv_buf)
-	write_mut         &sync.Mutex     // serializes write() and every write-cipher mutation
+	rlock             &sync.Mutex     // serializes read() and every read-cipher/recv_buf mutation; both locks are exclusive mutexes, not RwLock read sides, because each path rewrites AEAD sequence numbers
+	wlock             &sync.Mutex     // serializes write() and every write-cipher mutation
 	negotiated_alpn   string          // server's ALPN pick — always one of Config.alpn (the handshake aborts otherwise), '' if none
 	server_name       string          // SNI value sent and the name the certificate was checked against
 }
@@ -106,14 +117,15 @@ pub fn dial(address string, config Config) !&Conn {
 	mut conn := &Conn{
 		sock:              sock
 		hs:                hs
-		recv_buf:          []u8{cap: max_ciphertext_record_len + record_header_len} // one full frame
+		recv_buf:          []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
 		recv_pos:          0
 		app_buf:           []u8{cap: max_plaintext_record_len}                      // one full plaintext record
+		app_pos:           0
 		closed:            false
 		close_notify_sent: false
 		fatal_error:       ''
-		read_mut:          sync.new_mutex()
-		write_mut:         sync.new_mutex()
+		rlock:             sync.new_mutex()
+		wlock:             sync.new_mutex()
 		negotiated_alpn:   ''
 		server_name:       server_name
 	}
@@ -231,27 +243,47 @@ fn (mut c Conn) do_handshake(validator Validator) ! {
 	}
 }
 
-// write_records serializes records and sends them to the peer in order; one
-// socket write per record keeps record framing intact on the TCP stream.
+// write_records serializes the records into one buffer and pushes it to the
+// peer, coalescing a multi-record flight into a single write(2) syscall: TLS
+// rides the TCP byte stream, so the receiver's record framing cannot tell
+// whether the bytes went out in one push or several (RFC 8446 §5). A short
+// write resumes from the first unwritten byte instead of failing: a blocking
+// socket may legitimately accept only part of a large buffer, and the old
+// per-record form turned that ordinary kernel behavior into a fake error.
 fn (mut c Conn) write_records(recs []Record) ! {
 	if c.sock == unsafe { nil } {
 		return error('tls: socket is nil')
 	}
+	if recs.len == 0 {
+		return
+	}
+	mut total := 0
 	for rec in recs {
-		bytes := rec.serialize()
-		// defensive write records by checking write results
-		n := c.sock.write(bytes)!
-		if n != bytes.len {
-			return error('tls: incomplete record write (${n}/${bytes.len} bytes)')
+		total += record_header_len + rec.payload.len
+	}
+	mut batched := []u8{cap: total}
+	for rec in recs {
+		rec.serialize_into(mut batched)
+	}
+	mut written := 0
+	for written < batched.len {
+		n := c.sock.write(batched[written..])!
+		if n <= 0 {
+			return error('tls: socket write made no progress (${written}/${batched.len} bytes)')
 		}
+		written += n
 	}
 }
 
 // read_raw_record blocks until one complete TLS record (header + full payload)
-// has been buffered, then slices that frame off recv_buf and parses it. TCP may
-// deliver a record in pieces or several glued together, so the frame is only
-// consumed once its declared length is actually available.
+// has been buffered, then parses it in place off recv_buf. TCP may deliver a
+// record in pieces or several glued together, so the frame is only consumed
+// once its declared length is actually available.
 fn (mut c Conn) read_raw_record() !Record {
+	// One scratch buffer serves every socket read of this call: sock.read
+	// refills it in place, so a record arriving in TCP pieces no longer
+	// allocates recv_read_size bytes per retry.
+	mut tmp := []u8{len: recv_read_size}
 	for {
 		avail := c.recv_buf.len - c.recv_pos
 		if avail >= record_header_len {
@@ -263,17 +295,21 @@ fn (mut c Conn) read_raw_record() !Record {
 			}
 			total := record_header_len + payload_len
 			if avail >= total {
-				frame := c.recv_buf[c.recv_pos..c.recv_pos + total].clone()
+				// Parse directly over the live recv_buf: the only bytes that must
+				// outlive this call are the record payload, which read_bytes
+				// already copies out, so no intermediate frame clone is needed.
+				// The frame is consumed and compacted only after parsing, so the
+				// aliased slice is never invalidated while the reader walks it.
+				mut r := new_reader(c.recv_buf[c.recv_pos..c.recv_pos + total])
 				c.recv_pos += total
+				rec := parse_record(mut r)!
 				c.compact_recv_buf()
-				mut r := new_reader(frame)
-				return parse_record(mut r)!
+				return rec
 			}
 		}
 		if c.sock == unsafe { nil } {
 			return error('tls: connection closed (no socket available to read further records)')
 		}
-		mut tmp := []u8{len: recv_read_size}
 		n := c.sock.read(mut tmp) or {
 			return error('tls: connection closed while reading record: ${err}')
 		}
@@ -335,9 +371,9 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 pub fn (mut c Conn) read(mut buf []u8) !int {
 	// Serialize the whole read path: recv_buf, the server read cipher and the
 	// sticky error below are all read-modify state.
-	c.read_mut.lock()
+	c.rlock.lock()
 	defer {
-		c.read_mut.unlock()
+		c.rlock.unlock()
 	}
 	if buf.len == 0 {
 		return 0
@@ -349,13 +385,16 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		return error(c.fatal_error)
 	}
 	// A decrypted record can hold more than the caller's buffer; leftovers are
-	// drained first so no plaintext is dropped or reordered.
-	if c.app_buf.len > 0 {
-		n := copy(mut buf, c.app_buf)
-		if n == c.app_buf.len {
+	// drained first so no plaintext is dropped or reordered. app_pos indexes
+	// the leftover instead of slicing a fresh clone per call, so draining one
+	// record through a small caller buffer costs one memcpy per byte handed
+	// over, not a quadratic cascade of tail copies.
+	if c.app_buf.len > c.app_pos {
+		n := copy(mut buf, c.app_buf[c.app_pos..])
+		c.app_pos += n
+		if c.app_pos == c.app_buf.len {
 			c.app_buf.clear()
-		} else {
-			c.app_buf = c.app_buf[n..].clone()
+			c.app_pos = 0
 		}
 		return n
 	}
@@ -472,9 +511,9 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 pub fn (mut c Conn) write(data []u8) !int {
 	// Serialize against other writers and against the read path's KeyUpdate
 	// response, both of which mutate client_app_cipher and its sequence number.
-	c.write_mut.lock()
+	c.wlock.lock()
 	defer {
-		c.write_mut.unlock()
+		c.wlock.unlock()
 	}
 	// Refuse to encrypt onto a finished connection: writing after close_notify
 	// would hand the peer data it has already promised to stop reading.
@@ -489,6 +528,8 @@ pub fn (mut c Conn) write(data []u8) !int {
 	// Chunk to max_plaintext_record_len (2^14): TLS forbids larger plaintext
 	// records (RFC 8446 §5.1), so one write() may emit many encrypted records.
 	mut offset := 0
+	mut batch := []Record{}
+	mut batch_len := 0
 	for offset < data.len {
 		// §5.5 sender obligation: a key generation protects at most
 		// record_seq_limit records, and the KeyUpdate that rotates it is itself
@@ -500,6 +541,12 @@ pub fn (mut c Conn) write(data []u8) !int {
 		// even a single write() spanning the limit rekeys instead of wearing out
 		// the AEAD key.
 		if c.hs.client_app_cipher.seq_num >= record_seq_limit - 1 {
+			// Flush the pending batch first: the records below the limit were
+			// encrypted under the current key and must precede its KeyUpdate
+			// notice on the wire.
+			c.write_records(batch)!
+			batch = []Record{}
+			batch_len = 0
 			c.force_write_rekey()!
 		}
 		end := if data.len - offset > max_plaintext_record_len {
@@ -509,7 +556,16 @@ pub fn (mut c Conn) write(data []u8) !int {
 		}
 		chunk := data[offset..end]
 		enc := c.hs.client_app_cipher.encrypt_record(.application_data, chunk)!
-		c.write_records([enc])!
+		batch << enc
+		batch_len += record_header_len + enc.payload.len
+		// Ship at the batch bound or on the last chunk; every record in the
+		// batch is already encrypted under its key generation, so coalescing
+		// never reorders or mixes generations (see the flush above).
+		if batch_len >= write_batch_threshold || end == data.len {
+			c.write_records(batch)!
+			batch = []Record{}
+			batch_len = 0
+		}
 		offset = end
 	}
 	return data.len
@@ -517,12 +573,12 @@ pub fn (mut c Conn) write(data []u8) !int {
 
 // send_key_update_response answers a KeyUpdate(update_requested): it sends the
 // KeyUpdate under the current (old) write keys and then ratchets them (§4.6.3).
-// It owns write_mut for the whole send-then-update so a concurrent write() can
+// It owns wlock for the whole send-then-update so a concurrent write() can
 // never interleave and reuse a key/nonce; defer guarantees release on error.
 fn (mut c Conn) send_key_update_response() ! {
-	c.write_mut.lock()
+	c.wlock.lock()
 	defer {
-		c.write_mut.unlock()
+		c.wlock.unlock()
 	}
 	msg := build_key_update(false)
 	enc := c.hs.client_app_cipher.encrypt_record(.handshake, msg)!
@@ -544,12 +600,12 @@ fn (mut c Conn) force_write_rekey() ! {
 // close sends a close_notify alert and closes the underlying TCP connection.
 pub fn (mut c Conn) close() ! {
 	// Take the write lock so teardown cannot race a concurrent write()/KeyUpdate
-	// response over the write cipher. read_mut is deliberately not taken: a reader
+	// response over the write cipher. rlock is deliberately not taken: a reader
 	// may be blocked in a socket read, and close() must be able to unblock it by
 	// closing the socket below rather than waiting for that reader.
-	c.write_mut.lock()
+	c.wlock.lock()
 	defer {
-		c.write_mut.unlock()
+		c.wlock.unlock()
 	}
 	// Idempotent teardown: a second close() must not re-send close_notify or
 	// double-close the socket.
@@ -587,12 +643,13 @@ fn (mut c Conn) send_close_notify() {
 	if c.sock == unsafe { nil } {
 		return
 	}
-	plaintext_alert := alert_record(new_close_notify())
+	notify := new_close_notify()
+	plaintext_alert := alert_record(notify)
 	if c.hs.state != .connected {
 		c.write_records([plaintext_alert]) or {}
 		return
 	}
-	enc := c.hs.client_app_cipher.encrypt_record(.alert, new_close_notify().encode()) or {
+	enc := c.hs.client_app_cipher.encrypt_record(.alert, notify.encode()) or {
 		c.write_records([plaintext_alert]) or {}
 		return
 	}

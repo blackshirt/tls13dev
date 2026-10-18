@@ -85,12 +85,16 @@ enum CipherSuite as u16 {
 }
 
 // default_cipher_suites returns the suite list offered when the caller does not
-// configure one (all TLS 1.3 AEAD suites we implement).
+// configure one (all TLS 1.3 AEAD suites we implement). Servers that honor the
+// client's order take the first suite they support, so this list is our
+// performance preference: ChaCha20-Poly1305 leads because the AEAD backend is
+// software-only, where ChaCha reliably outruns AES-GCM; revisit the order if a
+// hardware-AES (AES-NI/OpenSSL) backend is ever introduced.
 fn default_cipher_suites() []CipherSuite {
 	return [
+		CipherSuite.tls_chacha20_poly1305_sha256,
 		CipherSuite.tls_aes_128_gcm_sha256,
 		CipherSuite.tls_aes_256_gcm_sha384,
-		CipherSuite.tls_chacha20_poly1305_sha256,
 	]
 }
 
@@ -135,40 +139,9 @@ mut:
 // HelloRetryRequest sentinel random string (RFC 8446 §4.1.3).
 // HRR is syntactically a ServerHello (same msg_type 2) and is identified only
 // by this fixed random value, so the message type alone cannot distinguish them.
-const hello_retry_request_random = [32]u8[
-	0xcf,
-	0x21,
-	0xad,
-	0x74,
-	0xe5,
-	0x9a,
-	0x61,
-	0x11,
-	0xbe,
-	0x1d,
-	0x8c,
-	0x02,
-	0x1e,
-	0x65,
-	0xb8,
-	0x91,
-	0xc2,
-	0xa2,
-	0x11,
-	0x16,
-	0x7a,
-	0xbb,
-	0x8c,
-	0x5e,
-	0x07,
-	0x9e,
-	0x09,
-	0xe2,
-	0xc8,
-	0xa8,
-	0x33,
-	0x9c,
-]
+const hello_retry_request_random = [u8(0xcf), 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d,
+	0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e,
+	0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c]
 
 // ServerHello holds the parsed ServerHello/HelloRetryRequest fields the client
 // acts on. Extension extraction obeys the §4.2 placement allowlist; semantic
@@ -497,7 +470,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 	mut server_share := KeyShareEntry{}
 	mut has_key_share := false
 	mut cookie := []u8{}
-	is_hrr := random == hello_retry_request_random[..] // §4.1.3: fixed sentinel random identifies an HRR
+	is_hrr := random == hello_retry_request_random // §4.1.3: fixed sentinel random identifies an HRR
 
 	exts := parse_extensions(ext_bytes)!
 	for ext in exts {

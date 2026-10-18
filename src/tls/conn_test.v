@@ -20,11 +20,12 @@ fn new_test_conn() !&Conn {
 		recv_buf:          []u8{}
 		recv_pos:          0
 		app_buf:           []u8{}
+		app_pos:           0
 		closed:            false
 		close_notify_sent: false
 		fatal_error:       ''
-		read_mut:          sync.new_mutex()
-		write_mut:         sync.new_mutex()
+		rlock:             sync.new_mutex()
+		wlock:             sync.new_mutex()
 		negotiated_alpn:   ''
 		server_name:       ''
 	}

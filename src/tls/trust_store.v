@@ -38,18 +38,21 @@ pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
 	mut count := 0
 	lines := pem_content.split_into_lines()
 	mut in_cert := false
-	mut b64_buf := ''
+	// Lines append into bytes and are joined once per certificate: string `+=`
+	// reallocated and copied on every line, making the bundle parse quadratic
+	// in the number of base64 lines.
+	mut b64_buf := []u8{}
 
 	for line in lines {
 		trimmed := line.trim_space()
 		if trimmed.starts_with('-----BEGIN ') && trimmed.ends_with('CERTIFICATE-----') {
 			in_cert = true
-			b64_buf = ''
+			b64_buf = []u8{}
 			continue
 		}
 		if trimmed.starts_with('-----END ') && trimmed.ends_with('CERTIFICATE-----') {
 			in_cert = false
-			der := base64.decode(b64_buf)
+			der := base64.decode(b64_buf.bytestr())
 			cert := parse_certificate(der) or {
 				continue
 			}
@@ -58,7 +61,7 @@ pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
 			continue
 		}
 		if in_cert {
-			b64_buf += trimmed
+			b64_buf << trimmed.bytes()
 		}
 	}
 	return count

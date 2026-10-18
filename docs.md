@@ -328,7 +328,7 @@ build one up front from `default_config()`).
 | `server_name` | `''` | SNI and certificate hostname verification target. Empty ⇒ derived from the dial address. Must match the server's certificate (SAN dNSName / IP, CN fallback per RFC 6125). |
 | `alpn` | `[]` (none offered) | Application protocols to offer, in preference order (e.g. `['h2', 'http/1.1']`). The server's pick is verified against this list. |
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
-| `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). |
+| `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is loaded and parsed on every dial — supply a populated `root_cas` to amortize that cost across connections. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]
