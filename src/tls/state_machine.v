@@ -155,6 +155,13 @@ fn (mut h ClientHandshake) process_server_hello(sh_record Record) !([]Record, Se
 		return error('handshake: expected ServerHello (2), got ${msg_type}')
 	}
 	body := r.read_bytes(length)! // body only; the header is re-added for the transcript below
+	// RFC 8446 §5.1: a handshake message immediately preceding a key change (the
+	// ServerHello) MUST align with a record boundary. Extra bytes coalesced after
+	// it in the same record would be silently dropped (and any following flight
+	// would then be mis-framed), so reject them as unexpected_message.
+	if r.remaining() != 0 {
+		return error('handshake: trailing data after ServerHello in the same record (unexpected_message)')
+	}
 	sh := parse_server_hello(body)! // §4.1.3 field decode plus the §4.2 extension allowlist
 	// Re-frame header + body so the transcript covers the exact wire layout.
 	full_sh_msg := wrap_handshake_message(.server_hello, body)
@@ -323,6 +330,36 @@ fn (mut h ClientHandshake) public_share_bytes() ![]u8 {
 	}
 }
 
+// The three small-order X25519 shared-secret results of RFC 7748 §6.1, in the
+// little-endian wire encoding so they can be compared byte-for-byte against a
+// raw secret: the identity, u = 1, and u = p-1 = 2^255-20 (0xec, thirty 0xff
+// octets, then a top byte of 0x7f).
+const x25519_secret_zero = [u8(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+const x25519_secret_one = [u8(1), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+const x25519_secret_p_minus_1 = [u8(0xec), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+
+// is_x25519_small_order reports whether a finished X25519 shared secret landed
+// in one of the three small-order results (see the constants above). Peer
+// points of order 2 or 4 (u = 1 and u = p-1) do not multiply to zero but still
+// produce a predictable secret, so callers must reject all three, not just the
+// identity.
+@[direct_array_access]
+fn is_x25519_small_order(secret []u8) bool {
+	if subtle.constant_time_compare(secret, x25519_secret_zero) == 1 {
+		return true
+	}
+	if subtle.constant_time_compare(secret, x25519_secret_one) == 1 {
+		return true
+	}
+	return subtle.constant_time_compare(secret, x25519_secret_p_minus_1) == 1
+}
+
 // compute_shared_secret performs the ECDHE exchange against the server's key
 // share, returning the raw shared secret that seeds the key schedule.
 fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]u8 {
@@ -347,21 +384,9 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 				return error('handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
 			}
 			secret := h.priv_x25519.x25519(server_share.key_exchange)!
-			// Defense in depth: peer points of order 2 or 4 (u = 1 and u = p-1,
-			// RFC 7748 §6.1) do not multiply to zero but still land in a tiny
-			// orbit — the secret is predictable, so reject all three small-order
-			// results, not just the all-zero one. u = p-1 is 0xec followed by 30
-			// 0xff bytes and a top byte of 0x7f (little-endian 2^255-20).
-			mut p_minus_1 := [u8(0xec)]
-			for _ in 0 .. 30 {
-				p_minus_1 << u8(0xff)
-			}
-			p_minus_1 << u8(0x7f)
-			mut one := []u8{len: 32}
-			one[0] = 1
-			if subtle.constant_time_compare(secret, []u8{len: 32, init: 0}) == 1
-				|| subtle.constant_time_compare(secret, one) == 1
-				|| subtle.constant_time_compare(secret, p_minus_1) == 1 {
+			// Defense in depth: reject every small-order result, not just the
+			// all-zero one (see is_x25519_small_order).
+			if is_x25519_small_order(secret) {
 				return error('handshake: computed X25519 shared secret is a small-order value (illegal_parameter)')
 			}
 			return secret
@@ -392,8 +417,19 @@ fn (mut h ClientHandshake) feed_encrypted_record(rec Record) ! {
 	// Decrypt under the server handshake keys; the true content type lies inside
 	// the inner plaintext (§5.1/§5.2).
 	decrypted := h.server_hs_cipher.decrypt_record(rec)!
+	if decrypted.content_type == .alert {
+		// RFC 8446 §6: after the ServerHello the server may surface a fatal alert
+		// under the handshake keys (e.g. decrypt_error, certificate_required,
+		// illegal_parameter). Decode and preserve its code instead of dropping it
+		// as a generic content-type mismatch.
+		peer_alert := parse_alert(decrypted.plaintext)!
+		if peer_alert.description == .close_notify {
+			return error('handshake: peer sent close_notify during handshake')
+		}
+		return error('handshake: received alert ${peer_alert.description} during handshake')
+	}
 	if decrypted.content_type != .handshake {
-		// Only handshake is legal in this phase; anything else violates §5.6.
+		// Only handshake is otherwise legal in this phase; anything else violates §5.6.
 		return error('handshake: unexpected content type in handshake phase: ${decrypted.content_type}')
 	}
 	// Accumulate plaintext; process_reassembled_messages joins fragments that span

@@ -10,6 +10,7 @@
 module tls
 
 import encoding.hex
+import crypto.aes
 
 // build_hrr_body assembles a HelloRetryRequest message body for tests. Pass a
 // group to include a key_share extension (group change request) and/or non-empty
@@ -438,4 +439,70 @@ fn test_zeroize_app_secrets_releases_traffic_secrets() ! {
 	h.zeroize_app_secrets()
 	assert h.client_ap_traffic.len == 0
 	assert h.server_ap_traffic.len == 0
+}
+
+// test_process_server_hello_rejects_trailing_data: RFC 8446 §5.1 requires the
+// ServerHello to align with a record boundary. A record that coalesces extra
+// bytes after the ServerHello would have them silently dropped (and any
+// following handshake flight would then be mis-framed), so it is refused as
+// unexpected_message instead of being accepted.
+fn test_process_server_hello_rejects_trailing_data() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.create_client_hello()!
+
+	sid := []u8{len: 32, init: 0x01}
+	body := build_server_hello_body(sid, CipherSuite.tls_aes_128_gcm_sha256)!
+	// Valid ServerHello handshake message, plus one coalesced trailing byte.
+	mut payload := wrap_handshake_message(.server_hello, body)
+	payload << u8(0x00)
+	rec := new_record(.handshake, payload)
+
+	h.process_server_hello(rec) or {
+		assert err.msg().contains('trailing data after ServerHello')
+		return
+	}
+	assert false
+}
+
+fn test_process_server_hello_accepts_aligned_record() ! {
+	mut h := new_client_handshake('example.com', [])!
+	h.create_client_hello()!
+
+	sid := []u8{len: 32, init: 0x01}
+	body := build_server_hello_body(sid, CipherSuite.tls_aes_128_gcm_sha256)!
+	rec := server_hello_record(body) // header + body only, no trailing bytes
+
+	// An aligned record must get past the alignment gate (it may fail later on
+	// key_share contents, but never on 'trailing data').
+	if _, _ := h.process_server_hello(rec) {
+		// accepted (or failed later) — either is fine, just not on alignment.
+	} else {
+		assert !err.msg().contains('trailing data after ServerHello')
+	}
+}
+
+// test_feed_encrypted_record_surfaces_handshake_alert: RFC 8446 §6 lets the
+// server send a fatal alert under the handshake keys after ServerHello (e.g.
+// decrypt_error, certificate_required). Previously it was collapsed into a
+// generic 'unexpected content type', losing the peer's reason; the alert code
+// must now be decoded and surfaced verbatim.
+fn test_feed_encrypted_record_surfaces_handshake_alert() ! {
+	key := [u8(0x01), 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+		0x0f, 0x10]
+	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
+	gcm_enc := aes.new_aes_gcm(key)!
+	gcm_dec := aes.new_aes_gcm(key)!
+	mut enc_state := new_record_cipher_state(gcm_enc, iv)!
+	mut dec_state := new_record_cipher_state(gcm_dec, iv)!
+
+	mut h := new_client_handshake('example.com', [])!
+	h.server_hs_cipher = dec_state
+
+	// A fatal (level 2) internal_error (80) alert, encrypted under the handshake keys.
+	alert_rec := enc_state.encrypt_record(.alert, [u8(2), 80])!
+	h.feed_encrypted_record(alert_rec) or {
+		assert err.msg().contains('received alert')
+		return
+	}
+	assert false
 }

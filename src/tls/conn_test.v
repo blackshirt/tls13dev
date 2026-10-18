@@ -7,6 +7,8 @@
 // a live socket; dial_example.v is their end-to-end coverage.
 module tls
 
+import sync
+
 // new_test_conn builds a fully-initialized Conn for the socket-free tests below.
 // Conn is @[noinit], so a bare &Conn{} would leave every field as garbage; this
 // helper supplies a real (but unused) handshake and zeroed buffers instead.
@@ -20,6 +22,9 @@ fn new_test_conn() !&Conn {
 		app_buf:           []u8{}
 		closed:            false
 		close_notify_sent: false
+		fatal_error:       ''
+		read_mut:          sync.new_mutex()
+		write_mut:         sync.new_mutex()
 		negotiated_alpn:   ''
 		server_name:       ''
 	}
@@ -98,4 +103,58 @@ fn test_conn_nil_safety() ! {
 	c.close()!
 	mut empty_buf := []u8{}
 	assert c.read(mut empty_buf)! == 0
+}
+
+// test_validate_compat_ccs_framing: a CCS body that is not the single byte 0x01
+// is framing garbage and must be refused, not silently dropped.
+fn test_validate_compat_ccs_framing() ! {
+	validate_compat_ccs([u8(0x02)], 0) or {
+		assert err.msg().contains('malformed change_cipher_spec')
+		return
+	}
+	assert false
+}
+
+// test_validate_compat_ccs_bounds_stream: exactly max_compat_ccs_records
+// well-formed dummy CCS records pass (the count is returned and grows), and the
+// next one aborts — the cap that stops do_handshake looping on a CCS flood.
+fn test_validate_compat_ccs_bounds_stream() ! {
+	mut seen := 0
+	for i in 0 .. max_compat_ccs_records {
+		seen = validate_compat_ccs([u8(0x01)], seen)!
+		assert seen == i + 1
+	}
+	validate_compat_ccs([u8(0x01)], seen) or {
+		assert err.msg().contains('too many change_cipher_spec')
+		return
+	}
+	assert false
+}
+
+// test_close_notify_is_clean_eof: close_notify must surface as a clean EOF (0)
+// with no sticky error, so a caller can distinguish orderly shutdown.
+fn test_close_notify_is_clean_eof() ! {
+	mut c := new_test_conn()!
+	n := c.handle_alert([u8(1), 0])! // level warning, description close_notify
+	assert n == 0
+	assert c.closed
+	assert c.fatal_error == ''
+}
+
+// test_fatal_alert_is_sticky_across_reads: a fatal alert must never be reduced
+// to a clean EOF (0) on later reads. Previously c.closed was set for fatal
+// alerts too, so a second read() returned 0 — recreating the truncation
+// ambiguity close_notify exists to prevent. The sticky error is re-surfaced.
+fn test_fatal_alert_is_sticky_across_reads() ! {
+	mut c := new_test_conn()!
+	c.handle_alert([u8(2), 80]) or { // level fatal, description internal_error
+		assert err.msg().contains('received alert')
+	}
+	assert c.fatal_error != ''
+	mut buf := []u8{len: 1}
+	c.read(mut buf) or {
+		assert err.msg().contains('received alert')
+		return
+	}
+	assert false // read must not succeed nor report EOF after a fatal alert
 }

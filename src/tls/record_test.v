@@ -238,3 +238,26 @@ fn test_record_seq_limit_backstops_receiver() ! {
 	}
 	assert false
 }
+
+// test_record_uninitialized_cipher_state_fails_closed: a zero-value
+// RecordCipherState (no keys installed) must return an error, never panic.
+// Feeding an encrypted record to the handshake before ServerHello installs the
+// server handshake keys previously reached compute_nonce with a zero-length IV
+// (index out of range panic) or a nil AEAD interface. This pins the fail-closed
+// guard that turns that unauthenticated DoS into a plain protocol error.
+fn test_record_uninitialized_cipher_state_fails_closed() ! {
+	mut uninit := RecordCipherState{}
+
+	mut decrypt_rejected := false
+	uninit.decrypt_record(new_record(.application_data, [u8(0x01), 0x02])) or {
+		assert err.msg().contains('cipher state not initialized')
+		decrypt_rejected = true
+	}
+	assert decrypt_rejected
+
+	uninit.encrypt_record(.application_data, 'data'.bytes()) or {
+		assert err.msg().contains('cipher state not initialized')
+		return
+	}
+	assert false
+}

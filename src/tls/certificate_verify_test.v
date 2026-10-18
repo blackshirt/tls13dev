@@ -98,3 +98,23 @@ fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 	}
 	assert false
 }
+
+// test_verify_certificate_verify_rejects_rsa_pkcs1: RFC 8446 §4.4.3 removes
+// RSASSA-PKCS1-v1_5 from CertificateVerify (RSA there is PSS-only), even though
+// the scheme may still be offered in signature_algorithms for certificate
+// signatures. Selecting it for the handshake signature is refused before any
+// key material is touched, so a keyless RSA leaf is enough to pin the rejection.
+fn test_verify_certificate_verify_rejects_rsa_pkcs1() ! {
+	content := 'x'.bytes()
+	rsa_leaf := Certificate{
+		public_key_algo: .rsa
+	}
+	verify_certificate_verify(rsa_leaf, ParsedCertificateVerify{
+		algorithm: .rsa_pkcs1_sha256
+		signature: [u8(0x01)]
+	}, content) or {
+		assert err.msg().contains('not permitted for TLS 1.3 CertificateVerify')
+		return
+	}
+	assert false
+}

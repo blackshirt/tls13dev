@@ -43,15 +43,11 @@ fn verify_certificate_verify(leaf Certificate, cv ParsedCertificateVerify, signe
 			}
 		}
 		.rsa_pkcs1_sha256 {
-			if leaf.public_key_algo != .rsa {
-				return error('handshake: CertificateVerify algorithm ${cv.algorithm} requires RSA certificate')
-			}
-			rsa_key := leaf.rsa_public_key or { return error('handshake: missing RSA public key') }
-			hash := HashAlgorithm.sha256.compute_hash(signed_content)
-			ok := rsa_key.verify_pkcs1_v1_5('sha256', hash, cv.signature)!
-			if !ok {
-				return error('handshake: RSA-PKCS1 SHA-256 CertificateVerify failed')
-			}
+			// RFC 8446 §4.2.3/§4.4.3: rsa_pkcs1_* schemes refer to signatures in
+			// certificates only and MUST NOT be used for the CertificateVerify
+			// signature, whose RSA instances are RSASSA-PSS exclusively. A server
+			// selecting it here is non-compliant; refuse rather than verify.
+			return error('handshake: rsa_pkcs1_sha256 is not permitted for TLS 1.3 CertificateVerify (RFC 8446 §4.4.3)')
 		}
 		.ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 {
 			if leaf.public_key_algo != .ecdsa {

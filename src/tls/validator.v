@@ -50,18 +50,22 @@ fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string)
 
 	// Hostname validation against the leaf certificate. IP literals are matched
 	// exclusively against iPAddress SANs per RFC 6125 §6.4.3 / RFC 2818 §3.1.
-	if hostname != '' {
-		if is_ip_literal(hostname) {
-			if !ip_san_matches(leaf.ip_sans, hostname) {
-				return error('pki: leaf certificate does not match IP address "${hostname}" (iPAddress SANs: ${leaf.ip_sans})')
-			}
-		} else {
-			// RFC 6125 §6.4.4: a present SAN extension disables the CN entirely,
-			// even when it holds no usable names — pass "" to express that.
-			cn := if leaf.has_san { '' } else { leaf.subject_cn }
-			if !verify_hostnames(leaf.sans, cn, hostname) {
-				return error('pki: leaf certificate does not match hostname "${hostname}" (SANs: ${leaf.sans}, CN: "${cn}")')
-			}
+	// An empty name cannot be checked, so it must fail closed: otherwise a dial
+	// address with no host part (e.g. ":443") would silently accept any trusted
+	// certificate. (insecure_skip_verify already returned above.)
+	if hostname == '' {
+		return error('pki: empty server name; cannot verify certificate hostname')
+	}
+	if is_ip_literal(hostname) {
+		if !ip_san_matches(leaf.ip_sans, hostname) {
+			return error('pki: leaf certificate does not match IP address "${hostname}" (iPAddress SANs: ${leaf.ip_sans})')
+		}
+	} else {
+		// RFC 6125 §6.4.4: a present SAN extension disables the CN entirely,
+		// even when it holds no usable names — pass "" to express that.
+		cn := if leaf.has_san { '' } else { leaf.subject_cn }
+		if !verify_hostnames(leaf.sans, cn, hostname) {
+			return error('pki: leaf certificate does not match hostname "${hostname}" (SANs: ${leaf.sans}, CN: "${cn}")')
 		}
 	}
 

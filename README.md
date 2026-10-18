@@ -97,8 +97,10 @@ library's bare sibling import (`tls`) relative to the executable's own directory
   caller-provided), validity windows, basic constraints, EKU `serverAuth`,
   RFC 6125 hostname matching (dNSName SANs with CN fallback only when no SAN
   list exists, single-label wildcards, IP SANs)
-- **Signature schemes**: RSA-PSS (SHA-256/384/512), RSA-PKCS1-v1_5 SHA-256,
-  ECDSA P-256/P-384, Ed25519 — for CertificateVerify and chain signatures
+- **Signature schemes**: RSA-PSS (SHA-256/384/512), ECDSA P-256/P-384, and
+  Ed25519 for CertificateVerify and chain signatures; RSA-PKCS1-v1_5 SHA-256
+  is accepted for chain signatures only — RFC 8446 §4.4.3 restricts
+  CertificateVerify's RSA instances to RSASSA-PSS
 - **Server auth completeness**: `Finished` verify_data, `CertificateVerify`
   over the §4.4.3 signed content, transcript-hash binding throughout
 - **ALPN** negotiation with RFC 7301 §3.1 selection checks
@@ -115,23 +117,28 @@ EncryptedExtensions allowlists), fixed-format extension data must be exactly
 its defined length, and ECDHE shares are size- and encoding-gated (§4.2.8.2)
 before any crypto backend sees them. Resource use is equally bounded: a single
 reassembled handshake message is capped at 1 MiB, a `Certificate` list longer
-than 32 entries is refused at parse time (before each entry is decoded), per-key
-record counts enforce the §5.5 rekeying obligation in both directions, and CA
-certificates with RSA keys below 2048 bits are refused. Malformed input is a
-handshake error, never a panic.
+than 32 entries is refused at parse time (before each entry is decoded), at
+most two middlebox dummy ChangeCipherSpec records are tolerated before the
+handshake aborts, per-key record counts enforce the §5.5 rekeying obligation in
+both directions, and CA certificates with RSA keys below 2048 bits are refused.
+Malformed input is a handshake error, never a panic.
 
 Certificate validation is strict X.509 too: DER must use minimal length
-encodings (X.690 §10.1) and a `keyUsage`/`basicConstraints` extension is honored
-when present — a leaf must assert `digitalSignature`, a signing CA `keyCertSign`,
-and `pathLenConstraint` caps how many intermediates may sit below a CA. TBSCertificate
-fields are element-counted after the optional `version [0]` is consumed, so a
-truncated v3 certificate fails the decode instead of indexing past the array, and
-RSA public keys must carry a non-zero, odd exponent (e=1 and even e are refused).
-The CertificateVerify scheme must match the leaf key type — and ECDSA schemes their
-exact curve (RFC 8446 §4.2.3) — before any key material is read. An
-unparseable validity date fails the whole decode rather than silently disabling
-expiry enforcement, and the X25519 exchange rejects every small-order shared
-secret (0, 1, p−1) not just the all-zero one.
+encodings (X.690 §10.1), each certificate extension OID appears at most once
+(RFC 5280 §4.2), and a `keyUsage`/`basicConstraints` extension is honored when
+present — a leaf must assert `digitalSignature`, a signing CA `keyCertSign`,
+and `pathLenConstraint` caps how many intermediates may sit below a CA (a
+malformed constraint collapses to the most restrictive 0, never the unlimited
+default). TBSCertificate fields are element-counted after the optional `version
+[0]` is consumed, so a truncated v3 certificate fails the decode instead of
+indexing past the array, and RSA public keys must carry a non-zero, odd
+exponent (e=1 and even e are refused). The CertificateVerify scheme must match
+the leaf key type — and ECDSA schemes their exact curve (RFC 8446 §4.2.3) —
+before any key material is read. An unparseable validity date fails the whole
+decode rather than silently disabling expiry enforcement — UTCTime and
+GeneralizedTime must be exact-width all-digit strings ending in `Z` — and the
+X25519 exchange rejects every small-order shared secret (0, 1, p−1) not just
+the all-zero one.
 
 ## Not (yet) implemented
 
@@ -153,7 +160,9 @@ covers: wire framing and bounds, record round trips and AEAD tamper
 detection, the RFC 8448 §3 key-schedule and transcript vectors, handshake
 message codecs against RFC 8448's ServerHello plus hand-built malformed
 fixtures (duplicate/unpermitted/trailing-byte extensions, bad share sizes,
-bad CertificateVerify framing), the full HRR state-machine path (group
+bad CertificateVerify framing, strict validity-time and pathLenConstraint
+encodings, non-context-tag GeneralNames, duplicate certificate extensions,
+and the dummy-CCS flood bound), the full HRR state-machine path (group
 change, cookie echo, cipher-suite binding, replay rejection), X.509 decoding
 end to end — a full hand-built v3 certificate with extensions, truncation
 regressions for the element-count guards, and OID edge inputs — plus name

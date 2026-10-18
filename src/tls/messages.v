@@ -243,8 +243,8 @@ fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	for r.remaining() > 0 {
 		typ := r.read_u16()!
 		data := r.read_vector_u16()!
-		for s in seen_types {
-			if s == typ {
+		for seen_type in seen_types {
+			if seen_type == typ {
 				return error('handshake: duplicate extension type 0x${typ:04x} in extensions block')
 			}
 		}
@@ -542,12 +542,13 @@ fn parse_server_hello(body []u8) !ServerHello {
 				if !is_hrr {
 					return error('handshake: cookie extension in a normal ServerHello (unsupported_extension)')
 				}
-				mut cr := new_reader(ext.data)
-				cookie = cr.read_vector_u16()!
+				// data_r already wraps this extension's bytes; reuse it rather than
+				// opening a second reader over the same input.
+				cookie = data_r.read_vector_u16()!
 				if cookie.len == 0 {
 					return error('handshake: HelloRetryRequest cookie must be non-empty')
 				}
-				if cr.remaining() != 0 {
+				if data_r.remaining() != 0 {
 					return error('handshake: trailing bytes in HelloRetryRequest cookie')
 				}
 			}
@@ -719,8 +720,8 @@ fn parse_encrypted_extensions(body []u8) !string {
 			// renegotiation this single-shot client never performed.
 			mut ri_r := new_reader(ext.data)
 			if ri_r.remaining() > 0 {
-				conn := ri_r.read_vector_u8()!
-				if conn.len != 0 || ri_r.remaining() != 0 {
+				renegotiated := ri_r.read_vector_u8()!
+				if renegotiated.len != 0 || ri_r.remaining() != 0 {
 					return error('handshake: renegotiation_info carried a non-empty renegotiated_connection')
 				}
 			}

@@ -219,8 +219,10 @@ Behavior and guarantees:
 - **Resource bounds** — a handshake message declaring more than 1 MiB is refused
   at its header before fragments accumulate; a `Certificate` list with more than
   32 entries is rejected during parsing (before each is ASN.1-decoded), and so are
-  chains that long and CA RSA keys shorter than 2048 bits; the post-handshake
-  `NewSessionTicket` backlog is capped at 32 stored tickets.
+  chains that long and CA RSA keys shorter than 2048 bits; at most two middlebox
+  dummy ChangeCipherSpec records are tolerated during the handshake, so a streamed
+  CCS flood cannot pin the loop; the post-handshake `NewSessionTicket` backlog is
+  capped at 32 stored tickets.
 
 ### 2.2 `Conn`
 
@@ -515,6 +517,7 @@ unpermitted extensions, truncated certificates, and bad share sizes are
 |---|---|
 | Handshake message declaring > 1 MiB | <span style="color:#cf222e">`dial()` error</span> (reassembly cap) |
 | Plaintext alert or ChangeCipherSpec post-handshake | <span style="color:#cf222e">`read()` error</span> (fatal `unexpected_message`; injection rejected) |
+| More than two dummy ChangeCipherSpec records during the handshake | <span style="color:#cf222e">`dial()` error</span> (flood bound `max_compat_ccs_records`, `unexpected_message`) |
 | Peer exceeds §5.5 per-key record limit without rekeying | <span style="color:#cf222e">`read()` error</span> |
 | `Certificate` list with more than 32 entries | <span style="color:#cf222e">`dial()` error</span> (rejected at parse, before decoding) |
 | `NewSessionTicket` with trailing bytes after its extensions | <span style="color:#cf222e">`dial()` error</span> (decode_error) |

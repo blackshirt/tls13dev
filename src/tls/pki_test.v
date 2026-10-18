@@ -129,3 +129,17 @@ fn test_is_ip_literal() {
 	assert !is_ip_literal('')
 	assert !is_ip_literal('example.com')
 }
+
+// test_verify_certificate_chain_rejects_empty_hostname: an empty server name
+// cannot be matched against a certificate, so verification must fail closed.
+// Previously an empty name skipped both SAN and CN checks, letting a dial
+// address with no host part accept any certificate chaining to a trusted root.
+fn test_verify_certificate_chain_rejects_empty_hostname() ! {
+	validator := new_validator(new_trust_store(), false)
+	leaf := Certificate{}
+	validator.verify_certificate_chain([leaf], '') or {
+		assert err.msg().contains('empty server name')
+		return
+	}
+	assert false
+}

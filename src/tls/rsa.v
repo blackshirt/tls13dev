@@ -19,6 +19,12 @@ mut:
 	size_bytes int         // key size in bytes (modulus length), used to bound signatures
 }
 
+// max_rsa_modulus_bytes bounds the accepted RSA modulus (8192 bits). Verifying a
+// signature against an enormous modulus is CPU-expensive (big-integer modexp), so
+// without a ceiling a certificate carrying a multi-megabit key is a cheap CPU
+// denial-of-service lever. 8192 bits is comfortably above any key in real use.
+const max_rsa_modulus_bytes = 1024
+
 // parse_rsa_public_key parses an RSA public key from ASN.1 DER (PKCS #1 RSAPublicKey).
 //
 //	RSAPublicKey ::= SEQUENCE {
@@ -47,6 +53,12 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	}
 	if n_bytes.len == 0 {
 		return error('rsa: empty modulus')
+	}
+	// Reject an oversized modulus BEFORE any hex encoding or big-Integer import:
+	// each verification does a big-integer exponentiation whose cost grows with
+	// key size, so a multi-megabit modulus would otherwise be a cheap CPU DoS.
+	if n_bytes.len > max_rsa_modulus_bytes {
+		return error('rsa: modulus ${n_bytes.len * 8} bits exceeds maximum supported ${max_rsa_modulus_bytes * 8} bits')
 	}
 
 	n_hex := hex.encode(n_bytes)

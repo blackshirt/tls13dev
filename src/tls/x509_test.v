@@ -78,6 +78,53 @@ fn test_parse_basic_constraints() {
 	assert path_len4 == 1
 }
 
+fn test_parse_path_len_constraint_strictness() {
+	// Legit non-negative, minimal values decode verbatim.
+	assert parse_path_len_constraint([u8(0x00)]) == 0
+	assert parse_path_len_constraint([u8(0x01)]) == 1
+	assert parse_path_len_constraint([u8(0x01), 0x00, 0x00]) == 65536
+	// Every malformed encoding collapses to 0 (most restrictive), never the -1
+	// unlimited sentinel that would widen the CA-depth limit validator.v enforces.
+	assert parse_path_len_constraint([]u8{}) == 0 // empty INTEGER
+	assert parse_path_len_constraint([u8(0x81)]) == 0 // negative (sign bit set)
+	assert parse_path_len_constraint([u8(0x00), 0x01]) == 0 // non-minimal leading zero
+	assert parse_path_len_constraint([u8(0x01), 0x00, 0x00, 0x00, 0x00]) == 0 // >4 octets
+}
+
+fn test_parse_basic_constraints_malformed_pathlen() {
+	// SEQUENCE { cA TRUE, pathLen INTEGER = 0x81 (negative) } -> limit 0, not -1.
+	neg := [u8(0x30), 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x81]
+	is_ca, path_len := parse_basic_constraints(neg)
+	assert is_ca
+	assert path_len == 0
+	// pathLen INTEGER = 0x02 0x02 00 01 (non-minimal "1") -> limit 0, not 1.
+	nonmin := [u8(0x30), 0x07, 0x01, 0x01, 0xff, 0x02, 0x02, 0x00, 0x01]
+	_, path_len2 := parse_basic_constraints(nonmin)
+	assert path_len2 == 0
+}
+
+fn test_parse_san_extension_rejects_non_context_tag() ! {
+	// A universal INTEGER (0x02) whose low 5 bits collide with dNSName [2], and a
+	// constructed [2] (0xa2), must both be ignored: GeneralName choices are
+	// primitive context-specific tags only, so bytestr()-ing their payload as a
+	// hostname would inject a bogus name into the identity set.
+	mut body := []u8{}
+	body << u8(0x02)
+	body << u8(2)
+	body << [u8(0x61), 0x62] // INTEGER "ab"
+	body << u8(0xa2)
+	body << u8(2)
+	body << [u8(0x61), 0x62] // constructed [2]
+	mut der := []u8{}
+	der << u8(0x30)
+	der << u8(body.len)
+	der << body
+
+	dns, ip := parse_san_extension(der)
+	assert dns.len == 0
+	assert ip.len == 0
+}
+
 fn test_parse_key_usage_and_bits() {
 	// BIT STRING, 0 unused bits, value 0x84 = digitalSignature (bit 0) |
 	// keyCertSign (bit 5), the two assertions the validator checks.
@@ -148,13 +195,42 @@ fn test_extract_cn_from_name() {
 }
 
 fn test_parse_asn1_time() ! {
-	// UTCTime (0x17) and GeneralizedTime (0x18) both decode to a unix value;
-	// any other tag is an unsupported encoding.
+	// Pin the exact epoch second for a known date: 2021-01-01T00:00:00Z =
+	// 1609459200. Equality (not just != 0) catches time.parse treating the UTC
+	// fields as local wall-clock time, which would shift every expiry check in
+	// validator.v by the host timezone offset.
 	utc := Asn1Element{ tag: u8(0x17), is_construct: false, data: '210101000000Z'.bytes() }
-	assert parse_asn1_time(utc)! != 0
+	assert parse_asn1_time(utc)! == 1609459200
 	gen := Asn1Element{ tag: u8(0x18), is_construct: false, data: '20210101000000Z'.bytes() }
-	assert parse_asn1_time(gen)! != 0
+	assert parse_asn1_time(gen)! == 1609459200
 
+	// RFC 5280 year pivot: UTCTime YY >= 50 decodes as 19xx, so '750101000000Z'
+	// is 1975-01-01T00:00:00Z = 157766400, not 2075.
+	pivot := Asn1Element{ tag: u8(0x17), is_construct: false, data: '750101000000Z'.bytes() }
+	assert parse_asn1_time(pivot)! == 157766400
+
+	// Strict DER (H1): a century-prefixed over-long UTCTime, a non-digit field,
+	// and a missing trailing 'Z' must all be rejected rather than silently
+	// misparsed into a wrong validity window the validator would then trust.
+	mut rejected := 0
+	overlong := Asn1Element{ tag: u8(0x17), is_construct: false, data: '20301231235959Z'.bytes() }
+	parse_asn1_time(overlong) or {
+		assert err.msg().contains('unsupported time encoding')
+		rejected++
+	}
+	nondigit := Asn1Element{ tag: u8(0x17), is_construct: false, data: '2A0101000000Z'.bytes() }
+	parse_asn1_time(nondigit) or {
+		assert err.msg().contains('unsupported time encoding')
+		rejected++
+	}
+	no_zulu := Asn1Element{ tag: u8(0x17), is_construct: false, data: '210101000000+'.bytes() }
+	parse_asn1_time(no_zulu) or {
+		assert err.msg().contains('unsupported time encoding')
+		rejected++
+	}
+	assert rejected == 3
+
+	// Any other tag is an unsupported encoding.
 	bad := Asn1Element{ tag: u8(0x0c), is_construct: false, data: 'whatever'.bytes() }
 	parse_asn1_time(bad) or {
 		assert err.msg().contains('unsupported time encoding')
@@ -228,7 +304,7 @@ fn cert_skeleton_parts() [][]u8 {
 	empty_body := []u8{}
 	empty_name := der_tlv(0x30, [empty_body])
 	validity := der_tlv(0x30, [der_tlv(0x17, ['200101000000Z'.bytes()]),
-		der_tlv(0x17, ['20301231235959Z'.bytes()])])
+		der_tlv(0x17, ['301231235959Z'.bytes()])])
 	mut sig_bits := []u8{}
 	sig_bits << u8(0x00)
 	sig_bits << u8(0x01)
@@ -297,7 +373,7 @@ fn test_parse_certificate_v3_full_decode() ! {
 	empty_body := []u8{}
 	issuer := der_tlv(0x30, [empty_body])
 	validity := der_tlv(0x30, [der_tlv(0x17, ['200101000000Z'.bytes()]),
-		der_tlv(0x17, ['20301231235959Z'.bytes()])])
+		der_tlv(0x17, ['301231235959Z'.bytes()])])
 	subject := der_tlv(0x30, [empty_body])
 	ver_body := [u8(0x02)]
 	version_v3 := der_tlv(0xa0, [der_tlv(0x02, [ver_body])])
@@ -369,4 +445,112 @@ fn test_parse_certificate_v3_full_decode() ! {
 	assert c.signature == [u8(0x01), 0x02]
 	assert c.tbs_raw[0] == 0x30
 	assert c.not_before_unix > 0 && c.not_before_unix < c.not_after_unix
+}
+
+// minimal_extension_cert builds a well-formed v3 certificate whose only
+// extension is the given OID (DER-encoded) with an optional critical flag.
+fn minimal_extension_cert(ext_oid_der []u8, critical bool, ext_value_der []u8) []u8 {
+	oid_sha256_rsa := [u8(0x06), 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]
+	sig_alg := der_tlv(0x30, [oid_sha256_rsa])
+	ser_body := [u8(0x2a)]
+	serial := der_tlv(0x02, [ser_body])
+	empty_body := []u8{}
+	issuer := der_tlv(0x30, [empty_body])
+	validity := der_tlv(0x30, [der_tlv(0x17, ['200101000000Z'.bytes()]),
+		der_tlv(0x17, ['301231235959Z'.bytes()])])
+	subject := der_tlv(0x30, [empty_body])
+	pub_alg_oid := [u8(0x06), 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]
+	curve_oid := [u8(0x06), 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]
+	alg := der_tlv(0x30, [pub_alg_oid, curve_oid])
+	mut point := []u8{len: 65, init: 0x01}
+	point[0] = 0x04
+	mut bits_body := [u8(0x00)]
+	bits_body << point
+	bitstr := der_tlv(0x03, [bits_body])
+	spki := der_tlv(0x30, [alg, bitstr])
+
+	mut ext_parts := [][]u8{}
+	ext_parts << ext_oid_der
+	if critical {
+		ext_parts << [u8(0x01), 0x01, 0xff]
+	}
+	ext_parts << der_tlv(0x04, [ext_value_der])
+	ext := der_tlv(0x30, ext_parts)
+	ext_list := der_tlv(0x30, [ext])
+	ext_wrap := der_tlv(0xa3, [ext_list])
+
+	tbs := der_tlv(0x30, [serial, sig_alg, issuer, validity, subject, spki, ext_wrap])
+	sig_bits := [u8(0x00), 0x01, 0x02]
+	sig_val := der_tlv(0x03, [sig_bits])
+	return der_tlv(0x30, [tbs, sig_alg, sig_val])
+}
+
+// test_parse_certificate_rejects_unknown_critical_extension: RFC 5280 §4.2
+// requires rejecting a certificate carrying a critical extension the
+// implementation does not understand — most importantly to stop a name-
+// constrained intermediate (critical nameConstraints) from being treated as
+// unconstrained. A non-critical unknown extension must still be ignored.
+fn test_parse_certificate_rejects_unknown_critical_extension() ! {
+	unknown_oid := [u8(0x06), 0x03, 0x2a, 0x03, 0x04] // OID 1.2.3.4
+	value := der_tlv(0x04, ['x'.bytes()])
+
+	critical_cert := minimal_extension_cert(unknown_oid, true, value)
+	parse_certificate(critical_cert) or {
+		assert err.msg().contains('unsupported critical extension')
+		return
+	}
+	assert false
+}
+
+fn test_parse_certificate_ignores_unknown_noncritical_extension() ! {
+	unknown_oid := [u8(0x06), 0x03, 0x2a, 0x03, 0x04]
+	value := der_tlv(0x04, ['x'.bytes()])
+
+	cert := minimal_extension_cert(unknown_oid, false, value)
+	c := parse_certificate(cert)!
+	assert c.version == 1
+}
+
+// test_parse_certificate_rejects_duplicate_extension: RFC 5280 §4.2 forbids two
+// instances of the same extension OID. Two identical BasicConstraints extensions
+// must fail the decode rather than let the second silently overwrite the first.
+fn test_parse_certificate_rejects_duplicate_extension() ! {
+	oid_sha256_rsa := [u8(0x06), 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]
+	sig_alg := der_tlv(0x30, [oid_sha256_rsa])
+	ser_body := [u8(0x2a)]
+	serial := der_tlv(0x02, [ser_body])
+	empty_body := []u8{}
+	issuer := der_tlv(0x30, [empty_body])
+	validity := der_tlv(0x30, [der_tlv(0x17, ['200101000000Z'.bytes()]),
+		der_tlv(0x17, ['301231235959Z'.bytes()])])
+	subject := der_tlv(0x30, [empty_body])
+	pub_alg_oid := [u8(0x06), 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]
+	curve_oid := [u8(0x06), 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]
+	alg := der_tlv(0x30, [pub_alg_oid, curve_oid])
+	mut point := []u8{len: 65, init: 0x01}
+	point[0] = 0x04
+	mut bits_body := []u8{}
+	bits_body << u8(0x00) // BIT STRING unused-bits count
+	bits_body << point
+	bitstr := der_tlv(0x03, [bits_body])
+	spki := der_tlv(0x30, [alg, bitstr])
+
+	// One non-critical BasicConstraints extension, then an identical twin.
+	bc_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x13]
+	bc_content := [u8(0x01), 0x01, 0xff] // BOOLEAN cA = TRUE
+	bc_value := der_tlv(0x30, [bc_content])
+	bc_ext := der_tlv(0x30, [bc_oid, der_tlv(0x04, [bc_value])])
+	ext_list := der_tlv(0x30, [bc_ext, bc_ext])
+	ext_wrap := der_tlv(0xa3, [ext_list])
+
+	tbs := der_tlv(0x30, [serial, sig_alg, issuer, validity, subject, spki, ext_wrap])
+	sig_bits := [u8(0x00), 0x01, 0x02]
+	sig_val := der_tlv(0x03, [sig_bits])
+	cert := der_tlv(0x30, [tbs, sig_alg, sig_val])
+
+	parse_certificate(cert) or {
+		assert err.msg().contains('duplicate extension')
+		return
+	}
+	assert false
 }

@@ -198,3 +198,57 @@ fn test_rsa_verify_raw_rejects_out_of_range() ! {
 	}
 	assert false
 }
+
+// rsa_long_form builds a SEQUENCE over long-form (>=128-byte) DER lengths. The
+// short-form rsa_seq helper cannot encode a >127-byte body, and the oversized
+// modulus test needs a 1025-byte modulus — exactly the shape a malicious cert
+// would carry to make each RSA verification do a multi-megabit modexp.
+fn rsa_long_form(n_content []u8, e_content []u8) []u8 {
+	// INTEGER tag + long-form length + content, for the modulus and the exponent.
+	mut n_tlv := []u8{}
+	n_tlv << u8(0x02)
+	n_tlv << u8(0x82)
+	n_tlv << u8((n_content.len >> 8) & 0xff)
+	n_tlv << u8(n_content.len & 0xff)
+	n_tlv << n_content
+	mut e_tlv := []u8{}
+	e_tlv << u8(0x02)
+	e_tlv << u8(0x03)
+	e_tlv << e_content
+	// Wrap both in a SEQUENCE with a long-form length.
+	mut body := []u8{}
+	body << n_tlv
+	body << e_tlv
+	mut der := []u8{}
+	der << u8(0x30)
+	der << u8(0x82)
+	der << u8((body.len >> 8) & 0xff)
+	der << u8(body.len & 0xff)
+	der << body
+	return der
+}
+
+fn test_parse_rsa_public_key_rejects_oversized_modulus() ! {
+	// A 1025-byte modulus (8200 bits) exceeds the 1024-byte (8192-bit) ceiling.
+	// Leading 0x7f keeps it positive without an ASN.1 sign byte, so size_bytes is
+	// exactly 1025. Must be rejected before any verification work is possible.
+	mut n_content := []u8{len: max_rsa_modulus_bytes + 1, init: 0x7f}
+	n_content[0] = 0x7f
+	e_content := [u8(0x01), 0x00, 0x01]
+	der := rsa_long_form(n_content, e_content)
+	parse_rsa_public_key(der) or {
+		assert err.msg().contains('exceeds maximum supported')
+		return
+	}
+	assert false
+}
+
+fn test_parse_rsa_public_key_accepts_modulus_at_ceiling() ! {
+	// Exactly max_rsa_modulus_bytes must still parse — only strictly-larger is refused.
+	n_content := []u8{len: max_rsa_modulus_bytes, init: 0x7f}
+	e_content := [u8(0x01), 0x00, 0x01]
+	der := rsa_long_form(n_content, e_content)
+	k := parse_rsa_public_key(der)!
+	assert k.size_bytes == max_rsa_modulus_bytes
+	assert k.e == 65537
+}

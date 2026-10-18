@@ -72,16 +72,33 @@ fn parse_certificate(der []u8) !Certificate {
 	if cert_seq.tag != 0x30 {
 		return error('x509: certificate must begin with SEQUENCE (0x30), got 0x${cert_seq.tag:02x}')
 	}
+	if r.remaining() != 0 {
+		return error('x509: trailing data after certificate')
+	}
 	// Re-parse the contents to capture the TBSCertificate's exact DER encoding
 	// (tag + length + value); this byte range is the message that was signed.
 	mut inner := new_reader(cert_seq.data)
 	tbs_start := inner.cursor
 	tbs_elem := read_asn1_element(mut inner)!
+	// This element should be a sequence-d tag
+	if tbs_elem.tag != 0x30 {
+		return error('x509: TBSCertificate must be a SEQUENCE')
+	}
 	tbs_raw := cert_seq.data[tbs_start..inner.cursor].clone()
-	// Skip the outer signatureAlgorithm: RFC 5280 §4.1.2.2 requires it to equal the
-	// TBS copy, and only the TBS copy is covered by the signature.
-	_ := read_asn1_element(mut inner)!
+	// RFC 5280 §4.1.2.3: the outer signatureAlgorithm must match
+	// TBSCertificate.signature.
+	outer_sig_alg_elem := read_asn1_element(mut inner)!
+	if outer_sig_alg_elem.tag != 0x30 {
+		return error('x509: outer signatureAlgorithm must be a SEQUENCE')
+	}
 	sig_val_elem := read_asn1_element(mut inner)!
+	if sig_val_elem.tag != 0x03 || sig_val_elem.data.len == 0
+		|| sig_val_elem.data[0] != 0 {
+		return error('x509: malformed signatureValue BIT STRING')
+	}
+	if inner.remaining() != 0 {
+		return error('x509: trailing fields inside Certificate')
+	}
 
 	tbs_elements := parse_sequence(tbs_elem.data)!
 	// Minimum 6 elements = serial, signature alg, issuer, validity, subject, SPKI;
@@ -96,11 +113,11 @@ fn parse_certificate(der []u8) !Certificate {
 	// default), so only consume it when the first element carries context tag 0.
 	mut version := 1
 	if (tbs_elements[0].tag & 0x1f) == 0 {
-		mut vr := new_reader(tbs_elements[0].data)
-		v_elem := read_asn1_element(mut vr)!
-		if v_elem.data.len > 0 {
+		mut version_r := new_reader(tbs_elements[0].data)
+		version_elem := read_asn1_element(mut version_r)!
+		if version_elem.data.len > 0 {
 			// Encoded 0-based (v1 = 0, v3 = 2); expose the human value.
-			version = int(v_elem.data[0]) + 1
+			version = int(version_elem.data[0]) + 1
 		}
 		idx++
 	}
@@ -121,6 +138,10 @@ fn parse_certificate(der []u8) !Certificate {
 	idx++
 
 	// 3. Signature Algorithm (AlgorithmIdentifier)
+	if tbs_elements[idx].tag != 0x30
+		|| tbs_elements[idx].data != outer_sig_alg_elem.data {
+		return error('x509: outer and TBSCertificate signatureAlgorithm mismatch')
+	}
 	sig_alg_inner := parse_sequence(tbs_elements[idx].data)!
 	mut tbs_sig_algo_oid := ''
 	mut tbs_sig_hash_oid := ''
@@ -238,22 +259,41 @@ fn parse_certificate(der []u8) !Certificate {
 	mut key_usage := []u8{}
 	mut has_eku := false
 	mut eku_server_auth := false
+	// RFC 5280 §4.2: each extension OID must appear at most once. Tracking seen
+	// OIDs stops a duplicate (e.g. a second SAN) from silently overwriting the
+	// first, which could drop names the issuer actually asserted.
+	mut seen_ext_oids := []string{}
 
 	for i in idx .. tbs_elements.len {
 		el := tbs_elements[i]
 		if (el.tag & 0x1f) == 3 { // [3] Context tag
-			ext_seq_wrap := parse_sequence(el.data) or { [] }
+			ext_seq_wrap := parse_sequence(el.data)!
 			if ext_seq_wrap.len > 0 {
-				ext_list := parse_sequence(ext_seq_wrap[0].data) or { [] }
+				ext_list := parse_sequence(ext_seq_wrap[0].data)!
 				for ext in ext_list {
-					parts := parse_sequence(ext.data) or { continue }
-					if parts.len < 2 {
-						continue
+					parts := parse_sequence(ext.data)!
+					if parts.len < 2 || parts.len > 3 {
+						return error('x509: malformed extension (${parts.len} elements)')
 					}
 					ext_oid := parse_oid(parts[0].data)
-					// extnValue is the last element: index 1 when `critical` is
-					// absent, index 2 when it is present.
-					ext_val_bytes := if parts.len == 2 { parts[1].data } else { parts[2].data }
+					if ext_oid in seen_ext_oids {
+						return error('x509: duplicate extension ${ext_oid}')
+					}
+					seen_ext_oids << ext_oid
+					// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT
+					// FALSE, extnValue }. The critical flag is present only when
+					// there are three elements; when omitted the value defaults
+					// to FALSE and extnValue sits at index 1, otherwise index 2.
+					mut critical := false
+					ext_val_bytes := if parts.len == 2 {
+						parts[1].data
+					} else {
+						if parts[1].tag != 0x01 || parts[1].data.len != 1 {
+							return error('x509: malformed critical flag for extension ${ext_oid}')
+						}
+						critical = parts[1].data[0] != 0
+						parts[2].data
+					}
 
 					match ext_oid {
 						'2.5.29.17' { // Subject Alternative Name (SAN)
@@ -275,7 +315,17 @@ fn parse_certificate(der []u8) !Certificate {
 							has_eku = true
 							eku_server_auth = parse_eku_server_auth(ext_val_bytes)
 						}
-						else {}
+						else {
+							// RFC 5280 §4.2: a certificate carrying a critical
+							// extension this implementation does not understand
+							// MUST be rejected. Ignoring one (notably critical
+							// nameConstraints or policyConstraints on an
+							// intermediate) would let a constrained CA issue for
+							// names outside its sandbox.
+							if critical {
+								return error('x509: unsupported critical extension ${ext_oid}')
+							}
+						}
 					}
 				}
 			}
@@ -334,19 +384,41 @@ fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	return ecdsa.PublicKey.from_uncompressed_bytes(c.public_key_raw, nid: c.ecdsa_curve)!
 }
 
+// is_digits reports whether s is non-empty and every byte is an ASCII digit.
+// parse_asn1_time uses it to reject a time whose fixed-width fields are
+// non-numeric before slicing them, so a malformed value fails the decode rather
+// than being coerced by str.int() into a bogus-but-parseable date.
+fn is_digits(s string) bool {
+	if s.len == 0 {
+		return false
+	}
+	for b in s.bytes() {
+		if b < `0` || b > `9` {
+			return false
+		}
+	}
+	return true
+}
+
 // parse_asn1_time parses UTCTime (tag 0x17) or GeneralizedTime (tag 0x18) to unix
 // seconds. RFC 5280 §4.1.2.5 mandates both forms across the 1950–2049 boundary;
 // the two-digit UTCTime year uses the RFC 5280 pivot (YY ≥ 50 ⇒ 19xx, else 20xx).
+// The widths are enforced exactly: UTCTime is YYMMDDhhmmssZ (13) and
+// GeneralizedTime is YYYYMMDDhhmmssZ (15), all digits plus a trailing 'Z'. A
+// longer payload (fractional seconds, +/-hhmm offsets) or a non-digit field is a
+// DER violation, not a value to guess at — slicing blindly at fixed offsets would
+// silently misparse it into a wrong validity window the validator then trusts
+// unconditionally (it never re-checks the calendar values behind *_unix).
 fn parse_asn1_time(el Asn1Element) !i64 {
 	s := el.data.bytestr()
-	// UTCTime YYMMDDhhmmssZ: 13 chars = six 2-digit fields + trailing 'Z' (UTC)
-	if el.tag == 0x17 && s.len >= 13 {
+	// UTCTime YYMMDDhhmmssZ: six 2-digit fields + trailing 'Z' (UTC)
+	if el.tag == 0x17 && s.len == 13 && is_digits(s[..12]) && s[12] == `Z` {
 		yy := s[0..2].int()
 		year := if yy >= 50 { 1900 + yy } else { 2000 + yy }
 		return time.parse('${year:04}-${s[2..4]}-${s[4..6]} ${s[6..8]}:${s[8..10]}:${s[10..12]}')!.unix()
 	}
-	// GeneralizedTime YYYYMMDDhhmmssZ: 15 chars = seven 2-digit fields + 'Z'
-	if el.tag == 0x18 && s.len >= 15 {
+	// GeneralizedTime YYYYMMDDhhmmssZ: seven 2-digit fields + trailing 'Z' (UTC)
+	if el.tag == 0x18 && s.len == 15 && is_digits(s[..14]) && s[14] == `Z` {
 		return time.parse('${s[0..4]}-${s[4..6]}-${s[6..8]} ${s[8..10]}:${s[10..12]}:${s[12..14]}')!.unix()
 	}
 	return error('x509: unsupported time encoding')
@@ -430,6 +502,13 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 
 	for general_names_r.remaining() > 0 {
 		gn := read_asn1_element(mut general_names_r) or { break }
+		// GeneralName choices are context-specific and primitive (dNSName [2] =
+		// 0x82, iPAddress [7] = 0x87). Requiring class 0x80 and a clear
+		// constructed bit stops a low-5-bits collision — a universal INTEGER
+		// (0x02) or a constructed [2] (0xa2) — from being read as a name.
+		if (gn.tag & 0xc0) != 0x80 || (gn.tag & 0x20) != 0 {
+			continue
+		}
 		match gn.tag & 0x1f {
 			2 { // [2] dNSName
 				// Disallow null bytes (CVE-2009-2408)
@@ -449,13 +528,42 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	return dns, ip
 }
 
+// parse_path_len_constraint decodes a BasicConstraints pathLenConstraint INTEGER,
+// enforcing the RFC 5280 §4.2.1.9 (0..MAX) range and DER minimal encoding. Any
+// invalid encoding — empty, oversized (>4 octets), a negative sign bit, or a
+// redundant leading 0x00 — collapses to 0 (no intermediate certificates permitted
+// below this CA), never -1, because the sentinel -1 means "unlimited" and would
+// silently widen the depth limit validator.v relies on for a junk pathLen.
+fn parse_path_len_constraint(data []u8) int {
+	if data.len == 0 || data.len > 4 {
+		return 0
+	}
+	// Negative INTEGER: the sign bit of the first content octet is set.
+	if data[0] & 0x80 != 0 {
+		return 0
+	}
+	// Non-minimal: a leading 0x00 is only legal to keep a high-bit-set value
+	// positive, but that case is excluded above, so any leading zero is redundant.
+	if data.len > 1 && data[0] == 0 {
+		return 0
+	}
+	mut v := u32(0)
+	for b in data {
+		// Accumulated unsigned so the byte-wise shift can never trip a signed
+		// overflow, then widened into the int field.
+		v = (v << 8) | u32(b)
+	}
+	return int(v)
+}
+
 // parse_basic_constraints parses the cA boolean and pathLenConstraint from a
 // BasicConstraints extension value (RFC 5280 §4.2.1.9):
 //
 //	BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
 //	                               pathLenConstraint INTEGER (0..MAX) OPTIONAL }
 //
-// The returned path limit is -1 when the INTEGER is absent, meaning unlimited.
+// The returned path limit is -1 only when the INTEGER is absent, meaning
+// unlimited; a present-but-malformed one yields 0 (see parse_path_len_constraint).
 fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := new_reader(inner)
@@ -467,18 +575,14 @@ fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	mut ca := false
 	mut found_ca := false
 	mut path_len := -1
+	mut found_path := false
 	for el in elements {
 		if el.tag == 0x01 && el.data.len > 0 && !found_ca { // BOOLEAN cA
 			ca = el.data[0] != 0
 			found_ca = true
-		} else if el.tag == 0x02 && el.data.len > 0 && el.data.len <= 4 { // INTEGER pathLen
-			// Non-negative by X.500 profile; accumulated unsigned so the byte-wise
-			// shift can never trip a signed overflow, then widened into the int field.
-			mut v := u32(0)
-			for b in el.data {
-				v = (v << 8) | u32(b)
-			}
-			path_len = int(v)
+		} else if el.tag == 0x02 && !found_path { // INTEGER pathLen (first wins)
+			found_path = true
+			path_len = parse_path_len_constraint(el.data)
 		}
 	}
 	// cA has DEFAULT FALSE, so it can be absent entirely: scanning for the first

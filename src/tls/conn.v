@@ -8,6 +8,7 @@
 module tls
 
 import net
+import sync
 import time
 
 // recv_buf_compact_threshold bounds the consumed prefix recv_buf may retain
@@ -24,8 +25,25 @@ const recv_read_size = 4096
 // exhausts memory (RFC 8446 §4.6.1 permits any number of tickets).
 const max_stored_session_tickets = 32
 
+// max_compat_ccs_records bounds how many middlebox-compatibility dummy
+// ChangeCipherSpec records the client tolerates while awaiting its flight.
+// RFC 8446 §5 / App. D.4 permit a peer at most one dummy CCS per ClientHello
+// (two across a HelloRetryRequest round trip). Each CCS record otherwise hits a
+// bare `continue` in do_handshake, so without a cap a malicious server could
+// stream them forever and pin the handshake in an unbounded loop — the per-read
+// socket timeout never fires because bytes keep arriving.
+const max_compat_ccs_records = 2
+
 // Conn is a TLS 1.3 client connection over TCP. The only way to build one is
 // dial(), which supplies every field; @[noinit] prevents a half-initialized Conn.
+//
+// Concurrency: read() and write() are each guarded by their own mutex, so one
+// goroutine may read while another writes (the Go crypto/tls model). The read
+// path also mutates the write cipher when answering a KeyUpdate request, so that
+// one write-side action takes write_mut before touching client_app_cipher; the
+// lock order is always read_mut → write_mut (close() follows the same order),
+// which keeps the pair deadlock-free. Any other method is not safe to call
+// concurrently with a close().
 @[noinit]
 pub struct Conn {
 mut:
@@ -36,6 +54,9 @@ mut:
 	app_buf           []u8            // decrypted application bytes that didn't fit the caller's buffer
 	closed            bool            // set once the connection is finished (close or fatal alert)
 	close_notify_sent bool            // guards against sending close_notify twice
+	fatal_error       string          // non-empty once a fatal alert/error closed the connection; re-surfaced by read()
+	read_mut          &sync.Mutex     // serializes read() (and every mutation of the read cipher/recv_buf)
+	write_mut         &sync.Mutex     // serializes write() and every write-cipher mutation
 	negotiated_alpn   string          // server's ALPN pick — always one of Config.alpn (the handshake aborts otherwise), '' if none
 	server_name       string          // SNI value sent and the name the certificate was checked against
 }
@@ -90,6 +111,9 @@ pub fn dial(address string, config Config) !&Conn {
 		app_buf:           []u8{cap: max_plaintext_record_len}                      // one full plaintext record
 		closed:            false
 		close_notify_sent: false
+		fatal_error:       ''
+		read_mut:          sync.new_mutex()
+		write_mut:         sync.new_mutex()
 		negotiated_alpn:   ''
 		server_name:       server_name
 	}
@@ -126,6 +150,23 @@ fn host_from_address(address string) string {
 	return address
 }
 
+// validate_compat_ccs checks one middlebox dummy ChangeCipherSpec record's
+// framing and enforces the tolerance bound documented at
+// max_compat_ccs_records. It takes the running count and returns the updated
+// value, so do_handshake can abort as soon as the peer exceeds the bound.
+fn validate_compat_ccs(payload []u8, seen int) !int {
+	mut total := seen + 1
+	if total > max_compat_ccs_records {
+		return error('tls: too many change_cipher_spec records during handshake (unexpected_message)')
+	}
+	// Compliant peers send exactly the single byte 0x01 (App. D.4); anything else
+	// is framing garbage, so refusing beats silently swallowing it.
+	if payload.len != 1 || payload[0] != 0x01 {
+		return error('tls: malformed change_cipher_spec during handshake (must be the single byte 0x01)')
+	}
+	return total
+}
+
 // do_handshake drives the full client flight: send ClientHello (+dummy CCS),
 // then feed every incoming record into the state machine until it reports
 // .connected. A loop, because the server flight can interleave dummy CCS records,
@@ -134,26 +175,29 @@ fn (mut c Conn) do_handshake(validator Validator) ! {
 	ch_recs, _ := c.hs.create_client_hello()!
 	c.write_records(ch_recs)!
 
+	mut ccs_seen := 0
 	for c.hs.state != .connected {
 		rec := c.read_raw_record()!
 
 		match rec.content_type {
 			.change_cipher_spec {
 				// The peer's middlebox-compatibility dummy CCS carries no protocol
-				// meaning in TLS 1.3 — accept and drop it (RFC 8446 §5). Compliant
-				// peers send exactly the single byte 0x01 (App. D.4); anything else
-				// is framing garbage, so refusing beats silently swallowing it.
-				if rec.payload.len != 1 || rec.payload[0] != 0x01 {
-					return error('tls: malformed change_cipher_spec during handshake (must be the single byte 0x01)')
-				}
+				// meaning in TLS 1.3 — accept and drop it (RFC 8446 §5), bounded by
+				// validate_compat_ccs.
+				ccs_seen = validate_compat_ccs(rec.payload, ccs_seen)!
 				continue
 			}
 			.alert {
-				// Plausible only before server keys are installed (a reject alert for
-				// our ClientHello); post-handshake alerts arrive encrypted as
-				// application_data and are handled in read(), not here.
-				a := parse_alert(rec.payload)!
-				return error('tls: received alert ${a.description} (level=${a.level})')
+				// A plaintext alert is only plausible before the server installs
+				// its handshake keys (a reject alert for our ClientHello). After
+				// ServerHello, RFC 8446 §6 requires alerts to be encrypted: an
+				// outer plaintext alert then is injected/unauthenticated and must
+				// be rejected as unexpected_message, not acted on.
+				if c.hs.state != .wait_server_hello {
+					return error('tls: unencrypted alert after ServerHello (unexpected_message)')
+				}
+				peer_alert := parse_alert(rec.payload)!
+				return error('tls: received alert ${peer_alert.description} (level=${peer_alert.level})')
 			}
 			.handshake {
 				followups, sh := c.hs.process_server_hello(rec)!
@@ -167,7 +211,13 @@ fn (mut c Conn) do_handshake(validator Validator) ! {
 				// Once the server installs its handshake keys, everything it sends —
 				// including the rest of the flight — is wrapped with outer type
 				// application_data; the true type is recovered from the inner
-				// plaintext when decrypted (RFC 8446 §5.1/§5.2).
+				// plaintext when decrypted (RFC 8446 §5.1/§5.2). Before the
+				// ServerHello installs those keys no encrypted record can be
+				// authentic, so an injected one must be rejected rather than fed
+				// to a not-yet-initialized cipher state.
+				if c.hs.state == .start || c.hs.state == .wait_server_hello {
+					return error('tls: unexpected encrypted record before ServerHello (unexpected_message)')
+				}
 				c.hs.feed_encrypted_record(rec)!
 				fins := c.hs.process_reassembled_messages(&validator)!
 				if fins.len > 0 {
@@ -189,7 +239,11 @@ fn (mut c Conn) write_records(recs []Record) ! {
 	}
 	for rec in recs {
 		bytes := rec.serialize()
-		c.sock.write(bytes)!
+		// defensive write records by checking write results
+		n := c.sock.write(bytes)!
+		if n != bytes.len {
+			return error('tls: incomplete record write (${n}/${bytes.len} bytes)')
+		}
 	}
 }
 
@@ -259,20 +313,40 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// by a memory compromise (RFC 8446 §1.3.1/§7.5). The triggering record was
 	// already decrypted before this handler ran, so the read cipher is not needed.
 	c.hs.zeroize_app_secrets()
-	a := parse_alert(payload)!
+	peer_alert := parse_alert(payload) or {
+		// Malformed alert body is itself fatal: pin a sticky error so subsequent
+		// read() calls re-report it rather than returning a clean EOF (0).
+		c.fatal_error = 'tls: received malformed alert'
+		return error(c.fatal_error)
+	}
 	// close_notify is the one clean-shutdown signal: return 0, the same value a
 	// normal EOF read yields, so callers treat it as orderly end-of-stream.
-	if a.description == .close_notify {
+	if peer_alert.description == .close_notify {
 		return 0
 	}
 	// Every other description is fatal per RFC 8446 §6; surface the peer's code verbatim.
-	return error('tls: received alert ${a.description}')
+	// Pin it as sticky so a later read() cannot mistake the closed stream for
+	// an orderly close_notify (returns the error, never 0).
+	c.fatal_error = 'tls: received alert ${peer_alert.description}'
+	return error(c.fatal_error)
 }
 
 // read decrypts application data into buf. Returns bytes read (0 on clean close).
 pub fn (mut c Conn) read(mut buf []u8) !int {
+	// Serialize the whole read path: recv_buf, the server read cipher and the
+	// sticky error below are all read-modify state.
+	c.read_mut.lock()
+	defer {
+		c.read_mut.unlock()
+	}
 	if buf.len == 0 {
 		return 0
+	}
+	// A fatal alert (or malformed alert) is sticky: report it on every read after
+	// the first, never 0, so a caller retrying after an error cannot mistake a
+	// truncated stream for an orderly close_notify.
+	if c.fatal_error != '' {
+		return error(c.fatal_error)
 	}
 	// A decrypted record can hold more than the caller's buffer; leftovers are
 	// drained first so no plaintext is dropped or reordered.
@@ -377,12 +451,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				request_update := parse_key_update(body)!
 				c.hs.update_read_traffic_keys()!
 				if request_update {
-					// §4.6.3: the response is protected under the current (old) write
-					// keys; the sender updates only after the message has been sent.
-					msg := build_key_update(false)
-					enc := c.hs.client_app_cipher.encrypt_record(.handshake, msg)!
-					c.write_records([enc])!
-					c.hs.update_write_traffic_keys()!
+					c.send_key_update_response()!
 				}
 			}
 			.certificate_request {
@@ -401,6 +470,12 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 
 // write encrypts and sends application data.
 pub fn (mut c Conn) write(data []u8) !int {
+	// Serialize against other writers and against the read path's KeyUpdate
+	// response, both of which mutate client_app_cipher and its sequence number.
+	c.write_mut.lock()
+	defer {
+		c.write_mut.unlock()
+	}
 	// Refuse to encrypt onto a finished connection: writing after close_notify
 	// would hand the peer data it has already promised to stop reading.
 	if c.closed {
@@ -440,6 +515,21 @@ pub fn (mut c Conn) write(data []u8) !int {
 	return data.len
 }
 
+// send_key_update_response answers a KeyUpdate(update_requested): it sends the
+// KeyUpdate under the current (old) write keys and then ratchets them (§4.6.3).
+// It owns write_mut for the whole send-then-update so a concurrent write() can
+// never interleave and reuse a key/nonce; defer guarantees release on error.
+fn (mut c Conn) send_key_update_response() ! {
+	c.write_mut.lock()
+	defer {
+		c.write_mut.unlock()
+	}
+	msg := build_key_update(false)
+	enc := c.hs.client_app_cipher.encrypt_record(.handshake, msg)!
+	c.write_records([enc])!
+	c.hs.update_write_traffic_keys()!
+}
+
 // force_write_rekey fulfills the §5.5 sender-side record limit: announce a
 // KeyUpdate with update_not_requested under the current (old) write keys, then
 // ratchet — the same send-then-update ordering §4.6.3 requires of a KeyUpdate
@@ -453,6 +543,14 @@ fn (mut c Conn) force_write_rekey() ! {
 
 // close sends a close_notify alert and closes the underlying TCP connection.
 pub fn (mut c Conn) close() ! {
+	// Take the write lock so teardown cannot race a concurrent write()/KeyUpdate
+	// response over the write cipher. read_mut is deliberately not taken: a reader
+	// may be blocked in a socket read, and close() must be able to unblock it by
+	// closing the socket below rather than waiting for that reader.
+	c.write_mut.lock()
+	defer {
+		c.write_mut.unlock()
+	}
 	// Idempotent teardown: a second close() must not re-send close_notify or
 	// double-close the socket.
 	if c.closed {
