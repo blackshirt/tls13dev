@@ -2,22 +2,17 @@
 //
 // state_machine.v sequences the TLS 1.3 client handshake of RFC 8446, driving the
 // message codec (messages.v), AEAD primitives (aead.v), §7.1 key schedule
-// (handshake_keys.v) and server-signature check (certificate_verify.v); conn.v owns
-// the socket and feeds records through this state machine.
+// (handshake_keys.v) and server-signature check (certificate_verify.v). It is
+// transport-neutral: the core emits raw handshake messages and the transport
+// (conn.v / tcp_transport.v) frames them into TLS records over TCP; the record
+// module's QUIC passthrough helpers (record.v, RFC 9001 §4) are the alternate
+// framing a future QUIC adapter would reuse.
 module tls
 
 import crypto.ecdsa
 import crypto.rand
 import crypto.subtle
 import x.crypto.curve25519
-
-// max_handshake_message_len bounds one reassembled handshake message. The
-// 24-bit length field on the wire permits ~16 MiB, and a server may fragment a
-// message across arbitrarily many records, so without a cap a hostile peer
-// could pin the client into buffering a gigantic "Certificate" piece by piece.
-// Real chains are tens of KiB even at the 32-certificate chain bound the
-// validator enforces, so 1 MiB leaves ample headroom while capping memory.
-const max_handshake_message_len = 1 << 20
 
 // HandshakeState tracks client progress. The wait_* order mirrors the fixed
 // post-ServerHello server flight (EncryptedExtensions → Certificate →
@@ -32,6 +27,17 @@ enum HandshakeState {
 	wait_server_finished      // CertificateVerify verified against the leaf key
 	connected                 // server Finished verified; application data may flow
 	failed                    // terminal error; no further handshake messages are accepted
+}
+
+// RawHandshakeMessage is one outbound handshake message the core produces,
+// before any transport frames or encrypts it. content_type is the TLS content
+// type it must travel under (.handshake for every message the core emits
+// today); msg is the wire bytes — the full handshake message, 4-byte header
+// included, exactly as it must be hashed and put on the wire.
+struct RawHandshakeMessage {
+mut:
+	content_type ContentType
+	msg          []u8
 }
 
 // ClientHandshake orchestrates the TLS 1.3 client handshake state machine.
@@ -111,8 +117,12 @@ fn new_client_handshake(server_name string, alpn []string) !ClientHandshake {
 	}
 }
 
-// create_client_hello generates the initial ClientHello record and dummy ChangeCipherSpec.
-fn (mut h ClientHandshake) create_client_hello() !([]Record, []u8) {
+// create_client_hello generates the initial ClientHello message and advances to
+// .wait_server_hello. It returns the raw handshake message bytes (header + body,
+// exactly what goes into the transcript); framing into a TLS record and the
+// middlebox-compatibility dummy ChangeCipherSpec are the TCP transport's job
+// (RFC 8446 App. D.4), so the core stays transport-neutral.
+fn (mut h ClientHandshake) create_client_hello() ![]u8 {
 	// Pin random/session id now: build_client_hello would otherwise draw fresh
 	// ones per call, and §4.1.4 requires the retry ClientHello to be identical
 	// except key_share/cookie (while §4.1.3 compares the echo to config.session_id).
@@ -126,19 +136,17 @@ fn (mut h ClientHandshake) create_client_hello() !([]Record, []u8) {
 	h.client_hello1 = full_client_hello.clone()
 	h.transcript.update(full_client_hello)
 
-	ch_rec := new_record(.handshake, full_client_hello)
-	// Dummy ChangeCipherSpec for middlebox compatibility (RFC 8446 App. D.4);
-	// servers must tolerate and ignore it.
-	ccs_rec := change_cipher_spec()
-
 	h.state = .wait_server_hello
-	return [ch_rec, ccs_rec], full_client_hello
+	return full_client_hello
 }
 
-// process_server_hello parses ServerHello or HelloRetryRequest. On HRR it
-// returns the follow-up records (second ClientHello + CCS); on a normal
-// ServerHello it returns an empty list after deriving the handshake keys.
-fn (mut h ClientHandshake) process_server_hello(sh_record Record) !([]Record, ServerHello) {
+// process_server_hello parses ServerHello or HelloRetryRequest from the raw
+// handshake message bytes the transport handed over (the ServerHello travels in
+// the clear, so no decryption precedes it). On HRR it returns the follow-up
+// message (the retry ClientHello, unframed and CCS-free — the transport adds
+// those); on a normal ServerHello it returns an empty list after installing the
+// handshake keys.
+fn (mut h ClientHandshake) process_server_hello(sh_msg []u8) !([]RawHandshakeMessage, ServerHello) {
 	if h.state != .wait_server_hello {
 		// Strict ordering: a ServerHello is only legal while we await it; reject
 		// out-of-turn messages before parsing (§4.4.1).
@@ -147,7 +155,7 @@ fn (mut h ClientHandshake) process_server_hello(sh_record Record) !([]Record, Se
 
 	// Peel the 4-byte handshake header (type || 3-byte length) to confirm the
 	// message type and bound the body (§4).
-	mut r := new_reader(sh_record.payload)
+	mut r := new_reader(sh_msg)
 	msg_type, length := parse_handshake_header(mut r)!
 	if msg_type != .server_hello {
 		// HelloRetryRequest reuses the ServerHello type value (2) and is told
@@ -243,7 +251,7 @@ fn (mut h ClientHandshake) process_server_hello(sh_record Record) !([]Record, Se
 	h.client_hs_cipher = h.new_cipher(client_hs_keys)!
 
 	h.state = .wait_encrypted_extensions
-	return []Record{}, sh
+	return []RawHandshakeMessage{}, sh
 }
 
 // set_hash_algo adopts the negotiated suite's hash, rebuilding the transcript
@@ -274,8 +282,10 @@ fn (h &ClientHandshake) new_cipher(keys TrafficKeys) !RecordCipherState {
 
 // build_second_client_hello builds the ClientHello retried after a
 // HelloRetryRequest: identical to the first except key_share (when a new group
-// was requested) and cookie (when supplied) — RFC 8446 §4.1.2.
-fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]Record {
+// was requested) and cookie (when supplied) — RFC 8446 §4.1.2. Like
+// create_client_hello it returns the raw message; the transport frames it and
+// repeats the dummy CCS only on the TCP path.
+fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]RawHandshakeMessage {
 	if change_group {
 		h.generate_key_share(group)!
 		h.config.client_share = KeyShareEntry{
@@ -291,10 +301,11 @@ fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group Na
 	// Finished MAC covers the retried flight (§4.4.1).
 	h.transcript.update(full_ch2)
 
-	ch_rec := new_record(.handshake, full_ch2)
-	ccs_rec := change_cipher_spec() // repeat the dummy CCS for middlebox compatibility (App. D.4)
 	h.state = .wait_server_hello // rearm: the server now answers with the real ServerHello
-	return [ch_rec, ccs_rec]
+	return [RawHandshakeMessage{
+		content_type: .handshake
+		msg:          full_ch2
+	}]
 }
 
 // generate_key_share creates a fresh ephemeral private key for the requested group.
@@ -438,14 +449,15 @@ fn (mut h ClientHandshake) feed_encrypted_record(rec Record) ! {
 }
 
 // process_reassembled_messages processes EncryptedExtensions → Certificate →
-// CertificateVerify → Finished. Returns [client_finished] when the handshake
-// completes, or an empty list when more encrypted data is needed.
-fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![]Record {
+// CertificateVerify → Finished. Returns the raw client Finished message when the
+// handshake completes (the transport frames and encrypts it), or an empty list
+// when more data is needed.
+fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![]RawHandshakeMessage {
 	// Loop over the reassembly buffer consuming one complete message at a time; a
 	// partial message means more records are needed, so return and wait.
 	for {
 		if h.reassembly_buf.len < 4 {
-			return []Record{} // need the 4-byte handshake header
+			return []RawHandshakeMessage{} // need the 4-byte handshake header
 		}
 		mut r := new_reader(h.reassembly_buf)
 		msg_type, length := parse_handshake_header(mut r)!
@@ -455,7 +467,7 @@ fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![
 			return error('handshake: handshake message length ${length} exceeds maximum ${max_handshake_message_len} (unexpected_message)')
 		}
 		if h.reassembly_buf.len < 4 + length {
-			return []Record{} // body not fully received yet
+			return []RawHandshakeMessage{} // body not fully received yet
 		}
 
 		// Consume the whole message: full_msg (header + body) is hashed into the
@@ -543,9 +555,9 @@ fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![
 				client_fin_msg := build_finished(client_verify_data)
 				h.transcript.update(client_fin_msg)
 
-				client_fin_rec := h.client_hs_cipher.encrypt_record(.handshake, client_fin_msg)!
-
-				// Switch the application record ciphers into place for post-handshake traffic.
+				// Switch the application record ciphers into place for post-handshake
+				// traffic. The handshake write cipher is left intact so the transport
+				// can still encrypt the client Finished under it.
 				h.server_app_cipher = h.new_cipher(server_app_keys)!
 				h.client_app_cipher = h.new_cipher(client_app_keys)!
 
@@ -558,14 +570,19 @@ fn (mut h ClientHandshake) process_reassembled_messages(validator &Validator) ![
 				// to reach this point is now dead, so destroy it here rather than keep
 				// it resident for the whole connection (RFC 8446 §7.5 / §1.3.1).
 				h.zeroize_handshake_secrets()
-				return [client_fin_rec]
+				// Hand the raw client Finished to the transport, which encrypts it
+				// under the still-active handshake keys.
+				return [RawHandshakeMessage{
+					content_type: .handshake
+					msg:          client_fin_msg
+				}]
 			}
 			else {
 				return error('handshake: unexpected handshake message ${msg_type}')
 			}
 		}
 	}
-	return []Record{}
+	return []RawHandshakeMessage{}
 }
 
 // update_read_traffic_keys ratchets the server application traffic secret to its

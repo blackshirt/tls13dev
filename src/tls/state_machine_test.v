@@ -41,12 +41,12 @@ fn build_hrr_body(session_id []u8, group ?NamedGroup, cookie []u8) ![]u8 {
 	return w.bytes()
 }
 
-// hrr_record frames an HRR body in a plaintext handshake record — the form the
-// client receives it in: ServerHello (and the HRR that reuses its type) is the
-// last unencrypted server message; encryption starts immediately after it
-// (RFC 8446 §5.1; unlike the client, the server sends no dummy ChangeCipherSpec).
-fn hrr_record(body []u8) Record {
-	return new_record(.handshake, wrap_handshake_message(.server_hello, body))
+// hrr_message wraps an HRR body as the raw ServerHello-typed handshake message.
+// The ServerHello (and the HRR reusing its type) is the last unencrypted server
+// message, so on the record-free core boundary it is read straight from the
+// message bytes (RFC 8446 §5.1; the server, unlike the client, sends no dummy CCS).
+fn hrr_message(body []u8) []u8 {
+	return wrap_handshake_message(.server_hello, body)
 }
 
 // build_server_hello_body assembles a normal (non-HRR) ServerHello body for
@@ -74,8 +74,8 @@ fn build_server_hello_body(session_id []u8, suite CipherSuite) ![]u8 {
 	return w.bytes()
 }
 
-fn server_hello_record(body []u8) Record {
-	return new_record(.handshake, wrap_handshake_message(.server_hello, body))
+fn server_hello_message(body []u8) []u8 {
+	return wrap_handshake_message(.server_hello, body)
 }
 
 fn test_hrr_sentinel_random_matches_rfc() {
@@ -175,12 +175,11 @@ fn test_process_hrr_group_change() ! {
 	sid := h.config.session_id.clone()
 
 	body := build_hrr_body(sid, NamedGroup.secp256r1, []u8{})!
-	followups, sh := h.process_server_hello(hrr_record(body))!
+	followups, sh := h.process_server_hello(hrr_message(body))!
 	assert sh.is_hello_retry_req
 	assert h.hrr_received
-	assert followups.len == 2
+	assert followups.len == 1
 	assert followups[0].content_type == .handshake
-	assert followups[1].content_type == .change_cipher_spec
 	assert h.config.client_share.group == .secp256r1
 	assert h.ecdhe_group == .secp256r1
 }
@@ -191,9 +190,9 @@ fn test_process_hrr_cookie_only_keeps_share() ! {
 	sid := h.config.session_id.clone()
 
 	body := build_hrr_body(sid, none, [u8(1), 2, 3, 4])!
-	followups, sh := h.process_server_hello(hrr_record(body))!
+	followups, sh := h.process_server_hello(hrr_message(body))!
 	assert sh.is_hello_retry_req
-	assert followups.len == 2
+	assert followups.len == 1
 	assert h.config.client_share.group == .x25519
 	assert h.ecdhe_group == .x25519
 	assert h.config.cookie == [u8(1), 2, 3, 4]
@@ -205,13 +204,13 @@ fn test_process_hrr_cookie_only_keeps_share() ! {
 // byte-identical to the first in those fields — only key_share/cookie change.
 fn test_hrr_second_client_hello_frozen_fields() ! {
 	mut h := new_client_handshake('example.com', [])!
-	_, ch1 := h.create_client_hello()!
+	ch1 := h.create_client_hello()!
 	assert h.config.random.len == client_hello_random_len
 	assert h.config.session_id.len == legacy_session_id_len
 
 	body := build_hrr_body(h.config.session_id, NamedGroup.secp256r1, []u8{})!
-	followups, _ := h.process_server_hello(hrr_record(body))!
-	ch2 := followups[0].payload
+	followups, _ := h.process_server_hello(hrr_message(body))!
+	ch2 := followups[0].msg
 	// handshake msg: 4-byte header + 2-byte legacy_version, then 32-byte random,
 	// then the u8-length-prefixed legacy_session_id.
 	assert ch2[6..38] == ch1[6..38] // random unchanged
@@ -225,7 +224,7 @@ fn test_process_hrr_session_id_mismatch_rejected() ! {
 	h.create_client_hello()!
 
 	body := build_hrr_body([]u8{len: 32, init: 0xff}, NamedGroup.secp256r1, []u8{})!
-	h.process_server_hello(hrr_record(body)) or {
+	h.process_server_hello(hrr_message(body)) or {
 		assert err.msg().contains('legacy_session_id_echo')
 		return
 	}
@@ -238,7 +237,7 @@ fn test_process_hrr_no_change_rejected() ! {
 	sid := h.config.session_id.clone()
 
 	body := build_hrr_body(sid, none, []u8{})!
-	h.process_server_hello(hrr_record(body)) or {
+	h.process_server_hello(hrr_message(body)) or {
 		assert err.msg().contains('would not change')
 		return
 	}
@@ -251,7 +250,7 @@ fn test_process_hrr_reselect_offered_group_rejected() ! {
 	sid := h.config.session_id.clone()
 
 	body := build_hrr_body(sid, NamedGroup.x25519, []u8{})!
-	h.process_server_hello(hrr_record(body)) or {
+	h.process_server_hello(hrr_message(body)) or {
 		assert err.msg().contains('reselected')
 		return
 	}
@@ -264,9 +263,9 @@ fn test_process_second_hrr_rejected() ! {
 	sid := h.config.session_id.clone()
 
 	body := build_hrr_body(sid, NamedGroup.secp256r1, []u8{})!
-	h.process_server_hello(hrr_record(body))!
+	h.process_server_hello(hrr_message(body))!
 	// A second HelloRetryRequest in the same connection is a protocol error.
-	h.process_server_hello(hrr_record(body)) or {
+	h.process_server_hello(hrr_message(body)) or {
 		assert err.msg().contains('second HelloRetryRequest')
 		return
 	}
@@ -284,15 +283,15 @@ fn test_process_hrr_cipher_suite_change_rejected() ! {
 
 	// HRR selects AES-128 (0x1301) while requesting the P-256 group.
 	hrr_body := build_hrr_body(sid, NamedGroup.secp256r1, []u8{})!
-	followups, sh := h.process_server_hello(hrr_record(hrr_body))!
-	assert followups.len == 2
+	followups, sh := h.process_server_hello(hrr_message(hrr_body))!
+	assert followups.len == 1
 	assert sh.cipher_suite == .tls_aes_128_gcm_sha256
 	assert h.hrr_cipher_suite == ?CipherSuite(CipherSuite.tls_aes_128_gcm_sha256)
 
 	// The final ServerHello instead picks AES-256 (0x1302), a suite the client
 	// did offer, so the mismatch is the only thing that should fail.
 	sh_body := build_server_hello_body(sid, .tls_aes_256_gcm_sha384)!
-	h.process_server_hello(server_hello_record(sh_body)) or {
+	h.process_server_hello(server_hello_message(sh_body)) or {
 		assert err.msg().contains('differs from HelloRetryRequest')
 		return
 	}
@@ -310,10 +309,10 @@ fn test_process_hrr_cipher_suite_match_proceeds() ! {
 	sid := h.config.session_id.clone()
 
 	hrr_body := build_hrr_body(sid, NamedGroup.secp256r1, []u8{})!
-	h.process_server_hello(hrr_record(hrr_body))!
+	h.process_server_hello(hrr_message(hrr_body))!
 
 	sh_body := build_server_hello_body(sid, .tls_aes_128_gcm_sha256)!
-	h.process_server_hello(server_hello_record(sh_body)) or {
+	h.process_server_hello(server_hello_message(sh_body)) or {
 		assert !err.msg().contains('differs from HelloRetryRequest')
 		return
 	}
@@ -344,7 +343,7 @@ fn test_process_hrr_empty_cookie_rejected() ! {
 	write_extension(mut ext, .cookie, cw.bytes())!
 	w.write_vector_u16(ext.bytes())!
 
-	h.process_server_hello(hrr_record(w.bytes())) or {
+	h.process_server_hello(hrr_message(w.bytes())) or {
 		assert err.msg().contains('cookie')
 		return
 	}
@@ -359,8 +358,8 @@ fn test_process_hrr_cookie_only_echos_cookie_in_ch2() ! {
 	sid := h.config.session_id.clone()
 
 	body := build_hrr_body(sid, none, [u8(1), 2, 3, 4])!
-	followups, _ := h.process_server_hello(hrr_record(body))!
-	ch2 := followups[0].payload
+	followups, _ := h.process_server_hello(hrr_message(body))!
+	ch2 := followups[0].msg
 	// cookie extension: type 44 (0x002c) || data_len 00 06 || vector 00 04 || 01 02 03 04
 	cookie_type := u16(ExtensionType.cookie)
 	needle := [
@@ -455,9 +454,8 @@ fn test_process_server_hello_rejects_trailing_data() ! {
 	// Valid ServerHello handshake message, plus one coalesced trailing byte.
 	mut payload := wrap_handshake_message(.server_hello, body)
 	payload << u8(0x00)
-	rec := new_record(.handshake, payload)
 
-	h.process_server_hello(rec) or {
+	h.process_server_hello(payload) or {
 		assert err.msg().contains('trailing data after ServerHello')
 		return
 	}
@@ -470,7 +468,7 @@ fn test_process_server_hello_accepts_aligned_record() ! {
 
 	sid := []u8{len: 32, init: 0x01}
 	body := build_server_hello_body(sid, CipherSuite.tls_aes_128_gcm_sha256)!
-	rec := server_hello_record(body) // header + body only, no trailing bytes
+	rec := server_hello_message(body) // header + body only, no trailing bytes
 
 	// An aligned record must get past the alignment gate (it may fail later on
 	// key_share contents, but never on 'trailing data').

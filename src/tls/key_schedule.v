@@ -153,10 +153,17 @@ fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int)
 	}
 }
 
+// derive_finished_key computes finished_key = HKDF-Expand-Label(BaseKey,
+// "finished", "", Hash.length), the MAC key RFC 8446 §4.4.4 binds to a Finished
+// message; compute_finished_verify_data HMACs it over the transcript.
+fn derive_finished_key(hash HashAlgorithm, base_key []u8) ![]u8 {
+	return hkdf_expand_label(hash, base_key, 'finished', []u8{}, hash.hash_len())!
+}
+
 // compute_finished_verify_data derives finished_key and computes HMAC over
 // transcript_hash (RFC 8446 §4.4.4). The traffic secret is never used directly
 // as an HMAC key, keeping the MAC key domain-separated from the record keys.
 fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_hash []u8) ![]u8 {
-	finished_key := hkdf_expand_label(hash, base_key, 'finished', []u8{}, hash.hash_len())!
+	finished_key := derive_finished_key(hash, base_key)!
 	return hash.compute_hmac(finished_key, transcript_hash)
 }

@@ -18,7 +18,10 @@ Full module and API reference documentation lives in [`docs.md`](docs.md).
 A current V toolchain — the library uses standard-library crypto only
 (`crypto.aes`, `x.crypto.chacha20poly1305`, `x.crypto.curve25519`, ECDSA /
 Ed25519 from `crypto.*`), so no external dependencies, but also no stable-release
-backward compatibility promise while V itself is pre-1.0.
+backward compatibility promise while V itself is pre-1.0. Compile anything
+performance-sensitive with `v -prod`: V's default `tcc` backend is 20–50×
+slower on this library's crypto hot paths (a chacha20-poly1305 bulk transfer
+measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
 
 ## Quick start
 
@@ -49,9 +52,9 @@ explicit way to build the same value).
 
 The module deliberately exports only this surface: `Conn`, `dial()`, `Config`
 (plus the `default_config()` helper) and the `TrustStore` used to populate
-`Config.root_cas`. Everything else — the record layer, wire codec, key schedule,
-handshake state machine, and X.509/ASN.1 parsing — is module-private
-implementation detail, not part of the API contract.
+`Config.root_cas`. Everything else — the record layer, wire codec, key
+schedule, handshake state machine, and X.509/ASN.1 parsing — is
+module-private implementation detail, not part of the API contract.
 
 ## Architecture
 
@@ -61,9 +64,9 @@ map is in [`docs.md`](docs.md)):
 
 | Source area      | Responsibility                                                               |
 |------------------|-----------------------------------------------------------------------------|
-| `conn`, `config` | The **entire public API**: `dial()`, `Conn` (read/write/close, `server_name`/`negotiated_alpn`), `Config` + `default_config()`, `TrustStore` — all else is module-private |
+| `conn`, `config` | The **public API** for TCP: `dial()`, `Conn` (read/write/close, `server_name`/`negotiated_alpn`), `Config` + `default_config()`, `TrustStore` |
 | `messages`, `state_machine`, `handshake_keys`, `aead`, `certificate_verify` | Message codecs, the handshake state machine, §7.1 adapter, AEAD primitives |
-| `record`, `alert`, `cipher_state` | Record layer (RFC 8446 §5), alerts (§6), per-direction cipher state |
+| `record`, `alert`, `cipher_state` | Record layer (RFC 8446 §5) including minimal QUIC passthrough framing (RFC 9001 §4), alerts (§6), per-direction cipher state |
 | `key_schedule`, `transcript` | HKDF key schedule (§7.1) and the running transcript hash                     |
 | `x509`, `asn1`, `validator`, `hostname`, `trust_store`, `rsa` | X.509/ASN.1 parsing, chain validation, hostname matching, trust store |
 | `reader`, `writer` | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)       |
@@ -148,6 +151,9 @@ the all-zero one.
 - Post-handshake record reassembly across fragmented records (fine for
   NewSessionTicket/KeyUpdate, which servers send one-per-record)
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
+- A QUIC transport stack (RFC 9001) — packet building, header protection,
+  number spaces, and `connection_close` signaling are out of scope; the record
+  module only carries the passthrough framing helpers a QUIC adapter needs
 - A server mode — this crate is client-only
 
 ## Testing
@@ -184,6 +190,7 @@ proven by the state-machine tests above.
 
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) — TLS 1.3
 - [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448) — test vectors
+- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (§4 framing helpers only)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
 - [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017) — RSA (PKCS#1 v1.5 / PSS)

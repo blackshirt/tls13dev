@@ -62,8 +62,8 @@ The module deliberately exports only:
 
 | Symbol | Kind | Purpose |
 |---|---|---|
-| `dial()` | function | Open a connection and run the handshake |
-| `Conn` | struct | The protected stream (`read` / `write` / `close`) |
+| `dial()` | function | Open a TCP connection and run the TLS 1.3 handshake |
+| `Conn` | struct | The TCP protected stream (`read` / `write` / `close`) |
 | `Config` | struct | Caller-facing dial options (`@[params]`) |
 | `default_config()` | function | Explicit conservative `Config` constructor |
 | `TrustStore` | struct | Custom root-CA set for `Config.root_cas` |
@@ -83,7 +83,8 @@ with the authoritative description of its role; this table summarizes it.
    caller
       ▼
  ┌───────────────────────────────┐
- │ conn.v · config.v             │  public API: dial() · Conn · Config
+ │ conn.v · tcp_transport.v ·    │  public API: dial() · Conn (TCP) ·
+ │ config.v                      │  Config · TrustStore
  ├───────────────────────────────┤
  │ state_machine.v               │  handshake sequencing, key ratchet
  ├───────────────────────────────┤
@@ -95,7 +96,8 @@ with the authoritative description of its role; this table summarizes it.
  │ key_schedule · handshake_keys │  · HKDF §7.1 ladder
  │ · cipher_state · aead         │  · per-direction AEAD state
  ├───────────────────────────────┤
- │ record · alert                │  record framing & reassembly, alerts
+ │ record · alert                │  record framing & reassembly (TCP ·
+ │                               │  QUIC passthrough), alerts
  ├───────────────────────────────┤
  │ reader.v · writer.v           │  bounds-checked wire codec
  └───────────────────────────────┘
@@ -104,13 +106,13 @@ with the authoritative description of its role; this table summarizes it.
 | Layer | Files | Responsibility |
 |---|---|---|
 | Wire codec | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
-| Record layer | `record.v`, `alert.v`, `cipher_state.v`, `aead.v` | Record framing and reassembly (§5), alert protocol enums + wire encoding (§6), per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. |
+| Record layer | `record.v`, `alert.v`, `cipher_state.v`, `aead.v` | Record framing and reassembly (§5), plus the minimal recordless QUIC passthrough framing (RFC 9001 §4: `passthrough_wrap` / `next_passthrough_message` extract self-framed handshake messages straight from a CRYPTO byte stream), alert protocol enums + wire encoding (§6), per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. |
 | Handshake messaging | `messages.v`, `transcript.v` | RFC 8446 §4 structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history. |
 | Key schedule | `key_schedule.v`, `handshake_keys.v` | HKDF-Extract/Expand ladder over (EC)DHE and traffic-secret stages (§7.1); `handshake_keys.v` adapts those pure derivations plus the offered-group policy to the handshake flow — it never touches the transcript or advances state. |
 | Signature check | `certificate_verify.v` | Verifies the server's CertificateVerify over the §4.4.3 transcript content; a pure function of (leaf key, signature, content). |
 | PKI | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. |
-| State machine | `state_machine.v` | Sequences the client handshake: drives codecs, AEAD, key schedule, signature verification, and the validator; owns no socket — `conn.v` feeds records through it. Scrubs handshake secrets and both ephemeral private keys the moment `.connected` makes them dead weight, and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene). |
-| Public API | `conn.v`, `config.v` | `dial()` + `Conn` (socket I/O, record buffering, post-handshake handling) and `Config` options. |
+| State machine | `state_machine.v` | Sequences the client handshake; owns the key ratchet and speaks raw handshake messages at its boundary (framing / AEAD / CCS are the TCP transport's concern). Owns no socket. Scrubs handshake secrets and both ephemeral private keys the moment `.connected` makes them dead weight, and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene). |
+| TCP transport | `conn.v`, `tcp_transport.v`, `config.v` | `conn.v` owns the public `dial()` entry, the `Conn` type, its read/write/close path, and the do_handshake that bridges the recordless core to the record-layer wire; `tcp_transport.v` isolates the framing/batching/CCS mechanics — reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, and the §5.5 per-key record-limit enforcement. |
 
 ### 1.3 Data flow of `dial()`
 
@@ -205,7 +207,8 @@ Behavior and guarantees:
 - **Timeouts** — `config.timeout` (or 30 s when unset/zero) is applied to both
   socket directions before the handshake, so a stalled peer cannot hang `dial()`.
 - **Trust anchors, by precedence** — explicit `config.root_cas` is used as-is;
-  else the system CA bundle is loaded (a load failure is a dial error), unless
+  else the system CA bundle is loaded — parsed once per process, then cached for
+  every later `dial()` (a load failure is a dial error) — unless
   `insecure_skip_verify` is set, in which case an empty store suffices.
 - <span style="color:#2ea44f">**No fd leaks**</span> — any handshake failure closes the socket it opened before
   returning the error; a half-connected `Conn` is never returned.
@@ -328,7 +331,7 @@ build one up front from `default_config()`).
 | `server_name` | `''` | SNI and certificate hostname verification target. Empty ⇒ derived from the dial address. Must match the server's certificate (SAN dNSName / IP, CN fallback per RFC 6125). |
 | `alpn` | `[]` (none offered) | Application protocols to offer, in preference order (e.g. `['h2', 'http/1.1']`). The server's pick is verified against this list. |
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
-| `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is loaded and parsed on every dial — supply a populated `root_cas` to amortize that cost across connections. |
+| `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]
@@ -344,7 +347,7 @@ pub fn default_config(server_name string) Config
 
 Builds a fully-populated, deliberately conservative `Config`: verification
 strictly on, no ALPN offer (server picks its default), system roots (the
-`root_cas` slot stays `none`; `dial()` loads the OS bundle). `alpn` and
+`root_cas` slot stays `none`; `dial()` uses the cached system bundle). `alpn` and
 `timeout` inherit their declared field defaults.
 
 ```v
@@ -411,7 +414,8 @@ was found. Paths probed, in order:
 | `/etc/ssl/cert.pem` | Alpine / macOS |
 
 `dial()` calls this automatically when `Config.root_cas` is unset and
-verification is on.
+verification is on — via a process-wide cache, so the bundle is parsed once
+per process rather than once per connection.
 
 ---
 

@@ -2,9 +2,10 @@
 //
 // Record layer tests: wire framing round-trips through serialize/parse, the
 // AEAD cipher state encrypts and decrypts in sequence-number lockstep across
-// records, a single flipped ciphertext byte must fail the tag check, and the
+// records, a single flipped ciphertext byte must fail the tag check, the
 // §5.5 per-key record limit plus the §5.2 inner-plaintext shape are refused
-// rather than mishandled.
+// rather than mishandled, and the recordless QUIC passthrough framing
+// (RFC 9001 §4) reassembles CRYPTO streams to the same bounds.
 module tls
 
 import crypto.aes
@@ -256,6 +257,79 @@ fn test_record_uninitialized_cipher_state_fails_closed() ! {
 
 	uninit.encrypt_record(.application_data, 'data'.bytes()) or {
 		assert err.msg().contains('cipher state not initialized')
+		return
+	}
+	assert false
+}
+
+// ---- QUIC passthrough framing (RFC 9001 §4) --------------------------------
+
+// test_passthrough_wrap_handshake_identity: over QUIC the handshake message
+// bytes reach CRYPTO frames unchanged — passthrough_wrap must be the identity
+// for .handshake (contrast new_record, which prepends a 5-byte record header).
+fn test_passthrough_wrap_handshake_identity() ! {
+	msg := [u8(0x14), 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd] // Finished, len 4
+	out := passthrough_wrap(.handshake, msg)!
+	assert out == msg
+}
+
+// test_passthrough_wrap_rejects_non_crypto_content: only handshake bytes have
+// a CRYPTO carrier; application data rides STREAM frames, alerts become
+// connection_close, and CCS is never sent — none may be misrouted onto the
+// CRYPTO path.
+fn test_passthrough_wrap_rejects_non_crypto_content() ! {
+	passthrough_wrap(.application_data, [u8(0x01)]) or {
+		assert err.msg().contains('does not travel in QUIC CRYPTO frames')
+		return
+	}
+	assert false
+}
+
+// test_next_passthrough_message_reassembles_fragments: a handshake message
+// split across CRYPTO-frame arrivals yields empty ("await more") until the
+// final fragment lands, then exactly the full message (header included) is
+// consumed and nothing else is touched.
+fn test_next_passthrough_message_reassembles_fragments() ! {
+	mut buf := [u8(0x08), 0x00, 0x00] // EncryptedExtensions, declared len 5; header short
+	assert next_passthrough_message(mut buf)!.len == 0
+	assert buf.len == 3
+
+	buf << u8(0x05) // header complete, body missing
+	assert next_passthrough_message(mut buf)!.len == 0
+	assert buf.len == 4
+
+	buf << [u8(0x01), 0x02, 0x03, 0x04, 0x05]
+	msg := next_passthrough_message(mut buf)!
+	assert msg.len == 9
+	assert msg[0] == u8(0x08)
+	assert msg[8] == u8(0x05)
+	assert buf.len == 0
+}
+
+// test_next_passthrough_message_splits_coalesced: two messages delivered in
+// one run of CRYPTO bytes are extracted one at a time, the remainder staying
+// buffered — the recordless twin of records coalesced into one TCP read.
+fn test_next_passthrough_message_splits_coalesced() ! {
+	mut buf := [u8(0x08), 0x00, 0x00, 0x01, 0xaa, 0x14, 0x00, 0x00, 0x02, 0xbb, 0xcc]
+
+	first := next_passthrough_message(mut buf)!
+	assert first.len == 5
+	assert first[0] == u8(0x08)
+	assert buf.len == 6
+
+	second := next_passthrough_message(mut buf)!
+	assert second.len == 6
+	assert second[0] == u8(0x14)
+	assert buf.len == 0
+}
+
+// test_next_passthrough_message_rejects_oversized_length: the declared length
+// must fail at the header, before further fragments can be buffered toward a
+// gigantic message — the same DoS cap parse_record enforces for TCP records.
+fn test_next_passthrough_message_rejects_oversized_length() ! {
+	mut buf := [u8(0x08), 0xff, 0xff, 0xff, 0x00] // declares ~16 MiB
+	next_passthrough_message(mut buf) or {
+		assert err.msg().contains('exceeds maximum')
 		return
 	}
 	assert false

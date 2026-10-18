@@ -3,6 +3,11 @@
 // trust_store.v loads and indexes trusted root CA certificates, seeding the
 // verifier's chain-of-trust check from the host's system trust bundle so leaf
 // certificates can be anchored back to a known-good root.
+//
+// This file is annotated @[has_globals] for one purpose: the process-wide
+// parsed-bundle cache (cached_system_roots) below. V rejects __global in
+// normal files, so the attribute opts this file in explicitly.
+@[has_globals]
 module tls
 
 import encoding.base64
@@ -91,4 +96,31 @@ pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 		}
 	}
 	return error('trust_store: no system root CA bundle found')
+}
+
+// cached_system_roots memoizes the parsed system trust bundle for the lifetime
+// of the process. Parsing a typical ~150-root host bundle is the single most
+// expensive step of a dial (tens of milliseconds), yet its contents are a
+// read-only property of the machine, so re-parsing it for every connection is
+// pure waste. The update is deliberately lock-free: two concurrent first dials
+// may both parse, and the loser's identical result overwrites the winner's —
+// a benign race, because both copies describe the same on-disk file. Every
+// caller receives a private clone via system_root_cas(), so mutating the
+// returned store can never touch the cache.
+__global cached_system_roots []Certificate
+
+// system_root_cas returns a TrustStore backed by the process-wide parsed
+// system bundle, parsing it on first use. dial() uses this instead of
+// load_system_ca_bundle() so an application that opens many connections pays
+// the bundle parse once per process rather than once per connection. The
+// returned store is a private clone, safe for the caller to mutate.
+fn system_root_cas() !TrustStore {
+	if cached_system_roots.len == 0 {
+		mut loader := new_trust_store()
+		loader.load_system_ca_bundle()!
+		cached_system_roots = loader.certs
+	}
+	mut ts := new_trust_store()
+	ts.certs = cached_system_roots.clone()
+	return ts
 }
