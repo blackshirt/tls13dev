@@ -233,7 +233,7 @@ fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 }
 
 // parse_handshake_header reads the 4-byte header from a reader. Pub so the
-// record-layer adapter can dispatch post-handshake messages through the same
+// TCP adapter can dispatch post-handshake messages through the same
 // framing the core uses; the bytes it reads are handshake-message framing,
 // which both transports share.
 pub fn parse_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
@@ -717,7 +717,7 @@ fn parse_encrypted_extensions(body []u8) !string {
 
 // parse_key_update decodes a KeyUpdate body (RFC 8446 §4.6.3) and reports
 // whether the sender requested that we also update our keys.
-// Wire enum: update_not_requested(0), update_requested(1). Pub so the record
+// Wire enum: update_not_requested(0), update_requested(1). Pub so the TCP
 // adapter can parse the post-handshake message its transport decrypted; the
 // ratchet itself is the core's (update_read/write_traffic_keys).
 pub fn parse_key_update(body []u8) !bool {
@@ -749,8 +749,9 @@ mut:
 }
 
 // parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1).
-// Pub so the record adapter can collect tickets; whether to keep them at all
-// is adapter policy (a QUIC engine discards them, RFC 9001 §4.2).
+// Pub so the TCP adapter can collect tickets; whether to keep them at all
+// is adapter policy — resumption itself stays unimplemented, and ticket
+// storage belongs to the stack above this core (RFC 9001 §4.5).
 pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	mut r := wire.new_reader(body)
 	lifetime := r.read_u32()!

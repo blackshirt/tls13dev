@@ -34,7 +34,7 @@ pub fn next_passthrough_message(mut buf []u8) ![]u8 {
 	}
 	msg_len := (int(buf[1]) << 16) | (int(buf[2]) << 8) | int(buf[3])
 	if msg_len > max_handshake_message_len {
-		return error('record: handshake message length ${msg_len} exceeds maximum ${max_handshake_message_len}')
+		return error('handshake: message length ${msg_len} exceeds maximum ${max_handshake_message_len}')
 	}
 	total := 4 + msg_len
 	if buf.len < total {

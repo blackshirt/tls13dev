@@ -44,8 +44,9 @@ mut:
 	server_app_cipher RecordCipherState // AEAD state for records the server sends under app keys
 	client_app_cipher RecordCipherState // AEAD state for records we send under app keys
 	// session_tickets holds the NewSessionTicket backlog the core parses but does
-	// not keep: resumption is adapter/upper-layer policy (QUIC discards tickets
-	// per RFC 9001 §4.2), so the queue lives on the TLS Conn, bounded below.
+	// not keep: resumption is adapter/upper-layer policy (RFC 9001 §4.5 leaves
+	// ticket storage to the stack above the handshake core), so the queue lives
+	// on the TLS Conn, bounded below.
 	session_tickets   []handshake.NewSessionTicket
 	recv_buf          []u8        // raw bytes read from the socket, framing not yet applied
 	recv_pos          int         // start of unconsumed data in recv_buf (prefix is already parsed)
@@ -246,8 +247,8 @@ fn (mut c Conn) do_handshake() ! {
 							// The only handshake-phase message the client sends once the server
 							// keys are up is its Finished, which travels under the client
 							// handshake keys (RFC 8446 §7.1). The core's application keys are
-							// cached but not installed yet, so the record sequence numbers and
-							// nonces are byte-identical to the pre-refactor path.
+							// cached but not installed yet, so this record simply continues
+							// the handshake-key sequence — no key change happens mid-flight.
 							enc := c.client_hs_cipher.encrypt_record(.handshake, m.msg)!
 							c.write_records([enc])!
 						}

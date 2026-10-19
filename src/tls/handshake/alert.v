@@ -4,8 +4,9 @@
 // AlertLevel/AlertDescription enums and their wire encoding. The enums are
 // shared transport vocabulary — the TLS record layer frames alerts as records
 // (that framing lives in tls' alert_record), while QUIC never carries an alert
-// on the handshake stream and instead maps the description to a
-// tls_alert(n) connection-close code via quic_connection_error (RFC 9001 §4.20).
+// on the handshake stream and instead maps the description to a CRYPTO_ERROR
+// connection-close code (0x100 + description) via quic_connection_error
+// (RFC 9001 §4.8).
 module handshake
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).
@@ -62,13 +63,13 @@ pub fn (a Alert) encode() []u8 {
 // parse_alert decodes a 2-byte alert payload.
 pub fn parse_alert(data []u8) !Alert {
 	if data.len != 2 {
-		return error('record: alert payload must be exactly 2 bytes, got ${data.len}')
+		return error('handshake: alert payload must be exactly 2 bytes, got ${data.len}')
 	}
 	level := match data[0] {
 		1 { AlertLevel.warning }
 		2 { AlertLevel.fatal }
 		else {
-			return error('record: invalid alert level ${data[0]}')
+			return error('handshake: invalid alert level ${data[0]}')
 		}
 	}
 	// The cast is unsafe on purpose: the received byte may be a description this
@@ -81,8 +82,8 @@ pub fn parse_alert(data []u8) !Alert {
 	}
 }
 
-// quic_connection_error maps an alert to the QUIC tls_alert(n) application
-// error code (RFC 9001 §4.20): a peer closing a connection because of this
+// quic_connection_error maps an alert to the QUIC CRYPTO_ERROR application
+// error code (RFC 9001 §4.8): a peer closing a connection because of this
 // alert signals 0x100 plus the alert description byte. Over QUIC alerts never
 // travel on the handshake stream — the record layer's job of decrypting and
 // routing an inner alert simply does not exist — so this mapping is the whole

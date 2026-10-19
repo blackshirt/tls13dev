@@ -315,7 +315,7 @@ fn (mut h ClientHandshake) set_hash_algo(algo HashAlgorithm) {
 // HelloRetryRequest: identical to the first except key_share (when a new group
 // was requested) and cookie (when supplied) — RFC 8446 §4.1.2. Like
 // create_client_hello it returns the raw message, level-tagged .initial (over
-// QUIC the retry rides the Initial CRYPTO stream, RFC 9001 §4.1.1); the
+// QUIC the retry rides the Initial CRYPTO stream, RFC 9001 §4.1.3); the
 // transport frames it and repeats the dummy CCS only on the TCP path.
 fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]HandshakeMessage {
 	if change_group {
@@ -464,7 +464,7 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 // the peer's bytes triggered (retry ClientHello at .initial, client Finished at
 // .handshake). Decryption is never seen here; alert routing belongs to the
 // adapter, which is why over QUIC alerts need no CRYPTO path at all (they
-// become tls_alert(n) connection-close codes, RFC 9001 §4.20).
+// become CRYPTO_ERROR connection-close codes, RFC 9001 §4.8).
 pub fn (mut h ClientHandshake) feed(level SecretLevel, bytes []u8) ![]HandshakeMessage {
 	match level {
 		.initial {
@@ -476,7 +476,7 @@ pub fn (mut h ClientHandshake) feed(level SecretLevel, bytes []u8) ![]HandshakeM
 			return h.drain_handshake()
 		}
 		.application {
-			return error('handshake: application-level bytes are post-handshake traffic; parse them with handle_post_handshake (RFC 9001 §4.2/§4.6)')
+			return error('handshake: application-level bytes are post-handshake traffic; parse them with handle_post_handshake (RFC 8446 §4.6)')
 		}
 	}
 }
@@ -567,7 +567,7 @@ pub fn (h &ClientHandshake) buffered_bytes(level SecretLevel) int {
 // the handshake level, so the handshake-stage traffic secrets and cached keys
 // can be destroyed. The TCP Conn calls it right after sending its Finished;
 // a QUIC engine must call it only once the handshake is confirmed per RFC 9001
-// §4.1.1/§4.9.2, since a peer may still send at Handshake level until then —
+// §4.1.2/§4.9.2, since a peer may still send at Handshake level until then —
 // that is why the ServerHello-time zeroization deliberately stops short of
 // this material.
 pub fn (mut h ClientHandshake) confirm_handshake() {
@@ -588,7 +588,7 @@ pub fn (mut h ClientHandshake) confirm_handshake() {
 // §5.1 "quic key" / "quic iv" / "quic hp" labels — secrets cross this boundary,
 // not TrafficKeys. Handshake-stage secrets and keys are deliberately retained
 // past .connected until confirm_handshake(), because a QUIC peer may still send
-// at Handshake level until the handshake is confirmed (RFC 9001 §4.1.1);
+// at Handshake level until the handshake is confirmed (RFC 9001 §4.1.2);
 // application secrets live from the server Finished until close.
 // .initial derives from the destination connection ID (§5.2), not the TLS
 // schedule, and is rejected.
@@ -760,7 +760,7 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 // KeyUpdate notice to go out under the old keys, so callers update after sending
 // and then rebuild their write protection — a TLS adapter restarts its record
 // sequence number at 0 (§5.3), while a QUIC adapter deliberately does NOT reset
-// packet numbers (RFC 9001 §6.1); this split is what makes that choice possible.
+// packet numbers (RFC 9000 §12.3); this split is what makes that choice possible.
 pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
 	h.client_ap_traffic = hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
 	h.client_app_keys = derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
@@ -774,7 +774,7 @@ pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
 // single success choke point (.connected). It deliberately does NOT touch the
 // handshake traffic secrets or cached handshake TrafficKeys — a QUIC adapter may
 // still protect packets at Handshake level until the handshake is confirmed, so
-// those survive until confirm_handshake() (RFC 9001 §4.1.1/§4.9.2). KeyUpdate
+// those survive until confirm_handshake() (RFC 9001 §4.1.2/§4.9.2). KeyUpdate
 // ratchets only *_ap_traffic, never the values cleared here.
 fn (mut h ClientHandshake) zeroize_handshake_secrets() {
 	// Scrub the buffer in place before releasing it: merely reassigning the slice

@@ -4,9 +4,8 @@
 // extracts one complete 4-byte-headered handshake message at a time from a
 // buffer that may hold fragments or coalesced messages, awaiting more bytes
 // until a full frame is present and capping the declared length before it can
-// drive a gigantic allocation. These moved with the primitive from tls'
-// record_test.v when the passthrough reassembly became part of the importable
-// handshake core (the QUIC engine reuses exactly this plumbing).
+// drive a gigantic allocation. They live in the importable handshake core
+// because a QUIC engine reuses exactly this plumbing.
 module handshake
 
 fn test_next_passthrough_message_reassembles_fragments() ! {

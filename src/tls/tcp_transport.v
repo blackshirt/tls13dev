@@ -4,10 +4,10 @@
 // handshake/application bytes into the length-prefixed records of RFC 8446 §5,
 // batches a flight's records into a single socket push, and reassembles records
 // from the TCP byte stream (which may split or coalesce them arbitrarily). The
-// handshake core (state_machine.v) speaks only raw messages; this file is the
-// sole place those messages become wire records on the TCP path. The recordless
-// QUIC framing (record.v, RFC 9001 §4) uses none of it — QUIC has no TLS
-// record layer.
+// handshake core (tls.handshake's state_machine.v) speaks only raw messages;
+// this file is the sole place those messages become wire records on the TCP
+// path. The recordless QUIC framing (tls.handshake's passthrough.v, RFC 9001 §4)
+// uses none of it — QUIC has no TLS record layer.
 module tls
 
 import tls.wire

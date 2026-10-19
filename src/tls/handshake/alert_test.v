@@ -1,12 +1,12 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Alert vocabulary tests, now against the transport-neutral home of the enums
+// Alert vocabulary tests against the transport-neutral home of the enums
 // (tls.handshake): the RFC 8446 §6.2 2-byte alert payload round-trips through
 // encode/parse_alert with its wire bytes pinned literally, malformed framing
 // (wrong length, unknown level) is rejected, an unenumerated description byte
-// is preserved verbatim, and the QUIC mapping turns a description into its
-// tls_alert(n) connection-close code (RFC 9001 §4.20). The record framing of an
-// alert (a TLS-only concern) is tested in tls' alert_test.v.
+// is preserved verbatim, and the QUIC mapping turns a description into a
+// CRYPTO_ERROR connection-close code (RFC 9001 §4.8). The record framing of an
+// alert (a TLS-only concern) is tested in tls' record_test.v.
 module handshake
 
 fn test_alert_close_notify_roundtrip() ! {
@@ -52,7 +52,7 @@ fn test_parse_alert_preserves_unknown_description() ! {
 }
 
 fn test_quic_connection_error_mapping() ! {
-	// RFC 9001 §4.20: an alert surfaces over QUIC as 0x100 + the description
+	// RFC 9001 §4.8: an alert surfaces over QUIC as 0x100 + the description
 	// byte. close_notify(0) → 0x100, handshake_failure(40) → 0x128.
 	assert AlertDescription.close_notify.quic_connection_error() == u32(0x100)
 	assert AlertDescription.handshake_failure.quic_connection_error() == u32(0x128)

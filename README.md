@@ -26,7 +26,7 @@ measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
 ## Quick start
 
 ```bash
-v test all                 # unit tests across all four modules
+v test .                   # unit tests across all four modules
 v run src/example/dial_example.v       # live demo: handshake + HTTP GET over TLS
 ```
 
@@ -72,7 +72,7 @@ tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
 
 | Module          | Responsibility                                                                              |
 |-----------------|---------------------------------------------------------------------------------------------|
-| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `alert`, `cipher_state`, `tcp_transport` |
+| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `cipher_state`, `tcp_transport` |
 | `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC passthrough framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
 | `tls.pki`       | Trust & parsing: `asn1`, `x509`, `validator`, `hostname`, `trust_store`, `rsa`              |
 | `tls.wire`      | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)                       |
@@ -81,7 +81,8 @@ Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
 only of certificates, and `tls.handshake` owns **no record, cipher, or socket
 concept** — a grep gate over `src/tls/handshake/` (`Record`, `RecordCipherState`,
 `ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
-`conn.v` in the `tls` module is the reference adapter that drives the core.
+`conn.v`/`tcp_transport.v` in the `tls` module are the reference adapter that
+drives the core.
 
 ### Adapter contract
 
@@ -195,14 +196,14 @@ the all-zero one.
   handshake core is nonetheless built to be driven over QUIC: it lives in the
   importable `tls.handshake` module (with the passthrough framing helpers, the
   level-tagged `feed`/`traffic_keys`/`exported_secrets` seam, and the
-  `AlertDescription → tls_alert(n)` mapping), so a QUIC engine needs only
-  `tls.handshake` + `tls.pki` and never imports `tls`
+  `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
+  only `tls.handshake` + `tls.pki` and never imports `tls`
 - A server mode — this crate is client-only
 
 ## Testing
 
 ```
-v test all
+v test .
 ```
 
 covers: wire framing and bounds, record round trips and AEAD tamper
@@ -233,7 +234,8 @@ proven by the state-machine tests above.
 
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) — TLS 1.3
 - [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448) — test vectors
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 framing helpers, §4.1 secret levels, §4.2 alert→error mapping)
+- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 framing helpers, §4.1 secret levels, §4.8 alert→error mapping)
+- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport (packet-number spaces and the never-reset rule cited from the adapter seam)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
 - [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017) — RSA (PKCS#1 v1.5 / PSS)

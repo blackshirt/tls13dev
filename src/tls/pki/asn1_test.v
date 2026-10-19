@@ -5,8 +5,8 @@
 // framing (truncated header, DER-illegal indefinite length, non-minimal long
 // form, a declared length beyond what is buffered) instead of over-reading;
 // parse_sequence walks child TLVs in order and yields an empty list for empty
-// input. Only parse_oid was covered previously (in pki_test.v); these fill the
-// TLV/length paths.
+// input. pki_test.v covers parse_oid's basic decoding (this file adds its edge
+// inputs too); these fill the TLV/length paths.
 module pki
 
 import tls.wire

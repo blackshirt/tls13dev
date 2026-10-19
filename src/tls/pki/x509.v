@@ -1,8 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// x509.v decodes DER-encoded X.509 v3 certificates into a Cert, pulling out the
-// subject/issuer names, validity window, public key, signature algorithm, and the
-// SAN/basic-constraints extensions that validator.v and hostname.v consume.
+// x509.v decodes DER-encoded X.509 v3 certificates into a Certificate, pulling
+// out the subject/issuer names, validity window, public key, signature
+// algorithm, and the SAN/basic-constraints extensions that validator.v and
+// hostname.v consume.
 module pki
 
 import crypto.ecdsa
