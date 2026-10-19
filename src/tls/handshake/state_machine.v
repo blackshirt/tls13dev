@@ -732,7 +732,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			if h.server_certs.len == 0 {
 				return error('handshake: missing server certificate for verification')
 			}
-			verify_certificate_verify(h.server_certs[0], cv, signed_content)!
+			verify_certificate_verify(leaf_key(h.server_certs[0]), cv, signed_content)!
 			h.state = .wait_server_finished
 		}
 		.finished {

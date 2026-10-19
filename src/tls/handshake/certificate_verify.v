@@ -6,9 +6,44 @@
 // advances protocol state.
 module handshake
 
+import crypto.ecdsa
 import crypto.ed25519
 import crypto.sha512
 import tls.pki
+
+// LeafKey is the slice of a certificate that CertificateVerify verification
+// consumes: key algorithm, curve and raw point bytes, and the optional parsed
+// RSA key. Splitting it out from pki.Certificate (whose construction is gated
+// by @[noinit], instances coming only from parse_certificate) keeps
+// verify_certificate_verify a pure function of its three arguments and lets the
+// policy tests pin keyless or mismatched leaves directly.
+struct LeafKey {
+	public_key_algo pki.PublicKeyAlgorithm
+	ecdsa_curve     ecdsa.Nid
+	rsa_public_key  ?pki.RsaPublicKey
+	public_key_raw  []u8
+}
+
+// leaf_key extracts the key material verify_certificate_verify consumes from a
+// parsed certificate.
+fn leaf_key(c pki.Certificate) LeafKey {
+	return LeafKey{
+		public_key_algo: c.public_key_algo
+		ecdsa_curve:     c.ecdsa_curve
+		rsa_public_key:  c.rsa_public_key
+		public_key_raw:  c.public_key_raw
+	}
+}
+
+// ecdsa_public_key reconstructs the ECDSA public key from the stored curve and
+// raw 0x04||X||Y point bytes — the same reconstruction
+// pki.Certificate.ecdsa_public_key performs for parsed certificates.
+fn (k LeafKey) ecdsa_public_key() !ecdsa.PublicKey {
+	if k.public_key_raw.len == 0 {
+		return error('handshake: empty ECDSA public key')
+	}
+	return ecdsa.PublicKey.from_uncompressed_bytes(k.public_key_raw, nid: k.ecdsa_curve)!
+}
 
 // hash_for_digest returns Hash(data) for the named digest ("sha256"/"sha384"/"sha512").
 // RSA-PSS verifies over a pre-computed digest; the else arm handles sha512.
@@ -21,11 +56,11 @@ fn hash_for_digest(digest_type string, data []u8) []u8 {
 }
 
 // verify_certificate_verify checks the server's CertificateVerify signature
-// against the leaf certificate's public key over the §4.4.3 signed content
-// (see certificate_verify_signed_content). RSA branches hash the content first
-// and verify a digest, while the ECDSA/Ed25519 APIs take the raw message and
-// hash internally per their own scheme.
-fn verify_certificate_verify(leaf pki.Certificate, cv ParsedCertificateVerify, signed_content []u8) ! {
+// against the leaf key material (extracted with leaf_key) over the §4.4.3
+// signed content (see certificate_verify_signed_content). RSA branches hash the
+// content first and verify a digest, while the ECDSA/Ed25519 APIs take the raw
+// message and hash internally per their own scheme.
+fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_content []u8) ! {
 	match cv.algorithm {
 		.rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 {
 			if leaf.public_key_algo != .rsa {

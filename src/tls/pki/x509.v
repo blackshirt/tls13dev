@@ -18,11 +18,17 @@ pub enum PublicKeyAlgorithm {
 	unknown
 }
 
-// Certificate represents a decoded X.509 certificate (RFC 5280).
+// Certificate represents a decoded X.509 certificate (RFC 5280). Instances come
+// from parse_certificate(); @[noinit] keeps other modules from fabricating one
+// whose fields disagree with what the parser would have produced — a forged SAN
+// list, raw/tbs_raw skew, or a has_* flag claiming an absent extension — and the
+// read-only `pub:` fields keep a delivered instance from being rewritten after
+// the fact: outside tls.pki a certificate is inspect-only, never mutable.
+@[noinit]
 pub struct Certificate {
-pub mut:
-	// These fields are read by the CertificateVerify check (tls module) and the
-	// chain/hostname validation inside this module.
+pub:
+	// Read-only outside tls.pki; consumed by the CertificateVerify check (the
+	// tls.handshake module) and the chain/hostname validation inside this module.
 	public_key_algo    PublicKeyAlgorithm
 	public_key_raw     []u8          // SubjectPublicKeyInfo BIT STRING contents
 	rsa_public_key     ?RsaPublicKey // set when public_key_algo is .rsa
