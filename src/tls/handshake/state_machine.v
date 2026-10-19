@@ -245,6 +245,13 @@ pub fn (h &ClientHandshake) negotiated_alpn() string {
 // middlebox-compatibility dummy ChangeCipherSpec are the TCP transport's job
 // (RFC 8446 App. D.4), so the core stays transport-neutral.
 pub fn (mut h ClientHandshake) create_client_hello() ![]u8 {
+	// A second call would replay the first ClientHello into the transcript a
+	// second time and silently corrupt every later hash; the retry ClientHello
+	// has its own path (build_second_client_hello, driven by HelloRetryRequest
+	// handling in feed()), so this entry point is single-shot.
+	if h.state != .start {
+		return error('handshake: create_client_hello() only runs once (state: ${h.state}); the retry ClientHello is produced by feed() during HelloRetryRequest handling')
+	}
 	// Pin random/session id now: build_client_hello would otherwise draw fresh
 	// ones per call, and §4.1.4 requires the retry ClientHello to be identical
 	// except key_share/cookie (while §4.1.3 compares the echo to config.session_id).
@@ -542,15 +549,50 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 // .handshake). Decryption is never seen here; alert routing belongs to the
 // adapter, which is why over QUIC alerts need no CRYPTO path at all (they
 // become CRYPTO_ERROR connection-close codes, RFC 9001 §4.8).
+// Contract misuse — feeding before create_client_hello(), Initial bytes outside
+// the ServerHello wait, or anything once the state machine has failed — is
+// refused with the state untouched so the caller can correct its sequencing.
+// Errors while parsing peer bytes instead set the terminal .failed state, and
+// each level's reassembly buffer is held to one maximum-size message plus its
+// header, so no input pattern can grow it without bound.
 pub fn (mut h ClientHandshake) feed(level SecretLevel, bytes []u8) ![]HandshakeMessage {
+	if h.state == .start {
+		return error('handshake: feed() before create_client_hello() — no ClientHello has been sent yet')
+	}
+	if h.state == .failed {
+		return error('handshake: state machine has failed; feed() refuses further messages')
+	}
 	match level {
 		.initial {
+			if h.state != .wait_server_hello {
+				return error('handshake: Initial-level bytes are only expected while awaiting ServerHello (state: ${h.state})')
+			}
 			h.initial_reassembly << bytes
-			return h.drain_initial()
+			out := h.drain_initial() or {
+				h.state = .failed
+				return err
+			}
+			// One feed may coalesce a consumed ServerHello with an oversized tail
+			// the loop no longer reaches; bound it even where drain cannot.
+			if h.initial_reassembly.len > 4 + max_handshake_message_len {
+				h.state = .failed
+				return error('handshake: Initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
+			}
+			return out
 		}
 		.handshake {
 			h.hs_reassembly << bytes
-			return h.drain_handshake()
+			out := h.drain_handshake() or {
+				h.state = .failed
+				return err
+			}
+			// Same bound for the Handshake level: late retransmits at .connected
+			// skip the drain loop, so the cap is the backstop.
+			if h.hs_reassembly.len > 4 + max_handshake_message_len {
+				h.state = .failed
+				return error('handshake: Handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
+			}
+			return out
 		}
 		.application {
 			return error('handshake: application-level bytes are post-handshake traffic; parse them with handle_post_handshake (RFC 8446 §4.6)')

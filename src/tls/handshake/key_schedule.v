@@ -64,7 +64,7 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 	// At most 255 blocks are reachable (one byte of counter); asking for more
 	// would wrap the counter and repeat a block (RFC 5869 §2.3).
 	if length > 255 * hash_len {
-		return error('hkdf_expand: requested length ${length} exceeds maximum (${255 * hash_len})')
+		return error('handshake: HKDF-Expand requested length ${length} exceeds maximum (${255 * hash_len})')
 	}
 	mut out := []u8{cap: length}
 	mut prev := []u8{} // T(0) is the empty string, so the first round has no prior block
@@ -108,10 +108,10 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 pub fn hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context []u8, length int) ![]u8 {
 	full_label := 'tls13 ' + label
 	if full_label.len > 255 {
-		return error('hkdf_expand_label: label too long')
+		return error('handshake: HKDF-Expand-Label label too long')
 	}
 	if context.len > 255 {
-		return error('hkdf_expand_label: context too long')
+		return error('handshake: HKDF-Expand-Label context too long')
 	}
 
 	mut hkdf_label := []u8{cap: 2 + 1 + full_label.len + 1 + context.len}

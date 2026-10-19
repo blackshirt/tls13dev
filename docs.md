@@ -210,7 +210,13 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
   every inbound and outbound message. `feed()` appends level-tagged bytes to a
   per-level reassembly buffer and consumes as many complete handshake messages
   as are available, returning the outbound messages ready to send (a retry
-  ClientHello at `.initial`, the client Finished at `.handshake`). A QUIC
+  ClientHello at `.initial`, the client Finished at `.handshake`). Misuse —
+  feeding before `create_client_hello()` (which is single-shot: a second call
+  would duplicate the ClientHello in the transcript), Initial bytes outside the
+  ServerHello wait, or anything after a failure — is a hard error, and a
+  protocol error while parsing peer bytes parks the machine in the terminal
+  `.failed` state that `feed()` refuses; each level's reassembly buffer is
+  capped at one maximum-size message. A QUIC
   adapter feeds reassembled CRYPTO-stream bytes per packet-number space
   directly; the TCP `Conn` strips record framing first and feeds the plaintext.
 - **Keys leave the core as `TrafficKeys`, never as ciphers.** The state machine

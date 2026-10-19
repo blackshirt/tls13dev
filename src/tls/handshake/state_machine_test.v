@@ -135,6 +135,81 @@ fn test_feed_rejects_out_of_order_message() ! {
 	assert false
 }
 
+// ---- feed() phase guards & failure semantics ----
+
+fn test_create_client_hello_only_runs_once() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	_ = h.create_client_hello()!
+	// A second call would inject a duplicate ClientHello into the transcript and
+	// poison every later hash with it — the single-shot entry point refuses.
+	h.create_client_hello() or {
+		assert err.msg().contains('only runs once')
+		assert h.state == .wait_server_hello
+		return
+	}
+	assert false
+}
+
+fn test_feed_before_client_hello_refused() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	// Nothing has been sent yet, so there is nothing for peer bytes to answer;
+	// the refusal is a contract error, not a failure — state stays .start.
+	h.feed(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
+		assert err.msg().contains('feed() before create_client_hello()')
+		assert h.state == .start
+		return
+	}
+	assert false
+}
+
+fn test_feed_initial_after_server_hello_refused() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	_ = h.create_client_hello()!
+	// The ServerHello wait is over: further Initial-level bytes have no legal
+	// meaning, and refusing them leaves the machine usable (state untouched).
+	h.state = .wait_encrypted_extensions
+	h.feed(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
+		assert err.msg().contains('while awaiting ServerHello')
+		assert h.state == .wait_encrypted_extensions
+		return
+	}
+	assert false
+}
+
+fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	_ = h.create_client_hello()!
+	// A ServerHello carrying a garbage body fails to parse; that failure is
+	// terminal, so the documented .failed state must actually be set ...
+	bad := wrap_hs(.server_hello, []u8{len: 8, init: 0x01})
+	h.feed(.initial, bad) or {
+		assert h.state == .failed
+		// ... and no later feed() may make progress against a dead machine.
+		h.feed(.initial, bad) or {
+			assert err.msg().contains('state machine has failed')
+			return
+		}
+		assert false
+		return
+	}
+	assert false
+}
+
+fn test_feed_reassembly_is_bounded_after_connected() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	_ = h.create_client_hello()!
+	// Late Handshake-level retransmits after .connected skip the drain loop, so
+	// without the cap an unbounded stream would park in hs_reassembly; the cap
+	// must trip first and fail the machine rather than grow memory.
+	h.state = .connected
+	h.feed(.handshake, []u8{len: 4 + max_handshake_message_len + 1, init: 0xAA}) or {
+		assert err.msg().contains('reassembly exceeds')
+		assert h.state == .failed
+		return
+	}
+	assert false
+}
+
 // ---- traffic_keys / exported_secrets lifecycle (white-box) ----
 
 fn test_traffic_keys_unavailable_before_derivation() ! {
