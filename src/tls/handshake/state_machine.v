@@ -20,12 +20,10 @@ import tls.pki
 import tls.wire
 
 // ─── How QUIC support is implemented ────────────────────────────────────────
-// QUIC support is not a separate code path inside this module: the core is
-// transport-neutral by construction, and a QUIC engine drives it through the
-// same pub seam the TCP adapter uses — importing tls.handshake (+ tls.pki for
-// trust anchors) and never importing tls at all. The whole integration is the
-// following engine-side loop; nothing here mentions records, cipher states,
-// or sockets:
+// Not a separate code path: an engine imports tls.handshake (+ tls.pki for
+// trust anchors), never tls, and drives the same pub contract named above.
+// The whole integration is the loop below — no records, cipher states, or
+// sockets anywhere in it:
 //
 //  1. Construct — new_client_handshake(server_name, alpn, validator), exactly
 //     as conn.v does. Initial packet keys are NOT part of the TLS key
@@ -76,11 +74,9 @@ import tls.wire
 //     the TCP adapter's handle_post_handshake consumes. A KeyUpdate on that
 //     stream is a connection error, per item 7.
 //
-// The TCP adapter (conn.v/tcp_transport.v) is the reference implementation of
-// this loop's TLS-shaped twin: one ordered record stream instead of three
-// CRYPTO streams, records instead of packets, "traffic upd" KeyUpdate instead
-// of Key Phase — which is exactly why the seam above carries no transport
-// concept at all.
+// The TCP adapter (conn.v/tcp_transport.v) is this loop's TLS-shaped twin:
+// one ordered record stream instead of three CRYPTO streams, records instead
+// of packets, "traffic upd" KeyUpdate instead of Key Phase.
 
 // HandshakeState tracks client progress. The wait_* order mirrors the fixed
 // post-ServerHello server flight (EncryptedExtensions → Certificate →
@@ -823,7 +819,7 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 // next generation (TLS KeyUpdate, RFC 8446 §7.2) and refreshes the cached write
 // TrafficKeys, mirroring update_read_traffic_keys. §4.6.3 still requires the
 // KeyUpdate notice to go out under the old keys, so callers update after sending
-// and then rebuild their write protection — the TLS adapter restarts its record
+// and then rebuild their write protection — the TCP adapter restarts its record
 // sequence number at 0 (§5.3). Like its read twin this is the TLS record path
 // only: QUIC forbids TLS KeyUpdate entirely (RFC 9001 §6) and updates packet
 // keys with its own Key Phase mechanism below this layer.

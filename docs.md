@@ -188,7 +188,11 @@ the client `Finished` is accepted by the server and the state reports
 
 `tls.handshake`'s `ClientHandshake` is the `pub` seam both the TCP record layer
 and an external QUIC engine drive. All framing and encryption decisions stay
-adapter-side; the core only sequences messages and ratchets keys.
+adapter-side; the core only sequences messages and ratchets keys. The
+`state_machine.v` file preamble carries the step-by-step walkthrough of the
+QUIC engine's side of this contract — construction, CRYPTO-stream I/O, key
+derivation, confirmation timing, alerts, Key Update, and post-handshake
+messages.
 
 ```v
 new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
@@ -197,7 +201,7 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
      (h) buffered_bytes(level SecretLevel) int                         // §5.1 hook
      (h) traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
      (h) exported_secrets(level SecretLevel) !([]u8, []u8)
-(mut h) update_read_traffic_keys() !   /   (mut h) update_write_traffic_keys() !
+(mut h) update_read_traffic_keys() !   /   (mut h) update_write_traffic_keys() !   // §7.2 ratchet, TLS record path
 (mut h) confirm_handshake()
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
 ```
@@ -229,9 +233,9 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
   secrets are released by `zeroize_app_secrets()` at teardown.
 - **Alerts and errors.** `tls.handshake`'s `alert.v` carries the shared
   `AlertDescription` vocabulary plus `quic_connection_error() → 0x100 + code`
-  (RFC 9001 §4.8). The `ContentType.alert`-stamping `alert_record` wrapper stays
-  in `tls`; alerts never travel on CRYPTO — a QUIC adapter maps them to
-  `connection_close` codes.
+  (RFC 9001 §4.8). The `ContentType.alert`-stamping `alert_record` wrapper
+  stays in `tls`; alerts never travel on CRYPTO — a QUIC adapter maps them to
+  a `CONNECTION_CLOSE` frame of type 0x1c.
 - **Record-boundary independence.** Because the core has no notion of a TLS
   record, `buffered_bytes(.initial)` is the only hook the TCP `Conn` needs to
   enforce the §5.1 "ServerHello must end at a record boundary" rule; a QUIC

@@ -26,8 +26,8 @@ measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
 ## Quick start
 
 ```bash
-v test .                   # unit tests across all four modules
-v run src/example/dial_example.v       # live demo: handshake + HTTP GET over TLS
+v test .                                # unit tests across all four modules
+v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
 ```
 
 ```v
@@ -97,7 +97,7 @@ feed(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entr
 buffered_bytes(level SecretLevel) int                     // §5.1 boundary hook
 traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
 exported_secrets(level SecretLevel) !([]u8, []u8)         // RFC 9001 §5.1 expansions
-update_read_traffic_keys() !  /  update_write_traffic_keys() !  // §7.2 ratchet
+update_read_traffic_keys() !  /  update_write_traffic_keys() !  // §7.2 ratchet (TLS record path)
 confirm_handshake()                                       // drop handshake-stage material
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 ```
@@ -192,13 +192,15 @@ the all-zero one.
   NewSessionTicket/KeyUpdate, which servers send one-per-record)
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A QUIC transport stack (RFC 9001) — packet building, header protection,
-  number spaces, and `connection_close` signaling are out of scope. The
+  packet-number spaces, and `CONNECTION_CLOSE` signaling are out of scope. The
   handshake core is nonetheless built to be driven over QUIC: it lives in the
   importable `tls.handshake` module (with the passthrough framing helpers, the
   level-tagged `feed`/`traffic_keys`/`exported_secrets` seam, and the
   `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
-  only `tls.handshake` + `tls.pki` and never imports `tls`
-- A server mode — this crate is client-only
+  only `tls.handshake` + `tls.pki` and never imports `tls`; the full
+  eight-step engine loop over that seam is walked through in the
+  `state_machine.v` file preamble
+- A server mode — this library is client-only
 
 ## Testing
 
@@ -234,7 +236,7 @@ proven by the state-machine tests above.
 
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) — TLS 1.3
 - [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448) — test vectors
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 framing helpers, §4.1 secret levels, §4.8 alert→error mapping)
+- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 CRYPTO framing, §4.1 secret levels, §4.8 alert→error mapping, §6 Key Phase)
 - [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport (CONNECTION_CLOSE frame types and packet-number spaces referenced by the QUIC walkthrough in `tls.handshake`)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
