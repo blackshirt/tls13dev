@@ -40,12 +40,32 @@ fn test_secret_level_order() ! {
 }
 
 fn test_handshake_message_carries_level_and_bytes() ! {
-	m := HandshakeMessage{
-		level: .handshake
-		msg:   [u8(0x14), 0x00, 0x00, 0x01, 0xff]
-	}
+	m := new_handshake_message(.handshake, [u8(0x14), 0x00, 0x00, 0x01, 0xff])!
 	assert m.level == .handshake
 	assert m.msg.len == 5
+}
+
+// The @[noinit] gate leaves new_handshake_message as the only way in, and it
+// refuses bytes whose 4-byte header disagrees with the body it is carrying —
+// a well-formed header must never vouch for truncated or padded message bytes.
+fn test_new_handshake_message_rejects_length_mismatch() ! {
+	// Finished header declaring a 5-byte body, message carrying only 1.
+	bad := [u8(0x14), 0x00, 0x00, 0x05, 0xff]
+	new_handshake_message(.handshake, bad) or {
+		assert err.msg().contains('declares 5 body bytes, message carries 1')
+		return
+	}
+	assert false
+}
+
+// A message shorter than its own header cannot even be parsed, so the
+// constructor surfaces the header error rather than building a shell.
+fn test_new_handshake_message_rejects_truncated_header() ! {
+	new_handshake_message(.initial, [u8(0x01), 0x00]) or {
+		assert err.msg().contains('header truncated')
+		return
+	}
+	assert false
 }
 
 // ---- feed() reassembly: split and coalesced delivery ----

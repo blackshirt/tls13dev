@@ -99,10 +99,31 @@ pub enum HandshakeState {
 // client Finished rides .handshake; msg is the wire bytes — the full handshake
 // message, 4-byte header included, exactly as it must be hashed and put on the
 // wire. The TCP adapter maps every level onto its single record stream.
+// Instances come from feed() or new_handshake_message(); @[noinit] keeps other
+// modules from pairing a valid 4-byte header with a body that does not match it.
+@[noinit]
 pub struct HandshakeMessage {
 pub mut:
 	level SecretLevel
 	msg   []u8
+}
+
+// new_handshake_message builds a HandshakeMessage for producers outside this
+// module (tests, or a future adapter synthesizing its own bytes). msg must be
+// exactly one complete handshake message — the 4-byte header plus the body its
+// declared length covers, nothing trailing (RFC 8446 §4) — so the struct
+// literal's freedom to ship a truncated or padded message behind a well-formed
+// header does not survive the @[noinit] gate.
+pub fn new_handshake_message(level SecretLevel, msg []u8) !HandshakeMessage {
+	mut r := wire.new_reader(msg)
+	_, length := parse_handshake_header(mut r)!
+	if r.remaining() != length {
+		return error('handshake: handshake message header declares ${length} body bytes, message carries ${r.remaining()}')
+	}
+	return HandshakeMessage{
+		level: level
+		msg:   msg
+	}
 }
 
 // SecretLevel names a QUIC encryption level (RFC 9001 §4.1): each level has its
@@ -393,10 +414,7 @@ fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group Na
 	h.transcript.update(full_ch2)
 
 	h.state = .wait_server_hello // rearm: the server now answers with the real ServerHello
-	return [HandshakeMessage{
-		level: .initial
-		msg:   full_ch2
-	}]
+	return [new_handshake_message(.initial, full_ch2)!]
 }
 
 // generate_key_share creates a fresh ephemeral private key for the requested group.
@@ -789,10 +807,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			h.zeroize_handshake_secrets()
 			// Hand the raw client Finished to the transport, which encrypts it
 			// under the still-active handshake keys.
-			return [HandshakeMessage{
-				level: .handshake
-				msg:   client_fin_msg
-			}]
+			return [new_handshake_message(.handshake, client_fin_msg)!]
 		}
 		else {
 			return error('handshake: unexpected handshake message ${msg_type}')
