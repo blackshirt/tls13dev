@@ -1,16 +1,14 @@
 // Copyright (c) 2026 blackshirt.
 //
 // record.v frames and (re)assembles plaintext and protected records of the TLS 1.3
-// record layer (RFC 8446 §5); alert_record (below) frames the §6 alert protocol
-// into records, and cipher_state.v carries per-direction AEAD sequence state
-// across the handshake-to-application key transition. The recordless QUIC
-// CRYPTO-stream reassembly (RFC 9001 §4) lives in tls.handshake's passthrough
+// record layer (RFC 8446 §5), and cipher_state.v carries per-direction AEAD
+// sequence state across the handshake-to-application key transition. The
+// recordless QUIC CRYPTO-stream reassembly (RFC 9001 §4) lives in tls.handshake's passthrough
 // framing; this module keeps only the ContentType-tagged record plumbing the
 // TLS transport owns.
 module tls
 
 import tls.wire
-import tls.handshake
 
 // ContentType identifies the type of message in a TLS record (RFC 8446 §5.1).
 enum ContentType as u8 {
@@ -122,11 +120,4 @@ fn parse_record(mut r wire.Reader) !Record {
 		legacy_version: version
 		payload:        payload
 	}
-}
-
-// alert_record wraps an alert in an unencrypted TLS record. Alerts sent before
-// the cipher keys take effect travel in plaintext; post-handshake alerts are
-// encrypted via the cipher state instead, with inner content type 21.
-fn alert_record(a handshake.Alert) Record {
-	return new_record(.alert, a.encode())
 }

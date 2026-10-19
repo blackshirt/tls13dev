@@ -55,6 +55,7 @@ mut:
 	app_pos           int         // start of undrained bytes in app_buf (mirrors recv_pos: draining advances the index instead of re-cloning the tail)
 	closed            bool        // set once the connection is finished (close or fatal alert)
 	close_notify_sent bool        // guards against sending close_notify twice
+	sock_closed       bool        // set once sock.close() ran: `closed` alone cannot guard the fd, because handle_alert marks closed while leaving the socket open for close() to collect
 	fatal_error       string      // non-empty once a fatal alert/error closed the connection; re-surfaced by read()
 	rlock             &sync.Mutex // serializes read() and every read-cipher/recv_buf mutation; both locks are exclusive mutexes, not RwLock read sides, because each path rewrites AEAD sequence numbers
 	wlock             &sync.Mutex // serializes write() and every write-cipher mutation
@@ -118,6 +119,7 @@ pub fn dial(address string, config Config) !&Conn {
 		app_pos:           0
 		closed:            false
 		close_notify_sent: false
+		sock_closed:       false
 		fatal_error:       ''
 		rlock:             sync.new_mutex()
 		wlock:             sync.new_mutex()
@@ -609,9 +611,7 @@ pub fn (mut c Conn) close() ! {
 	// Idempotent teardown: a second close() must not re-send close_notify or
 	// double-close the socket.
 	if c.closed {
-		if c.sock != unsafe { nil } {
-			c.sock.close() or {}
-		}
+		c.close_socket()
 		return
 	}
 	// Emit close_notify at most once; guarded separately from `closed` so a failure
@@ -626,30 +626,38 @@ pub fn (mut c Conn) close() ! {
 	// (RFC 8446 §1.3.1/§7.5). send_close_notify above already used the live cipher,
 	// so nothing still needs these secrets.
 	c.hs.zeroize_app_secrets()
+	c.close_socket()
+}
 
-	// Best-effort socket close: errors are swallowed because we are already tearing
-	// down and the caller has nothing left to act on.
-	if c.sock != unsafe { nil } {
-		c.sock.close() or {}
+// close_socket closes the TCP transport exactly once. `closed` alone cannot be
+// the once-guard: handle_alert marks a connection closed while leaving the
+// socket open for close() to collect, so a separate flag distinguishes
+// "teardown requested" from "fd already released". Re-closing an fd number the
+// kernel has meanwhile recycled for an unrelated connection would sever that
+// connection instead of failing harmlessly.
+fn (mut c Conn) close_socket() {
+	if c.sock == unsafe { nil } || c.sock_closed {
+		return
 	}
+	c.sock.close() or {}
+	c.sock_closed = true
 }
 
 // send_close_notify writes a close_notify alert, encrypted with the application
-// keys once the handshake has completed (falling back to a plaintext record if
-// encryption fails). RFC 8446 §6.1/§A.4: alerts after the server Finished MUST be
-// encrypted; plaintext close_notify is only correct when keys are not yet up.
+// keys (RFC 8446 §6.1/§A.4). A Conn only exists once the handshake has
+// completed, so those keys are always up; if encryption fails anyway, or the
+// state machine is somehow not .connected, nothing is sent — a plaintext
+// alert would violate §6, and a compliant peer is required to reject exactly
+// that record (our own read() does), so silence beats a forbidden write.
 fn (mut c Conn) send_close_notify() {
 	if c.sock == unsafe { nil } {
 		return
 	}
-	notify := handshake.new_close_notify()
-	plaintext_alert := alert_record(notify)
 	if c.hs.state() != .connected {
-		c.write_records([plaintext_alert]) or {}
 		return
 	}
+	notify := handshake.new_close_notify()
 	enc := c.client_app_cipher.encrypt_record(.alert, notify.encode()) or {
-		c.write_records([plaintext_alert]) or {}
 		return
 	}
 	c.write_records([enc]) or {}

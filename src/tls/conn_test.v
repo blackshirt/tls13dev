@@ -7,6 +7,7 @@
 // a live socket; dial_example.v is their end-to-end coverage.
 module tls
 
+import net
 import sync
 import tls.handshake
 import tls.pki
@@ -160,4 +161,44 @@ fn test_fatal_alert_is_sticky_across_reads() ! {
 		return
 	}
 	assert false // read must not succeed nor report EOF after a fatal alert
+}
+
+// test_close_is_idempotent_with_live_socket exercises teardown over a real
+// socket — the path new_test_conn's nil sock cannot reach. close() twice must
+// release the fd exactly once: the second call previously re-closed an fd the
+// kernel may have recycled for an unrelated connection, which would sever that
+// connection instead of failing harmlessly. The handshake core stays fresh
+// (never connected) here, so close() sends no alert record — only the fd
+// ownership matters to this test.
+fn test_close_is_idempotent_with_live_socket() ! {
+	mut listener := net.listen_tcp(.ip, '127.0.0.1:0')!
+	defer {
+		listener.close() or {}
+	}
+	local := listener.addr()!
+	mut sock := net.dial_tcp(local.str())!
+	mut hs := handshake.new_client_handshake('', []string{}, pki.new_validator(pki.new_trust_store(), false))!
+	mut c := &Conn{
+		sock:              sock
+		hs:                hs
+		recv_buf:          []u8{}
+		app_buf:           []u8{}
+		closed:            false
+		close_notify_sent: false
+		sock_closed:       false
+		fatal_error:       ''
+		rlock:             sync.new_mutex()
+		wlock:             sync.new_mutex()
+		negotiated_alpn:   ''
+		server_name:       ''
+	}
+
+	c.close()!
+	assert c.closed
+	assert c.close_notify_sent
+	assert c.sock_closed
+
+	// The second close must be a no-op for the fd: no panic, no re-close.
+	c.close()!
+	assert c.sock_closed
 }

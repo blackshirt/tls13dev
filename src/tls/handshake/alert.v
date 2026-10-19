@@ -3,7 +3,7 @@
 // alert.v models the RFC 8446 §6 alert protocol vocabulary: the
 // AlertLevel/AlertDescription enums and their wire encoding. The enums are
 // shared transport vocabulary — the TLS record layer frames alerts as records
-// (that framing lives in tls' alert_record), while QUIC never carries an alert
+// (that framing lives in tls' record layer), while QUIC never carries an alert
 // on the handshake stream and instead maps the description to a CRYPTO_ERROR
 // connection-close code (0x100 + description) via quic_connection_error
 // (RFC 9001 §4.8).

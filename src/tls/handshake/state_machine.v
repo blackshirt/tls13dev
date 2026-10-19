@@ -651,14 +651,26 @@ pub fn (h &ClientHandshake) traffic_keys(level SecretLevel) !(TrafficKeys, Traff
 			if h.client_hs_keys.key.len == 0 || h.server_hs_keys.key.len == 0 {
 				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by confirm_handshake)')
 			}
-			return h.client_hs_keys, h.server_hs_keys
+			return clone_traffic_keys(h.client_hs_keys), clone_traffic_keys(h.server_hs_keys)
 		}
 		.application {
 			if h.client_app_keys.key.len == 0 || h.server_app_keys.key.len == 0 {
 				return error('handshake: application traffic keys unavailable before the server Finished')
 			}
-			return h.client_app_keys, h.server_app_keys
+			return clone_traffic_keys(h.client_app_keys), clone_traffic_keys(h.server_app_keys)
 		}
+	}
+}
+
+// clone_traffic_keys copies one direction's key/iv buffers so callers never
+// alias the core's cached material. Aliasing would matter twice: an adapter
+// mutating its copy would corrupt the core's state, and the core wipes the
+// superseded generation in place during a KeyUpdate ratchet — which would
+// otherwise destroy keys the adapter is still encrypting with.
+fn clone_traffic_keys(k TrafficKeys) TrafficKeys {
+	return TrafficKeys{
+		key: k.key.clone()
+		iv:  k.iv.clone()
 	}
 }
 
@@ -879,7 +891,15 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 	if h.server_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
-	h.server_ap_traffic = hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
+	// Advance first, then destroy the superseded generation in place: the old
+	// secret and the keys derived from it must not survive the ratchet in freed
+	// storage, which is the whole point of KeyUpdate's forward secrecy.
+	new_secret := hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
+	for i in 0 .. h.server_ap_traffic.len {
+		h.server_ap_traffic[i] = 0
+	}
+	h.server_ap_traffic = new_secret
+	wipe_traffic_keys(mut h.server_app_keys)
 	h.server_app_keys = derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, aead_nonce_len)!
 }
 
@@ -897,7 +917,15 @@ pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
 	if h.client_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
-	h.client_ap_traffic = hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
+	// Same supersession rule as the read side: compute the next generation from
+	// the old secret, then wipe the old secret and its cached keys before the
+	// replacement lands.
+	new_secret := hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
+	for i in 0 .. h.client_ap_traffic.len {
+		h.client_ap_traffic[i] = 0
+	}
+	h.client_ap_traffic = new_secret
+	wipe_traffic_keys(mut h.client_app_keys)
 	h.client_app_keys = derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
 }
 

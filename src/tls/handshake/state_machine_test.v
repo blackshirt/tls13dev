@@ -414,3 +414,41 @@ fn test_next_passthrough_rejects_oversize_length() ! {
 	}
 	assert false
 }
+
+fn test_traffic_keys_returns_independent_copies() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	h.client_hs_keys = TrafficKeys{ key: [u8(1), 2, 3], iv: [u8(4), 5] }
+	h.server_hs_keys = TrafficKeys{ key: [u8(6), 7], iv: [u8(8)] }
+	ck, sk := h.traffic_keys(.handshake)!
+	// Aliasing the core's buffers would let a KeyUpdate ratchet — which wipes
+	// the superseded generation in place — destroy keys an adapter still holds.
+	assert unsafe { voidptr(&ck.key[0]) } != unsafe { voidptr(&h.client_hs_keys.key[0]) }
+	assert unsafe { voidptr(&ck.iv[0]) } != unsafe { voidptr(&h.client_hs_keys.iv[0]) }
+	assert unsafe { voidptr(&sk.key[0]) } != unsafe { voidptr(&h.server_hs_keys.key[0]) }
+	assert ck.key == [u8(1), 2, 3]
+	assert sk.key == [u8(6), 7]
+}
+
+fn test_update_traffic_keys_wipes_superseded_generation() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	h.server_ap_traffic = []u8{len: 32, init: 7}
+	h.server_app_keys = TrafficKeys{ key: [u8(9), 9, 9], iv: [u8(9)] }
+	// Aliases into the old generation, captured before the ratchet runs.
+	old_secret := h.server_ap_traffic
+	old_key := h.server_app_keys.key
+
+	h.update_read_traffic_keys()!
+
+	// The ratchet computes the successor first, then zeroes the superseded
+	// material in place — free storage must not keep a live old generation.
+	assert old_secret.len == 32
+	for b in old_secret {
+		assert b == 0
+	}
+	for b in old_key {
+		assert b == 0
+	}
+	assert h.server_ap_traffic != old_secret
+	assert h.server_ap_traffic.len == 32
+	assert h.server_app_keys.key.len > 0
+}

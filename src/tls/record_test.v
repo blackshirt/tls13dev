@@ -10,7 +10,6 @@ module tls
 
 import crypto.aes
 import tls.wire
-import tls.handshake
 
 fn test_record_serialization_roundtrip() ! {
 	payload := [u8(1), 2, 3, 4, 5]
@@ -262,12 +261,4 @@ fn test_record_uninitialized_cipher_state_fails_closed() ! {
 		return
 	}
 	assert false
-}
-
-fn test_alert_record_framing() ! {
-	// alert_record wraps the 2-byte payload in a plaintext .alert record.
-	rec := alert_record(handshake.new_close_notify())
-	assert rec.content_type == .alert
-	assert rec.legacy_version == legacy_record_version
-	assert rec.payload == [u8(0x01), 0x00]
 }

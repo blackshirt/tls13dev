@@ -12,6 +12,7 @@ module pki
 
 import encoding.base64
 import os
+import sync
 
 // TrustStore stores trusted root CA certificates. Instances come from
 // new_trust_store(); @[noinit] stops a bare TrustStore{} from silently existing
@@ -102,12 +103,15 @@ pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 // of the process. Parsing a typical ~150-root host bundle is the single most
 // expensive step of a dial (tens of milliseconds), yet its contents are a
 // read-only property of the machine, so re-parsing it for every connection is
-// pure waste. The update is deliberately lock-free: two concurrent first dials
-// may both parse, and the loser's identical result overwrites the winner's —
-// a benign race, because both copies describe the same on-disk file. Every
-// caller receives a private clone via system_root_cas(), so mutating the
-// returned store can never touch the cache.
+// pure waste. The memo sits behind a global mutex: the cache is a slice header
+// assigned by the loader and read by every clone, so concurrent first dials
+// racing on it would be a data race (a torn header can yield garbage roots, not
+// merely duplicate work). The zero-initialized Mutex is valid as-given on every
+// platform V supports — static-init on Linux, lazy_init in Darwin's lock(), and
+// a zeroed SRWLOCK on Windows. Every caller receives a private clone via
+// system_root_cas(), so mutating the returned store can never touch the cache.
 __global cached_system_roots []Certificate
+__global cached_system_roots_mu sync.Mutex
 
 // system_root_cas returns a TrustStore backed by the process-wide parsed
 // system bundle, parsing it on first use. dial() uses this instead of
@@ -115,6 +119,12 @@ __global cached_system_roots []Certificate
 // the bundle parse once per process rather than once per connection. The
 // returned store is a private clone, safe for the caller to mutate.
 pub fn system_root_cas() !TrustStore {
+	cached_system_roots_mu.lock()
+	// defer (not unlock-after-success): a bundle load error must still release
+	// the mutex, or the failed first dial would deadlock every later one.
+	defer {
+		cached_system_roots_mu.unlock()
+	}
 	if cached_system_roots.len == 0 {
 		mut loader := new_trust_store()
 		loader.load_system_ca_bundle()!
