@@ -19,6 +19,69 @@ import x.crypto.curve25519
 import tls.pki
 import tls.wire
 
+// ─── How QUIC support is implemented ────────────────────────────────────────
+// QUIC support is not a separate code path inside this module: the core is
+// transport-neutral by construction, and a QUIC engine drives it through the
+// same pub seam the TCP adapter uses — importing tls.handshake (+ tls.pki for
+// trust anchors) and never importing tls at all. The whole integration is the
+// following engine-side loop; nothing here mentions records, cipher states,
+// or sockets:
+//
+//  1. Construct — new_client_handshake(server_name, alpn, validator), exactly
+//     as conn.v does. Initial packet keys are NOT part of the TLS key
+//     schedule: QUIC derives them from the destination connection ID
+//     (RFC 9001 §5.2), which is why traffic_keys(.initial) and
+//     exported_secrets(.initial) refuse — that derivation belongs to the
+//     engine, below this layer.
+//  2. Outbound — create_client_hello() yields the first ClientHello;
+//     feed() later returns the level-tagged follow-ups (retry ClientHello at
+//     .initial, client Finished at .handshake). Each HandshakeMessage.msg is
+//     a complete handshake message (4-byte header included) to place verbatim
+//     into a CRYPTO frame at that level. No dummy ChangeCipherSpec is ever
+//     produced: that is TCP middlebox compatibility only (RFC 8446 App. D.4),
+//     and QUIC packets are already opaque (RFC 9001 §4.1.3).
+//  3. Inbound — strip QUIC packet protection yourself, concatenate each
+//     encryption level's CRYPTO frames into that level's byte stream, and
+//     hand the bytes to feed(.initial | .handshake). Within a level the
+//     stream is self-framed handshake messages (RFC 9001 §4);
+//     next_passthrough_message (passthrough.v) is the core's own reassembly
+//     helper and is deliberately reusable engine-side.
+//  4. Traffic keys — after ServerHello, either consume traffic_keys() (the
+//     raw §7.1 TrafficKeys) or, as packet protection normally needs, take
+//     exported_secrets() and expand the "quic key" / "quic iv" / "quic hp"
+//     labels over them with the pub hkdf_expand_label (RFC 9001 §5.1; the
+//     header-protection key comes from "quic hp"). The core installs no
+//     AEAD anywhere — every protection state is rebuilt engine-side.
+//  5. Confirmation — call confirm_handshake() only once the handshake is
+//     confirmed (HANDSHAKE_DONE or a 1-RTT acknowledgment, RFC 9001 §4.1.2),
+//     NOT at client-Finished time like the TCP adapter: a peer may keep
+//     sending at Handshake level until confirmation, so the cached handshake
+//     keys must survive until then (they are discarded at §4.9.2).
+//  6. Alerts — never ride CRYPTO frames (RFC 9001 §4.1.3): map a received
+//     AlertDescription with quic_connection_error() (0x100 + description,
+//     RFC 9001 §4.8) and raise a CONNECTION_CLOSE of type 0x1c yourself.
+//  7. Key update — QUIC replaces TLS KeyUpdate entirely with its own Key
+//     Phase mechanism (RFC 9001 §6): an endpoint MUST NOT send a TLS
+//     KeyUpdate and MUST treat a received one as a connection error
+//     (0x010a, unexpected_message-equivalent). The next generation of 1-RTT
+//     secrets is therefore derived engine-side as
+//     HKDF-Expand-Label(secret, "quic ku", "", Hash.length) (§6.1) — not via
+//     update_read/write_traffic_keys(), whose "traffic upd" label is the TLS
+//     record path's; the header-protection key never updates.
+//  8. Post-handshake — feed(.application) refuses by contract: over QUIC TLS
+//     application data is never carried (RFC 9001 §4.1.3). NewSessionTicket
+//     arrives on the 1-RTT CRYPTO stream after the handshake (RFC 9001
+//     §4.5); reassemble it with next_passthrough_message and decode with the
+//     pub parse_new_session_ticket codec (RFC 8446 §4.6.1) — the same pair
+//     the TCP adapter's handle_post_handshake consumes. A KeyUpdate on that
+//     stream is a connection error, per item 7.
+//
+// The TCP adapter (conn.v/tcp_transport.v) is the reference implementation of
+// this loop's TLS-shaped twin: one ordered record stream instead of three
+// CRYPTO streams, records instead of packets, "traffic upd" KeyUpdate instead
+// of Key Phase — which is exactly why the seam above carries no transport
+// concept at all.
+
 // HandshakeState tracks client progress. The wait_* order mirrors the fixed
 // post-ServerHello server flight (EncryptedExtensions → Certificate →
 // CertificateVerify → Finished, RFC 8446 §1/§4.1); each handler asserts its
@@ -568,8 +631,8 @@ pub fn (h &ClientHandshake) buffered_bytes(level SecretLevel) int {
 // can be destroyed. The TCP Conn calls it right after sending its Finished;
 // a QUIC engine must call it only once the handshake is confirmed per RFC 9001
 // §4.1.2/§4.9.2, since a peer may still send at Handshake level until then —
-// that is why the ServerHello-time zeroization deliberately stops short of
-// this material.
+// that is why zeroize_handshake_secrets() (which runs at .connected) deliberately
+// stops short of this material.
 pub fn (mut h ClientHandshake) confirm_handshake() {
 	for i in 0 .. h.client_hs_traffic.len {
 		h.client_hs_traffic[i] = 0
@@ -743,9 +806,11 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 }
 
 // update_read_traffic_keys ratchets the server application traffic secret to its
-// next generation (KeyUpdate, RFC 8446 §7.2) and refreshes the cached read
+// next generation (TLS KeyUpdate, RFC 8446 §7.2) and refreshes the cached read
 // TrafficKeys. It never installs a cipher: the adapter rebuilds its own read
-// protection from traffic_keys(.application) afterward.
+// protection from traffic_keys(.application) afterward. This is the TLS record
+// path only — over QUIC a received TLS KeyUpdate is a connection error
+// (RFC 9001 §6) and the engine ratchets with the "quic ku" label itself.
 pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 	// Ratchet the secret forward: new_secret = HKDF-Expand-Label(old, "traffic
 	// upd", "", Hash) (§7.2); overwriting the old secret is the forward-security
@@ -755,12 +820,13 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 }
 
 // update_write_traffic_keys ratchets the client application traffic secret to its
-// next generation (KeyUpdate, RFC 8446 §7.2) and refreshes the cached write
+// next generation (TLS KeyUpdate, RFC 8446 §7.2) and refreshes the cached write
 // TrafficKeys, mirroring update_read_traffic_keys. §4.6.3 still requires the
 // KeyUpdate notice to go out under the old keys, so callers update after sending
-// and then rebuild their write protection — a TLS adapter restarts its record
-// sequence number at 0 (§5.3), while a QUIC adapter deliberately does NOT reset
-// packet numbers (RFC 9000 §12.3); this split is what makes that choice possible.
+// and then rebuild their write protection — the TLS adapter restarts its record
+// sequence number at 0 (§5.3). Like its read twin this is the TLS record path
+// only: QUIC forbids TLS KeyUpdate entirely (RFC 9001 §6) and updates packet
+// keys with its own Key Phase mechanism below this layer.
 pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
 	h.client_ap_traffic = hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
 	h.client_app_keys = derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!

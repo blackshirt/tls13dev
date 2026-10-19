@@ -235,7 +235,7 @@ proven by the state-machine tests above.
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) — TLS 1.3
 - [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448) — test vectors
 - [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 framing helpers, §4.1 secret levels, §4.8 alert→error mapping)
-- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport (packet-number spaces and the never-reset rule cited from the adapter seam)
+- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport (CONNECTION_CLOSE frame types and packet-number spaces referenced by the QUIC walkthrough in `tls.handshake`)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
 - [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017) — RSA (PKCS#1 v1.5 / PSS)

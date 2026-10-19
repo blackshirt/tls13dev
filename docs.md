@@ -215,9 +215,12 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
   `traffic_keys()`, and a QUIC adapter runs the RFC 9001 §5.1
   `"quic key"`/`"quic iv"`/`"quic hp"` expansions over `exported_secrets()`
   (via the `pub hkdf_expand_label`). `update_*_traffic_keys()` ratchet the
-  application secrets (§7.2); each adapter rebuilds its own protection state,
-  so TLS's per-generation record-sequence reset (§5.3) and QUIC's
-  non-resetting packet numbers (RFC 9000 §12.3) are the adapter's concern.
+  application secrets through the TLS KeyUpdate label (§7.2) — the TCP
+  adapter's path only: QUIC forbids TLS KeyUpdate entirely (RFC 9001 §6) and
+  derives next-generation 1-RTT secrets itself with the `"quic ku"` label
+  (§6.1), keyed off its own Key Phase bit. Each adapter rebuilds its
+  protection state, so TLS's per-generation record-sequence reset (§5.3)
+  stays entirely on the TLS side.
 - **Secret lifecycle.** `confirm_handshake()` drops the handshake-stage cached
   keys/secrets once the adapter is done with them (the TCP `Conn` calls it
   right after writing the client Finished; a QUIC adapter calls it per
