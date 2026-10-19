@@ -281,7 +281,7 @@ fn (mut c Conn) do_handshake() ! {
 	// Our Finished went out above under the handshake ciphers; from here nothing
 	// may protect or decrypt at the handshake level, so the core may destroy the
 	// handshake-stage secrets and cached keys (RFC 8446 §7.5 forward secrecy).
-	c.hs.confirm_handshake()
+	c.hs.confirm_handshake()!
 }
 
 // cipher_from_keys instantiates one direction's record protection from the

@@ -378,3 +378,16 @@ fn test_parse_extensions_rejects_duplicate() ! {
 		assert false
 	}
 }
+
+fn test_parse_finished_requires_hash_length() ! {
+	// §4.4.4 fixes verify_data at Hash.length: a wrong-sized body is a framing
+	// error pinned here, where it belongs, before a later comparison could
+	// misread it as a transcript mismatch.
+	good := parse_finished([]u8{len: 32}, 32)!
+	assert good.len == 32
+	parse_finished([]u8{len: 31}, 32) or {
+		assert err.msg().contains('expected 32 (Hash.length, RFC 8446 §4.4.4)')
+		return
+	}
+	assert false
+}

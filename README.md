@@ -98,7 +98,7 @@ buffered_bytes(level SecretLevel) int                     // §5.1 boundary hook
 traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
 exported_secrets(level SecretLevel) !([]u8, []u8)         // RFC 9001 §5.1 expansions
 update_read_traffic_keys() !  /  update_write_traffic_keys() !  // §7.2 ratchet (TLS record path)
-confirm_handshake()                                       // drop handshake-stage material
+confirm_handshake() !                                    // drop handshake-stage material
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 ```
 

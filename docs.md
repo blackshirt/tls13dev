@@ -202,7 +202,7 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
      (h) traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
      (h) exported_secrets(level SecretLevel) !([]u8, []u8)
 (mut h) update_read_traffic_keys() !   /   (mut h) update_write_traffic_keys() !   // §7.2 ratchet, TLS record path
-(mut h) confirm_handshake()
+(mut h) confirm_handshake() !
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
 ```
 
@@ -234,9 +234,11 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
 - **Secret lifecycle.** `confirm_handshake()` drops the handshake-stage cached
   keys/secrets once the adapter is done with them (the TCP `Conn` calls it
   right after writing the client Finished; a QUIC adapter calls it per
-  RFC 9001 §4.1.2/§4.9.2). `exported_secrets(.handshake)` stays valid until
+  RFC 9001 §4.1.2/§4.9.2, and before `.connected` it errors rather than
+  stranding the client Finished). `exported_secrets(.handshake)` stays valid until
   then, so a QUIC stack can derive keys after the server Finished. Application
-  secrets are released by `zeroize_app_secrets()` at teardown.
+  secrets *and* their cached `TrafficKeys` are released by
+  `zeroize_app_secrets()` at teardown.
 - **Alerts and errors.** `tls.handshake`'s `alert.v` carries the shared
   `AlertDescription` vocabulary plus `quic_connection_error() → 0x100 + code`
   (RFC 9001 §4.8). The `ContentType.alert`-stamping `alert_record` wrapper

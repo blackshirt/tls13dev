@@ -688,8 +688,13 @@ pub fn (h &ClientHandshake) buffered_bytes(level SecretLevel) int {
 // a QUIC engine must call it only once the handshake is confirmed per RFC 9001
 // §4.1.2/§4.9.2, since a peer may still send at Handshake level until then —
 // that is why zeroize_handshake_secrets() (which runs at .connected) deliberately
-// stops short of this material.
-pub fn (mut h ClientHandshake) confirm_handshake() {
+// stops short of this material. Until .connected the transport still needs
+// those keys to encrypt the client Finished, so an early call is refused
+// instead of stranding the handshake.
+pub fn (mut h ClientHandshake) confirm_handshake() ! {
+	if h.state != .connected {
+		return error('handshake: confirm_handshake() runs only once the handshake reached .connected (state: ${h.state})')
+	}
 	for i in 0 .. h.client_hs_traffic.len {
 		h.client_hs_traffic[i] = 0
 	}
@@ -698,8 +703,8 @@ pub fn (mut h ClientHandshake) confirm_handshake() {
 	}
 	h.client_hs_traffic = []u8{}
 	h.server_hs_traffic = []u8{}
-	h.client_hs_keys = TrafficKeys{}
-	h.server_hs_keys = TrafficKeys{}
+	wipe_traffic_keys(mut h.client_hs_keys)
+	wipe_traffic_keys(mut h.server_hs_keys)
 }
 
 // exported_secrets returns (client, server) clones of the §7.1 traffic secrets
@@ -801,7 +806,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			}
 			// Verify the server Finished over the transcript up to but
 			// excluding this message, using the server handshake traffic secret.
-			server_verify_data := parse_finished(body)!
+			server_verify_data := parse_finished(body, h.hash_algo.hash_len())!
 			th_before_sfin := h.transcript.current_hash()
 
 			expected_verify_data := compute_finished_verify_data(h.hash_algo, h.server_hs_traffic, th_before_sfin)!
@@ -864,10 +869,16 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 // protection from traffic_keys(.application) afterward. This is the TLS record
 // path only — over QUIC a received TLS KeyUpdate is a connection error
 // (RFC 9001 §6) and the engine ratchets with the "quic ku" label itself.
+// A secret that does not exist — no server Finished yet, or already destroyed
+// by zeroize_app_secrets — refuses the ratchet rather than being expanded
+// into junk keys.
 pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 	// Ratchet the secret forward: new_secret = HKDF-Expand-Label(old, "traffic
 	// upd", "", Hash) (§7.2); overwriting the old secret is the forward-security
 	// property KeyUpdate exists to deliver.
+	if h.server_ap_traffic.len == 0 {
+		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
+	}
 	h.server_ap_traffic = hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
 	h.server_app_keys = derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, aead_nonce_len)!
 }
@@ -879,8 +890,13 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 // and then rebuild their write protection — the TCP adapter restarts its record
 // sequence number at 0 (§5.3). Like its read twin this is the TLS record path
 // only: QUIC forbids TLS KeyUpdate entirely (RFC 9001 §6) and updates packet
-// keys with its own Key Phase mechanism below this layer.
+// keys with its own Key Phase mechanism below this layer. Like its read twin
+// it refuses when the secret does not exist (before the server Finished, or
+// after zeroize_app_secrets), so an empty secret is never expanded.
 pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
+	if h.client_ap_traffic.len == 0 {
+		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
+	}
 	h.client_ap_traffic = hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
 	h.client_app_keys = derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
 }
@@ -915,11 +931,13 @@ fn (mut h ClientHandshake) zeroize_handshake_secrets() {
 // keys protecting application data can be re-derived, so keeping them past
 // teardown would let a later memory compromise decrypt recorded traffic
 // and undo the app-phase forward secrecy the handshake zeroization above is
-// meant to establish (RFC 8446 §1.3.1/§7.5). The adapter's live protection
-// keeps its own instantiated keys, so this only closes the secret-recovery
-// path; it is safe because read/write refuse once closed and KeyUpdate
-// ratcheting is the sole reader, reachable only while the connection is still
-// open.
+// meant to establish (RFC 8446 §1.3.1/§7.5). The cached TrafficKeys derived
+// from them are wiped for the same reason — §7.5 says forget the secret
+// values *and* the keys — while the adapter's live record cipher is a
+// separate instantiation it may still need to send close_notify. After this,
+// read/write refuse (closed) and traffic_keys/exported_secrets no longer
+// hand out the dead material; KeyUpdate ratcheting is refused by its own
+// guard, reachable only while the connection is still open.
 pub fn (mut h ClientHandshake) zeroize_app_secrets() {
 	for i in 0 .. h.client_ap_traffic.len {
 		h.client_ap_traffic[i] = 0
@@ -929,4 +947,20 @@ pub fn (mut h ClientHandshake) zeroize_app_secrets() {
 	}
 	h.client_ap_traffic = []u8{}
 	h.server_ap_traffic = []u8{}
+	wipe_traffic_keys(mut h.client_app_keys)
+	wipe_traffic_keys(mut h.server_app_keys)
+}
+
+// wipe_traffic_keys zeroes a cached TrafficKeys byte by byte before releasing
+// it: reassignment alone would hand the allocator the key material intact, the
+// same reason zeroize_handshake_secrets wipes in place first. Best-effort
+// against optimizer dead-store elimination, but the release always takes effect.
+fn wipe_traffic_keys(mut keys TrafficKeys) {
+	for i in 0 .. keys.key.len {
+		keys.key[i] = 0
+	}
+	for i in 0 .. keys.iv.len {
+		keys.iv[i] = 0
+	}
+	keys = TrafficKeys{}
 }

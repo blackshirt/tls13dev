@@ -633,9 +633,14 @@ fn certificate_verify_signed_content(transcript_hash []u8) []u8 {
 }
 
 // parse_finished reads the verify_data from a Finished message (RFC 8446 §4.4.4).
-// The body is exactly verify_data with no length prefix or other fields, so the
-// slice is returned as-is.
-fn parse_finished(body []u8) ![]u8 {
+// The body is exactly verify_data with no length prefix or other fields; its
+// length is fixed at Hash.length, so a wrong-sized body fails here as a framing
+// problem rather than surfacing later as a verify_data mismatch that would
+// blame the transcript instead of the encoding.
+fn parse_finished(body []u8, hash_len int) ![]u8 {
+	if body.len != hash_len {
+		return error('handshake: Finished verify_data is ${body.len} bytes, expected ${hash_len} (Hash.length, RFC 8446 §4.4.4)')
+	}
 	return body.clone()
 }
 

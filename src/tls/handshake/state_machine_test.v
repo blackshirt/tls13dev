@@ -235,8 +235,9 @@ fn test_confirm_handshake_drops_handshake_material() ! {
 	h.server_hs_traffic = [u8(4), 5, 6]
 	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
 	h.server_hs_keys = TrafficKeys{ key: [u8(9)], iv: [u8(10)] }
+	h.state = .connected
 
-	h.confirm_handshake()
+	h.confirm_handshake()!
 
 	assert h.client_hs_traffic.len == 0
 	assert h.server_hs_traffic.len == 0
@@ -252,16 +253,91 @@ fn test_confirm_handshake_drops_handshake_material() ! {
 	assert false
 }
 
+fn test_confirm_handshake_requires_connected_state() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	h.client_hs_traffic = [u8(1), 2, 3]
+	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
+	// The transport still owes the client Finished to the handshake keys;
+	// destroying them early must be refused with nothing wiped, so the
+	// handshake can proceed after the caller corrects its ordering.
+	h.confirm_handshake() or {
+		assert err.msg().contains('reached .connected')
+		assert h.client_hs_traffic.len == 3
+		assert h.client_hs_keys.key.len == 1
+		return
+	}
+	assert false
+}
+
 fn test_zeroize_app_secrets_clears_and_refuses() ! {
 	mut h := new_client_handshake('example.com', []string{}, make_validator())!
 	h.client_ap_traffic = [u8(11), 12]
 	h.server_ap_traffic = [u8(13), 14]
+	h.client_app_keys = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
+	h.server_app_keys = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
 
 	h.zeroize_app_secrets()
 
 	assert h.client_ap_traffic.len == 0
 	assert h.server_ap_traffic.len == 0
-	_, _ := h.exported_secrets(.application) or {
+	// §7.5 says forget the secret values *and* the keys: the cached
+	// TrafficKeys die with them, so no accessor hands them out afterward.
+	assert h.client_app_keys.key.len == 0
+	assert h.client_app_keys.iv.len == 0
+	assert h.server_app_keys.key.len == 0
+	_, _ := h.traffic_keys(.application) or {
+		_, _ := h.exported_secrets(.application) or {
+			return
+		}
+		assert false
+	}
+	assert false
+}
+
+fn test_update_traffic_keys_refuse_missing_secrets() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	// No server Finished has been processed, so both application traffic
+	// secrets are still empty; expanding an empty secret would install junk
+	// keys that look just like real ones.
+	h.update_read_traffic_keys() or {
+		assert err.msg().contains('server application traffic secret')
+		h.update_write_traffic_keys() or {
+			assert err.msg().contains('client application traffic secret')
+			return
+		}
+		assert false
+		return
+	}
+	assert false
+}
+
+fn test_update_traffic_keys_ratchet_forward() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	// With live secrets present the ratchet must actually advance them (§7.2)
+	// and rebuild the cached keys the adapter reads back through traffic_keys().
+	h.server_ap_traffic = []u8{len: 32, init: 1}
+	h.client_ap_traffic = []u8{len: 32, init: 2}
+	old_server := h.server_ap_traffic.clone()
+	old_client := h.client_ap_traffic.clone()
+	h.update_read_traffic_keys()!
+	h.update_write_traffic_keys()!
+	assert h.server_ap_traffic != old_server
+	assert h.client_ap_traffic != old_client
+	assert h.server_ap_traffic.len == 32
+	assert h.client_ap_traffic.len == 32
+	keys, _ := h.traffic_keys(.application)!
+	assert keys.key.len > 0
+}
+
+fn test_update_traffic_keys_refuses_after_zeroize() ! {
+	mut h := new_client_handshake('example.com', []string{}, make_validator())!
+	h.client_ap_traffic = [u8(1), 2, 3]
+	h.client_app_keys = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
+	h.zeroize_app_secrets()
+	// A ratchet after teardown would resurrect the destroyed secret as a new
+	// generation of keys; the guard names the teardown as the cause.
+	h.update_write_traffic_keys() or {
+		assert err.msg().contains('destroyed by zeroize_app_secrets')
 		return
 	}
 	assert false
