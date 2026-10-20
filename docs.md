@@ -520,8 +520,10 @@ per process rather than once per connection.
 
 ## 3. Usage
 
-Runnable recipes; a full end-to-end demo (`v run src/example/dial_example.v`)
-lives in `src/example/dial_example.v`.
+Runnable recipes. Two runnable examples live alongside each other: a minimal
+client (`v run src/example/simple_example.v`) and a fuller demo
+(`v run src/example/dial_example.v`) that adds CLI arguments/flags, HTTP
+status/header parsing, and chunked-body decoding.
 
 ### 3.1 Basic client
 

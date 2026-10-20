@@ -27,6 +27,7 @@ measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
 
 ```bash
 v test .                                # unit tests across all four modules
+v run src/example/simple_example.v      # minimal client: HTTPS GET
 v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
 ```
 
@@ -116,7 +117,8 @@ the core, so both transports inherit them.
 ```
 src/
   example/
-    dial_example.v   runnable end-to-end demo (handshake + HTTP GET over TLS)
+    simple_example.v minimal client (handshake + HTTPS GET, no flags)
+    dial_example.v   fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
   tls/              module `tls`: record layer + public TCP client API
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation
