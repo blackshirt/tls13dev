@@ -101,3 +101,13 @@ pub fn new_close_notify() Alert {
 		description: .close_notify
 	}
 }
+
+// new_alert builds a fatal alert with the given description. It is the
+// send-side twin of parse_alert for the failure path: RFC 8446 §6 makes every
+// alert except close_notify fatal, so no level parameter is offered.
+pub fn new_alert(description AlertDescription) Alert {
+	return Alert{
+		level:       .fatal
+		description: description
+	}
+}

@@ -180,6 +180,12 @@ mut:
 	// negotiated_alpn() rather than made public directly.
 	state           HandshakeState
 	negotiated_alpn string // server's ALPN pick, '' if none; the RFC 7301 §3.1 check guarantees it was one of config.alpn
+	// fail_alert is the alert description an adapter should surface to the peer
+	// when this handshake dies. RFC 8446 §6 makes internal_error a legal
+	// catch-all, so the default suffices; the sites that can classify their
+	// failure precisely (unexpected_message, illegal_parameter, decrypt_error,
+	// bad_certificate, ...) overwrite it before the error bubbles out.
+	fail_alert AlertDescription = .internal_error
 }
 
 // new_client_handshake creates a ClientHandshake offering an X25519 key share —
@@ -239,6 +245,16 @@ pub fn (h &ClientHandshake) negotiated_alpn() string {
 	return h.negotiated_alpn
 }
 
+// failure_alert returns the alert description an adapter should surface to the
+// peer when this handshake dies (RFC 8446 §6). The default is internal_error,
+// which §6 makes a legal catch-all for any internal failure; the sites that
+// can classify their failure precisely overwrite the field before the error
+// bubbles out. A QUIC adapter maps the description to a CRYPTO_ERROR
+// connection-close code via AlertDescription.quic_connection_error (§4.8).
+pub fn (h &ClientHandshake) failure_alert() AlertDescription {
+	return h.fail_alert
+}
+
 // create_client_hello generates the initial ClientHello message and advances to
 // .wait_server_hello. It returns the raw handshake message bytes (header + body,
 // exactly what goes into the transcript); framing into a TLS record and the
@@ -279,6 +295,7 @@ fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]Handshake
 	if h.state != .wait_server_hello {
 		// Strict ordering: a ServerHello is only legal while we await it; reject
 		// out-of-turn messages before parsing (§4.4.1).
+		h.fail_alert = .unexpected_message
 		return error('handshake: unexpected ServerHello in state ${h.state}')
 	}
 
@@ -289,6 +306,7 @@ fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]Handshake
 	if msg_type != .server_hello {
 		// HelloRetryRequest reuses the ServerHello type value (2) and is told
 		// apart only by the sentinel random later in the parser (§4.1.3).
+		h.fail_alert = .unexpected_message
 		return error('handshake: expected ServerHello (2), got ${msg_type}')
 	}
 	body := r.read_bytes(length)! // body only; the header is re-added for the transcript below
@@ -304,21 +322,28 @@ fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]Handshake
 	if sh.is_hello_retry_req {
 		// §4.1.4: validate shared fields, reject a second HelloRetryRequest, and
 		// require that the request actually changes something.
-		sh.validate(&h.config)!
+		sh.validate(&h.config) or {
+			h.fail_alert = .illegal_parameter
+			return err
+		}
 		if h.hrr_received {
+			h.fail_alert = .unexpected_message
 			return error('handshake: received second HelloRetryRequest (unexpected_message)')
 		}
 
 		if !sh.has_key_share && sh.cookie.len == 0 {
+			h.fail_alert = .illegal_parameter
 			return error('handshake: HelloRetryRequest would not change the ClientHello (illegal_parameter)')
 		}
 		if sh.has_key_share {
 			// The requested group must be offered and differ from the one already
 			// sent a key share for (RFC 8446 §4.2.8).
 			if !is_supported_group(sh.server_share.group) {
+				h.fail_alert = .illegal_parameter
 				return error('handshake: HelloRetryRequest requested unsupported group ${sh.server_share.group} (illegal_parameter)')
 			}
 			if sh.server_share.group == h.config.client_share.group {
+				h.fail_alert = .illegal_parameter
 				return error('handshake: HelloRetryRequest reselected the already-offered group ${sh.server_share.group} (illegal_parameter)')
 			}
 		}
@@ -336,17 +361,23 @@ fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]Handshake
 
 	// Normal ServerHello: validate echoed fields and that a key share was
 	// selected for our group; (EC)DHE cannot proceed without one.
-	sh.validate(&h.config)!
+	sh.validate(&h.config) or {
+		h.fail_alert = .illegal_parameter
+		return err
+	}
 	// §4.1.4: after a HelloRetryRequest the ServerHello suite must match the HRR's.
 	if hrr_suite := h.hrr_cipher_suite {
 		if hrr_suite != sh.cipher_suite {
+			h.fail_alert = .illegal_parameter
 			return error('handshake: ServerHello cipher suite ${sh.cipher_suite} differs from HelloRetryRequest suite ${hrr_suite} (illegal_parameter)')
 		}
 	}
 	if !sh.has_key_share {
+		h.fail_alert = .illegal_parameter
 		return error('handshake: ServerHello missing key_share extension')
 	}
 	if sh.server_share.group != h.ecdhe_group {
+		h.fail_alert = .illegal_parameter
 		return error('handshake: ServerHello key_share group ${sh.server_share.group} does not match offered group ${h.ecdhe_group}')
 	}
 
@@ -497,6 +528,7 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 		.secp256r1 { 65 } // 0x04 || X || Y uncompressed point
 	}
 	if server_share.key_exchange.len != expected_len {
+		h.fail_alert = .illegal_parameter
 		return error('handshake: ${server_share.group} key_share is ${server_share.key_exchange.len} bytes, expected ${expected_len}')
 	}
 	match server_share.group {
@@ -508,12 +540,14 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 			// small-order identity and would yield an all-zero secret; gate before
 			// the backend so the abort carries our named protocol error.
 			if subtle.constant_time_compare(server_share.key_exchange, []u8{len: 32, init: 0}) == 1 {
+				h.fail_alert = .illegal_parameter
 				return error('handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
 			}
 			secret := h.priv_x25519.x25519(server_share.key_exchange)!
 			// Defense in depth: reject every small-order result, not just the
 			// all-zero one (see is_x25519_small_order).
 			if is_x25519_small_order(secret) {
+				h.fail_alert = .illegal_parameter
 				return error('handshake: computed X25519 shared secret is a small-order value (illegal_parameter)')
 			}
 			return secret
@@ -530,6 +564,7 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 			)!
 			secret := priv.derive_shared_secret(peer)!
 			if subtle.constant_time_compare(secret, []u8{len: secret.len, init: 0}) == 1 {
+				h.fail_alert = .illegal_parameter
 				return error('handshake: computed P-256 shared secret is all-zero value (illegal_parameter)')
 			}
 			return secret
@@ -569,13 +604,14 @@ pub fn (mut h ClientHandshake) feed(level SecretLevel, bytes []u8) ![]HandshakeM
 			}
 			h.initial_reassembly << bytes
 			out := h.drain_initial() or {
-				h.state = .failed
+				h.abort()
 				return err
 			}
 			// One feed may coalesce a consumed ServerHello with an oversized tail
 			// the loop no longer reaches; bound it even where drain cannot.
 			if h.initial_reassembly.len > 4 + max_handshake_message_len {
-				h.state = .failed
+				h.fail_alert = .decode_error
+				h.abort()
 				return error('handshake: Initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 			return out
@@ -583,13 +619,14 @@ pub fn (mut h ClientHandshake) feed(level SecretLevel, bytes []u8) ![]HandshakeM
 		.handshake {
 			h.hs_reassembly << bytes
 			out := h.drain_handshake() or {
-				h.state = .failed
+				h.abort()
 				return err
 			}
 			// Same bound for the Handshake level: late retransmits at .connected
 			// skip the drain loop, so the cap is the backstop.
 			if h.hs_reassembly.len > 4 + max_handshake_message_len {
-				h.state = .failed
+				h.fail_alert = .decode_error
+				h.abort()
 				return error('handshake: Handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 			return out
@@ -771,6 +808,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 	match msg_type {
 		.encrypted_extensions {
 			if h.state != .wait_encrypted_extensions {
+				h.fail_alert = .unexpected_message
 				return error('handshake: unexpected EncryptedExtensions')
 			}
 			alpn := parse_encrypted_extensions(body)!
@@ -778,6 +816,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			// no ALPN); an unoffered value could silently steer the application
 			// protocol below us.
 			if alpn != '' && !h.config.alpn.contains(alpn) {
+				h.fail_alert = .illegal_parameter
 				return error('handshake: server selected ALPN "${alpn}" not offered by client')
 			}
 			h.negotiated_alpn = alpn
@@ -786,6 +825,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 		}
 		.certificate {
 			if h.state != .wait_certificate {
+				h.fail_alert = .unexpected_message
 				return error('handshake: unexpected Certificate')
 			}
 			cert_ders := parse_certificate_message(body)!
@@ -795,11 +835,15 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			for der in cert_ders {
 				h.server_certs << pki.parse_certificate(der)!
 			}
-			h.validator.verify_certificate_chain(h.server_certs, h.config.server_name)!
+			h.validator.verify_certificate_chain(h.server_certs, h.config.server_name) or {
+				h.fail_alert = .bad_certificate
+				return err
+			}
 			h.state = .wait_certificate_verify
 		}
 		.certificate_verify {
 			if h.state != .wait_certificate_verify {
+				h.fail_alert = .unexpected_message
 				return error('handshake: unexpected CertificateVerify')
 			}
 			cv := parse_certificate_verify(body)!
@@ -807,13 +851,18 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			h.transcript.update(full_msg)
 
 			if h.server_certs.len == 0 {
+				h.fail_alert = .decode_error
 				return error('handshake: missing server certificate for verification')
 			}
-			verify_certificate_verify(leaf_key(h.server_certs[0]), cv, signed_content)!
+			verify_certificate_verify(leaf_key(h.server_certs[0]), cv, signed_content) or {
+				h.fail_alert = .decrypt_error
+				return err
+			}
 			h.state = .wait_server_finished
 		}
 		.finished {
 			if h.state != .wait_server_finished {
+				h.fail_alert = .unexpected_message
 				return error('handshake: unexpected Finished message')
 			}
 			// Verify the server Finished over the transcript up to but
@@ -825,6 +874,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			// Constant-time compare: verify_data is a MAC over the transcript,
 			// and a naive compare would leak a byte-by-byte Finished forgery.
 			if subtle.constant_time_compare(server_verify_data, expected_verify_data) != 1 {
+				h.fail_alert = .decrypt_error
 				return error('handshake: server Finished verify_data mismatch')
 			}
 			h.transcript.update(full_msg)
@@ -856,6 +906,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			h.client_app_keys = client_app_keys
 
 			if h.hs_reassembly.len > 0 {
+				h.fail_alert = .decode_error
 				return error('handshake: unexpected trailing data after server Finished in handshake flight')
 			}
 
@@ -869,6 +920,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			return [new_handshake_message(.handshake, client_fin_msg)!]
 		}
 		else {
+			h.fail_alert = .unexpected_message
 			return error('handshake: unexpected handshake message ${msg_type}')
 		}
 	}
@@ -927,6 +979,49 @@ pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
 	h.client_ap_traffic = new_secret
 	wipe_traffic_keys(mut h.client_app_keys)
 	h.client_app_keys = derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
+}
+
+// abort destroys every secret the handshake has derived so far and parks the
+// state machine in the terminal .failed state. RFC 8446 §1.3.1/§7.5 require
+// destroying key material the moment it is known dead; a failed handshake
+// kills the Handshake Secret, the traffic secrets, and the cached TrafficKeys
+// immediately instead of leaving them resident until the caller drops the
+// object. It is the failure-path twin of the success-choke-point wipes and is
+// the only legal way for an adapter to reach .failed. The ephemeral ECDHE
+// private halves are released exactly the way zeroize_handshake_secrets
+// releases them: after the (possibly failed) shared-secret computation they
+// are dead either way, and the vlib key types expose no in-place wipe.
+pub fn (mut h ClientHandshake) abort() {
+	for i in 0 .. h.handshake_secret.len {
+		h.handshake_secret[i] = 0
+	}
+	h.handshake_secret = []u8{}
+	for i in 0 .. h.client_hs_traffic.len {
+		h.client_hs_traffic[i] = 0
+	}
+	h.client_hs_traffic = []u8{}
+	for i in 0 .. h.server_hs_traffic.len {
+		h.server_hs_traffic[i] = 0
+	}
+	h.server_hs_traffic = []u8{}
+	wipe_traffic_keys(mut h.client_hs_keys)
+	wipe_traffic_keys(mut h.server_hs_keys)
+	// Defensive: application secrets cannot exist before .connected, but the
+	// wipe is cheap and keeps abort() a single choke point for adapters that
+	// call it from post-handshake failure paths too.
+	for i in 0 .. h.client_ap_traffic.len {
+		h.client_ap_traffic[i] = 0
+	}
+	h.client_ap_traffic = []u8{}
+	for i in 0 .. h.server_ap_traffic.len {
+		h.server_ap_traffic[i] = 0
+	}
+	h.server_ap_traffic = []u8{}
+	wipe_traffic_keys(mut h.client_app_keys)
+	wipe_traffic_keys(mut h.server_app_keys)
+	h.priv_x25519 = unsafe { nil }
+	h.priv_p256 = none
+	h.state = .failed
 }
 
 // zeroize_handshake_secrets destroys the key-schedule intermediate and the

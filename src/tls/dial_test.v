@@ -1,0 +1,450 @@
+// Copyright (c) 2026 blackshirt.
+//
+// dial_test.v runs the TLS client through dial() over real TCP sockets against
+// scripted in-process peers: the full-handshake twin of the fakeserver (record
+// layer and all), plus plaintext negatives that exercise the record-layer
+// gates (invalid content type, ServerHello boundary, CCS tolerance, pre-SH
+// alerts) end to end. Module tls gives the scripts the same private record
+// primitives the Conn itself uses, so no production seam exists for tests.
+module tls
+
+import net
+import time
+import tls.fakeserver
+import tls.handshake
+import tls.wire
+
+// scripted_read_full fills buf[start..] from the socket until full, so record
+// headers and bodies that arrive in TCP fragments are reassembled exactly like
+// Conn.read_raw_record's loop does.
+fn scripted_read_full(mut c net.TcpConn, mut buf []u8, start int) ! {
+	mut pos := start
+	for pos < buf.len {
+		n := c.read(mut buf[pos..]) or { return err }
+		if n <= 0 {
+			return error('tls test: unexpected EOF (read ${pos}/${buf.len} bytes)')
+		}
+		pos += n
+	}
+}
+
+// scripted_read_record reads exactly one TLS record off the socket using the
+// production parser, so scripts see the same Record the client would.
+fn scripted_read_record(mut c net.TcpConn) !Record {
+	mut hdr := []u8{len: record_header_len}
+	scripted_read_full(mut c, mut hdr, 0)!
+	plen := int(hdr[3]) << 8 | int(hdr[4])
+	if plen > max_ciphertext_record_len {
+		return error('tls test: record length ${plen} exceeds maximum')
+	}
+	mut full := []u8{len: record_header_len + plen}
+	copy(mut full[..record_header_len], hdr)
+	scripted_read_full(mut c, mut full, record_header_len)!
+	mut r := wire.new_reader(full)
+	return parse_record(mut r)!
+}
+
+// start_scripted_server binds an ephemeral loopback listener, hands its
+// address back synchronously, and runs script against the first accepted
+// connection on a background thread. It returns the dial address and a
+// one-shot channel carrying the script's outcome ('OK' or 'ERR ...').
+fn start_scripted_server(script fn (mut c net.TcpConn) !) (string, chan string) {
+	addr_ch := chan string{cap: 1}
+	res_ch := chan string{cap: 1}
+	spawn scripted_server_worker(script, addr_ch, res_ch)
+	addr := <-addr_ch
+	return addr, res_ch
+}
+
+// scripted_server_worker is the listener thread body: accept once, run the
+// script, report the outcome. Every failure path sends something on both
+// channels so the test side can never block forever.
+fn scripted_server_worker(script fn (mut c net.TcpConn) !, addr_ch chan string, res_ch chan string) {
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0', net.ListenOptions{}) or {
+		msg := 'ERR listen: ${err.msg()}'
+		addr_ch <- msg
+		res_ch <- msg
+		return
+	}
+	a := l.addr() or {
+		msg := 'ERR addr: ${err.msg()}'
+		addr_ch <- msg
+		res_ch <- msg
+		return
+	}
+	port := a.port() or {
+		msg := 'ERR port: ${err.msg()}'
+		addr_ch <- msg
+		res_ch <- msg
+		return
+	}
+	addr_ch <- '127.0.0.1:${port}'
+	mut c := l.accept() or {
+		res_ch <- 'ERR accept: ${err.msg()}'
+		l.close() or {}
+		return
+	}
+	script(mut c) or {
+		res_ch <- 'ERR script: ${err.msg()}'
+		c.close() or {}
+		l.close() or {}
+		return
+	}
+	c.close() or {}
+	l.close() or {}
+	res_ch <- 'OK'
+}
+
+// expect_dial_failure dials addr expecting an error whose message contains
+// want, waits for the scripted peer to finish, and reports a clean outcome.
+fn expect_dial_failure(addr string, want string, res_ch chan string) ! {
+	ts := fakeserver.test_trust_store() or { return error('fakeserver trust store: ${err.msg()}') }
+	dial(addr, server_name: fakeserver.server_name, root_cas: ts, timeout: 5 * time.second) or {
+		if !err.msg().contains(want) {
+			return error('dial failed with "${err.msg()}", expected it to contain "${want}"')
+		}
+		res := <-res_ch
+		if res != 'OK' {
+			return error('scripted server did not finish cleanly: ${res}')
+		}
+		return
+	}
+	return error('dial unexpectedly succeeded; wanted a failure containing "${want}"')
+}
+
+// ---- Full handshake over TCP ----
+// full_handshake_script is the record-layer twin of the fakeserver flight: it
+// reads the client's plaintext ClientHello+CCS, answers with ServerHello+CCS,
+// protects EE/Cert/CV/Fin under the server handshake keys, verifies the client
+// Finished under the client handshake keys, then streams one NewSessionTicket
+// and one application record under the server application keys.
+fn full_handshake_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	ccs_rec := scripted_read_record(mut c)!
+	if ccs_rec.content_type != .change_cipher_spec {
+		return error('expected the client dummy CCS second, got ${ccs_rec.content_type}')
+	}
+
+	mut srv := fakeserver.new_server(alpn: ['h2', 'http/1.1']) or {
+		return error('fakeserver: ${err.msg()}')
+	}
+	fl := srv.handle_client_hello(ch_rec.payload) or {
+		return error('fakeserver CH: ${err.msg()}')
+	}
+	if fl.is_hrr {
+		return error('unexpected HelloRetryRequest in the default configuration')
+	}
+
+	// Plaintext ServerHello plus the server's dummy CCS (App. D.4).
+	sh_rec := new_record(.handshake, fl.server_hello)
+	c.write(sh_rec.serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	// The rest of the flight, one encrypted record per message, under the
+	// server handshake keys the client just derived from the same schedule.
+	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	mut senc := new_record_cipher_state(aead, siv)!
+	for m in fl.rest {
+		enc := senc.encrypt_record(.handshake, m)!
+		c.write(enc.serialize()) or { return err }
+	}
+
+	// The client's Finished arrives encrypted under the client handshake keys.
+	cfin_rec := scripted_read_record(mut c)!
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_record_cipher_state(caead, civ)!
+	dec := cdec.decrypt_record(cfin_rec)!
+	if dec.content_type != .handshake {
+		return error('client Finished has inner type ${dec.content_type}, expected handshake')
+	}
+	srv.handle_client_finished(dec.plaintext) or { return error('fakeserver Finished: ${err.msg()}') }
+
+	// Post-handshake: a NewSessionTicket and one application record, both
+	// under the server application traffic keys.
+	akey, aiv := srv.server_app_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
+	mut aenc := new_record_cipher_state(aaead, aiv)!
+	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
+	c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+	payload := 'hello from fakeserver'.bytes()
+	c.write(aenc.encrypt_record(.application_data, payload)!.serialize()) or { return err }
+}
+
+fn test_dial_completes_full_handshake_and_reads_app_data() ! {
+	addr, res_ch := start_scripted_server(full_handshake_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		alpn:        ['h2']
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	assert conn.negotiated_alpn() == 'h2'
+
+	// read() must consume the NewSessionTicket as post-handshake traffic and
+	// then surface the application bytes that followed it in the stream.
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)!
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+
+	assert conn.session_tickets.len == 1
+	assert conn.session_tickets[0].ticket_lifetime == 3600
+	assert conn.session_tickets[0].ticket == [u8(0xaa), 0xbb, 0xcc, 0xdd]
+
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// ---- Plaintext / malformed-record negatives ----
+
+// alert_before_sh_script rejects the ClientHello with a plaintext fatal alert,
+// the only kind of alert legal before the ServerHello (RFC 8446 §6).
+fn alert_before_sh_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)! // client dummy CCS
+	// fatal (2) handshake_failure (40).
+	c.write(new_record(.alert, [u8(2), 40]).serialize()) or { return err }
+}
+
+fn test_dial_rejects_plaintext_alert_before_server_hello() ! {
+	addr, res_ch := start_scripted_server(alert_before_sh_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	expect_dial_failure(addr, 'received alert', res_ch)!
+}
+
+// sh_trailing_junk_script answers the ClientHello with a ServerHello record
+// that coalesces one extra trailing byte — legal framing for the record layer
+// but a direct violation of the RFC 8446 §5.1 ServerHello boundary rule.
+fn sh_trailing_junk_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+	mut srv := fakeserver.new_server() or { return error('fakeserver: ${err.msg()}') }
+	fl := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH: ${err.msg()}') }
+	mut payload := fl.server_hello.clone()
+	payload << 0x00 // the forbidden trailing byte
+	c.write(new_record(.handshake, payload).serialize()) or { return err }
+}
+
+fn test_dial_rejects_trailing_bytes_after_server_hello() ! {
+	addr, res_ch := start_scripted_server(sh_trailing_junk_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	expect_dial_failure(addr, 'misframed ServerHello', res_ch)!
+}
+
+// excess_ccs_script floods the client with three dummy CCS records; RFC 8446
+// App. D.4 allows at most one per ClientHello (two across an HRR round trip),
+// so the third must abort the handshake.
+fn excess_ccs_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)! // client dummy CCS
+	for _ in 0 .. 3 {
+		c.write(change_cipher_spec().serialize()) or { return err }
+	}
+}
+
+fn test_dial_rejects_third_ccs_record() ! {
+	addr, res_ch := start_scripted_server(excess_ccs_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	expect_dial_failure(addr, 'too many change_cipher_spec', res_ch)!
+}
+
+// garbage_type_script writes a well-framed record whose content type is not a
+// TLS content type at all.
+fn garbage_type_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	// [type=99] [version 0x0303] [length 0]
+	c.write([u8(99), 0x03, 0x03, 0x00, 0x00]) or { return err }
+}
+
+fn test_dial_rejects_invalid_record_content_type() ! {
+	addr, res_ch := start_scripted_server(garbage_type_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	expect_dial_failure(addr, 'invalid content type', res_ch)!
+}
+
+// ---- HelloRetryRequest over TCP ----
+
+// hrr_script performs the change_group HelloRetryRequest round trip at the
+// record layer: HRR+CCS, retry ClientHello+CCS, then the normal flight.
+fn hrr_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+
+	mut srv := fakeserver.new_server(hrr: .change_group) or { return error('fakeserver: ${err.msg()}') }
+	fl1 := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH1: ${err.msg()}') }
+	if !fl1.is_hrr {
+		return error('expected a HelloRetryRequest')
+	}
+	c.write(new_record(.handshake, fl1.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	// The client's retry ClientHello + a fresh dummy CCS (App. D.4).
+	ch2_rec := scripted_read_record(mut c)!
+	if ch2_rec.content_type != .handshake {
+		return error('expected the retry ClientHello as a handshake record')
+	}
+	_ := scripted_read_record(mut c)!
+
+	fl2 := srv.handle_client_hello(ch2_rec.payload) or { return error('fakeserver CH2: ${err.msg()}') }
+	if fl2.is_hrr {
+		return error('unexpected second HelloRetryRequest')
+	}
+	c.write(new_record(.handshake, fl2.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	mut senc := new_record_cipher_state(aead, siv)!
+	for m in fl2.rest {
+		enc := senc.encrypt_record(.handshake, m)!
+		c.write(enc.serialize()) or { return err }
+	}
+
+	cfin_rec := scripted_read_record(mut c)!
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_record_cipher_state(caead, civ)!
+	dec := cdec.decrypt_record(cfin_rec)!
+	srv.handle_client_finished(dec.plaintext) or { return error('fakeserver Finished: ${err.msg()}') }
+}
+
+fn test_dial_completes_hello_retry_request_round_trip() ! {
+	addr, res_ch := start_scripted_server(hrr_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+	// A clean handshake with no ALPN offer must yield an empty pick.
+	assert conn.negotiated_alpn() == ''
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// ---- Failure alerts over TCP ----
+
+// alert_back_script drives the client to fail on a Bad CertificateVerify (a
+// corrupt signature) and then reads the client's own fatal alert off the wire,
+// asserting both its framing (encrypted under the client handshake keys, since
+// the ServerHello installed them) and its describing code.
+fn alert_back_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+
+	mut srv := fakeserver.new_server(bad_certificate_verify: true) or {
+		return error('fakeserver: ${err.msg()}')
+	}
+	fl := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH: ${err.msg()}') }
+	c.write(new_record(.handshake, fl.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	mut senc := new_record_cipher_state(aead, siv)!
+	for m in fl.rest {
+		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
+	}
+
+	// The client rejects CertificateVerify and answers with a fatal alert
+	// encrypted under its client handshake keys.
+	alert_rec := scripted_read_record(mut c)!
+	if alert_rec.content_type != .application_data {
+		return error('client alert has outer type ${alert_rec.content_type}, expected application_data (encrypted)')
+	}
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_record_cipher_state(caead, civ)!
+	dec := cdec.decrypt_record(alert_rec)!
+	if dec.content_type != .alert {
+		return error('client sent inner type ${dec.content_type}, expected alert')
+	}
+	peer_alert := handshake.parse_alert(dec.plaintext)!
+	if peer_alert.level != .fatal {
+		return error('client alert level is ${peer_alert.level}, expected fatal')
+	}
+	if peer_alert.description != .decrypt_error {
+		return error('client alert is ${peer_alert.description}, expected decrypt_error')
+	}
+}
+
+fn test_dial_sends_fatal_alert_on_certificate_verify_failure() ! {
+	addr, res_ch := start_scripted_server(alert_back_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	expect_dial_failure(addr, 'CertificateVerify failed', res_ch)!
+}
+
+// alert_back_pre_sh_script answers the ClientHello with a malformed ServerHello
+// body that forces a plaintext failure before the client derives any handshake
+// keys, then reads the client's plaintext fatal alert.
+fn alert_back_pre_sh_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+	// A complete ServerHello header with an empty body: the client fails in
+	// parse before installing handshake keys, so its alert must be plaintext.
+	c.write(new_record(.handshake, [u8(0x02), 0x00, 0x00, 0x00]).serialize()) or { return err }
+
+	alert_rec := scripted_read_record(mut c)!
+	if alert_rec.content_type != .alert {
+		return error('client pre-SH alert has type ${alert_rec.content_type}, expected plaintext alert')
+	}
+	peer_alert := handshake.parse_alert(alert_rec.payload)!
+	if peer_alert.level != .fatal {
+		return error('client alert level is ${peer_alert.level}, expected fatal')
+	}
+}
+
+fn test_dial_sends_plaintext_fatal_alert_before_server_hello() ! {
+	addr, res_ch := start_scripted_server(alert_back_pre_sh_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	// A malformed ServerHello fails before any classification, so the surfaced
+	// message is the parse error rather than a named alert.
+	expect_dial_failure(addr, 'unexpected EOF', res_ch)!
+}

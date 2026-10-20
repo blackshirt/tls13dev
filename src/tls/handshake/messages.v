@@ -649,6 +649,49 @@ fn build_finished(verify_data []u8) []u8 {
 	return wrap_handshake_message(.finished, verify_data)
 }
 
+// CertificateRequest is the outcome of decoding a server CertificateRequest
+// (RFC 8446 §4.3.2). This client holds no certificate, so the fields exist to
+// validate the message's structure (and to prove we understood it) rather than
+// to select a credential; only the request context must be echoed verbatim.
+pub struct CertificateRequest {
+pub:
+	request_context []u8 // echoed verbatim in the responding Certificate (§4.4.2)
+}
+
+// parse_certificate_request decodes the CertificateRequest body (RFC 8446
+// §4.3.2): certificate_request_context<0..2^8-1> plus the extensions block.
+// The extensions (signature_algorithms, certificate_authorities, ...) constrain
+// a client credential we do not have, so their content is not interpreted here,
+// but the block itself must be well-formed and bounded — a malformed or
+// oversized request is a decode error, never silently ignored. §4.3.2 also
+// requires signature_algorithms to be present in TLS 1.3; the caller enforces
+// that, since only it knows the whole negotiated context.
+fn parse_certificate_request(body []u8) !CertificateRequest {
+	mut r := wire.new_reader(body)
+	request_context := r.read_vector_u8()!
+	ext_bytes := r.read_vector_u16()!
+	if r.remaining() != 0 {
+		return error('handshake: trailing bytes in CertificateRequest (decode_error)')
+	}
+	_ := parse_extensions(ext_bytes)!
+	return CertificateRequest{
+		request_context: request_context.clone()
+	}
+}
+
+// build_empty_certificate creates a Certificate message with no certificates
+// (RFC 8446 §4.4.2), the legal response of a client that holds no credential
+// after the server sent a CertificateRequest. The certificate_list is a u24
+// length of zero and the certificate_request_context echoes the request's own
+// context verbatim (§4.4.2 requires the exact bytes back).
+fn build_empty_certificate(request_context []u8) []u8 {
+	mut body := []u8{}
+	body << u8(request_context.len)
+	body << request_context
+	body << [u8(0), 0, 0] // u24 certificate_list length: empty
+	return wrap_handshake_message(.certificate, body)
+}
+
 // parse_encrypted_extensions decodes EncryptedExtensions (RFC 8446 §4.3.1) and
 // returns the negotiated ALPN protocol (empty when none). Per §4.3.1 only
 // client-offered extensions belong here; the tolerated echoes are the empty
@@ -746,7 +789,7 @@ pub fn build_key_update(request_update bool) []u8 {
 
 // NewSessionTicket holds a parsed NewSessionTicket (fields needed for storage).
 pub struct NewSessionTicket {
-mut:
+pub mut:
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
 	ticket_age_add  u32  // random value for obfuscating ticket age in early_data (§4.6.1)
 	ticket_nonce    []u8 // ties the ticket to this connection's resumption master secret

@@ -190,3 +190,18 @@ fn (mut s RecordCipherState) decrypt_record(rec Record) !DecryptedRecord {
 		plaintext:    plaintext
 	}
 }
+
+// wipe_cipher_state zeroes a record cipher state's IV in place and resets the
+// sequence number, so a discarded or failed connection leaves no nonce base
+// from which record nonces under the dead key could be reconstructed. It is
+// called from the handshake-failure and close paths alongside the core's
+// secret wipes; the AEAD handle is dropped with the struct, matching the
+// best-effort bar of handshake.wipe_traffic_keys (vlib cipher objects expose
+// no in-place key wipe).
+fn wipe_cipher_state(mut s RecordCipherState) {
+	for i in 0 .. s.iv.len {
+		s.iv[i] = 0
+	}
+	s.iv = []u8{}
+	s.seq_num = 0
+}

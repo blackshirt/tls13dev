@@ -61,6 +61,9 @@ mut:
 	wlock             &sync.Mutex // serializes write() and every write-cipher mutation
 	negotiated_alpn   string      // server's ALPN pick — always one of Config.alpn (the handshake aborts otherwise), '' if none
 	server_name       string      // SNI value sent and the name the certificate was checked against
+	// Failure-alert plumbing, used only by send_failure_alert on a dead handshake.
+	peer_terminated bool                        // set when the peer itself sent the alert: never alert back into a socket the peer already closed
+	fail_alert      ?handshake.AlertDescription // adapter-classified alert; when unset, send_failure_alert falls back to the core's hs.failure_alert()
 }
 
 // dial connects to address (host:port), performs a TLS 1.3 handshake, and returns Conn.
@@ -127,10 +130,15 @@ pub fn dial(address string, config Config) !&Conn {
 		server_name:       server_name
 	}
 
-	// Run the full client flight; on failure close the socket (so an aborted
-	// connection does not leak the fd) and propagate the error rather than
-	// returning a half-connected Conn that would misbehave on read.
+	// Run the full client flight; on failure send the classified fatal alert
+	// (RFC 8446 §6) while the record ciphers still exist, then wipe every
+	// secret the aborted handshake may have derived (the core's schedule
+	// material and this adapter's record-cipher IVs), close the socket (so an
+	// aborted connection does not leak the fd), and propagate the error rather
+	// than returning a half-connected Conn that would misbehave on read.
 	conn.do_handshake() or {
+		conn.send_failure_alert()
+		conn.wipe_on_failure()
 		sock.close() or {}
 		return err
 	}
@@ -181,7 +189,10 @@ fn (mut c Conn) do_handshake() ! {
 				// The peer's middlebox-compatibility dummy CCS carries no protocol
 				// meaning in TLS 1.3 — accept and drop it (RFC 8446 §5), bounded by
 				// validate_compat_ccs.
-				ccs_seen = validate_compat_ccs(rec.payload, ccs_seen)!
+				ccs_seen = validate_compat_ccs(rec.payload, ccs_seen) or {
+					c.fail_alert = .unexpected_message
+					return err
+				}
 				continue
 			}
 			.alert {
@@ -191,9 +202,13 @@ fn (mut c Conn) do_handshake() ! {
 				// outer plaintext alert then is injected/unauthenticated and must
 				// be rejected as unexpected_message, not acted on.
 				if c.hs.state() != .wait_server_hello {
+					c.fail_alert = .unexpected_message
 					return error('tls: unencrypted alert after ServerHello (unexpected_message)')
 				}
 				peer_alert := handshake.parse_alert(rec.payload)!
+				// The peer terminated of its own accord: never alert back into a
+				// socket the peer has already given up on (RFC 8446 §6).
+				c.peer_terminated = true
 				return error('tls: received alert ${peer_alert.description} (level=${peer_alert.level})')
 			}
 			.handshake {
@@ -201,6 +216,7 @@ fn (mut c Conn) do_handshake() ! {
 				// is outstanding (an HRR answer rearms the wait, so still
 				// outstanding); anything later must arrive protected (§5.1/§6).
 				if c.hs.state() != .wait_server_hello {
+					c.fail_alert = .unexpected_message
 					return error('tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
 				msgs := c.hs.feed(.initial, rec.payload)!
@@ -209,9 +225,11 @@ fn (mut c Conn) do_handshake() ! {
 				// bytes leave leftovers the handshake stream behind the record
 				// cannot be trusted to deliver correctly (§5.1).
 				if c.hs.buffered_bytes(.initial) != 0 {
+					c.fail_alert = .unexpected_message
 					return error('tls: misframed ServerHello record: ${c.hs.buffered_bytes(.initial)} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
+					c.fail_alert = .unexpected_message
 					return error('tls: incomplete ServerHello at record boundary (unexpected_message)')
 				}
 				if c.hs.state() == .wait_encrypted_extensions {
@@ -236,6 +254,7 @@ fn (mut c Conn) do_handshake() ! {
 				// authentic, so an injected one must be rejected rather than fed
 				// to a not-yet-initialized cipher state.
 				if c.hs.state() == .start || c.hs.state() == .wait_server_hello {
+					c.fail_alert = .unexpected_message
 					return error('tls: unexpected encrypted record before ServerHello (unexpected_message)')
 				}
 				dec := c.server_hs_cipher.decrypt_record(rec)!
@@ -262,17 +281,21 @@ fn (mut c Conn) do_handshake() ! {
 						// code instead of dropping it as a generic content-type mismatch.
 						peer_alert := handshake.parse_alert(dec.plaintext)!
 						if peer_alert.description == .close_notify {
+							c.peer_terminated = true
 							return error('tls: peer sent close_notify during handshake')
 						}
+						c.peer_terminated = true
 						return error('tls: received alert ${peer_alert.description} during handshake')
 					}
 					else {
 						// Only handshake and alert are legal here; anything else violates §5.6.
+						c.fail_alert = .unexpected_message
 						return error('tls: unexpected content type in handshake phase: ${dec.content_type}')
 					}
 				}
 			}
 			else {
+				c.fail_alert = .unexpected_message
 				return error('tls: unexpected record type ${rec.content_type} during handshake')
 			}
 		}
@@ -340,7 +363,14 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// traffic secrets so captured application traffic cannot be decrypted later
 	// by a memory compromise (RFC 8446 §1.3.1/§7.5). The triggering record was
 	// already decrypted before this handler ran, so the read cipher is not needed.
+	// The record cipher states' IVs are wiped here too, because the idempotent
+	// early-return in close() (this flag is already true) would otherwise skip
+	// the wipe those states receive on the normal teardown path.
 	c.hs.zeroize_app_secrets()
+	wipe_cipher_state(mut c.server_hs_cipher)
+	wipe_cipher_state(mut c.client_hs_cipher)
+	wipe_cipher_state(mut c.server_app_cipher)
+	wipe_cipher_state(mut c.client_app_cipher)
 	peer_alert := handshake.parse_alert(payload) or {
 		// Malformed alert body is itself fatal: pin a sticky error so subsequent
 		// read() calls re-report it rather than returning a clean EOF (0).
@@ -624,9 +654,57 @@ pub fn (mut c Conn) close() ! {
 	// Teardown is terminal: drop the application traffic secrets so a later memory
 	// compromise cannot re-derive the record keys and decrypt captured traffic
 	// (RFC 8446 §1.3.1/§7.5). send_close_notify above already used the live cipher,
-	// so nothing still needs these secrets.
+	// so nothing still needs these secrets. The record cipher states' IVs go with
+	// them: a nonce base for a dead key is itself dead material.
 	c.hs.zeroize_app_secrets()
+	wipe_cipher_state(mut c.server_hs_cipher)
+	wipe_cipher_state(mut c.client_hs_cipher)
+	wipe_cipher_state(mut c.server_app_cipher)
+	wipe_cipher_state(mut c.client_app_cipher)
 	c.close_socket()
+}
+
+// wipe_on_failure destroys every secret a failed handshake may have derived
+// before the error tore the connection down: the core's key-schedule material
+// (ClientHandshake.abort also parks the state machine in .failed), plus this
+// adapter's record cipher states, whose IVs are derived from the same schedule.
+// dial() calls it on every do_handshake failure so an aborted connection never
+// leaves handshake traffic keys or nonce bases resident in the discarded Conn.
+fn (mut c Conn) wipe_on_failure() {
+	c.hs.abort()
+	wipe_cipher_state(mut c.server_hs_cipher)
+	wipe_cipher_state(mut c.client_hs_cipher)
+	wipe_cipher_state(mut c.server_app_cipher)
+	wipe_cipher_state(mut c.client_app_cipher)
+}
+
+// send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
+// selecting the encryption level from the ciphers actually installed: app keys
+// if the handshake reached .connected, else handshake keys once the
+// ServerHello is accepted, else plaintext — the only form legal before the
+// ServerHello. dial() calls it after do_handshake fails and before
+// wipe_on_failure destroys the ciphers it needs.
+fn (mut c Conn) send_failure_alert() {
+	if c.peer_terminated {
+		return
+	}
+	desc := c.fail_alert or { c.hs.failure_alert() }
+	payload := handshake.new_alert(desc).encode()
+	// A RecordCipherState reports "initialized" exactly when its IV is the full
+	// nonce base, so an unwiped failure path cannot encrypt and falls through to
+	// the pre-ServerHello plaintext form; after the ServerHello a plaintext
+	// alert would be rejected by a compliant peer, so it is never used there.
+	if c.client_app_cipher.iv.len == aead_nonce_len {
+		enc := c.client_app_cipher.encrypt_record(.alert, payload) or { return }
+		c.write_records([enc]) or {}
+		return
+	}
+	if c.client_hs_cipher.iv.len == aead_nonce_len {
+		enc := c.client_hs_cipher.encrypt_record(.alert, payload) or { return }
+		c.write_records([enc]) or {}
+		return
+	}
+	c.write_records([new_record(.alert, payload)]) or {}
 }
 
 // close_socket closes the TCP transport exactly once. `closed` alone cannot be
