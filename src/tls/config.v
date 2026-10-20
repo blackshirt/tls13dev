@@ -30,6 +30,11 @@ pub:
 	// root_cas, when set, is used instead of the system trust store — e.g. for
 	// private CAs in enterprise or testing setups.
 	root_cas ?pki.TrustStore
+	// min_rsa_bits floors the accepted RSA leaf (server) key size in bits. Zero
+	// keeps the default (pki.default_min_rsa_bits = 2048). Lowering it is a
+	// deliberate security downgrade, provided only for interoperability with a
+	// legacy server.
+	min_rsa_bits int
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }

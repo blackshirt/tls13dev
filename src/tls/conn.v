@@ -48,6 +48,7 @@ mut:
 	// ticket storage to the stack above the handshake core), so the queue lives
 	// on the TLS Conn, bounded below.
 	session_tickets   []handshake.NewSessionTicket
+	post_hs_buf       []u8        // reassembly buffer for post-handshake messages (NewSessionTicket/KeyUpdate) split across records (RFC 8446 §5.2)
 	recv_buf          []u8        // raw bytes read from the socket, framing not yet applied
 	recv_pos          int         // start of unconsumed data in recv_buf (prefix is already parsed)
 	read_scratch      []u8        // connection-lifetime scratch filled by sock.read in read_raw_record, so a record arriving in TCP pieces costs no allocation
@@ -105,8 +106,14 @@ pub fn dial(address string, config Config) !&Conn {
 		}
 	}
 	validator := pki.new_validator(store, config.insecure_skip_verify)
+	// Apply the caller's RSA leaf-key floor only when they overrode the default;
+	// zero keeps pki's built-in 2048-bit minimum.
+	mut validator_mut := validator
+	if config.min_rsa_bits > 0 {
+		validator_mut.set_min_rsa_bits(config.min_rsa_bits)
+	}
 
-	mut hs := handshake.new_client_handshake(server_name, config.alpn, validator) or {
+	mut hs := handshake.new_client_handshake(server_name, config.alpn, validator_mut) or {
 		sock.close() or {}
 		return err
 	}
@@ -480,21 +487,34 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 }
 
 // handle_post_handshake consumes NewSessionTicket and KeyUpdate messages from a
-// decrypted post-handshake plaintext.
+// decrypted post-handshake plaintext. RFC 8446 §5.2 lets a sender fragment a
+// handshake message across multiple records (and coalesce several into one), so
+// partial bytes accumulate in post_hs_buf across calls and complete messages are
+// consumed immediately, mirroring the core's per-level reassembly. The buffer is
+// bounded so a peer cannot force unbounded growth with a never-completing
+// message header.
 fn (mut c Conn) handle_post_handshake(data []u8) ! {
-	// Loop while complete 4-byte-headered messages remain. Unlike the handshake
-	// phase there is no reassembly buffer across records, so a message split over
-	// two records surfaces as a truncation error — acceptable because these
-	// messages are sent one-per-record in practice (§5.2 permits, not requires, splitting).
-	mut buf := data.clone()
-	for buf.len >= 4 {
-		mut r := wire.new_reader(buf)
-		msg_type, length := handshake.parse_handshake_header(mut r)!
-		if buf.len < 4 + length {
-			return error('tls: truncated post-handshake message')
+	c.post_hs_buf << data
+	for {
+		if c.post_hs_buf.len < 4 {
+			return // header still incomplete; wait for the next record
 		}
-		body := buf[4..4 + length].clone()
-		buf = buf[4 + length..].clone()
+		mut r := wire.new_reader(c.post_hs_buf)
+		msg_type, length := handshake.parse_handshake_header(mut r)!
+		// handshake.max_handshake_message_len is the same bound the core enforces on
+		// reassembly; a declared length beyond it (or a buffer that can never
+		// reach it) is a protocol violation, not a reason to allocate.
+		if length > handshake.max_handshake_message_len {
+			return error('tls: post-handshake message declares ${length} bytes, exceeds maximum ${handshake.max_handshake_message_len}')
+		}
+		if c.post_hs_buf.len < 4 + length {
+			if c.post_hs_buf.len > 4 + handshake.max_handshake_message_len {
+				return error('tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message')
+			}
+			return // body still incomplete; wait for the next record
+		}
+		body := c.post_hs_buf[4..4 + length].clone()
+		c.post_hs_buf = c.post_hs_buf[4 + length..].clone()
 		match msg_type {
 			.new_session_ticket {
 				ticket := handshake.parse_new_session_ticket(body)!
@@ -528,9 +548,6 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				return error('tls: unexpected post-handshake message ${msg_type} (unexpected_message)')
 			}
 		}
-	}
-	if buf.len > 0 {
-		return error('tls: truncated post-handshake message header (${buf.len} bytes)')
 	}
 }
 

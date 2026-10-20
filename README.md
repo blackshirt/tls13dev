@@ -139,7 +139,10 @@ that imports it must sit beside it.
 - **Certificate verification**: chain to a trusted root (system bundle or
   caller-provided), validity windows, basic constraints, EKU `serverAuth`,
   RFC 6125 hostname matching (dNSName SANs with CN fallback only when no SAN
-  list exists, single-label wildcards, IP SANs)
+  list exists, single-label wildcards, IP SANs), Name Constraints
+  (permitted/excluded dNSName and iPAddress subtrees, RFC 5280 §4.2.1.10), and
+  a default-on RSA leaf-key strength floor (≥2048 bits, adjustable or disabled
+  via `Validator.set_min_rsa_bits`)
 - **Signature schemes**: RSA-PSS (SHA-256/384/512), ECDSA P-256/P-384, and
   Ed25519 for CertificateVerify and chain signatures; RSA-PKCS1-v1_5 SHA-256
   is accepted for chain signatures only — RFC 8446 §4.4.3 restricts
@@ -151,6 +154,14 @@ that imports it must sit beside it.
   (read keys ratchet on receipt; a response is sent with correct §4.6.3
   old-key-before-new ordering when the server requests it), sender-side
   automatic rekey at the §5.5 per-key record limit, `close_notify`
+- **Client authentication**: a server `CertificateRequest` is answered with the
+  empty `Certificate` a credential-less client must send (RFC 8446 §4.4.2),
+  bound into the transcript before the server flight is verified
+- **Failure handling**: a failed handshake classifies its alert (`internal_error`
+  as the §6 catch-all, with `unexpected_message`/`illegal_parameter`/
+  `decrypt_error`/`bad_certificate` set where the cause is known) and sends it —
+  plaintext before the ServerHello, under the handshake keys after — before
+  destroying every derived secret (§7.5) and closing the socket
 
 ### Hardened parsing
 
@@ -163,7 +174,8 @@ reassembled handshake message is capped at 1 MiB, a `Certificate` list longer
 than 32 entries is refused at parse time (before each entry is decoded), at
 most two middlebox dummy ChangeCipherSpec records are tolerated before the
 handshake aborts, per-key record counts enforce the §5.5 rekeying obligation in
-both directions, and CA certificates with RSA keys below 2048 bits are refused.
+both directions, and RSA keys below 2048 bits are refused — CAs always, and the
+leaf under the default `min_rsa_bits` floor (see `Validator` in `docs.md`).
 Malformed input is a handshake error, never a panic.
 
 Certificate validation is strict X.509 too: DER must use minimal length
@@ -187,9 +199,11 @@ the all-zero one.
 
 - Session resumption / PSK / 0-RTT (tickets are received but not usable;
   the key schedule always runs the no-PSK "early secret" path)
-- Client authentication (`CertificateRequest` is recognized, not answered)
-- Post-handshake record reassembly across fragmented records (fine for
-  NewSessionTicket/KeyUpdate, which servers send one-per-record)
+- Certificate **revocation** — CRL and OCSP are not implemented, so a
+  revoked-but-unexpired certificate is accepted. There is no callback hook
+  either; a caller needing revocation must validate out of band before
+  trusting the connection. See [`docs.md`](docs.md) for the rationale and the
+  recommended pattern.
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A QUIC transport stack (RFC 9001) — packet building, header protection,
   packet-number spaces, and `CONNECTION_CLOSE` signaling are out of scope. The
@@ -218,10 +232,24 @@ and the dummy-CCS flood bound), the full HRR state-machine path (group
 change, cookie echo, cipher-suite binding, replay rejection), X.509 decoding
 end to end — a full hand-built v3 certificate with extensions, truncation
 regressions for the element-count guards, and OID edge inputs — plus name
-matching including the SAN-vs-CN precedence rule, RSA exponent policy,
-CertificateVerify scheme-vs-key-type and curve binding, forward-secrecy
-zeroization of handshake and application secrets, and TCP record
-(re)framing in the connection layer.
+matching including the SAN-vs-CN precedence rule, Name Constraints subtree
+enforcement (permitted/excluded dNSName and iPAddress), the RSA exponent
+policy and leaf strength floor, CertificateVerify scheme-vs-key-type and
+curve binding, forward-secrecy zeroization of handshake and application
+secrets, and TCP record (re)framing in the connection layer.
+
+The core flight is additionally exercised end to end against an in-repo fake
+TLS 1.3 server (`src/tls/fakeserver/`, a test-only module): tests drive the
+real `ClientHandshake` through a complete X25519 handshake byte by byte,
+asserting the client's ServerHello/Finished/alert bytes and the derived
+traffic keys, then the same handshake over a live loopback TCP socket through
+`tls.dial()` — including HelloRetryRequest, a CertificateRequest answered
+with an empty `Certificate`, post-handshake messages split across records, and
+the negative paths (bad Finished, bad CertificateVerify, unoffered ALPN,
+out-of-order certificate, plaintext alert, trailing ServerHello junk, excess
+ChangeCipherSpec, illegal content type). The fake server reimplements the key
+schedule locally and imports only `tls.wire`/`tls.pki`, so it never shares code
+with the implementation under test.
 
 Coverage honesty: the RFC 8448 worked vectors exercise the AES-128-GCM /
 SHA-256 key-schedule and transcript path from the fixed shared secret
@@ -230,7 +258,7 @@ SHA-384, and ChaCha20-Poly1305 are verified by round trips and
 suite-parameter consistency rather than external vectors, and real-server
 behavior (all suites, HRR retries, interop quirks) is what the runnable demo
 (`v run src/example/dial_example.v`) is for — the HRR retry path itself is
-proven by the state-machine tests above.
+proven by both the state-machine tests and the fake-server flight.
 
 ## References
 

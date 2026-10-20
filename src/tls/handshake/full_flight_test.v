@@ -59,6 +59,41 @@ fn feed_encrypted_flight(mut h ClientHandshake, flight []u8) ![]HandshakeMessage
 	return produced
 }
 
+fn test_client_auth_request_answered_with_empty_certificate() ! {
+	// A server CertificateRequest must not derail the client: it answers with an
+	// empty Certificate (§4.4.2) whose bytes are folded into the transcript,
+	// then continues to authenticate the server as usual. This drives the whole
+	// exchange: EE+CReq → client empty Certificate → server Cert/CV/Fin →
+	// client Finished.
+	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut srv := fakeserver.new_server(client_auth: true)!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	assert !fl.is_hrr
+	h.feed(.initial, fl.server_hello)!
+
+	// EE + CertificateRequest: the client must emit exactly its empty Certificate.
+	assert fl.rest.len == 2
+	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
+	assert produced.len == 1
+	assert produced[0].level == .handshake
+	assert h.state() == .wait_certificate
+
+	// Feed the client's empty Certificate to the server; it validates the echo
+	// and returns the deferred Cert/CV/Fin tail.
+	tail := srv.handle_client_certificate(produced[0].msg)!
+	assert tail.len == 3
+
+	// The tail completes the handshake and yields the client Finished.
+	out := feed_encrypted_flight(mut h, fakeserver.flatten(tail))!
+	assert out.len == 1
+	assert h.state() == .connected
+	srv.handle_client_finished(out[0].msg)!
+
+	assert h.server_certs.len == 1
+}
+
 fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	mut h := new_client_handshake(fakeserver.server_name, ['h2'], make_trusted_validator())!
 	mut srv := fakeserver.new_server(alpn: ['h2', 'http/1.1'])!

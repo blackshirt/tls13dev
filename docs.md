@@ -44,6 +44,7 @@ crypto — no OpenSSL bindings, no third-party dependencies.
   - [3.2 Private CA / pinned lab roots](#32-private-ca--pinned-lab-roots)
   - [3.3 Testing escape hatch](#33-testing-escape-hatch)
   - [3.4 HelloRetryRequest — handled transparently](#34-helloretryrequest--handled-transparently)
+  - [3.5 Revocation is out of scope](#35-revocation-is-out-of-scope)
 - [4. Error handling summary](#4-error-handling-summary)
   - [4.1 Connection lifecycle](#41-connection-lifecycle)
   - [4.2 Wire & handshake protocol violations](#42-wire--handshake-protocol-violations)
@@ -125,7 +126,7 @@ role; this table summarizes it by owning module.
 | Module | Files | Responsibility |
 |---|---|---|
 | `tls.wire` | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
-| `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. `TrustStore` is public so `Config.root_cas` can be populated. |
+| `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN, name constraints) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 5280 §4.2.1.10 name-constraint enforcement (permitted/excluded dNSName and iPAddress subtrees on the leaf) with a default-on leaf RSA strength floor, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. `TrustStore` is public so `Config.root_cas` can be populated. |
 | `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `handshake_keys.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v` | The transport-neutral core: RFC 8446 §4 message structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history; the §7.1 HKDF-Extract/Expand ladder (`key_schedule.v`) which `handshake_keys.v` adapts — with the offered-group policy — to the handshake flow without touching the transcript; the AEAD constructors a suite maps to (`aead.v`); the CertificateVerify signature check over the §4.4.3 content (`certificate_verify.v`); the shared alert vocabulary — `AlertDescription`, its `encode`/`parse_alert`, and the RFC 9001 §4.8 `quic_connection_error` mapping (`alert.v`); and the recordless CRYPTO-stream passthrough reassembly `next_passthrough_message` with the 1 MiB `max_handshake_message_len` cap (RFC 9001 §4, `passthrough.v`). The `state_machine.v` sequences it all, owns the key ratchet, and speaks raw handshake messages at its `pub` boundary — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. It scrubs handshake secrets and both ephemeral private keys at `.connected` and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene), deferring handshake-stage material to `confirm_handshake()` so a QUIC adapter can still use it per RFC 9001 §4.1.2/§4.9.2. |
 | `tls` | `record.v`, `cipher_state.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `alert_record` wrapper, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side helpers (`alert_record`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
 | `tls` | `conn.v`, `tcp_transport.v`, `config.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `RecordCipherState` installation from `traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here; `tcp_transport.v` isolates the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits); `config.v` holds `Config`/`default_config()`. |
@@ -166,9 +167,11 @@ The full exchange one successful `dial()` performs, in wire order:
   ◄─────────  ServerHello           plaintext; ends the client's waiting
   ◄─ ─ ─ ─    (dummy ChangeCipherSpec — middlebox compatibility)
   ◄─────────  EncryptedExtensions   ┐ under handshake keys
+  ◄─────────  CertificateRequest?   │ server requests client auth
   ◄─────────  Certificate           │ server's chain, in leaf-to-
   ◄─────────  CertificateVerify     │ issuer order
   ◄─────────  Finished              ┘ transcript-bound verify_data
+  ─────────►  Certificate            empty, if a request was received
   ─────────►  Finished              client flight; both sides derive
                                     application keys on success
   ⇄ ⇄ ⇄ ⇄ ⇄   application_data …    records sealed with traffic keys
@@ -182,7 +185,13 @@ Each `◄─ ─ ─` dummy ChangeCipherSpec is accepted and ignored (§5). The
 handshake↔traffic key transition is derived inside the state machine and
 installed by the adapter as records are processed; `dial()` returns only after
 the client `Finished` is accepted by the server and the state reports
-`.connected`.
+`.connected`. If the server sends a `CertificateRequest`, the client answers
+with the empty `Certificate` a credential-less client must send (§4.4.2),
+folded into the transcript before the server flight is verified — the library
+has no client certificate to offer, so it declines rather than aborting.
+Post-handshake messages (`NewSessionTicket`, `KeyUpdate`) are reassembled from
+the decrypted record stream even when a single message is split across records
+(the core's 1 MiB cap still bounds the buffer).
 
 ### 1.5 Adapter contract (`tls.handshake`)
 
@@ -305,7 +314,8 @@ Behavior and guarantees:
 - **Resource bounds** — a handshake message declaring more than 1 MiB is refused
   at its header before fragments accumulate; a `Certificate` list with more than
   32 entries is rejected during parsing (before each is ASN.1-decoded), and so are
-  chains that long and CA RSA keys shorter than 2048 bits; at most two middlebox
+  chains that long, CA RSA keys shorter than 2048 bits, and a leaf under the
+  `min_rsa_bits` floor; at most two middlebox
   dummy ChangeCipherSpec records are tolerated during the handshake, so a streamed
   CCS flood cannot pin the loop; the post-handshake `NewSessionTicket` backlog is
   capped at 32 stored tickets.
@@ -401,6 +411,7 @@ pub:
 	alpn                 []string = []string{}
 	insecure_skip_verify bool
 	root_cas             ?pki.TrustStore
+	min_rsa_bits         int
 	timeout              time.Duration = 30 * time.second
 }
 ```
@@ -415,6 +426,7 @@ build one up front from `default_config()`).
 | `alpn` | `[]` (none offered) | Application protocols to offer, in preference order (e.g. `['h2', 'http/1.1']`). The server's pick is verified against this list. |
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
+| `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]
@@ -581,6 +593,35 @@ echoes any `cookie`, and re-sends a ClientHello. The transcript substitutes the
 first HelloRetryRequest with its `message_hash` (§4.4.1) so Finished
 verification binds the entire two-round exchange.
 
+### 3.5 Revocation is out of scope
+
+> [!IMPORTANT]
+> <span style="color:#b26a00">This library does not consult CRLs or OCSP.</span>
+> A certificate that is unexpired, correctly chained, and in policy is accepted
+> even if the issuer has revoked it.
+
+This is a deliberate scope decision, not an oversight. Revocation checking is
+famously unreliable — soft-fail CRL/OCSP silently accepts when the responder is
+unreachable, hard-fail turns a third-party outage into a client outage, OCSP
+stapling requires the server to cooperate, and CRLs are large and stale. A
+half-implemented check gives operators false confidence. There is also **no
+callback hook**: a hook that runs after `dial()` returns is too late to stop the
+handshake, and one that runs mid-handshake would have to be `pub` in the
+transport-neutral core, dragging application policy into a module that owns no
+socket concept.
+
+If your threat model needs revocation:
+
+1. Validate the leaf **out of band** before trusting the connection — fetch the
+   issuer's CRL or an OCSP response, verify its signature and freshness, and
+   check the leaf's serial number against it. Do this against the certificate
+   the server presented, not a second one fetched independently.
+2. Use short-lived leaf certificates so revocation windows are minutes, not
+   months — the practical mitigation most large deployments rely on.
+3. If you must bind it to the handshake, terminate TLS in a component that
+   already does stapled-OCSP validation and treat this library's result as the
+   transport beneath it.
+
 ---
 
 ## 4. Error handling summary
@@ -589,6 +630,17 @@ All fallible operations return `!` (V option/result errors); there are
 <span style="color:#2ea44f">**no panics on malformed input**</span> — bad framing, oversized records, duplicate or
 unpermitted extensions, truncated certificates, and bad share sizes are
 <span style="color:#2ea44f">handshake errors, never memory-safety events</span>.
+
+When the handshake fails, `dial()` sends a fatal alert before closing: a
+plaintext one before the ServerHello, and one sealed under the handshake keys
+afterward. The alert is classified from the cause where it is known —
+`unexpected_message` for a message out of sequence, `illegal_parameter` for a
+bad share or malformed field, `decrypt_error` for a record that fails to
+authenticate, `bad_certificate` for a certificate failure — and falls back to
+the §6 catch-all `internal_error`. Immediately after, every secret the failing
+attempt derived (handshake and application traffic secrets, cached traffic
+keys, ephemeral private keys) is wiped, so a retained buffer cannot unlock a
+recorded session (§7.5).
 
 ### 4.1 Connection lifecycle
 
@@ -601,7 +653,7 @@ unpermitted extensions, truncated certificates, and bad share sizes are
 | Peer fatal alert (encrypted, post-handshake) | <span style="color:#cf222e">`read()` error</span> carrying the alert description |
 | `write()` after `close()` or before handshake | error, nothing sent |
 | `close()` twice | <span style="color:#2ea44f">no-op, no error, `close_notify` sent at most once</span> |
-| Handshake failure inside `dial()` | error; the socket is closed — no fd leak |
+| Handshake failure inside `dial()` | error; a classified fatal alert is sent, secrets are wiped, and the socket is closed — no fd leak, no retained key material |
 
 ### 4.2 Wire & handshake protocol violations
 
@@ -623,6 +675,9 @@ unpermitted extensions, truncated certificates, and bad share sizes are
 | Leaf/CA `keyUsage` present but forbidding its required use | <span style="color:#cf222e">`dial()` error</span> (digitalSignature / keyCertSign) |
 | `basicConstraints` pathLenConstraint exceeded | <span style="color:#cf222e">`dial()` error</span> |
 | CA RSA key < 2048 bits in the chain | <span style="color:#cf222e">`dial()` error</span> |
+| Leaf RSA key below `Config.min_rsa_bits` (default 2048) | <span style="color:#cf222e">`dial()` error</span> (raise/lower via `min_rsa_bits`) |
+| Leaf dNSName/iPAddress outside a CA's permitted Subtrees, or inside an excluded one | <span style="color:#cf222e">`dial()` error</span> (RFC 5280 §4.2.1.10) |
+| No revocation information consulted (CRL/OCSP) | <span style="color:#b26a00">accepted — revocation is out of scope</span> |
 | Unparseable certificate validity time | <span style="color:#cf222e">`dial()` error</span> (decode fails; expiry always enforced) |
 | Non-minimal DER length or invalid RSA public exponent (`e` = 0, degenerate 1, or any even value such as 2) | <span style="color:#cf222e">`dial()` error</span> (decode rejected) |
 | `TBSCertificate` missing mandatory fields — with or without the optional `version [0]` element | <span style="color:#cf222e">`dial()` error</span> (post-version element-count guard; a truncated v3 certificate fails the decode cleanly instead of indexing past the element array) |

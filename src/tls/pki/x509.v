@@ -65,7 +65,17 @@ pub:
 	key_usage       []u8 // BIT STRING contents of keyUsage, big-endian named bits
 	has_eku         bool // an extendedKeyUsage extension was present at all
 	eku_server_auth bool // EKU includes id-kp-serverAuth, required for TLS servers
-	signature       []u8 // BIT STRING contents of signatureValue
+	// name_constraints, when the CA asserts it, restricts the namespace of names
+	// a subordinate certificate may carry (RFC 5280 §4.2.1.10). permitted_dns /
+	// permitted_ip are the permittedSubtrees for dNSName and iPAddress
+	// respectively; excluded_dns / excluded_ip are the excludedSubtrees. A
+	// subtree is enforced only for the name forms it lists.
+	name_constraints_present bool
+	permitted_dns            []string
+	excluded_dns             []string
+	permitted_ip             [][]u8
+	excluded_ip              [][]u8
+	signature                []u8 // BIT STRING contents of signatureValue
 }
 
 // parse_certificate decodes an X.509 DER certificate.
@@ -267,6 +277,11 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut key_usage := []u8{}
 	mut has_eku := false
 	mut eku_server_auth := false
+	mut nc_present := false
+	mut permitted_dns := []string{}
+	mut excluded_dns := []string{}
+	mut permitted_ip := [][]u8{}
+	mut excluded_ip := [][]u8{}
 	// RFC 5280 §4.2: each extension OID must appear at most once. Tracking seen
 	// OIDs stops a duplicate (e.g. a second SAN) from silently overwriting the
 	// first, which could drop names the issuer actually asserted.
@@ -323,6 +338,10 @@ pub fn parse_certificate(der []u8) !Certificate {
 							has_eku = true
 							eku_server_auth = parse_eku_server_auth(ext_val_bytes)
 						}
+						'2.5.29.30' { // Name Constraints (RFC 5280 §4.2.1.10)
+							nc_present = true
+							permitted_dns, excluded_dns, permitted_ip, excluded_ip = parse_name_constraints(ext_val_bytes)
+						}
 						else {
 							// RFC 5280 §4.2: a certificate carrying a critical
 							// extension this implementation does not understand
@@ -347,34 +366,39 @@ pub fn parse_certificate(der []u8) !Certificate {
 	}
 
 	return Certificate{
-		raw:                der.clone()
-		tbs_raw:            tbs_raw
-		version:            version
-		serial_number:      serial_number
-		signature_algo_oid: tbs_sig_algo_oid
-		signature_hash_oid: tbs_sig_hash_oid
-		issuer_cn:          issuer_cn
-		subject_cn:         subject_cn
-		issuer_dn:          issuer_dn
-		subject_dn:         subject_dn
-		not_before:         not_before
-		not_after:          not_after
-		not_before_unix:    not_before_unix
-		not_after_unix:     not_after_unix
-		public_key_algo:    pk_algo
-		public_key_raw:     raw_pk_bytes
-		rsa_public_key:     rsa_key
-		ecdsa_curve:        ecdsa_curve
-		sans:               sans
-		ip_sans:            ip_sans
-		has_san:            has_san
-		is_ca:              is_ca
-		max_path_len:       max_path_len
-		has_key_usage:      has_key_usage
-		key_usage:          key_usage
-		has_eku:            has_eku
-		eku_server_auth:    eku_server_auth
-		signature:          signature_bytes
+		raw:                      der.clone()
+		tbs_raw:                  tbs_raw
+		version:                  version
+		serial_number:            serial_number
+		signature_algo_oid:       tbs_sig_algo_oid
+		signature_hash_oid:       tbs_sig_hash_oid
+		issuer_cn:                issuer_cn
+		subject_cn:               subject_cn
+		issuer_dn:                issuer_dn
+		subject_dn:               subject_dn
+		not_before:               not_before
+		not_after:                not_after
+		not_before_unix:          not_before_unix
+		not_after_unix:           not_after_unix
+		public_key_algo:          pk_algo
+		public_key_raw:           raw_pk_bytes
+		rsa_public_key:           rsa_key
+		ecdsa_curve:              ecdsa_curve
+		sans:                     sans
+		ip_sans:                  ip_sans
+		has_san:                  has_san
+		is_ca:                    is_ca
+		max_path_len:             max_path_len
+		has_key_usage:            has_key_usage
+		key_usage:                key_usage
+		has_eku:                  has_eku
+		eku_server_auth:          eku_server_auth
+		name_constraints_present: nc_present
+		permitted_dns:            permitted_dns
+		excluded_dns:             excluded_dns
+		permitted_ip:             permitted_ip
+		excluded_ip:              excluded_ip
+		signature:                signature_bytes
 	}
 }
 
@@ -534,6 +558,85 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 		}
 	}
 	return dns, ip
+}
+
+// parse_name_constraints decodes the NameConstraints extension value
+// (RFC 5280 §4.2.1.10) into the permitted/excluded dNSName and iPAddress
+// subtrees. The value may be wrapped in an OCTET STRING (an extension)'s inner
+// value already is the DER NameConstraints, but unwrap is applied for symmetry
+// with parse_san_extension). Only dNSName and iPAddress subtrees are retained:
+// the client validates TLS server identities, which are exactly those two name
+// forms. A GeneralSubtree minimum/maximum (BaseDistance) is parsed past, since
+// RFC 5280 §4.2.1.10 forbids a non-zero minimum for the name forms we enforce.
+fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
+	mut permitted_dns := []string{}
+	mut excluded_dns := []string{}
+	mut permitted_ip := [][]u8{}
+	mut excluded_ip := [][]u8{}
+
+	inner := unwrap_octet_string(ext_bytes)
+	mut r := wire.new_reader(inner)
+	seq := read_asn1_element(mut r) or { return permitted_dns, excluded_dns, permitted_ip, excluded_ip }
+	mut body := wire.new_reader(seq.data)
+
+	for body.remaining() > 0 {
+		field := read_asn1_element(mut body) or { break }
+		// [0] permittedSubtrees and [1] excludedSubtrees are context-specific
+		// CONSTRUCTED tags: 0xa0 and 0xa1. A different tag is skipped.
+		is_permitted := field.tag == 0xa0
+		is_excluded := field.tag == 0xa1
+		if !is_permitted && !is_excluded {
+			continue
+		}
+		mut subtrees := wire.new_reader(field.data)
+		// GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree: the [0]/[1]
+		// field wraps this SEQUENCE, whose contents are the GeneralSubtree entries.
+		if subtrees.remaining() == 0 {
+			continue
+		}
+		list := read_asn1_element(mut subtrees) or { continue }
+		mut entries := wire.new_reader(list.data)
+		for entries.remaining() > 0 {
+			gs := read_asn1_element(mut entries) or { break }
+			// Each GeneralSubtree is a SEQUENCE whose first element is the base
+			// GeneralName.
+			mut gs_body := wire.new_reader(gs.data)
+			if gs_body.remaining() == 0 {
+				continue
+			}
+			base := read_asn1_element(mut gs_body) or { continue }
+			if (base.tag & 0xc0) != 0x80 || (base.tag & 0x20) != 0 {
+				continue
+			}
+			match base.tag & 0x1f {
+				2 { // [2] dNSName
+					if base.data.contains(0) {
+						continue // null-byte smuggling guard, as in SAN parsing
+					}
+					name := base.data.bytestr()
+					if is_permitted {
+						permitted_dns << name
+					} else {
+						excluded_dns << name
+					}
+				}
+				7 { // [7] iPAddress
+					// In nameConstraints an iPAddress subtree is address+mask: 8
+					// bytes for IPv4 (4+4), 32 for IPv6 (16+16). Unlike a SAN
+					// iPAddress (bare 4/16), the mask form is what we store.
+					if base.data.len == 8 || base.data.len == 32 {
+						if is_permitted {
+							permitted_ip << base.data.clone()
+						} else {
+							excluded_ip << base.data.clone()
+						}
+					}
+				}
+				else {}
+			}
+		}
+	}
+	return permitted_dns, excluded_dns, permitted_ip, excluded_ip
 }
 
 // parse_path_len_constraint decodes a BasicConstraints pathLenConstraint INTEGER,

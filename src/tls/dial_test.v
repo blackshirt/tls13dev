@@ -117,8 +117,18 @@ fn expect_dial_failure(addr string, want string, res_ch chan string) ! {
 // reads the client's plaintext ClientHello+CCS, answers with ServerHello+CCS,
 // protects EE/Cert/CV/Fin under the server handshake keys, verifies the client
 // Finished under the client handshake keys, then streams one NewSessionTicket
-// and one application record under the server application keys.
+// and one application record under the server application keys. With
+// split_ticket the NewSessionTicket bytes are spread across two application-key
+// records, so the client's post-handshake reassembly is exercised.
 fn full_handshake_script(mut c net.TcpConn) ! {
+	run_full_handshake(mut c, false)!
+}
+
+fn split_ticket_script(mut c net.TcpConn) ! {
+	run_full_handshake(mut c, true)!
+}
+
+fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
 	ch_rec := scripted_read_record(mut c)!
 	if ch_rec.content_type != .handshake {
 		return error('expected a handshake record first, got ${ch_rec.content_type}')
@@ -170,7 +180,17 @@ fn full_handshake_script(mut c net.TcpConn) ! {
 	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
 	mut aenc := new_record_cipher_state(aaead, aiv)!
 	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
-	c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+	if split_ticket {
+		// Fragment the ticket across two records: the first carries the 4-byte
+		// header plus part of the body, the second the remainder. RFC 8446 §5.2
+		// permits a handshake message to span records, so the client must
+		// reassemble rather than treat the first as truncated.
+		cut := 8
+		c.write(aenc.encrypt_record(.handshake, nst[..cut])!.serialize()) or { return err }
+		c.write(aenc.encrypt_record(.handshake, nst[cut..])!.serialize()) or { return err }
+	} else {
+		c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+	}
 	payload := 'hello from fakeserver'.bytes()
 	c.write(aenc.encrypt_record(.application_data, payload)!.serialize()) or { return err }
 }
@@ -198,6 +218,33 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 
 	assert conn.session_tickets.len == 1
 	assert conn.session_tickets[0].ticket_lifetime == 3600
+	assert conn.session_tickets[0].ticket == [u8(0xaa), 0xbb, 0xcc, 0xdd]
+
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+fn test_dial_reassembles_post_handshake_message_across_records() ! {
+	// A NewSessionTicket fragmented over two application-key records must be
+	// reassembled and parsed as one message, then the application bytes after it
+	// must still be delivered.
+	addr, res_ch := start_scripted_server(split_ticket_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		alpn:        ['h2']
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)!
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+	assert conn.session_tickets.len == 1
 	assert conn.session_tickets[0].ticket == [u8(0xaa), 0xbb, 0xcc, 0xdd]
 
 	conn.close() or {}
@@ -359,9 +406,7 @@ fn test_dial_completes_hello_retry_request_round_trip() ! {
 	assert res == 'OK'
 }
 
-// ---- Failure alerts over TCP ----
-
-// alert_back_script drives the client to fail on a Bad CertificateVerify (a
+// ---- Failure alerts over TCP ----// alert_back_script drives the client to fail on a Bad CertificateVerify (a
 // corrupt signature) and then reads the client's own fatal alert off the wire,
 // asserting both its framing (encrypted under the client handshake keys, since
 // the ServerHello installed them) and its describing code.
@@ -447,4 +492,75 @@ fn test_dial_sends_plaintext_fatal_alert_before_server_hello() ! {
 	// A malformed ServerHello fails before any classification, so the surfaced
 	// message is the parse error rather than a named alert.
 	expect_dial_failure(addr, 'unexpected EOF', res_ch)!
+}
+
+// ---- Client authentication (CertificateRequest) over TCP ----
+
+// client_auth_script sends a CertificateRequest after EncryptedExtensions, reads
+// the client's encrypted empty Certificate, feeds it to the fakeserver, then
+// streams the deferred Cert/CV/Fin tail and reads the client Finished.
+fn client_auth_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+
+	mut srv := fakeserver.new_server(client_auth: true) or {
+		return error('fakeserver: ${err.msg()}')
+	}
+	fl := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH: ${err.msg()}') }
+	c.write(new_record(.handshake, fl.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	mut senc := new_record_cipher_state(aead, siv)!
+	// fl.rest is [EncryptedExtensions, CertificateRequest].
+	for m in fl.rest {
+		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
+	}
+
+	// The client answers with its empty Certificate under the client handshake keys.
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_record_cipher_state(caead, civ)!
+	ccert_rec := scripted_read_record(mut c)!
+	ccert := cdec.decrypt_record(ccert_rec)!
+	if ccert.content_type != .handshake {
+		return error('client Certificate inner type ${ccert.content_type}, expected handshake')
+	}
+	tail := srv.handle_client_certificate(ccert.plaintext) or {
+		return error('fakeserver client Certificate: ${err.msg()}')
+	}
+
+	// The deferred tail continues under the same server handshake key generation
+	// (senc's sequence number is already past EE+CReq).
+	for m in tail {
+		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
+	}
+
+	cfin_rec := scripted_read_record(mut c)!
+	cfin := cdec.decrypt_record(cfin_rec)!
+	if cfin.content_type != .handshake {
+		return error('client Finished inner type ${cfin.content_type}, expected handshake')
+	}
+	srv.handle_client_finished(cfin.plaintext) or { return error('fakeserver Finished: ${err.msg()}') }
+}
+
+fn test_dial_answers_certificate_request_with_empty_certificate() ! {
+	addr, res_ch := start_scripted_server(client_auth_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+	assert conn.negotiated_alpn() == ''
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
 }

@@ -554,3 +554,89 @@ fn test_parse_certificate_rejects_duplicate_extension() ! {
 	}
 	assert false
 }
+
+// test_parse_name_constraints: the NameConstraints extension (critical, RFC 5280
+// §4.2.1.10) must be decoded into the permitted/excluded dNSName and iPAddress
+// subtrees rather than rejected as an unknown critical extension.
+fn test_parse_name_constraints() ! {
+	// permittedSubtrees [0] = SEQUENCE OF GeneralSubtree{ dNSName "example.com" }
+	dns_base := der_tlv(0x82, ['example.com'.bytes()])
+	dns_subtree := der_tlv(0x30, [dns_base])
+	permitted := der_tlv(0xa0, [der_tlv(0x30, [dns_subtree])])
+
+	// excludedSubtrees [1] = SEQUENCE OF GeneralSubtree{ iPAddress 10.0.0.0/8 }
+	ip_base := der_tlv(0x87, [[u8(10), 0, 0, 0], [u8(255), 0, 0, 0]])
+	ip_subtree := der_tlv(0x30, [ip_base])
+	excluded := der_tlv(0xa1, [der_tlv(0x30, [ip_subtree])])
+
+	nc_value := der_tlv(0x30, [permitted, excluded])
+	nc_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x1e] // 2.5.29.30
+
+	cert := minimal_extension_cert(nc_oid, true, nc_value)
+	c := parse_certificate(cert)!
+
+	assert c.name_constraints_present
+	assert c.permitted_dns == ['example.com']
+	assert c.excluded_ip.len == 1
+	assert c.excluded_ip[0] == [u8(10), 0, 0, 0, 255, 0, 0, 0]
+}
+
+// ---- Name-constraint subtree matching ----
+
+fn test_dns_within_subtree_matching() {
+	// Exact name and subdomains match; a different registrable name does not.
+	assert dns_within_subtree('example.com', 'example.com')
+	assert dns_within_subtree('a.example.com', 'example.com')
+	assert dns_within_subtree('deep.a.example.com', 'example.com')
+	// Case-insensitive per RFC 5280 §7.2.
+	assert dns_within_subtree('EXAMPLE.com', 'example.com')
+	// A boundary lookalike must not match.
+	assert !dns_within_subtree('notexample.com', 'example.com')
+	// A leading-dot subtree matches only subdomains, not the bare name.
+	assert dns_within_subtree('a.example.com', '.example.com')
+	assert !dns_within_subtree('example.com', '.example.com')
+}
+
+fn test_ip_within_subtree_matching() {
+	// 10.0.0.0/8 covers 10.1.2.3 but not 11.0.0.1.
+	cidr := [u8(10), 0, 0, 0, 255, 0, 0, 0]
+	assert ip_within_subtree([u8(10), 1, 2, 3], cidr)
+	assert !ip_within_subtree([u8(11), 0, 0, 1], cidr)
+	// A length mismatch (IPv6 candidate vs IPv4 subtree) must not match.
+	assert !ip_within_subtree([u8(0x20)], cidr)
+}
+
+fn test_enforce_name_constraints_rejects_out_of_subtree() ! {
+	ca := Certificate{
+		name_constraints_present: true
+		permitted_dns:            ['example.com']
+	}
+	inside := Certificate{
+		sans: ['api.example.com']
+	}
+	enforce_name_constraints(ca, inside)!
+
+	outside := Certificate{
+		sans: ['evil.test']
+	}
+	enforce_name_constraints(ca, outside) or {
+		assert err.msg().contains('outside the permitted subtrees')
+		return
+	}
+	assert false
+}
+
+fn test_enforce_name_constraints_honors_exclusions() ! {
+	ca := Certificate{
+		name_constraints_present: true
+		excluded_dns:             ['bad.example.com']
+	}
+	banned := Certificate{
+		sans: ['x.bad.example.com']
+	}
+	enforce_name_constraints(ca, banned) or {
+		assert err.msg().contains('excluded subtree')
+		return
+	}
+	assert false
+}

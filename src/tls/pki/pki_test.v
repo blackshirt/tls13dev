@@ -143,3 +143,52 @@ fn test_verify_certificate_chain_rejects_empty_hostname() ! {
 	}
 	assert false
 }
+
+// rsa_leaf_of_bits builds a leaf Certificate carrying an RSA public key whose
+// modulus is `bits` long, enough to exercise check_leaf_rsa_floor without a real
+// signed chain.
+fn rsa_leaf_of_bits(bits int) Certificate {
+	modulus := []u8{len: bits / 8, init: 0xab}
+	mut key := RsaPublicKey{
+		e: u64(65537)
+	}
+	key.size_bytes = modulus.len
+	return Certificate{
+		public_key_algo: .rsa
+		rsa_public_key:  key
+	}
+}
+
+fn test_leaf_rsa_floor_default_is_2048() ! {
+	// A 1024-bit leaf key is refused under the default floor.
+	check_leaf_rsa_floor(rsa_leaf_of_bits(1024), default_min_rsa_bits) or {
+		assert err.msg().contains('leaf RSA key too short')
+		assert err.msg().contains('1024 bits')
+		return
+	}
+	assert false
+}
+
+fn test_leaf_rsa_floor_accepts_2048_and_above() ! {
+	check_leaf_rsa_floor(rsa_leaf_of_bits(2048), default_min_rsa_bits)!
+	check_leaf_rsa_floor(rsa_leaf_of_bits(3072), default_min_rsa_bits)!
+}
+
+fn test_leaf_rsa_floor_ignores_non_rsa() ! {
+	// An EC/Ed25519 leaf has no RSA modulus; the floor must not touch it.
+	check_leaf_rsa_floor(Certificate{
+		public_key_algo: .ed25519
+	}, default_min_rsa_bits)!
+}
+
+fn test_set_min_rsa_bits_escape_hatch() {
+	mut v := new_validator(new_trust_store(), false)
+	assert v.effective_min_rsa_bits() == default_min_rsa_bits
+	// Lowering the floor admits a 1024-bit leaf the default rejects.
+	v.set_min_rsa_bits(1024)
+	assert v.effective_min_rsa_bits() == 1024
+	check_leaf_rsa_floor(rsa_leaf_of_bits(1024), v.effective_min_rsa_bits())!
+	// Zero restores the default.
+	v.set_min_rsa_bits(0)
+	assert v.effective_min_rsa_bits() == default_min_rsa_bits
+}

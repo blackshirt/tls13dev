@@ -86,7 +86,8 @@ pub enum HandshakeState {
 	start                     // nothing sent yet; create_client_hello moves us out of here
 	wait_server_hello         // ClientHello sent; awaiting ServerHello or HelloRetryRequest
 	wait_encrypted_extensions // ServerHello accepted and handshake keys installed
-	wait_certificate          // EncryptedExtensions accepted (ALPN/SNI checks done)
+	wait_certificate_request  // EncryptedExtensions accepted; a CertificateRequest may (optionally) follow before the Certificate (§4.3.2/§4.4.1)
+	wait_certificate          // EncryptedExtensions (and any CertificateRequest) accepted (ALPN/SNI checks done); awaiting the server Certificate
 	wait_certificate_verify   // server chain parsed and hostname/chain validated
 	wait_server_finished      // CertificateVerify verified against the leaf key
 	connected                 // server Finished verified; application data may flow
@@ -174,6 +175,7 @@ mut:
 	hs_reassembly      []u8
 	validator          pki.Validator     // trust anchors + hostname policy, injected at construction
 	server_certs       []pki.Certificate // chain sent by the server, leaf first, once Certificate is parsed
+	request_context    []u8              // certificate_request_context echoed from a server CertificateRequest (§4.3.2); drives the empty client Certificate (§4.4.2)
 	hrr_received       bool              // set after a HelloRetryRequest so the second CH is validated as such
 	hrr_cipher_suite   ?CipherSuite      // suite selected in the HelloRetryRequest; the final ServerHello must reuse it (§4.1.4)
 	// Progress and outcome fields adapters poll; surfaced through state() and
@@ -821,10 +823,35 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			}
 			h.negotiated_alpn = alpn
 			h.transcript.update(full_msg)
+			h.state = .wait_certificate_request
+		}
+		.certificate_request {
+			// §4.3.2: CertificateRequest is the first server-flight message that
+			// indicates the server wants client authentication. This client holds
+			// no credential, so it must still acknowledge the request with an
+			// empty Certificate (§4.4.2) rather than ignore it or fail.
+			if h.state != .wait_certificate_request {
+				h.fail_alert = .unexpected_message
+				return error('handshake: unexpected CertificateRequest')
+			}
+			req := parse_certificate_request(body)!
+			h.transcript.update(full_msg)
+			h.request_context = req.request_context
 			h.state = .wait_certificate
+
+			// The empty Certificate-response (RFC 8446 §4.4.2) enters the
+			// transcript BEFORE the server's Certificate/CertificateVerify/
+			// Finished are verified, so the server Finished is computed over the
+			// transcript that already includes our response.
+			response := build_empty_certificate(h.request_context)
+			h.transcript.update(response)
+			return [new_handshake_message(.handshake, response)!]
 		}
 		.certificate {
-			if h.state != .wait_certificate {
+			// §4.4.1: the server Certificate follows EncryptedExtensions directly,
+			// or a CertificateRequest may sit before it (client authentication);
+			// accept both orders.
+			if h.state != .wait_certificate_request && h.state != .wait_certificate {
 				h.fail_alert = .unexpected_message
 				return error('handshake: unexpected Certificate')
 			}

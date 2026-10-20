@@ -25,6 +25,7 @@ const hs_server_hello = u8(2)
 const hs_new_session_ticket = u8(4)
 const hs_encrypted_extensions = u8(8)
 const hs_certificate = u8(11)
+const hs_certificate_request = u8(13)
 const hs_certificate_verify = u8(15)
 const hs_finished = u8(20)
 const hs_message_hash = u8(254)
@@ -99,12 +100,17 @@ pub:
 	// the client offered, so tests can prove the RFC 7301 §3.1 check aborts on
 	// an unoffered selection. Empty (the default) means "pick normally".
 	force_alpn string
+	// client_auth sends a CertificateRequest after EncryptedExtensions and
+	// expects the client's empty Certificate response (RFC 8446 §4.3.2/§4.4.2)
+	// folded into the transcript before the server Certificate.
+	client_auth bool
 }
 
 // Stage tracks where the fakeserver is in its two-hello state machine.
 enum Stage {
 	expect_ch              // awaiting the first ClientHello
 	expect_ch2             // HelloRetryRequest sent; awaiting the retry ClientHello
+	expect_client_cert     // CertificateRequest sent; awaiting the client's empty Certificate
 	expect_client_finished // server flight sent; awaiting the client Finished
 	done                   // client Finished verified; connection logically complete
 }
@@ -127,6 +133,11 @@ mut:
 	server_hs_traffic   []u8
 	client_ap_traffic   []u8
 	server_ap_traffic   []u8
+	// pending_tail holds the server-flight messages that follow a client
+	// CertificateRequest/response exchange (Certificate, CertificateVerify,
+	// Finished), deferred until the client's empty Certificate is folded into
+	// the transcript so the Finished binds the correct running hash.
+	pending_tail [][]u8
 }
 
 // Flight is one server response: the (possibly HelloRetryRequest) ServerHello
@@ -222,7 +233,7 @@ pub fn (mut s Server) handle_client_hello(msg []u8) !Flight {
 			}
 			return s.finish_flight(ch, msg)
 		}
-		.expect_client_finished, .done {
+		.expect_client_cert, .expect_client_finished, .done {
 			return error('fakeserver: unexpected extra ClientHello (stage ${s.stage})')
 		}
 	}
@@ -268,7 +279,11 @@ fn pick_hrr_group(groups []u16, current u16) !u16 {
 
 // finish_flight performs the (EC)DHE exchange, builds ServerHello, derives the
 // handshake secrets, and emits EncryptedExtensions + Certificate +
-// CertificateVerify + Finished over the growing transcript.
+// CertificateVerify + Finished over the growing transcript. When client_auth is
+// set the flight is split: EncryptedExtensions + CertificateRequest go out
+// immediately, the rest is deferred to handle_client_certificate so the
+// client's empty Certificate sits between CertificateRequest and Certificate in
+// the transcript (RFC 8446 §4.4.1/§4.4.2).
 fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	server_share, shared := server_ecdhe(ch.share_group, ch.share)!
 	s.shared_secret = shared
@@ -287,12 +302,42 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 		pick_alpn(s.cfg.alpn, ch.alpn)
 	}
 	ee := build_encrypted_extensions(alpn_proto)!
+	s.transcript.append(ee)
+
+	if s.cfg.client_auth {
+		// §4.3.2: request client credentials, then WAIT for the client's empty
+		// Certificate before emitting the authenticated server tail.
+		creq := build_certificate_request()!
+		s.transcript.append(creq)
+		s.stage = .expect_client_cert
+		return Flight{
+			is_hrr:       false
+			server_hello: sh
+			rest:         [ee, creq]
+		}
+	}
+
+	tail := s.build_server_tail()!
+	s.stage = .expect_client_finished
+	mut rest := [][]u8{cap: 1 + tail.len}
+	rest << ee
+	rest << tail
+	return Flight{
+		is_hrr:       false
+		server_hello: sh
+		rest:         rest
+	}
+}
+
+// build_server_tail builds Certificate + CertificateVerify + Finished over the
+// transcript as it currently stands (after EncryptedExtensions, and after a
+// client Certificate when client_auth is set).
+fn (mut s Server) build_server_tail() ![][]u8 {
 	cert := build_certificate(leaf_der() or {
 		return error('fakeserver: cannot decode embedded leaf certificate (${err.msg()})')
 	})!
 
 	// CertificateVerify signs the transcript through Certificate (§4.4.3).
-	s.transcript.append(ee)
 	s.transcript.append(cert)
 	th_cv := s.transcript.hash()
 	signed := server_signed_content(th_cv)
@@ -319,12 +364,43 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	// Application secrets bind to the transcript including server Finished
 	// (th_sfin after appending Finished, §7.1).
 	s.derive_application_secrets()!
-	s.stage = .expect_client_finished
-	return Flight{
-		is_hrr:       false
-		server_hello: sh
-		rest:         [ee, cert, cv, fin]
+	return [cert, cv, fin]
+}
+
+// handle_client_certificate consumes the client's empty Certificate response to
+// a CertificateRequest, folds it into the transcript, and returns the deferred
+// server tail (Certificate + CertificateVerify + Finished).
+pub fn (mut s Server) handle_client_certificate(msg []u8) ![][]u8 {
+	if s.stage != .expect_client_cert {
+		return error('fakeserver: client Certificate is unexpected in stage ${s.stage}')
 	}
+	mut r := wire.new_reader(msg)
+	typ := r.read_u8()!
+	if typ != hs_certificate {
+		return error('fakeserver: expected Certificate (11), got handshake type ${typ}')
+	}
+	blen := int(r.read_u24()!)
+	body := r.read_bytes(blen)!
+	if r.remaining() != 0 {
+		return error('fakeserver: trailing bytes after client Certificate')
+	}
+	// §4.4.2: the client echoes our request context and sends an empty list.
+	mut br := wire.new_reader(body)
+	req_ctx := br.read_vector_u8()!
+	if req_ctx.len != 0 {
+		return error('fakeserver: client returned a non-empty certificate_request_context')
+	}
+	cert_list := br.read_vector_u24()!
+	if cert_list.len != 0 {
+		return error('fakeserver: client Certificate list is not empty')
+	}
+	if br.remaining() != 0 {
+		return error('fakeserver: trailing bytes in client Certificate body')
+	}
+	s.transcript.append(msg)
+	tail := s.build_server_tail()!
+	s.stage = .expect_client_finished
+	return tail
 }
 
 // handle_client_finished verifies the client Finished against the transcript
@@ -724,4 +800,21 @@ fn build_certificate_verify(signature []u8) ![]u8 {
 	body.write_u16(0x0807) // ed25519 (§4.2.3)
 	body.write_vector_u16(signature)!
 	return wrap_handshake(hs_certificate_verify, body.bytes())
+}
+
+// build_certificate_request emits a CertificateRequest (RFC 8446 §4.3.2) with
+// an empty request context and just the mandatory signature_algorithms
+// extension (Ed25519), the minimal well-formed request.
+fn build_certificate_request() ![]u8 {
+	// signature_algorithms: a u16-length list of schemes, here just Ed25519.
+	mut sa_body := wire.new_writer(4)
+	sa_body.write_vector_u16([u8(0x08), 0x07])!
+	mut ext := wire.new_writer(sa_body.len() + 4)
+	ext.write_u16(ext_signature_algorithms)
+	ext.write_vector_u16(sa_body.bytes())!
+
+	mut body := wire.new_writer(ext.len() + 3)
+	body.write_vector_u8([]u8{})! // certificate_request_context: empty
+	body.write_vector_u16(ext.bytes())!
+	return wrap_handshake(hs_certificate_request, body.bytes())
 }

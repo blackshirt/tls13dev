@@ -16,7 +16,7 @@ module handshake
 // gigantic "Certificate" piece by piece. Real chains are tens of KiB even at
 // the 32-certificate chain bound the validator enforces, so 1 MiB leaves ample
 // headroom while capping memory.
-const max_handshake_message_len = 1 << 20
+pub const max_handshake_message_len = 1 << 20
 
 // next_passthrough_message extracts one complete handshake message from the
 // front of a CRYPTO byte stream — the recordless analogue of the record
