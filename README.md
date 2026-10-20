@@ -29,6 +29,7 @@ measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
 v test .                                # unit tests across all four modules
 v run src/example/simple_example.v      # minimal client: HTTPS GET
 v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
+v run src/example/trust_store_example.v # client supplying its own root_cas
 ```
 
 ```v
@@ -117,8 +118,9 @@ the core, so both transports inherit them.
 ```
 src/
   example/
-    simple_example.v minimal client (handshake + HTTPS GET, no flags)
-    dial_example.v   fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
+    simple_example.v      minimal client (handshake + HTTPS GET, no flags)
+    trust_store_example.v minimal client with its own Config.root_cas
+    dial_example.v        fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
   tls/              module `tls`: record layer + public TCP client API
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation
@@ -215,7 +217,9 @@ the all-zero one.
   `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
   only `tls.handshake` + `tls.pki` and never imports `tls`; the full
   eight-step engine loop over that seam is walked through in the
-  `state_machine.v` file preamble
+  `state_machine.v` file preamble and in
+  [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md), the dedicated
+  adapter guide
 - A server mode — this library is client-only
 
 ## Testing

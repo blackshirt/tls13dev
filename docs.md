@@ -71,7 +71,9 @@ the separation is enforced by the compiler rather than by convention alone.
 In particular a grep gate over `src/tls/handshake/` proves the core owns no
 record-layer token (`Record`, `RecordCipherState`, `ContentType`,
 `change_cipher_spec`, `record_header_len`), which is what makes `tls.handshake`
-safe to import from a QUIC stack that has no record layer at all.
+safe to import from a QUIC stack that has no record layer at all. Building such
+a stack is covered end to end in
+[`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md).
 
 ### 1.1 Public vs. private surface
 
@@ -198,10 +200,12 @@ the decrypted record stream even when a single message is split across records
 `tls.handshake`'s `ClientHandshake` is the `pub` seam both the TCP record layer
 and an external QUIC engine drive. All framing and encryption decisions stay
 adapter-side; the core only sequences messages and ratchets keys. The
-`state_machine.v` file preamble carries the step-by-step walkthrough of the
-QUIC engine's side of this contract — construction, CRYPTO-stream I/O, key
-derivation, confirmation timing, alerts, Key Update, and post-handshake
-messages.
+step-by-step walkthrough of the QUIC engine's side of this contract —
+construction, CRYPTO-stream I/O, key derivation, confirmation timing, alerts,
+Key Update/Phase, and post-handshake messages — lives in the `state_machine.v`
+file preamble and, in full, in
+[`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md), the dedicated guide to
+building a QUIC adapter.
 
 ```v
 new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
@@ -520,10 +524,11 @@ per process rather than once per connection.
 
 ## 3. Usage
 
-Runnable recipes. Two runnable examples live alongside each other: a minimal
-client (`v run src/example/simple_example.v`) and a fuller demo
-(`v run src/example/dial_example.v`) that adds CLI arguments/flags, HTTP
-status/header parsing, and chunked-body decoding.
+Runnable recipes. Three runnable examples live alongside each other: a minimal
+client (`v run src/example/simple_example.v`), a minimal trust-store demo
+(`v run src/example/trust_store_example.v`) that supplies its own
+`Config.root_cas`, and a fuller demo (`v run src/example/dial_example.v`) that
+adds CLI arguments/flags, HTTP status/header parsing, and chunked-body decoding.
 
 ### 3.1 Basic client
 
