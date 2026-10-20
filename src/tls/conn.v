@@ -34,9 +34,9 @@ const max_stored_session_tickets = 32
 pub struct Conn {
 mut:
 	sock &net.TcpConn              // underlying TCP transport
-	hs   handshake.ClientHandshake // transport-neutral handshake core, driven through feed()/traffic_keys()
+	hs   handshake.ClientHandshake // transport-neutral handshake core, driven through receive()/record_traffic_keys()
 	// The four RecordCipherStates are the record layer's own state: the adapter
-	// builds them from the core's traffic_keys() at the key-change boundaries and
+	// builds them from the core's record_traffic_keys() at the key-change boundaries and
 	// the core never sees them. They live here precisely because protection is
 	// per-transport (QUIC builds packet keys from the same keys instead).
 	server_hs_cipher  RecordCipherState // AEAD state for records the server sends under handshake keys
@@ -226,14 +226,14 @@ fn (mut c Conn) do_handshake() ! {
 					c.fail_alert = .unexpected_message
 					return error('tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
-				msgs := c.hs.feed(.initial, rec.payload)!
+				msgs := c.hs.receive(.initial, rec.payload)!
 				// The record must have yielded exactly one complete message: a
 				// truncated ServerHello leaves a partial buffer, coalesced trailing
 				// bytes leave leftovers the handshake stream behind the record
 				// cannot be trusted to deliver correctly (§5.1).
-				if c.hs.buffered_bytes(.initial) != 0 {
+				if c.hs.unconsumed_bytes(.initial) != 0 {
 					c.fail_alert = .unexpected_message
-					return error('tls: misframed ServerHello record: ${c.hs.buffered_bytes(.initial)} leftover byte(s) (unexpected_message)')
+					return error('tls: misframed ServerHello record: ${c.hs.unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
 					c.fail_alert = .unexpected_message
@@ -270,7 +270,7 @@ fn (mut c Conn) do_handshake() ! {
 				// decrypts at all (packet protection sits below its CRYPTO stream).
 				match dec.content_type {
 					.handshake {
-						msgs := c.hs.feed(.handshake, dec.plaintext)!
+						msgs := c.hs.receive(.handshake, dec.plaintext)!
 						for m in msgs {
 							// The only handshake-phase message the client sends once the server
 							// keys are up is its Finished, which travels under the client
@@ -313,7 +313,7 @@ fn (mut c Conn) do_handshake() ! {
 	// Our Finished went out above under the handshake ciphers; from here nothing
 	// may protect or decrypt at the handshake level, so the core may destroy the
 	// handshake-stage secrets and cached keys (RFC 8446 §7.5 forward secrecy).
-	c.hs.confirm_handshake()!
+	c.hs.on_handshake_confirmed()!
 }
 
 // cipher_from_keys instantiates one direction's record protection from the
@@ -327,19 +327,19 @@ fn cipher_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !Re
 }
 
 // install_handshake_ciphers builds both handshake-key record states from the
-// core's traffic_keys(.handshake); called once after the ServerHello is fed.
+// core's record_traffic_keys(.handshake); called once after the ServerHello is fed.
 fn (mut c Conn) install_handshake_ciphers() ! {
-	ck, sk := c.hs.traffic_keys(.handshake)!
+	ck, sk := c.hs.record_traffic_keys(.handshake)!
 	suite := c.hs.negotiated_cipher_suite()
 	c.client_hs_cipher = cipher_from_keys(suite, ck)!
 	c.server_hs_cipher = cipher_from_keys(suite, sk)!
 }
 
 // install_application_ciphers builds both application-key record states from
-// the core's traffic_keys(.application); called once at .connected, after the
+// the core's record_traffic_keys(.application); called once at .connected, after the
 // client Finished itself rode the handshake ciphers.
 fn (mut c Conn) install_application_ciphers() ! {
-	ck, sk := c.hs.traffic_keys(.application)!
+	ck, sk := c.hs.record_traffic_keys(.application)!
 	suite := c.hs.negotiated_cipher_suite()
 	c.client_app_cipher = cipher_from_keys(suite, ck)!
 	c.server_app_cipher = cipher_from_keys(suite, sk)!
@@ -349,14 +349,14 @@ fn (mut c Conn) install_application_ciphers() ! {
 // core ratcheted the client secret (KeyUpdate): the read cipher keeps its
 // sequence number because the peer's generation did not change.
 fn (mut c Conn) rekeyed_write_cipher() ! {
-	ck, _ := c.hs.traffic_keys(.application)!
+	ck, _ := c.hs.record_traffic_keys(.application)!
 	c.client_app_cipher = cipher_from_keys(c.hs.negotiated_cipher_suite(), ck)!
 }
 
 // rekeyed_read_cipher rebuilds only the read-side application state after the
 // core ratcheted the server secret on receiving the peer's KeyUpdate.
 fn (mut c Conn) rekeyed_read_cipher() ! {
-	_, sk := c.hs.traffic_keys(.application)!
+	_, sk := c.hs.record_traffic_keys(.application)!
 	c.server_app_cipher = cipher_from_keys(c.hs.negotiated_cipher_suite(), sk)!
 }
 

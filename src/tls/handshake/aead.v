@@ -50,7 +50,7 @@ pub fn suite_key_len(suite CipherSuite) int {
 // both constructors reject wrong-sized keys, and every key reaching this point
 // was expanded to suite_key_len bytes by the key schedule. Exported because
 // suite→AEAD is the one piece of protection knowledge both adapters instantiate
-// from traffic_keys(): the TCP Conn builds its record ciphers this way, and a
+// from record_traffic_keys(): the TCP Conn builds its record ciphers this way, and a
 // QUIC engine's packet protection uses the same constructors.
 pub fn new_aead_for_suite(suite CipherSuite, key []u8) !cipher.AEAD {
 	return match suite {

@@ -1,0 +1,140 @@
+# Making the handshake adapter contract easier to use (proposal)
+
+**Status: naming pass done; the rest is still a proposal.**
+
+The rename in the table below has been applied. The larger changes (an event
+stream, or the four smaller additions) are not implemented yet.
+
+The `tls.handshake` core is driven through a small public API. It works, but it
+is not obvious to use: you have to already know *when* to call things and *why*
+the calls return what they do. This document explains the problem in plain
+terms and proposes a clearer contract.
+
+---
+
+## The problem
+
+Here is what an adapter has to do today, using the real TCP loop as an example:
+
+```v
+ch := hs.create_client_hello()!        // returns raw bytes
+send(ch)
+
+for hs.state() != .connected {          // check state to know when we're done
+    rec := read_record()
+    msgs := hs.receive(.initial, rec)!
+    if hs.unconsumed_bytes(.initial) != 0 { fail() }   // check: bad framing?
+    if msgs.len == 0 && hs.state() == .wait_server_hello { fail() }
+    if hs.state() == .wait_encrypted_extensions { install_keys() }  // check: install now?
+    for m in msgs { send(m.msg) }
+}
+hs.on_handshake_confirmed()!                 // must be called at the right time
+```
+
+Nothing here is wrong, but it is hard to learn from the signatures alone. The
+main annoyances:
+
+1. **`receive()` returns a list, but not the reason.** When it returns nothing you
+   must check `state()` and `unconsumed_bytes()` to find out why.
+2. **Two output shapes.** The first message is plain `[]u8`; later ones are a
+   tagged struct. You special-case the first.
+3. **Two key accessors that look the same.** `record_traffic_keys()` and
+   `quic_traffic_secrets()` both take a level, both return a client/server pair,
+   and both fail at different times for different transports.
+4. **Timing you must remember.** `on_handshake_confirmed()` is right for TCP but
+   wrong for QUIC; `record_traffic_keys` works after ServerHello but not after
+   `on_handshake_confirmed`. The types don't say any of this.
+5. **Failure is in three places.** The error, `state() == .failed`, and
+   `failure_alert()`.
+6. **`unconsumed_bytes()` is a TCP-only concern** (the ServerHello record
+   boundary) sitting in the shared API.
+
+---
+
+## The idea
+
+Let `receive()` tell the adapter what to do, instead of making the adapter ask.
+
+```v
+pub enum HandshakeEvent {
+    send     HandshakeMessage // put msg.msg on the wire at msg.level
+    keys     KeyStage         // install protection for this stage
+    complete                  // handshake done; application secrets are ready
+}
+```
+
+The loop then reads like a recipe, with no state poking:
+
+```v
+for ev in hs.begin() {
+    if ev is .send { send(ev.msg) }
+}
+
+for {
+    rec := read_record()
+    for ev in hs.receive(.initial, rec) {
+        match ev {
+            .send { send(ev.msg) }
+            .keys { stage } { install(stage) }  // fires once per stage
+            .complete { done() }
+        }
+    }
+}
+```
+
+This fixes points 1, 2, and 4 in one move: one output shape, and the events
+carry the "why".
+
+---
+
+## Smaller changes (if the rewrite is too big)
+
+If changing `receive()`'s return type is too much for a tested core, these four
+additions remove most of the pain without touching existing calls:
+
+1. **`pending_key_stage() ?KeyStage`** — read why `receive()` advanced, instead of
+   comparing `state()` to enum values.
+2. **`create_client_hello_message() !HandshakeMessage`** — same shape as
+   everything else; keep the old `[]u8` version as a thin wrapper.
+3. **Transport-named key accessors** — renaming `traffic_keys` →
+   `record_traffic_keys` and `exported_secrets` → `quic_traffic_secrets` puts
+   the intended consumer in the name. *(done)*
+4. **`failure() ?HandshakeFailure`** — one accessor giving the alert and the
+   message, instead of three checks.
+
+---
+
+## Naming
+
+**Applied.** These renames are in the code now:
+
+| Was | Now | Why |
+|---|---|---|
+| `feed` | `receive` | says the direction |
+| `traffic_keys` | `record_traffic_keys` | names the consumer |
+| `exported_secrets` | `quic_traffic_secrets` | names the consumer |
+| `confirm_handshake` | `on_handshake_confirmed` | it's a notification, not an action |
+| `buffered_bytes` | `unconsumed_bytes` | "unconsumed input" is clearer |
+
+---
+
+## What stays the same
+
+Everything security-related: message ordering, transcript binding, size caps,
+alert classification, and the secret-zeroization lifecycle. This is only about
+how the same machine is presented to the adapter.
+
+---
+
+## Recommendation
+
+- Do the **naming pass** now — cheap and clear.
+- Do the **four smaller additions** next, and update `conn.v` and the tests.
+- Treat the **event stream** as the eventual goal once one adapter has used it.
+
+## Questions
+
+1. Event stream, or are the four smaller additions enough?
+2. Should `create_client_hello` keep returning raw bytes for anyone who wants
+   them?
+3. Rename now, or wait and rename everything together with the event stream?

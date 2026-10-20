@@ -95,17 +95,17 @@ encryption decision stays adapter-side:
 ```v
 new_client_handshake(server_name, alpn, pki.Validator) !ClientHandshake
 create_client_hello() ![]u8
-feed(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
-buffered_bytes(level SecretLevel) int                     // §5.1 boundary hook
-traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
-exported_secrets(level SecretLevel) !([]u8, []u8)         // RFC 9001 §5.1 expansions
+receive(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
+unconsumed_bytes(level SecretLevel) int                     // §5.1 boundary hook
+record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
+quic_traffic_secrets(level SecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
 update_read_traffic_keys() !  /  update_write_traffic_keys() !  // §7.2 ratchet (TLS record path)
-confirm_handshake() !                                    // drop handshake-stage material
+on_handshake_confirmed() !                                    // drop handshake-stage material
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 ```
 
 `SecretLevel` (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags both
-`feed()` and the returned `HandshakeMessage`s. `feed()` appends level-tagged
+`receive()` and the returned `HandshakeMessage`s. `receive()` appends level-tagged
 bytes to a per-level reassembly buffer and consumes as many complete messages
 as are available, returning outbound messages ready to send. The TCP `Conn`
 encrypts each returned message under the cipher matching its level; a QUIC
@@ -213,7 +213,7 @@ the all-zero one.
   packet-number spaces, and `CONNECTION_CLOSE` signaling are out of scope. The
   handshake core is nonetheless built to be driven over QUIC: it lives in the
   importable `tls.handshake` module (with the passthrough framing helpers, the
-  level-tagged `feed`/`traffic_keys`/`exported_secrets` seam, and the
+  level-tagged `receive`/`record_traffic_keys`/`quic_traffic_secrets` seam, and the
   `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
   only `tls.handshake` + `tls.pki` and never imports `tls`; the full
   eight-step engine loop over that seam is walked through in the

@@ -141,7 +141,7 @@ fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 
 // TrafficKeys holds the derived AEAD key and IV for one traffic direction at
 // one encryption level. The core caches them and hands copies out through
-// ClientHandshake.traffic_keys(); each adapter instantiates its own protection
+// ClientHandshake.record_traffic_keys(); each adapter instantiates its own protection
 // from them (the TLS record layer builds cipher states, QUIC expands the same
 // material into packet keys), which is why the fields are the seam's public
 // payload.

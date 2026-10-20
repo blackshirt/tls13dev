@@ -17,19 +17,19 @@ fn make_trusted_validator() pki.Validator {
 	return pki.new_validator(ts, false)
 }
 
-// expect_no_handshake_keys reports whether traffic_keys(.handshake) refuses —
-// the expected state once confirm_handshake() dropped the handshake material.
+// expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —
+// the expected state once on_handshake_confirmed() dropped the handshake material.
 fn expect_no_handshake_keys(h &ClientHandshake) bool {
-	h.traffic_keys(.handshake) or {
+	h.record_traffic_keys(.handshake) or {
 		return true
 	}
 	return false
 }
 
-// expect_no_exported_handshake_secrets reports whether exported_secrets(.handshake)
+// expect_no_exported_handshake_secrets reports whether quic_traffic_secrets(.handshake)
 // refuses — the expected state once the handshake traffic secrets were wiped.
 fn expect_no_exported_handshake_secrets(h &ClientHandshake) bool {
-	h.exported_secrets(.handshake) or {
+	h.quic_traffic_secrets(.handshake) or {
 		return true
 	}
 	return false
@@ -53,7 +53,7 @@ fn assert_handshake_material_destroyed(h &ClientHandshake) {
 fn feed_encrypted_flight(mut h ClientHandshake, flight []u8) ![]HandshakeMessage {
 	mut produced := []HandshakeMessage{}
 	for i in 0 .. flight.len {
-		msgs := h.feed(.handshake, [flight[i]])!
+		msgs := h.receive(.handshake, [flight[i]])!
 		produced << msgs
 	}
 	return produced
@@ -71,7 +71,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
 	assert !fl.is_hrr
-	h.feed(.initial, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	// EE + CertificateRequest: the client must emit exactly its empty Certificate.
 	assert fl.rest.len == 2
@@ -103,7 +103,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert !fl.is_hrr
 
 	// Plaintext ServerHello on the Initial level; nothing outbound yet.
-	out := h.feed(.initial, fl.server_hello)!
+	out := h.receive(.initial, fl.server_hello)!
 	assert out.len == 0
 	assert h.state() == .wait_encrypted_extensions
 
@@ -120,17 +120,17 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert h.server_certs.len == 1
 
 	// Application traffic keys are the reusable post-handshake state (§7.1).
-	ck, sk := h.traffic_keys(.application)!
+	ck, sk := h.record_traffic_keys(.application)!
 	assert ck.key.len == 16
 	assert ck.iv.len == 12
 	assert sk.key.len == 16
 	assert sk.iv.len == 12
 
-	// confirm_handshake() destroys the handshake stage but keeps application
+	// on_handshake_confirmed() destroys the handshake stage but keeps application
 	// material alive for the connection's lifetime (RFC 8446 §7.5).
-	h.confirm_handshake()!
+	h.on_handshake_confirmed()!
 	assert expect_no_handshake_keys(&h)
-	akc, aks := h.traffic_keys(.application)!
+	akc, aks := h.record_traffic_keys(.application)!
 	assert akc.key.len == 16
 	assert aks.key.len == 16
 	assert aks.iv.len == 12
@@ -146,18 +146,18 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 
 	// The HRR arrives at Initial level; the core answers with the retry
 	// ClientHello (P-256 share) and rearms the ServerHello wait.
-	out := h.feed(.initial, fl1.server_hello)!
+	out := h.receive(.initial, fl1.server_hello)!
 	assert out.len == 1
 	assert out[0].level == .initial
 	assert h.state() == .wait_server_hello
 
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
-	out2 := h.feed(.initial, fl2.server_hello)!
+	out2 := h.receive(.initial, fl2.server_hello)!
 	assert out2.len == 0
 	assert h.state() == .wait_encrypted_extensions
 
-	produced := h.feed(.handshake, fakeserver.flatten(fl2.rest))!
+	produced := h.receive(.handshake, fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1
 	srv.handle_client_finished(produced[0].msg)!
 	assert h.state() == .connected
@@ -172,16 +172,16 @@ fn test_hello_retry_request_cookie_only_reaches_connected() ! {
 	fl1 := srv.handle_client_hello(ch)!
 	assert fl1.is_hrr
 
-	out := h.feed(.initial, fl1.server_hello)!
+	out := h.receive(.initial, fl1.server_hello)!
 	assert out.len == 1
 	// The retry ClientHello must carry the echoed cookie; the fakeserver
 	// verifies it and rejects a wrong echo.
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
 
-	out2 := h.feed(.initial, fl2.server_hello)!
+	out2 := h.receive(.initial, fl2.server_hello)!
 	assert out2.len == 0
-	produced := h.feed(.handshake, fakeserver.flatten(fl2.rest))!
+	produced := h.receive(.handshake, fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1
 	srv.handle_client_finished(produced[0].msg)!
 	assert h.state() == .connected
@@ -193,9 +193,9 @@ fn test_rejects_bad_server_finished() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.feed(.initial, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
-	h.feed(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('Finished verify_data mismatch')
 		assert h.failure_alert() == .decrypt_error
 		assert_handshake_material_destroyed(h)
@@ -210,9 +210,9 @@ fn test_rejects_bad_certificate_verify() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.feed(.initial, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
-	h.feed(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('Ed25519 CertificateVerify failed')
 		assert h.failure_alert() == .decrypt_error
 		assert_handshake_material_destroyed(h)
@@ -227,12 +227,12 @@ fn test_rejects_out_of_order_certificate() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.feed(.initial, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	// fl.rest is [EE, Cert, CV, Fin]; feed Certificate where EncryptedExtensions
 	// is expected — the state machine must reject the reorder (§4.4.1).
 	assert fl.rest.len == 4
-	h.feed(.handshake, fl.rest[1]) or {
+	h.receive(.handshake, fl.rest[1]) or {
 		assert err.msg().contains('unexpected Certificate')
 		assert h.failure_alert() == .unexpected_message
 		assert_handshake_material_destroyed(h)
@@ -249,9 +249,9 @@ fn test_rejects_unoffered_alpn() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.feed(.initial, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
-	h.feed(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('not offered by client')
 		assert h.failure_alert() == .illegal_parameter
 		assert_handshake_material_destroyed(h)
@@ -278,7 +278,7 @@ fn test_malformed_server_hello_aborts_and_destroys() ! {
 	_ := h.create_client_hello()!
 	// A complete ServerHello header with an empty body: parse fails before the
 	// key schedule ran, so the failure path must still leave no keys behind.
-	h.feed(.initial, [u8(0x02), 0x00, 0x00, 0x00]) or {
+	h.receive(.initial, [u8(0x02), 0x00, 0x00, 0x00]) or {
 		assert h.state() == .failed
 		assert expect_no_handshake_keys(h)
 		return

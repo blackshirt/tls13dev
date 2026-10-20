@@ -129,9 +129,9 @@ role; this table summarizes it by owning module.
 |---|---|---|
 | `tls.wire` | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
 | `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN, name constraints) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 5280 §4.2.1.10 name-constraint enforcement (permitted/excluded dNSName and iPAddress subtrees on the leaf) with a default-on leaf RSA strength floor, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. `TrustStore` is public so `Config.root_cas` can be populated. |
-| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `handshake_keys.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v` | The transport-neutral core: RFC 8446 §4 message structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history; the §7.1 HKDF-Extract/Expand ladder (`key_schedule.v`) which `handshake_keys.v` adapts — with the offered-group policy — to the handshake flow without touching the transcript; the AEAD constructors a suite maps to (`aead.v`); the CertificateVerify signature check over the §4.4.3 content (`certificate_verify.v`); the shared alert vocabulary — `AlertDescription`, its `encode`/`parse_alert`, and the RFC 9001 §4.8 `quic_connection_error` mapping (`alert.v`); and the recordless CRYPTO-stream passthrough reassembly `next_passthrough_message` with the 1 MiB `max_handshake_message_len` cap (RFC 9001 §4, `passthrough.v`). The `state_machine.v` sequences it all, owns the key ratchet, and speaks raw handshake messages at its `pub` boundary — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. It scrubs handshake secrets and both ephemeral private keys at `.connected` and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene), deferring handshake-stage material to `confirm_handshake()` so a QUIC adapter can still use it per RFC 9001 §4.1.2/§4.9.2. |
+| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `handshake_keys.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v` | The transport-neutral core: RFC 8446 §4 message structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history; the §7.1 HKDF-Extract/Expand ladder (`key_schedule.v`) which `handshake_keys.v` adapts — with the offered-group policy — to the handshake flow without touching the transcript; the AEAD constructors a suite maps to (`aead.v`); the CertificateVerify signature check over the §4.4.3 content (`certificate_verify.v`); the shared alert vocabulary — `AlertDescription`, its `encode`/`parse_alert`, and the RFC 9001 §4.8 `quic_connection_error` mapping (`alert.v`); and the recordless CRYPTO-stream passthrough reassembly `next_passthrough_message` with the 1 MiB `max_handshake_message_len` cap (RFC 9001 §4, `passthrough.v`). The `state_machine.v` sequences it all, owns the key ratchet, and speaks raw handshake messages at its `pub` boundary — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. It scrubs handshake secrets and both ephemeral private keys at `.connected` and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene), deferring handshake-stage material to `on_handshake_confirmed()` so a QUIC adapter can still use it per RFC 9001 §4.1.2/§4.9.2. |
 | `tls` | `record.v`, `cipher_state.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `alert_record` wrapper, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side helpers (`alert_record`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
-| `tls` | `conn.v`, `tcp_transport.v`, `config.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `RecordCipherState` installation from `traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here; `tcp_transport.v` isolates the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits); `config.v` holds `Config`/`default_config()`. |
+| `tls` | `conn.v`, `tcp_transport.v`, `config.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `RecordCipherState` installation from `record_traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here; `tcp_transport.v` isolates the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits); `config.v` holds `Config`/`default_config()`. |
 
 ### 1.3 Data flow of `dial()`
 
@@ -205,22 +205,24 @@ construction, CRYPTO-stream I/O, key derivation, confirmation timing, alerts,
 Key Update/Phase, and post-handshake messages — lives in the `state_machine.v`
 file preamble and, in full, in
 [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md), the dedicated guide to
-building a QUIC adapter.
+building a QUIC adapter. A proposal to make this contract more self-describing
+is in
+[`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md).
 
 ```v
 new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
 (mut h) create_client_hello() ![]u8
-(mut h) feed(level SecretLevel, bytes []u8) ![]HandshakeMessage
-     (h) buffered_bytes(level SecretLevel) int                         // §5.1 hook
-     (h) traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
-     (h) exported_secrets(level SecretLevel) !([]u8, []u8)
+(mut h) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage
+     (h) unconsumed_bytes(level SecretLevel) int                         // §5.1 hook
+     (h) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
+     (h) quic_traffic_secrets(level SecretLevel) !([]u8, []u8)
 (mut h) update_read_traffic_keys() !   /   (mut h) update_write_traffic_keys() !   // §7.2 ratchet, TLS record path
-(mut h) confirm_handshake() !
+(mut h) on_handshake_confirmed() !
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
 ```
 
 - **`SecretLevel`** (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags
-  every inbound and outbound message. `feed()` appends level-tagged bytes to a
+  every inbound and outbound message. `receive()` appends level-tagged bytes to a
   per-level reassembly buffer and consumes as many complete handshake messages
   as are available, returning the outbound messages ready to send (a retry
   ClientHello at `.initial`, the client Finished at `.handshake`). Misuse —
@@ -228,15 +230,15 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
   would duplicate the ClientHello in the transcript), Initial bytes outside the
   ServerHello wait, or anything after a failure — is a hard error, and a
   protocol error while parsing peer bytes parks the machine in the terminal
-  `.failed` state that `feed()` refuses; each level's reassembly buffer is
+  `.failed` state that `receive()` refuses; each level's reassembly buffer is
   capped at one maximum-size message. A QUIC
   adapter feeds reassembled CRYPTO-stream bytes per packet-number space
   directly; the TCP `Conn` strips record framing first and feeds the plaintext.
 - **Keys leave the core as `TrafficKeys`, never as ciphers.** The state machine
   caches the derived client/server handshake and application `TrafficKeys` but
   installs no AEAD — the TCP `Conn` builds its `RecordCipherState`s from
-  `traffic_keys()`, and a QUIC adapter runs the RFC 9001 §5.1
-  `"quic key"`/`"quic iv"`/`"quic hp"` expansions over `exported_secrets()`
+  `record_traffic_keys()`, and a QUIC adapter runs the RFC 9001 §5.1
+  `"quic key"`/`"quic iv"`/`"quic hp"` expansions over `quic_traffic_secrets()`
   (via the `pub hkdf_expand_label`). `update_*_traffic_keys()` ratchet the
   application secrets through the TLS KeyUpdate label (§7.2) — the TCP
   adapter's path only: QUIC forbids TLS KeyUpdate entirely (RFC 9001 §6) and
@@ -244,11 +246,11 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
   (§6.1), keyed off its own Key Phase bit. Each adapter rebuilds its
   protection state, so TLS's per-generation record-sequence reset (§5.3)
   stays entirely on the TLS side.
-- **Secret lifecycle.** `confirm_handshake()` drops the handshake-stage cached
+- **Secret lifecycle.** `on_handshake_confirmed()` drops the handshake-stage cached
   keys/secrets once the adapter is done with them (the TCP `Conn` calls it
   right after writing the client Finished; a QUIC adapter calls it per
   RFC 9001 §4.1.2/§4.9.2, and before `.connected` it errors rather than
-  stranding the client Finished). `exported_secrets(.handshake)` stays valid until
+  stranding the client Finished). `quic_traffic_secrets(.handshake)` stays valid until
   then, so a QUIC stack can derive keys after the server Finished. Application
   secrets *and* their cached `TrafficKeys` are released by
   `zeroize_app_secrets()` at teardown.
@@ -258,7 +260,7 @@ new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHa
   stays in `tls`; alerts never travel on CRYPTO — a QUIC adapter maps them to
   a `CONNECTION_CLOSE` frame of type 0x1c.
 - **Record-boundary independence.** Because the core has no notion of a TLS
-  record, `buffered_bytes(.initial)` is the only hook the TCP `Conn` needs to
+  record, `unconsumed_bytes(.initial)` is the only hook the TCP `Conn` needs to
   enforce the §5.1 "ServerHello must end at a record boundary" rule; a QUIC
   engine ignores it entirely.
 

@@ -37,8 +37,9 @@ The core was therefore split so that the carrier is always someone else's job:
    │  state_machine.v  sequences all of the above; speaks raw, level-tagged messages     │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
-        │ feed(level, bytes)                  │ traffic_keys / exported_secrets      │ create_client_hello / feed
-        │                                     │                                     │
+        │ receive(level, bytes)                │ record_traffic_keys /                │ create_client_hello /
+        │                                      │ quic_traffic_secrets                 │ receive
+        │                                      │                                      │
    ┌────┴──────────────┐              ┌───────┴───────────┐               ┌─────────┴──────────┐
    │ tls TCP adapter   │              │ a QUIC engine     │               │ tests / other      │
    │ conn.v +          │              │ (RFC 9001)        │               │ transports         │
@@ -105,7 +106,7 @@ start
   connected                     (client Finished emitted; application secrets live)
 ```
 
-`failed` is terminal: once reached, `feed()` refuses further input. A protocol
+`failed` is terminal: once reached, `receive()` refuses further input. A protocol
 violation moves the machine to `failed` and wipes all derived material (see
 §5). The public accessors `state()`, `negotiated_alpn()`, and
 `negotiated_cipher_suite()` let an adapter poll progress and outcome.
@@ -117,7 +118,7 @@ violation moves the machine to `failed` and wipes all derived material (see
 `ALPN`, `supported_groups`, `signature_algorithms`, and `supported_versions`.
 A HelloRetryRequest arrives as a pseudo-ServerHello at `.initial`; the core
 switches to the requested group, regenerates the share, echoes any cookie, and
-`feed()` **returns the second ClientHello** (tagged `.initial`) for the adapter
+`receive()` **returns the second ClientHello** (tagged `.initial`) for the adapter
 to send. The transcript substitutes the first ClientHello with its
 `message_hash` (§4.4.1) so the Finished binds the whole two-round exchange.
 The retry suite is remembered (`hrr_cipher_suite`) and the final ServerHello
@@ -147,7 +148,7 @@ make QUIC correct:
 
 QUIC derives its **Initial** keys from the destination connection ID
 (RFC 9001 §5.2), not from the TLS key schedule. So the core exposes no initial
-material: `traffic_keys(.initial)` and `exported_secrets(.initial)` both
+material: `record_traffic_keys(.initial)` and `quic_traffic_secrets(.initial)` both
 refuse. The engine derives Initial keys itself, below this layer.
 
 ### 3.2 Secrets, not TrafficKeys, cross the boundary
@@ -161,9 +162,9 @@ RFC 9001 §5.1 expansions itself:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-`exported_secrets(level)` hands out `(client, server)` clones of those secrets.
-`traffic_keys(level)` is provided for the record layer (and for tests) but a
-QUIC engine should use `exported_secrets()` + the public `hkdf_expand_label()`.
+`quic_traffic_secrets(level)` hands out `(client, server)` clones of those secrets.
+`record_traffic_keys(level)` is provided for the record layer (and for tests) but a
+QUIC engine should use `quic_traffic_secrets()` + the public `hkdf_expand_label()`.
 
 ### 3.3 Handshake keys survive until confirmation
 
@@ -171,8 +172,8 @@ A QUIC peer may keep sending at the Handshake level **until the handshake is
 confirmed** (HANDSHAKE_DONE or a 1-RTT acknowledgment, RFC 9001 §4.1.2), not
 merely until the client sends its Finished. So the core deliberately retains
 the handshake traffic secrets and cached keys past `.connected`, and discards
-them only when the adapter calls `confirm_handshake()` — the §4.9.2 behavior.
-The TCP adapter calls `confirm_handshake()` right after sending its Finished
+them only when the adapter calls `on_handshake_confirmed()` — the §4.9.2 behavior.
+The TCP adapter calls `on_handshake_confirmed()` right after sending its Finished
 because record-based TLS has no such window; **a QUIC engine must not**, or it
 will strand keys it still needs.
 
@@ -230,7 +231,7 @@ ch1 := hs.create_client_hello()!
 //    concatenate CRYPTO frame payloads into `initial_stream`.
 
 // 4. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
-msgs := hs.feed(.initial, initial_stream)!
+msgs := hs.receive(.initial, initial_stream)!
 for m in msgs {
     // The only .initial output the core ever produces is the retry ClientHello
     // after a HelloRetryRequest — send it in an Initial CRYPTO frame and loop.
@@ -240,7 +241,7 @@ for m in msgs {
 // 5. Now derive Handshake keys from the exported secrets and protect Handshake
 //    packets with them; the server flight (EE, [CertReq], Cert, CV, Finished)
 //    rides Handshake CRYPTO.
-(ck, sk) := hs.exported_secrets(.handshake)!
+(ck, sk) := hs.quic_traffic_secrets(.handshake)!
 suite := hs.negotiated_cipher_suite()
 hash := handshake.suite_hash_algo(suite)
 key_len := handshake.suite_key_len(suite)
@@ -249,7 +250,7 @@ qkey := handshake.hkdf_expand_label(hash, ck, 'quic key', []u8{}, key_len)!
 
 // 6. Feed the reassembled Handshake CRYPTO stream. The return carries the
 //    client Finished (tagged .handshake) once the server flight verifies.
-flight := hs.feed(.handshake, handshake_stream)!
+flight := hs.receive(.handshake, handshake_stream)!
 for m in flight {
     if m.level == .handshake {
         // Send m.msg in a Handshake CRYPTO frame, protected with the client
@@ -258,12 +259,12 @@ for m in flight {
 }
 
 // 7. Application secrets are live at .connected. Derive 1-RTT packet keys with
-//    the 'quic key'/'quic iv'/'quic hp' labels from exported_secrets(.application).
-(cap, sap) := hs.exported_secrets(.application)!
+//    the 'quic key'/'quic iv'/'quic hp' labels from quic_traffic_secrets(.application).
+(cap, sap) := hs.quic_traffic_secrets(.application)!
 
 // 8. Confirm the handshake only when QUIC says so (HANDSHAKE_DONE / 1-RTT ack),
 //    then release the handshake-stage material.
-hs.confirm_handshake()!
+hs.on_handshake_confirmed()!
 
 // 9. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_passthrough_message and decode with parse_new_session_ticket.
@@ -272,19 +273,19 @@ hs.confirm_handshake()!
 
 ### Notes on each step
 
-- **`feed()` is the single inbound entry point.** It appends bytes to that
+- **`receive()` is the single inbound entry point.** It appends bytes to that
   level's reassembly buffer and consumes every complete message immediately.
   Returned messages are the outbound follow-ups triggered by the peer's bytes.
   Contract misuse (feeding before `create_client_hello()`, Initial bytes outside
   the ServerHello wait, anything after `failed`) is refused with the state left
   untouched so you can fix your sequencing.
-- **`buffered_bytes(level)`** reports incomplete bytes parked in a level's
+- **`unconsumed_bytes(level)`** reports incomplete bytes parked in a level's
   buffer. The TCP adapter uses it for the §5.1 ServerHello record-boundary rule;
   that rule is meaningless over QUIC, so the core does not own it — but the
   accessor is there if you need visibility.
 - **`negotiated_alpn()`** returns the server's ALPN pick (`''` if none). The
   core already verified it was one you offered (RFC 7301 §3.1).
-- **`feed(.application, …)` refuses by contract**: application data never
+- **`receive(.application, …)` refuses by contract**: application data never
   rides CRYPTO (RFC 9001 §4.1.3). Reassemble post-handshake CRYPTO and decode it
   yourself with `next_passthrough_message` + `parse_new_session_ticket`.
 
@@ -307,7 +308,7 @@ When the core kills a handshake it takes two actions an adapter must respect:
    (RFC 8446 §1.3.1/§7.5). `abort()` is the only legal way for an adapter to
    reach `.failed`. The success path wipes at `.connected`
    (`zeroize_handshake_secrets`) and at teardown (`zeroize_app_secrets`), with
-   the handshake stage deferred to `confirm_handshake()` per §3.3 above.
+   the handshake stage deferred to `on_handshake_confirmed()` per §3.3 above.
 
 Your adapter should: read `failure_alert()`, convert it to a QUIC connection
 error, close the connection, and drop its own per-level protection state.
@@ -320,21 +321,21 @@ error, close the connection, and drop its own per-level protection state.
 // Construction and driving
 new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
 (mut h) create_client_hello() ![]u8
-(mut h) feed(level SecretLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage
 
 // Observation
 (h) state() HandshakeState
 (h) negotiated_alpn() string
 (h) negotiated_cipher_suite() CipherSuite
-(h) buffered_bytes(level SecretLevel) int
+(h) unconsumed_bytes(level SecretLevel) int
 (h) failure_alert() AlertDescription
 
 // Key material (secrets for QUIC; keys for the record layer)
-(h) exported_secrets(level SecretLevel) !([]u8, []u8)     // (client, server)
-(h) traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)
+(h) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) // (client, server)
+(h) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)
 
 // Lifecycle
-(mut h) confirm_handshake() !                            // QUIC: at handshake confirmation
+(mut h) on_handshake_confirmed() !                            // QUIC: at handshake confirmation
 (mut h) update_read_traffic_keys() !                     // TLS record path only
 (mut h) update_write_traffic_keys() !                    // TLS record path only
 (mut h) abort()                                          // → .failed, wipes all secrets
@@ -379,6 +380,10 @@ has to be a transport.
 
 ## 8. See also
 
+- `src/tls/handshake/CONTRACT.md` — a proposal to make the adapter contract
+  itself more self-describing (event stream, unified output, transport-named
+  key accessors). Read it if the `receive()`/`state()`/`record_traffic_keys()` shape here
+  feels unintuitive; it is the design counterpart to this usage guide.
 - `src/tls/handshake/state_machine.v` — the `pub` seam; its preamble carries
   the condensed 8-step QUIC walkthrough.
 - `src/tls/handshake/passthrough.v` — CRYPTO-stream reassembly (RFC 9001 §4).
