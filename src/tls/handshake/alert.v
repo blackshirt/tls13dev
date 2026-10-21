@@ -48,9 +48,13 @@ pub enum AlertDescription as u8 {
 	no_application_protocol         = 120
 }
 
-// Alert is the 2-byte TLS alert payload.
+// Alert is the 2-byte TLS alert payload. Its fields are read-only outside this
+// module: an adapter inspects the peer's alert but never rewrites it. @[noinit]
+// keeps a caller from fabricating an Alert with an out-of-range level (0 is not
+// a valid AlertLevel); only parse_alert/new_alert/new_close_notify produce one.
+@[noinit]
 pub struct Alert {
-pub mut:
+pub:
 	level       AlertLevel       // warning (1) or fatal (2)
 	description AlertDescription // what went wrong (RFC 8446 §6.2)
 }

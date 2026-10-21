@@ -12,13 +12,16 @@ import crypto.sha512
 import crypto.subtle
 import tls.wire
 
-// RsaPublicKey represents a decoded RSA public key.
+// RsaPublicKey represents a decoded RSA public key. Its fields are module-private
+// and can only be populated by the parser. @[noinit] blocks a zero-value
+// RsaPublicKey{} (n=0, e=0, size_bytes=0), which would otherwise be a
+// constructed-out-of-thin-air key feeding signature verification.
+@[noinit]
 pub struct RsaPublicKey {
 mut:
-	n big.Integer // Modulus
-	e u64         // Public exponent (usually 65537)
-pub mut:
-	size_bytes int // key size in bytes (modulus length), used to bound signatures
+	n          big.Integer // Modulus
+	e          u64         // Public exponent (usually 65537)
+	size_bytes int         // key size in bytes (modulus length), used to bound signatures
 }
 
 // max_rsa_modulus_bytes bounds the accepted RSA modulus (8192 bits). Verifying a

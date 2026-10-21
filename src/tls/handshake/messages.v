@@ -790,7 +790,9 @@ pub fn build_key_update(request_update bool) []u8 {
 // NewSessionTicket holds a parsed NewSessionTicket (RFC 8446 §4.6.1). Its fields
 // are module-private: ticket handling is deliberate adapter/upper-layer policy
 // and the internals are not part of the public surface. Adapters reach the
-// values through the read-only accessors below.
+// values through the read-only accessors below. @[noinit] ensures a ticket can
+// only come from the parser, never from a fabricated empty literal.
+@[noinit]
 pub struct NewSessionTicket {
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
 	ticket_age_add  u32  // random value for obfuscating ticket age in early_data (§4.6.1)

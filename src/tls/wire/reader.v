@@ -10,6 +10,9 @@ module wire
 // Reader is a bounds-checked cursor over TLS wire data.
 // Every read validates its length first: parsers face hostile input and must
 // reject truncation or malformed framing rather than panic (RFC 8446 §4).
+// @[noinit] enforces construction through new_reader, so a cursor always starts
+// over an explicit buffer rather than a silently empty one.
+@[noinit]
 pub struct Reader {
 	data []u8 // buffer being parsed; never mutated, only walked
 mut:

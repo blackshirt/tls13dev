@@ -7,7 +7,9 @@ module wire
 
 // Writer appends TLS wire data to an in-memory buffer.
 // All multi-byte integers use network byte order (big-endian, RFC 8446 §2),
-// regardless of the host's native endianness.
+// regardless of the host's native endianness. @[noinit] enforces construction
+// through new_writer so the buffer's starting capacity is always explicit.
+@[noinit]
 pub struct Writer {
 mut:
 	buf []u8 // bytes accumulated for the frame currently being built

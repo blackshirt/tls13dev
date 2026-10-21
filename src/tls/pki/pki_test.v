@@ -5,6 +5,8 @@
 // loading the host's system trust bundle.
 module pki
 
+import math.big
+
 fn test_hostname_matching() {
 	// Exact matches
 	assert match_hostname('example.com', 'example.com')
@@ -149,10 +151,11 @@ fn test_verify_certificate_chain_rejects_empty_hostname() ! {
 // signed chain.
 fn rsa_leaf_of_bits(bits int) Certificate {
 	modulus := []u8{len: bits / 8, init: 0xab}
-	mut key := RsaPublicKey{
-		e: u64(65537)
+	key := RsaPublicKey{
+		n:          big.Integer{}
+		e:          u64(65537)
+		size_bytes: modulus.len
 	}
-	key.size_bytes = modulus.len
 	return Certificate{
 		public_key_algo: .rsa
 		rsa_public_key:  key
