@@ -787,13 +787,36 @@ pub fn build_key_update(request_update bool) []u8 {
 	return wrap_handshake_message(.key_update, [val])
 }
 
-// NewSessionTicket holds a parsed NewSessionTicket (fields needed for storage).
+// NewSessionTicket holds a parsed NewSessionTicket (RFC 8446 §4.6.1). Its fields
+// are module-private: ticket handling is deliberate adapter/upper-layer policy
+// and the internals are not part of the public surface. Adapters reach the
+// values through the read-only accessors below.
 pub struct NewSessionTicket {
-pub mut:
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
 	ticket_age_add  u32  // random value for obfuscating ticket age in early_data (§4.6.1)
 	ticket_nonce    []u8 // ties the ticket to this connection's resumption master secret
 	ticket          []u8 // opaque resumption token to present in a future ClientHello
+}
+
+// lifetime returns the ticket_lifetime in seconds.
+pub fn (t &NewSessionTicket) lifetime() u32 {
+	return t.ticket_lifetime
+}
+
+// age_add returns the ticket_age_add obfuscation value.
+pub fn (t &NewSessionTicket) age_add() u32 {
+	return t.ticket_age_add
+}
+
+// nonce returns the ticket nonce.
+pub fn (t &NewSessionTicket) nonce() []u8 {
+	return t.ticket_nonce
+}
+
+// bytes returns the opaque ticket (the resumption token) so a caller can store
+// it for a future ClientHello.
+pub fn (t &NewSessionTicket) bytes() []u8 {
+	return t.ticket
 }
 
 // parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1).

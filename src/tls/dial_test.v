@@ -217,8 +217,8 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 	assert buf[..n] == 'hello from fakeserver'.bytes()
 
 	assert conn.session_tickets.len == 1
-	assert conn.session_tickets[0].ticket_lifetime == 3600
-	assert conn.session_tickets[0].ticket == [u8(0xaa), 0xbb, 0xcc, 0xdd]
+	assert conn.session_tickets[0].lifetime() == 3600
+	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
 
 	conn.close() or {}
 	res := <-res_ch
@@ -245,7 +245,7 @@ fn test_dial_reassembles_post_handshake_message_across_records() ! {
 	n := conn.read(mut buf)!
 	assert buf[..n] == 'hello from fakeserver'.bytes()
 	assert conn.session_tickets.len == 1
-	assert conn.session_tickets[0].ticket == [u8(0xaa), 0xbb, 0xcc, 0xdd]
+	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
 
 	conn.close() or {}
 	res := <-res_ch
