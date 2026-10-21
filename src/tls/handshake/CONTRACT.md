@@ -1,9 +1,11 @@
 # Making the handshake adapter contract easier to use (proposal)
 
-**Status: naming pass done; the rest is still a proposal.**
+**Status: naming pass and transport-mode guard done; the event stream is still a
+proposal.**
 
-The rename in the table below has been applied. The larger changes (an event
-stream, or the four smaller additions) are not implemented yet.
+The rename in the table below and the `TransportMode` guard (see below) are in
+the code. The larger changes (an event stream, or the four smaller additions)
+are not implemented yet.
 
 The `tls.handshake` core is driven through a small public API. It works, but it
 is not obvious to use: you have to already know *when* to call things and *why*
@@ -39,15 +41,16 @@ main annoyances:
 2. **Two output shapes.** The first message is plain `[]u8`; later ones are a
    tagged struct. You special-case the first.
 3. **Two key accessors that look the same.** `record_traffic_keys()` and
-   `quic_traffic_secrets()` both take a level, both return a client/server pair,
-   and both fail at different times for different transports.
+   `quic_traffic_secrets()` both take a level and both return a client/server
+   pair. *(partly fixed: the transport mode now rejects the wrong one.)*
 4. **Timing you must remember.** `on_handshake_confirmed()` is right for TCP but
    wrong for QUIC; `record_traffic_keys` works after ServerHello but not after
    `on_handshake_confirmed`. The types don't say any of this.
 5. **Failure is in three places.** The error, `state() == .failed`, and
    `failure_alert()`.
 6. **`record_unconsumed_bytes()` is a TCP-only concern** (the ServerHello record
-   boundary) sitting in the shared API.
+   boundary) sitting in the shared API. *(partly fixed: it is now a no-op off
+   the record path.)*
 
 ---
 
@@ -117,6 +120,32 @@ additions remove most of the pain without touching existing calls:
 | `buffered_bytes` | `record_unconsumed_bytes` | "unconsumed input" is clearer |
 | `update_read_traffic_keys` | `record_update_read_traffic_keys` | names the record path |
 | `update_write_traffic_keys` | `record_update_write_traffic_keys` | names the record path |
+| `RecordCipherState` | `RecordProtector` | it protects records, it is not the layer |
+| `cipher_from_keys` | `record_protector_from_keys` | says what it builds |
+
+---
+
+## Transport mode guard
+
+**Applied.** The mode-specific half of the API is now gated instead of being
+documented-only. `TransportMode { record, quic }` is fixed at construction and
+enforced at every mode-specific call:
+
+```v
+new_record_handshake(server_name, alpn, validator) !ClientHandshake  // .record
+new_quic_handshake(server_name, alpn, validator) !ClientHandshake    // .quic
+(h) mode() TransportMode
+```
+
+- `.record` allows `record_traffic_keys()`, `record_unconsumed_bytes()`,
+  `record_update_read_traffic_keys()`, `record_update_write_traffic_keys()` and
+  refuses `quic_traffic_secrets()`.
+- `.quic` allows `quic_traffic_secrets()` and refuses every `record_*` accessor;
+  `record_unconsumed_bytes()` is a no-op returning `0`.
+
+This turns points 3 and 6 from "remember which one to call" into a rejected call,
+without the larger event-stream rewrite. `conn.v` builds with
+`new_record_handshake`; `quic.ClientEngine` with `new_quic_handshake`.
 
 ---
 
