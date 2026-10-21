@@ -479,6 +479,25 @@ pub fn (s &Server) client_handshake_keys() !([]u8, []u8) {
 	return traffic_keys(s.client_hs_traffic)
 }
 
+// server_handshake_secret returns the raw §7.1 server handshake traffic secret,
+// so a QUIC test peer can run its own RFC 9001 §5.1 "quic key"/"quic iv"/
+// "quic hp" expansions instead of the TLS record "key"/"iv" ones.
+pub fn (s &Server) server_handshake_secret() ![]u8 {
+	if s.server_hs_traffic.len == 0 {
+		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
+	}
+	return s.server_hs_traffic.clone()
+}
+
+// client_handshake_secret returns the raw §7.1 client handshake traffic secret,
+// for a QUIC test peer to derive packet protection from.
+pub fn (s &Server) client_handshake_secret() ![]u8 {
+	if s.client_hs_traffic.len == 0 {
+		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
+	}
+	return s.client_hs_traffic.clone()
+}
+
 // server_app_keys returns the fakeserver's server-direction application traffic
 // key and IV, so the test transport can send post-handshake records (tickets,
 // application data) the client will accept.
@@ -487,6 +506,15 @@ pub fn (s &Server) server_app_keys() !([]u8, []u8) {
 		return error('fakeserver: application secrets not derived yet (server Finished not built)')
 	}
 	return traffic_keys(s.server_ap_traffic)
+}
+
+// server_app_secret returns the raw §7.1 server application traffic secret, for
+// a QUIC test peer to derive 1-RTT packet protection from.
+pub fn (s &Server) server_app_secret() ![]u8 {
+	if s.server_ap_traffic.len == 0 {
+		return error('fakeserver: application secrets not derived yet (server Finished not built)')
+	}
+	return s.server_ap_traffic.clone()
 }
 
 // new_session_ticket builds a minimal but valid NewSessionTicket (RFC 8446
