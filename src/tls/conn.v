@@ -35,14 +35,14 @@ pub struct Conn {
 mut:
 	sock &net.TcpConn              // underlying TCP transport
 	hs   handshake.ClientHandshake // transport-neutral handshake core, driven through receive()/record_traffic_keys()
-	// The four RecordCipherStates are the record layer's own state: the adapter
+	// The four RecordProtectors are the record layer's own state: the adapter
 	// builds them from the core's record_traffic_keys() at the key-change boundaries and
 	// the core never sees them. They live here precisely because protection is
 	// per-transport (QUIC builds packet keys from the same keys instead).
-	server_hs_cipher  RecordCipherState // AEAD state for records the server sends under handshake keys
-	client_hs_cipher  RecordCipherState // AEAD state for records we send under handshake keys
-	server_app_cipher RecordCipherState // AEAD state for records the server sends under app keys
-	client_app_cipher RecordCipherState // AEAD state for records we send under app keys
+	server_hs_cipher  RecordProtector // AEAD state for records the server sends under handshake keys
+	client_hs_cipher  RecordProtector // AEAD state for records we send under handshake keys
+	server_app_cipher RecordProtector // AEAD state for records the server sends under app keys
+	client_app_cipher RecordProtector // AEAD state for records we send under app keys
 	// session_tickets holds the NewSessionTicket backlog the core parses but does
 	// not keep: resumption is adapter/upper-layer policy (RFC 9001 §4.5 leaves
 	// ticket storage to the stack above the handshake core), so the queue lives
@@ -113,7 +113,7 @@ pub fn dial(address string, config Config) !&Conn {
 		validator_mut.set_min_rsa_bits(config.min_rsa_bits)
 	}
 
-	mut hs := handshake.new_client_handshake(server_name, config.alpn, validator_mut) or {
+	mut hs := handshake.new_record_handshake(server_name, config.alpn, validator_mut) or {
 		sock.close() or {}
 		return err
 	}
@@ -231,9 +231,9 @@ fn (mut c Conn) do_handshake() ! {
 				// truncated ServerHello leaves a partial buffer, coalesced trailing
 				// bytes leave leftovers the handshake stream behind the record
 				// cannot be trusted to deliver correctly (§5.1).
-				if c.hs.unconsumed_bytes(.initial) != 0 {
+				if c.hs.record_unconsumed_bytes(.initial) != 0 {
 					c.fail_alert = .unexpected_message
-					return error('tls: misframed ServerHello record: ${c.hs.unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
+					return error('tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
 					c.fail_alert = .unexpected_message
@@ -259,7 +259,7 @@ fn (mut c Conn) do_handshake() ! {
 				// plaintext when decrypted (RFC 8446 §5.1/§5.2). Before the
 				// ServerHello installs those keys no encrypted record can be
 				// authentic, so an injected one must be rejected rather than fed
-				// to a not-yet-initialized cipher state.
+				// to a not-yet-initialized record protector.
 				if c.hs.state() == .start || c.hs.state() == .wait_server_hello {
 					c.fail_alert = .unexpected_message
 					return error('tls: unexpected encrypted record before ServerHello (unexpected_message)')
@@ -316,14 +316,14 @@ fn (mut c Conn) do_handshake() ! {
 	c.hs.on_handshake_confirmed()!
 }
 
-// cipher_from_keys instantiates one direction's record protection from the
+// record_protector_from_keys instantiates one direction's record protection from the
 // core's cached TrafficKeys. Sequence numbers restart at 0 for each key
 // generation (§5.3), so every derivation builds a new state rather than
 // mutating an old one; this bridge is exactly where the record layer meets the
 // transport-neutral core and belongs to the adapter, not the core.
-fn cipher_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !RecordCipherState {
+fn record_protector_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !RecordProtector {
 	aead := handshake.new_aead_for_suite(suite, keys.key())!
-	return new_record_cipher_state(aead, keys.iv())!
+	return new_record_protector(aead, keys.iv())!
 }
 
 // install_handshake_ciphers builds both handshake-key record states from the
@@ -331,8 +331,8 @@ fn cipher_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !Re
 fn (mut c Conn) install_handshake_ciphers() ! {
 	ck, sk := c.hs.record_traffic_keys(.handshake)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_hs_cipher = cipher_from_keys(suite, ck)!
-	c.server_hs_cipher = cipher_from_keys(suite, sk)!
+	c.client_hs_cipher = record_protector_from_keys(suite, ck)!
+	c.server_hs_cipher = record_protector_from_keys(suite, sk)!
 }
 
 // install_application_ciphers builds both application-key record states from
@@ -341,8 +341,8 @@ fn (mut c Conn) install_handshake_ciphers() ! {
 fn (mut c Conn) install_application_ciphers() ! {
 	ck, sk := c.hs.record_traffic_keys(.application)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_app_cipher = cipher_from_keys(suite, ck)!
-	c.server_app_cipher = cipher_from_keys(suite, sk)!
+	c.client_app_cipher = record_protector_from_keys(suite, ck)!
+	c.server_app_cipher = record_protector_from_keys(suite, sk)!
 }
 
 // rekeyed_write_cipher rebuilds only the write-side application state after the
@@ -350,14 +350,14 @@ fn (mut c Conn) install_application_ciphers() ! {
 // sequence number because the peer's generation did not change.
 fn (mut c Conn) rekeyed_write_cipher() ! {
 	ck, _ := c.hs.record_traffic_keys(.application)!
-	c.client_app_cipher = cipher_from_keys(c.hs.negotiated_cipher_suite(), ck)!
+	c.client_app_cipher = record_protector_from_keys(c.hs.negotiated_cipher_suite(), ck)!
 }
 
 // rekeyed_read_cipher rebuilds only the read-side application state after the
 // core ratcheted the server secret on receiving the peer's KeyUpdate.
 fn (mut c Conn) rekeyed_read_cipher() ! {
 	_, sk := c.hs.record_traffic_keys(.application)!
-	c.server_app_cipher = cipher_from_keys(c.hs.negotiated_cipher_suite(), sk)!
+	c.server_app_cipher = record_protector_from_keys(c.hs.negotiated_cipher_suite(), sk)!
 }
 
 // handle_alert processes an alert received after the handshake. It marks the
@@ -370,14 +370,14 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// traffic secrets so captured application traffic cannot be decrypted later
 	// by a memory compromise (RFC 8446 §1.3.1/§7.5). The triggering record was
 	// already decrypted before this handler ran, so the read cipher is not needed.
-	// The record cipher states' IVs are wiped here too, because the idempotent
+	// The record protectors' IVs are wiped here too, because the idempotent
 	// early-return in close() (this flag is already true) would otherwise skip
 	// the wipe those states receive on the normal teardown path.
 	c.hs.zeroize_app_secrets()
-	wipe_cipher_state(mut c.server_hs_cipher)
-	wipe_cipher_state(mut c.client_hs_cipher)
-	wipe_cipher_state(mut c.server_app_cipher)
-	wipe_cipher_state(mut c.client_app_cipher)
+	wipe_record_protector(mut c.server_hs_cipher)
+	wipe_record_protector(mut c.client_hs_cipher)
+	wipe_record_protector(mut c.server_app_cipher)
+	wipe_record_protector(mut c.client_app_cipher)
 	peer_alert := handshake.parse_alert(payload) or {
 		// Malformed alert body is itself fatal: pin a sticky error so subsequent
 		// read() calls re-report it rather than returning a clean EOF (0).
@@ -530,7 +530,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				// §4.6.3: a recipient always advances its read keys on receiving a
 				// KeyUpdate; request_update only decides whether a response is owed.
 				request_update := handshake.parse_key_update(body)!
-				c.hs.update_read_traffic_keys()!
+				c.hs.record_update_read_traffic_keys()!
 				// The core ratcheted secrets only; this adapter owns the record
 				// state, so swap in the new read cipher (its sequence number
 				// restarts at 0 for the new generation, §5.3) before any further
@@ -627,7 +627,7 @@ fn (mut c Conn) send_key_update_response() ! {
 	msg := handshake.build_key_update(false)
 	enc := c.client_app_cipher.encrypt_record(.handshake, msg)!
 	c.write_records([enc])!
-	c.hs.update_write_traffic_keys()!
+	c.hs.record_update_write_traffic_keys()!
 	// Send-then-ratchet above happened under the old keys; now swap in the
 	// rebuilt write cipher before the next write() can reach it.
 	c.rekeyed_write_cipher()!
@@ -641,7 +641,7 @@ fn (mut c Conn) force_write_rekey() ! {
 	msg := handshake.build_key_update(false)
 	enc := c.client_app_cipher.encrypt_record(.handshake, msg)!
 	c.write_records([enc])!
-	c.hs.update_write_traffic_keys()!
+	c.hs.record_update_write_traffic_keys()!
 	c.rekeyed_write_cipher()!
 }
 
@@ -671,28 +671,28 @@ pub fn (mut c Conn) close() ! {
 	// Teardown is terminal: drop the application traffic secrets so a later memory
 	// compromise cannot re-derive the record keys and decrypt captured traffic
 	// (RFC 8446 §1.3.1/§7.5). send_close_notify above already used the live cipher,
-	// so nothing still needs these secrets. The record cipher states' IVs go with
+	// so nothing still needs these secrets. The record protectors' IVs go with
 	// them: a nonce base for a dead key is itself dead material.
 	c.hs.zeroize_app_secrets()
-	wipe_cipher_state(mut c.server_hs_cipher)
-	wipe_cipher_state(mut c.client_hs_cipher)
-	wipe_cipher_state(mut c.server_app_cipher)
-	wipe_cipher_state(mut c.client_app_cipher)
+	wipe_record_protector(mut c.server_hs_cipher)
+	wipe_record_protector(mut c.client_hs_cipher)
+	wipe_record_protector(mut c.server_app_cipher)
+	wipe_record_protector(mut c.client_app_cipher)
 	c.close_socket()
 }
 
 // wipe_on_failure destroys every secret a failed handshake may have derived
 // before the error tore the connection down: the core's key-schedule material
 // (ClientHandshake.abort also parks the state machine in .failed), plus this
-// adapter's record cipher states, whose IVs are derived from the same schedule.
+// adapter's record protectors, whose IVs are derived from the same schedule.
 // dial() calls it on every do_handshake failure so an aborted connection never
 // leaves handshake traffic keys or nonce bases resident in the discarded Conn.
 fn (mut c Conn) wipe_on_failure() {
 	c.hs.abort()
-	wipe_cipher_state(mut c.server_hs_cipher)
-	wipe_cipher_state(mut c.client_hs_cipher)
-	wipe_cipher_state(mut c.server_app_cipher)
-	wipe_cipher_state(mut c.client_app_cipher)
+	wipe_record_protector(mut c.server_hs_cipher)
+	wipe_record_protector(mut c.client_hs_cipher)
+	wipe_record_protector(mut c.server_app_cipher)
+	wipe_record_protector(mut c.client_app_cipher)
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
@@ -707,7 +707,7 @@ fn (mut c Conn) send_failure_alert() {
 	}
 	desc := c.fail_alert or { c.hs.failure_alert() }
 	payload := handshake.new_alert(desc).encode()
-	// A RecordCipherState reports "initialized" exactly when its IV is the full
+	// A RecordProtector reports "initialized" exactly when its IV is the full
 	// nonce base, so an unwiped failure path cannot encrypt and falls through to
 	// the pre-ServerHello plaintext form; after the ServerHello a plaintext
 	// alert would be rejected by a compliant peer, so it is never used there.
@@ -751,7 +751,7 @@ fn (mut c Conn) send_close_notify() {
 	if c.hs.state() != .connected {
 		return
 	}
-	notify := handshake.new_close_notify()
+	notify := handshake.new_alert(.close_notify)
 	enc := c.client_app_cipher.encrypt_record(.alert, notify.encode()) or {
 		return
 	}

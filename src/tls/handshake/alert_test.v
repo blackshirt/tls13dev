@@ -10,7 +10,7 @@
 module handshake
 
 fn test_alert_close_notify_roundtrip() ! {
-	a := new_close_notify()
+	a := new_alert(.close_notify)
 	enc := a.encode()
 	// §6.2/§6.1: warning(1) || close_notify(0), pinned to literal bytes so a
 	// symmetric encode/parse bug cannot pass a round-trip unnoticed.
@@ -19,6 +19,12 @@ fn test_alert_close_notify_roundtrip() ! {
 	parsed := parse_alert(enc)!
 	assert parsed.level == .warning
 	assert parsed.description == .close_notify
+}
+
+fn test_new_alert_levels() {
+	// §6.1: close_notify is the only warning-level alert; everything else is fatal.
+	assert new_alert(.close_notify).level == .warning
+	assert new_alert(.handshake_failure).level == .fatal
 }
 
 fn test_parse_alert_rejects_bad_length() ! {

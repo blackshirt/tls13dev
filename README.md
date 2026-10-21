@@ -81,7 +81,7 @@ tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
 
 Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
 only of certificates, and `tls.handshake` owns **no record, cipher, or socket
-concept** — a grep gate over `src/tls/handshake/` (`Record`, `RecordCipherState`,
+concept** — a grep gate over `src/tls/handshake/` (`Record`, `RecordProtector`,
 `ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
 `conn.v`/`tcp_transport.v` in the `tls` module are the reference adapter that
 drives the core.
@@ -93,16 +93,31 @@ through the same small `pub` API on `ClientHandshake`; every framing and
 encryption decision stays adapter-side:
 
 ```v
-new_client_handshake(server_name, alpn, pki.Validator) !ClientHandshake
-create_client_hello() ![]u8
+// shared (both modes)
+new_record_handshake(server_name, alpn, pki.Validator) !ClientHandshake  // mode = .record
+new_quic_handshake(server_name, alpn, pki.Validator) !ClientHandshake    // mode = .quic
+mode() TransportMode  /  create_client_hello() ![]u8
 receive(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
-unconsumed_bytes(level SecretLevel) int                     // §5.1 boundary hook
-record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
-quic_traffic_secrets(level SecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
-update_read_traffic_keys() !  /  update_write_traffic_keys() !  // §7.2 ratchet (TLS record path)
 on_handshake_confirmed() !                                    // drop handshake-stage material
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
+failure_alert() AlertDescription  /  abort()  /  zeroize_app_secrets()
+
+// TLS record path only
+record_unconsumed_bytes(level SecretLevel) int                     // §5.1 boundary hook
+record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
+record_update_read_traffic_keys() !  /  record_update_write_traffic_keys() !  // §7.2 ratchet
+
+// QUIC path only
+quic_traffic_secrets(level SecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
 ```
+
+The mode is fixed at construction (`new_record_handshake()` /
+`new_quic_handshake()`, or `new_client_handshake(..., TransportMode)`) and is
+enforced: a QUIC-mode handshake rejects `record_traffic_keys()` and the
+`record_update_*_traffic_keys()` ratchets with an error, `record_unconsumed_bytes()`
+is a no-op, and a record-mode handshake rejects `quic_traffic_secrets()`. Both
+share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
+`new_aead_for_suite`.
 
 `SecretLevel` (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags both
 `receive()` and the returned `HandshakeMessage`s. `receive()` appends level-tagged

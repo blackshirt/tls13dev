@@ -23,7 +23,7 @@ send(ch)
 for hs.state() != .connected {          // check state to know when we're done
     rec := read_record()
     msgs := hs.receive(.initial, rec)!
-    if hs.unconsumed_bytes(.initial) != 0 { fail() }   // check: bad framing?
+    if hs.record_unconsumed_bytes(.initial) != 0 { fail() }   // check: bad framing?
     if msgs.len == 0 && hs.state() == .wait_server_hello { fail() }
     if hs.state() == .wait_encrypted_extensions { install_keys() }  // check: install now?
     for m in msgs { send(m.msg) }
@@ -35,7 +35,7 @@ Nothing here is wrong, but it is hard to learn from the signatures alone. The
 main annoyances:
 
 1. **`receive()` returns a list, but not the reason.** When it returns nothing you
-   must check `state()` and `unconsumed_bytes()` to find out why.
+   must check `state()` and `record_unconsumed_bytes()` to find out why.
 2. **Two output shapes.** The first message is plain `[]u8`; later ones are a
    tagged struct. You special-case the first.
 3. **Two key accessors that look the same.** `record_traffic_keys()` and
@@ -46,7 +46,7 @@ main annoyances:
    `on_handshake_confirmed`. The types don't say any of this.
 5. **Failure is in three places.** The error, `state() == .failed`, and
    `failure_alert()`.
-6. **`unconsumed_bytes()` is a TCP-only concern** (the ServerHello record
+6. **`record_unconsumed_bytes()` is a TCP-only concern** (the ServerHello record
    boundary) sitting in the shared API.
 
 ---
@@ -114,7 +114,9 @@ additions remove most of the pain without touching existing calls:
 | `traffic_keys` | `record_traffic_keys` | names the consumer |
 | `exported_secrets` | `quic_traffic_secrets` | names the consumer |
 | `confirm_handshake` | `on_handshake_confirmed` | it's a notification, not an action |
-| `buffered_bytes` | `unconsumed_bytes` | "unconsumed input" is clearer |
+| `buffered_bytes` | `record_unconsumed_bytes` | "unconsumed input" is clearer |
+| `update_read_traffic_keys` | `record_update_read_traffic_keys` | names the record path |
+| `update_write_traffic_keys` | `record_update_write_traffic_keys` | names the record path |
 
 ---
 

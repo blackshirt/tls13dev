@@ -10,6 +10,29 @@
 // streams and pulls keys out through record_traffic_keys/quic_traffic_secrets. The pub API
 // below is exactly that adapter contract; nothing else in this module crosses
 // the boundary.
+//
+// The contract is split by mode, selected once at construction through the
+// TransportMode enum and enforced at every mode-specific call (a wrong-mode
+// call is rejected, never silently returns empty material):
+//
+//   Shared (both modes)
+//     new_client_handshake, mode, state, negotiated_alpn,
+//     negotiated_cipher_suite, failure_alert, create_client_hello, receive,
+//     on_handshake_confirmed, abort, zeroize_app_secrets
+//
+//   TLS record path only (mode == .record; tls.Conn / tcp_transport.v)
+//     record_traffic_keys, record_unconsumed_bytes,
+//     record_update_read_traffic_keys, record_update_write_traffic_keys
+//
+//   QUIC path only (mode == .quic; tls.quic.ClientEngine and external engines)
+//     quic_traffic_secrets
+//
+// Construct with new_record_handshake() or new_quic_handshake() to pin the
+// mode. Both modes also use the shared key helpers hkdf_expand_label,
+// suite_hash_algo, suite_key_len and new_aead_for_suite, plus the HandshakeMessage
+// and TrafficKeys types. A TLS adapter decrypts/encrypts records itself and
+// feeds plaintext; a QUIC adapter feeds per-level CRYPTO bytes and expands the
+// exported secrets under the RFC 9001 §5.1 labels.
 module handshake
 
 import crypto.ecdsa
@@ -25,12 +48,12 @@ import tls.wire
 // The whole integration is the loop below — no records, cipher states, or
 // sockets anywhere in it:
 //
-//  1. Construct — new_client_handshake(server_name, alpn, validator), exactly
-//     as conn.v does. Initial packet keys are NOT part of the TLS key
-//     schedule: QUIC derives them from the destination connection ID
-//     (RFC 9001 §5.2), which is why record_traffic_keys(.initial) and
-//     quic_traffic_secrets(.initial) refuse — that derivation belongs to the
-//     engine, below this layer.
+//  1. Construct — new_quic_handshake(server_name, alpn, validator), pinning the
+//     .quic mode (conn.v's twin is new_record_handshake). Initial packet keys
+//     are NOT part of the TLS key schedule: QUIC derives them from the
+//     destination connection ID (RFC 9001 §5.2), which is why
+//     record_traffic_keys(.initial) and quic_traffic_secrets(.initial) refuse —
+//     that derivation belongs to the engine, below this layer.
 //  2. Outbound — create_client_hello() yields the first ClientHello;
 //     receive() later returns the level-tagged follow-ups (retry ClientHello at
 //     .initial, client Finished at .handshake). Each HandshakeMessage.msg is
@@ -146,6 +169,15 @@ pub enum SecretLevel {
 	application
 }
 
+// TransportMode selects which adapter shape drives the core. It is fixed at
+// construction and guards the mode-specific methods: a record-layer call on a
+// QUIC-mode handshake (or vice versa) is rejected instead of silently operating
+// on material the other transport never populates.
+pub enum TransportMode {
+	record // TLS 1.3 record layer (tls.Conn): record_traffic_keys, record_unconsumed_bytes, record_update_*_traffic_keys
+	quic   // QUIC engine (tls.quic.ClientEngine): quic_traffic_secrets
+}
+
 // ClientHandshake orchestrates the TLS 1.3 client handshake state machine.
 // The pub methods below are the adapter contract; every field stays private so
 // adapters go through the seam (state()/negotiated_alpn() surface the two the
@@ -153,6 +185,7 @@ pub enum SecretLevel {
 @[noinit]
 pub struct ClientHandshake {
 mut:
+	mode              TransportMode     // adapter shape; guards the mode-specific methods
 	config            ClientHelloConfig // inputs echoed/replayed when rebuilding the second ClientHello
 	transcript        Transcript        // running hash of all handshake messages (RFC 8446 §4.4.1)
 	hash_algo         HashAlgorithm     // hash of the negotiated suite; drives every key derivation
@@ -206,7 +239,10 @@ mut:
 // server's suite selection. The validator is constructor-injected: it is only
 // consulted when receive() reaches the Certificate message, but the core needs it
 // mid-feed and cannot take it per call without splitting the reassembly loop.
-pub fn new_client_handshake(server_name string, alpn []string, validator pki.Validator) !ClientHandshake {
+// mode fixes which adapter shape drives the core and gates the mode-specific
+// methods; callers use new_record_handshake / new_quic_handshake for the common
+// cases.
+pub fn new_client_handshake(server_name string, alpn []string, validator pki.Validator, mode TransportMode) !ClientHandshake {
 	// Generate the X25519 key pair up front: TLS 1.3 has no separate key-exchange
 	// round trip, so the public share must ride in the initial ClientHello (§4.2.8).
 	mut priv_key := curve25519.PrivateKey.new()! // fresh 32-byte X25519 scalar
@@ -233,6 +269,7 @@ pub fn new_client_handshake(server_name string, alpn []string, validator pki.Val
 
 	return ClientHandshake{
 		state:              .start
+		mode:               mode
 		config:             cfg
 		transcript:         new_transcript(.sha256)
 		hash_algo:          .sha256
@@ -243,6 +280,23 @@ pub fn new_client_handshake(server_name string, alpn []string, validator pki.Val
 		initial_reassembly: []u8{cap: 4096}
 		hs_reassembly:      []u8{cap: 4096}
 	}
+}
+
+// new_record_handshake creates a TLS 1.3 record-layer handshake (tls.Conn): the
+// record_* methods are allowed, the QUIC-only ones are refused.
+pub fn new_record_handshake(server_name string, alpn []string, validator pki.Validator) !ClientHandshake {
+	return new_client_handshake(server_name, alpn, validator, .record)
+}
+
+// new_quic_handshake creates a QUIC handshake (tls.quic.ClientEngine): the
+// quic_traffic_secrets method is allowed, the record-layer ones are refused.
+pub fn new_quic_handshake(server_name string, alpn []string, validator pki.Validator) !ClientHandshake {
+	return new_client_handshake(server_name, alpn, validator, .quic)
+}
+
+// mode returns the adapter shape this handshake was built for.
+pub fn (h &ClientHandshake) mode() TransportMode {
+	return h.mode
 }
 
 // state reports current handshake progress; the TCP adapter polls it to know
@@ -326,7 +380,7 @@ fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]Handshake
 	// not checked here: reassembly already handed over exactly one complete
 	// handshake message (its own 4-byte header length), which is the
 	// transport-neutral invariant, and QUIC has no record boundaries at all. The
-	// TCP adapter enforces the per-record boundary itself via unconsumed_bytes().
+	// TCP adapter enforces the per-record boundary itself via record_unconsumed_bytes().
 	sh := parse_server_hello(body)! // §4.1.3 field decode plus the §4.2 extension allowlist
 	// Re-frame header + body so the transcript covers the exact wire layout.
 	full_sh_msg := wrap_handshake_message(.server_hello, body)
@@ -653,7 +707,7 @@ pub fn (mut h ClientHandshake) receive(level SecretLevel, bytes []u8) ![]Handsha
 // the Initial-level buffer. Only one is ever legal — after a normal ServerHello
 // the stream switches to .handshake bytes — so the loop stops as soon as the
 // wait ends; bytes left over are the adapter's boundary concern, surfaced via
-// unconsumed_bytes(.initial).
+// record_unconsumed_bytes(.initial).
 fn (mut h ClientHandshake) drain_initial() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state == .wait_server_hello {
@@ -685,13 +739,16 @@ fn (mut h ClientHandshake) drain_handshake() ![]HandshakeMessage {
 }
 
 // record_traffic_keys returns the (client, server) TrafficKeys cached for one
-// encryption level. Adapters instantiate their own protection from them — the
-// TCP Conn builds its record AEAD states, a QUIC engine expands the same
-// secrets under the RFC 9001 §5.1 "quic key"/"quic iv"/"quic hp" labels.
+// encryption level. This is the TLS record path only: the TCP Conn builds its
+// record AEAD states from them, whereas a QUIC engine takes the raw secrets
+// through quic_traffic_secrets() and does its own RFC 9001 §5.1 expansion.
 // .initial keys derive from the destination connection ID (§5.2), not the TLS
 // schedule, so they are refused. Handshake-level keys survive until
 // on_handshake_confirmed().
 pub fn (h &ClientHandshake) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys) {
+	if h.mode != .record {
+		return error('handshake: record_traffic_keys() is TLS record path only; this handshake is in ${h.mode} mode (use quic_traffic_secrets())')
+	}
 	match level {
 		.initial {
 			return error('handshake: initial keys derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
@@ -723,13 +780,16 @@ fn clone_traffic_keys(k TrafficKeys) TrafficKeys {
 	}
 }
 
-// unconsumed_bytes reports the incomplete bytes parked in one level's reassembly
+// record_unconsumed_bytes reports the incomplete bytes parked in one level's reassembly
 // buffer. The TCP adapter uses it for the RFC 8446 §5.1 ServerHello
 // record-boundary rule (the rule is meaningless over QUIC, which is why the
 // core does not own it): after receiving a plaintext record that carried the
 // ServerHello, anything still buffered means the record coalesced more than one
 // handshake message or truncated it, and must be rejected.
-pub fn (h &ClientHandshake) unconsumed_bytes(level SecretLevel) int {
+pub fn (h &ClientHandshake) record_unconsumed_bytes(level SecretLevel) int {
+	if h.mode != .record {
+		return 0
+	}
 	return match level {
 		.initial {
 			h.initial_reassembly.len
@@ -778,6 +838,9 @@ pub fn (mut h ClientHandshake) on_handshake_confirmed() ! {
 // .initial derives from the destination connection ID (§5.2), not the TLS
 // schedule, and is rejected.
 pub fn (h &ClientHandshake) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) {
+	if h.mode != .quic {
+		return error('handshake: quic_traffic_secrets() is QUIC path only; this handshake is in ${h.mode} mode (use record_traffic_keys())')
+	}
 	match level {
 		.initial {
 			return error('handshake: initial secrets derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
@@ -964,7 +1027,7 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 	return []HandshakeMessage{}
 }
 
-// update_read_traffic_keys ratchets the server application traffic secret to its
+// record_update_read_traffic_keys ratchets the server application traffic secret to its
 // next generation (TLS KeyUpdate, RFC 8446 §7.2) and refreshes the cached read
 // TrafficKeys. It never installs a cipher: the adapter rebuilds its own read
 // protection from record_traffic_keys(.application) afterward. This is the TLS record
@@ -973,7 +1036,10 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 // A secret that does not exist — no server Finished yet, or already destroyed
 // by zeroize_app_secrets — refuses the ratchet rather than being expanded
 // into junk keys.
-pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
+pub fn (mut h ClientHandshake) record_update_read_traffic_keys() ! {
+	if h.mode != .record {
+		return error('handshake: record_update_read_traffic_keys() is TLS record path only; this handshake is in ${h.mode} mode')
+	}
 	// Ratchet the secret forward: new_secret = HKDF-Expand-Label(old, "traffic
 	// upd", "", Hash) (§7.2); overwriting the old secret is the forward-security
 	// property KeyUpdate exists to deliver.
@@ -992,9 +1058,9 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 	h.server_app_keys = derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, aead_nonce_len)!
 }
 
-// update_write_traffic_keys ratchets the client application traffic secret to its
+// record_update_write_traffic_keys ratchets the client application traffic secret to its
 // next generation (TLS KeyUpdate, RFC 8446 §7.2) and refreshes the cached write
-// TrafficKeys, mirroring update_read_traffic_keys. §4.6.3 still requires the
+// TrafficKeys, mirroring record_update_read_traffic_keys. §4.6.3 still requires the
 // KeyUpdate notice to go out under the old keys, so callers update after sending
 // and then rebuild their write protection — the TCP adapter restarts its record
 // sequence number at 0 (§5.3). Like its read twin this is the TLS record path
@@ -1002,7 +1068,10 @@ pub fn (mut h ClientHandshake) update_read_traffic_keys() ! {
 // keys with its own Key Phase mechanism below this layer. Like its read twin
 // it refuses when the secret does not exist (before the server Finished, or
 // after zeroize_app_secrets), so an empty secret is never expanded.
-pub fn (mut h ClientHandshake) update_write_traffic_keys() ! {
+pub fn (mut h ClientHandshake) record_update_write_traffic_keys() ! {
+	if h.mode != .record {
+		return error('handshake: record_update_write_traffic_keys() is TLS record path only; this handshake is in ${h.mode} mode')
+	}
 	if h.client_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}

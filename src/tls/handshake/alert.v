@@ -51,7 +51,7 @@ pub enum AlertDescription as u8 {
 // Alert is the 2-byte TLS alert payload. Its fields are read-only outside this
 // module: an adapter inspects the peer's alert but never rewrites it. @[noinit]
 // keeps a caller from fabricating an Alert with an out-of-range level (0 is not
-// a valid AlertLevel); only parse_alert/new_alert/new_close_notify produce one.
+// a valid AlertLevel); only parse_alert/new_alert produce one.
 @[noinit]
 pub struct Alert {
 pub:
@@ -97,21 +97,13 @@ pub fn (d AlertDescription) quic_connection_error() u32 {
 	return 0x100 + u32(d)
 }
 
-// new_close_notify builds the warning close_notify alert, the only alert allowed
-// at warning level (RFC 8446 §6.1). It signals orderly shutdown.
-pub fn new_close_notify() Alert {
-	return Alert{
-		level:       .warning
-		description: .close_notify
-	}
-}
-
-// new_alert builds a fatal alert with the given description. It is the
-// send-side twin of parse_alert for the failure path: RFC 8446 §6 makes every
-// alert except close_notify fatal, so no level parameter is offered.
+// new_alert builds an alert with the given description. It is the send-side
+// twin of parse_alert: RFC 8446 §6 makes every alert except close_notify fatal,
+// so close_notify is the only description emitted at warning level (RFC 8446
+// §6.1) and needs no separate constructor.
 pub fn new_alert(description AlertDescription) Alert {
 	return Alert{
-		level:       .fatal
+		level:       if description == .close_notify { .warning } else { .fatal }
 		description: description
 	}
 }

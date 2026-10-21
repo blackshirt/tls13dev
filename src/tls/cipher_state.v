@@ -28,25 +28,25 @@ const nonce_seq_offset = aead_nonce_len - 8
 // tolerate 2^36.5, but one conservative bound avoids per-suite special cases.
 const record_seq_limit = u64(1 << 24)
 
-// RecordCipherState manages encryption, decryption, sequence numbers, and nonces
+// RecordProtector manages encryption, decryption, sequence numbers, and nonces
 // for one direction of a TLS 1.3 connection (RFC 8446 §5.2 & §5.3).
 // Each record's nonce is derived from a static per-direction value plus the
 // sequence number, so no per-record IV is ever transmitted.
-struct RecordCipherState {
+struct RecordProtector {
 mut:
 	aead    cipher.AEAD // AEAD primitive for this direction (AES-GCM or ChaCha20-Poly1305)
 	iv      []u8        // 12-byte nonce base from the key schedule ("iv" label), not a per-record IV
 	seq_num u64         // record counter for this direction; implicitly part of every nonce
 }
 
-// new_record_cipher_state initializes a per-direction cipher state at seq 0
+// new_record_protector initializes a per-direction record protector at seq 0
 // (the first record under each key uses sequence number 0). The IV must be the
 // suite's full nonce base — aead_nonce_len bytes.
-fn new_record_cipher_state(aead cipher.AEAD, iv []u8) !RecordCipherState {
+fn new_record_protector(aead cipher.AEAD, iv []u8) !RecordProtector {
 	if iv.len != aead_nonce_len {
 		return error('record: IV length must be ${aead_nonce_len} bytes, got ${iv.len}')
 	}
-	return RecordCipherState{
+	return RecordProtector{
 		aead:    aead
 		iv:      iv.clone()
 		seq_num: 0
@@ -58,7 +58,7 @@ fn new_record_cipher_state(aead cipher.AEAD, iv []u8) !RecordCipherState {
 // under a fixed key without ever transmitting it, which AES-GCM and
 // ChaCha20-Poly1305 both require; the sequence number occupies only the low 64
 // bits, so the first 4 bytes of the IV are left untouched.
-fn (s &RecordCipherState) compute_nonce(seq u64) []u8 {
+fn (s &RecordProtector) compute_nonce(seq u64) []u8 {
 	mut nonce := s.iv.clone()
 	for i in 0 .. 8 {
 		shift := (7 - i) * 8
@@ -82,13 +82,13 @@ fn record_aad(content_type ContentType, version u16, length int) []u8 {
 // encrypt_record encrypts a plaintext payload into an encrypted Record (§5.2).
 // The outer ContentType is always application_data (23): TLS 1.3 hides the real
 // message type so observers cannot fingerprint handshake or alert traffic.
-fn (mut s RecordCipherState) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
+fn (mut s RecordProtector) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
 	// Fail closed on an uninitialized/partial cipher state: without this the
 	// nonce computation below indexes a zero-length IV (panic) or calls a nil
 	// AEAD interface. No legitimate path reaches here before the handshake
 	// installs the keys, so refusing is the only safe answer.
 	if s.iv.len != aead_nonce_len {
-		return error('record: cipher state not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
+		return error('record: record protector not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
 	}
 	if s.seq_num >= record_seq_limit {
 		// RFC 8446 §5.5: rekeying is mandatory before this bound; reaching the
@@ -129,13 +129,13 @@ mut:
 
 // decrypt_record decrypts an encrypted Record, verifies the AEAD tag, and
 // extracts the true inner ContentType and plaintext (RFC 8446 §5.2).
-fn (mut s RecordCipherState) decrypt_record(rec Record) !DecryptedRecord {
+fn (mut s RecordProtector) decrypt_record(rec Record) !DecryptedRecord {
 	// Fail closed on an uninitialized/partial cipher state (no handshake keys
 	// installed yet): the nonce computation below would index a zero-length IV
 	// and panic, and the AEAD interface would be nil. An encrypted record
 	// arriving before the keys exist is a protocol violation, never a panic.
 	if s.iv.len != aead_nonce_len {
-		return error('record: cipher state not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
+		return error('record: record protector not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
 	}
 	if s.seq_num >= record_seq_limit {
 		// Receive-side twin of the §5.5 bound: a peer that sent more than the
@@ -191,14 +191,14 @@ fn (mut s RecordCipherState) decrypt_record(rec Record) !DecryptedRecord {
 	}
 }
 
-// wipe_cipher_state zeroes a record cipher state's IV in place and resets the
+// wipe_record_protector zeroes a record protector's IV in place and resets the
 // sequence number, so a discarded or failed connection leaves no nonce base
 // from which record nonces under the dead key could be reconstructed. It is
 // called from the handshake-failure and close paths alongside the core's
 // secret wipes; the AEAD handle is dropped with the struct, matching the
 // best-effort bar of handshake.wipe_traffic_keys (vlib cipher objects expose
 // no in-place key wipe).
-fn wipe_cipher_state(mut s RecordCipherState) {
+fn wipe_record_protector(mut s RecordProtector) {
 	for i in 0 .. s.iv.len {
 		s.iv[i] = 0
 	}

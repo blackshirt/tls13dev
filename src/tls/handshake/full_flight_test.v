@@ -10,9 +10,9 @@ module handshake
 import tls.fakeserver
 import tls.pki
 
-// make_trusted_validator builds a Validator over the fakeserver's embedded
+// fixture_trusted_validator builds a Validator over the fakeserver's embedded
 // test CA so the Certificate message authenticates exactly the fake chain.
-fn make_trusted_validator() pki.Validator {
+fn fixture_trusted_validator() pki.Validator {
 	ts := fakeserver.test_trust_store() or { panic('fakeserver trust store: ${err.msg()}') }
 	return pki.new_validator(ts, false)
 }
@@ -26,13 +26,12 @@ fn expect_no_handshake_keys(h &ClientHandshake) bool {
 	return false
 }
 
-// expect_no_exported_handshake_secrets reports whether quic_traffic_secrets(.handshake)
-// refuses — the expected state once the handshake traffic secrets were wiped.
+// expect_no_exported_handshake_secrets reports whether the handshake traffic
+// secrets are gone — the expected state once they were wiped. It reads the
+// private fields directly (same module) rather than going through a transport
+// accessor, since this object is record-mode.
 fn expect_no_exported_handshake_secrets(h &ClientHandshake) bool {
-	h.quic_traffic_secrets(.handshake) or {
-		return true
-	}
-	return false
+	return h.client_hs_traffic.len == 0 && h.server_hs_traffic.len == 0
 }
 
 // assert_handshake_material_destroyed checks the Phase 1 failure-path contract:
@@ -65,7 +64,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	// then continues to authenticate the server as usual. This drives the whole
 	// exchange: EE+CReq → client empty Certificate → server Cert/CV/Fin →
 	// client Finished.
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(client_auth: true)!
 
 	ch := h.create_client_hello()!
@@ -95,7 +94,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 }
 
 fn test_full_handshake_reaches_connected_byte_by_byte() ! {
-	mut h := new_client_handshake(fakeserver.server_name, ['h2'], make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, ['h2'], fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(alpn: ['h2', 'http/1.1'])!
 
 	ch := h.create_client_hello()!
@@ -137,7 +136,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 }
 
 fn test_hello_retry_request_change_group_reaches_connected() ! {
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(hrr: .change_group)!
 
 	ch := h.create_client_hello()!
@@ -165,7 +164,7 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 }
 
 fn test_hello_retry_request_cookie_only_reaches_connected() ! {
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(hrr: .cookie_only)!
 
 	ch := h.create_client_hello()!
@@ -188,7 +187,7 @@ fn test_hello_retry_request_cookie_only_reaches_connected() ! {
 }
 
 fn test_rejects_bad_server_finished() ! {
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(bad_finished: true)!
 
 	ch := h.create_client_hello()!
@@ -205,7 +204,7 @@ fn test_rejects_bad_server_finished() ! {
 }
 
 fn test_rejects_bad_certificate_verify() ! {
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(bad_certificate_verify: true)!
 
 	ch := h.create_client_hello()!
@@ -222,7 +221,7 @@ fn test_rejects_bad_certificate_verify() ! {
 }
 
 fn test_rejects_out_of_order_certificate() ! {
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server()!
 
 	ch := h.create_client_hello()!
@@ -244,7 +243,7 @@ fn test_rejects_out_of_order_certificate() ! {
 fn test_rejects_unoffered_alpn() ! {
 	// Client offers nothing; the server "picks" h2 — the RFC 7301 §3.1 check
 	// must abort rather than negotiate an unoffered protocol.
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	mut srv := fakeserver.new_server(force_alpn: 'h2')!
 
 	ch := h.create_client_hello()!
@@ -264,7 +263,7 @@ fn test_abort_before_secrets_is_safe() ! {
 	// abort() must tolerate being called when nothing has been derived yet —
 	// dial()'s failure path invokes it on every error, including ones that
 	// occur before the ClientHello was even built.
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	h.abort()
 	assert h.state() == .failed
 	assert expect_no_handshake_keys(h)
@@ -274,7 +273,7 @@ fn test_abort_before_secrets_is_safe() ! {
 fn test_malformed_server_hello_aborts_and_destroys() ! {
 	// A ServerHello that cannot even parse fails before the key schedule ran;
 	// the failure path still parks the machine in .failed and leaves no keys.
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	_ := h.create_client_hello()!
 	// A complete ServerHello header with an empty body: parse fails before the
 	// key schedule ran, so the failure path must still leave no keys behind.
@@ -289,7 +288,7 @@ fn test_malformed_server_hello_aborts_and_destroys() ! {
 fn test_default_failure_alert_is_internal_error() ! {
 	// A failure that never classified itself reports internal_error, the §6
 	// catch-all, so an adapter always has a legal alert to send.
-	mut h := new_client_handshake(fakeserver.server_name, []string{}, make_trusted_validator())!
+	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
 	_ := h.create_client_hello()!
 	assert h.failure_alert() == .internal_error
 }

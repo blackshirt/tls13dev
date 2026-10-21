@@ -18,6 +18,9 @@ tls.exe
 src/**/*_test
 !src/**/*_test.v
 
+# Project docs (not shipped)
+src/_docs/
+
 # Editors / OS
 .DS_Store
 .idea/

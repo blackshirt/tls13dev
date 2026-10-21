@@ -51,7 +51,7 @@ The core was therefore split so that the carrier is always someone else's job:
 Two properties make this work:
 
 1. **The core owns no record, cipher, or socket concept.** A grep gate over
-   `src/tls/handshake/` (`Record`, `RecordCipherState`, `ContentType`,
+   `src/tls/handshake/` (`Record`, `RecordProtector`, `ContentType`,
    `change_cipher_spec`, `record_header_len`) keeps it that way. The core never
    encrypts, never frames a record, and never calls `read(2)`/`write(2)`.
 
@@ -165,6 +165,8 @@ RFC 9001 §5.1 expansions itself:
 `quic_traffic_secrets(level)` hands out `(client, server)` clones of those secrets.
 `record_traffic_keys(level)` is provided for the record layer (and for tests) but a
 QUIC engine should use `quic_traffic_secrets()` + the public `hkdf_expand_label()`.
+The mode guard enforces this: build the handshake with `new_quic_handshake()`, and
+`record_traffic_keys()` (and the record ratchets) will reject the call outright.
 
 ### 3.3 Handshake keys survive until confirmation
 
@@ -182,7 +184,7 @@ will strand keys it still needs.
 Over QUIC, TLS KeyUpdate does not exist: an endpoint MUST NOT send one and MUST
 treat a received one as a connection error (RFC 9001 §6). The next generation
 of 1-RTT secrets is derived engine-side with the `quic ku` label
-(§6.1) — **not** via `update_read_traffic_keys()`/`update_write_traffic_keys()`,
+(§6.1) — **not** via `record_update_read_traffic_keys()`/`record_update_write_traffic_keys()`,
 whose `traffic upd` label is the TLS record path's. The header-protection key
 never updates.
 
@@ -219,8 +221,8 @@ import tls.pki
 mut store := pki.new_trust_store()
 store.load_system_ca_bundle()!
 
-// 1. Construct — same call conn.v makes. X25519 share generated here.
-mut hs := handshake.new_client_handshake('example.com', ['h3'], pki.new_validator(store, false))!
+// 1. Construct — QUIC mode pins the contract; X25519 share generated here.
+mut hs := handshake.new_quic_handshake('example.com', ['h3'], pki.new_validator(store, false))!
 
 // 2. First ClientHello. `ch1` is a complete handshake message; place it into a
 //    CRYPTO frame in an Initial packet (which YOU protect with Initial keys
@@ -279,10 +281,10 @@ hs.on_handshake_confirmed()!
   Contract misuse (feeding before `create_client_hello()`, Initial bytes outside
   the ServerHello wait, anything after `failed`) is refused with the state left
   untouched so you can fix your sequencing.
-- **`unconsumed_bytes(level)`** reports incomplete bytes parked in a level's
+- **`record_unconsumed_bytes(level)`** reports incomplete bytes parked in a level's
   buffer. The TCP adapter uses it for the §5.1 ServerHello record-boundary rule;
-  that rule is meaningless over QUIC, so the core does not own it — but the
-  accessor is there if you need visibility.
+  that rule is meaningless over QUIC, so a QUIC-mode handshake makes this a no-op
+  (returns 0).
 - **`negotiated_alpn()`** returns the server's ALPN pick (`''` if none). The
   core already verified it was one you offered (RFC 7301 §3.1).
 - **`receive(.application, …)` refuses by contract**: application data never
@@ -318,26 +320,28 @@ error, close the connection, and drop its own per-level protection state.
 ## 6. The public API at a glance
 
 ```v
-// Construction and driving
-new_client_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
+// Construction and driving (mode is fixed here and enforced on every call)
+new_quic_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
+new_record_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake
 (mut h) create_client_hello() ![]u8
 (mut h) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage
 
 // Observation
+(h) mode() TransportMode
 (h) state() HandshakeState
 (h) negotiated_alpn() string
 (h) negotiated_cipher_suite() CipherSuite
-(h) unconsumed_bytes(level SecretLevel) int
 (h) failure_alert() AlertDescription
 
 // Key material (secrets for QUIC; keys for the record layer)
-(h) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) // (client, server)
-(h) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)
+(h) quic_traffic_secrets(level SecretLevel) !([]u8, []u8)       // QUIC mode only, (client, server)
+(h) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // record mode only
+(h) record_unconsumed_bytes(level SecretLevel) int             // record mode only (else 0)
 
 // Lifecycle
 (mut h) on_handshake_confirmed() !                            // QUIC: at handshake confirmation
-(mut h) update_read_traffic_keys() !                     // TLS record path only
-(mut h) update_write_traffic_keys() !                    // TLS record path only
+(mut h) record_update_read_traffic_keys() !                     // TLS record path only
+(mut h) record_update_write_traffic_keys() !                    // TLS record path only
 (mut h) abort()                                          // → .failed, wipes all secrets
 
 // Recordless framing + alert mapping

@@ -16,7 +16,7 @@ import tls.pki
 // Conn is @[noinit], so a bare &Conn{} would leave every field as garbage; this
 // helper supplies a real (but unused) handshake and zeroed buffers instead.
 fn new_test_conn() !&Conn {
-	mut hs := handshake.new_client_handshake('', []string{}, pki.new_validator(pki.new_trust_store(), false))!
+	mut hs := handshake.new_record_handshake('', []string{}, pki.new_validator(pki.new_trust_store(), false))!
 	return &Conn{
 		sock:              unsafe { nil }
 		hs:                hs
@@ -177,7 +177,7 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	}
 	local := listener.addr()!
 	mut sock := net.dial_tcp(local.str())!
-	mut hs := handshake.new_client_handshake('', []string{}, pki.new_validator(pki.new_trust_store(), false))!
+	mut hs := handshake.new_record_handshake('', []string{}, pki.new_validator(pki.new_trust_store(), false))!
 	mut c := &Conn{
 		sock:              sock
 		hs:                hs
