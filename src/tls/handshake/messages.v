@@ -652,9 +652,9 @@ fn build_finished(verify_data []u8) []u8 {
 // CertificateRequest is the outcome of decoding a server CertificateRequest
 // (RFC 8446 §4.3.2). This client holds no certificate, so the fields exist to
 // validate the message's structure (and to prove we understood it) rather than
-// to select a credential; only the request context must be echoed verbatim.
-pub struct CertificateRequest {
-pub:
+// to select a credential; only the request context must be echoed verbatim. The
+// type and its fields are module-private: it never reaches the public surface.
+struct CertificateRequest {
 	request_context []u8 // echoed verbatim in the responding Certificate (§4.4.2)
 }
 
