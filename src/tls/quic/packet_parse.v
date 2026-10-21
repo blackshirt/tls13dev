@@ -10,8 +10,7 @@ module quic
 
 // LongPacketMeta is the framing a receiver can recover from a long header
 // before removing header protection.
-pub struct LongPacketMeta {
-pub:
+struct LongPacketMeta {
 	ptype       PacketType
 	version     u32
 	dcid        []u8
@@ -26,7 +25,7 @@ pub:
 // long_packet_meta parses the protection-independent framing of a long header.
 // It returns the type, IDs, token, the offset of the masked packet number, and
 // the total packet length derived from the length field (RFC 9000 §17.2).
-pub fn long_packet_meta(buf []u8) !LongPacketMeta {
+fn long_packet_meta(buf []u8) !LongPacketMeta {
 	if buf.len < 7 {
 		return error('quic: long header too short (${buf.len} bytes)')
 	}

@@ -20,7 +20,7 @@ pub enum HashAlgorithm {
 }
 
 // hash_len returns the digest length in bytes.
-pub fn (h HashAlgorithm) hash_len() int {
+fn (h HashAlgorithm) hash_len() int {
 	return match h {
 		.sha256 { 32 }
 		.sha384 { 48 }
@@ -28,7 +28,7 @@ pub fn (h HashAlgorithm) hash_len() int {
 }
 
 // compute_hash calculates the hash of data.
-pub fn (h HashAlgorithm) compute_hash(data []u8) []u8 {
+fn (h HashAlgorithm) compute_hash(data []u8) []u8 {
 	return match h {
 		.sha256 { sha256.sum256(data) }
 		.sha384 { sha512.sum384(data) }

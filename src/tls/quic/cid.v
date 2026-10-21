@@ -11,7 +11,7 @@ import crypto.rand
 // random_cid returns `n` cryptographically-random connection-ID bytes
 // (RFC 9000 §5.1). Connection IDs should not be predictable, so the engine uses
 // the platform CSPRNG.
-pub fn random_cid(n int) ![]u8 {
+fn random_cid(n int) ![]u8 {
 	if n <= 0 || n > 20 {
 		return error('quic: connection ID length ${n} must be 1..20 (RFC 9000 §17.2)')
 	}

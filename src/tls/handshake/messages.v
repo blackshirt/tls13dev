@@ -804,12 +804,12 @@ pub fn (t &NewSessionTicket) lifetime() u32 {
 }
 
 // age_add returns the ticket_age_add obfuscation value.
-pub fn (t &NewSessionTicket) age_add() u32 {
+fn (t &NewSessionTicket) age_add() u32 {
 	return t.ticket_age_add
 }
 
 // nonce returns the ticket nonce.
-pub fn (t &NewSessionTicket) nonce() []u8 {
+fn (t &NewSessionTicket) nonce() []u8 {
 	return t.ticket_nonce
 }
 

@@ -60,8 +60,7 @@ fn initial_hkdf_extract(salt []u8, ikm []u8) []u8 {
 // InitialKeys holds one direction's Initial protection material: the AEAD
 // packet key, the packet-number nonce base, and the header-protection key
 // (RFC 9001 §5.2). The engine builds an AEAD from `key` and masks with `hp`.
-pub struct InitialKeys {
-pub:
+struct InitialKeys {
 	key []u8 // 16-byte AES-128-GCM key ("quic key")
 	iv  []u8 // 12-byte packet-number nonce base ("quic iv")
 	hp  []u8 // 16-byte header-protection key ("quic hp")
@@ -71,7 +70,7 @@ pub:
 // Destination Connection ID (RFC 9001 §5.2). The DCID is the one the client put
 // in its very first Initial packet; it never changes for the derivation even if
 // the connection ID later does.
-pub fn derive_initial_keys(client_dcid []u8) !(InitialKeys, InitialKeys) {
+fn derive_initial_keys(client_dcid []u8) !(InitialKeys, InitialKeys) {
 	if client_dcid.len == 0 {
 		return error('quic: Initial key derivation needs a non-empty destination connection ID')
 	}

@@ -289,7 +289,7 @@ pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !
 // DigestInfo is matched as one whole byte string (DER prefix + hash) rather than
 // parsed: permissive prefix handling enabled Bleichenbacher-style forgeries, so
 // the exact canonical encoding must appear byte-for-byte or be rejected.
-pub fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig []u8) !bool {
+fn (k &RsaPublicKey) verify_pkcs1_v1_5(digest_type string, m_hash []u8, sig []u8) !bool {
 	em := k.rsa_verify_raw(sig)!
 	if em.len < 11 {
 		return error('rsa-pkcs1: message too short')

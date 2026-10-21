@@ -27,7 +27,7 @@ const short_header_form = u8(0x00)
 
 // LongPacketType is the 2-bit type in a long header's first byte
 // (RFC 9000 §17.2), shifted up by two bits in the wire byte.
-pub enum LongPacketType {
+enum LongPacketType {
 	initial   = 0
 	zero_rtt  = 1
 	handshake = 2
@@ -38,7 +38,7 @@ pub enum LongPacketType {
 const long_header_type_mask = u8(0x30)
 
 // PacketType is the engine-facing level of a parsed packet.
-pub enum PacketType {
+enum PacketType {
 	initial
 	zero_rtt
 	handshake
@@ -48,7 +48,7 @@ pub enum PacketType {
 
 // first_byte_long reports whether the first byte marks a long header
 // (RFC 9000 §17.2).
-pub fn first_byte_long(b u8) bool {
+fn first_byte_long(b u8) bool {
 	return b & long_header_form != 0
 }
 
@@ -85,7 +85,7 @@ fn read_varint_field(buf []u8, off int) !([]u8, int) {
 // tag length, because the Length field counts the packet number, the payload,
 // *and* the tag (RFC 9000 §17.2). Returns the prefix and the byte offset where
 // the PN begins.
-pub fn build_long_header(ptype PacketType, version u32, dcid []u8, scid []u8, token []u8, payload_len int, pn_len int, tag_len int) !([]u8, int) {
+fn build_long_header(ptype PacketType, version u32, dcid []u8, scid []u8, token []u8, payload_len int, pn_len int, tag_len int) !([]u8, int) {
 	type_bits := match ptype {
 		.initial { u8(0x00) }
 		.zero_rtt { u8(0x10) }
@@ -116,7 +116,7 @@ pub fn build_long_header(ptype PacketType, version u32, dcid []u8, scid []u8, to
 // byte (RFC 9000 §17.3). The caller appends the packet number and payload.
 // `key_phase` sets the Key Phase bit (bit 0x04), which the engine flips when it
 // updates 1-RTT keys (§6).
-pub fn build_short_header(dcid []u8, pn_len int, key_phase bool) []u8 {
+fn build_short_header(dcid []u8, pn_len int, key_phase bool) []u8 {
 	mut first := fixed_bit | u8((pn_len - 1) & 0x03)
 	if key_phase {
 		first |= 0x04
@@ -129,7 +129,7 @@ pub fn build_short_header(dcid []u8, pn_len int, key_phase bool) []u8 {
 
 // encode_packet_number writes pn using exactly pn_len bytes, big-endian
 // (RFC 9000 §17.1).
-pub fn encode_packet_number(pn u64, pn_len int) ![]u8 {
+fn encode_packet_number(pn u64, pn_len int) ![]u8 {
 	if pn_len < 1 || pn_len > 4 {
 		return error('quic: packet number length ${pn_len} must be 1..4')
 	}
@@ -146,7 +146,7 @@ pub fn encode_packet_number(pn u64, pn_len int) ![]u8 {
 // §17.1, "the number of bits must be at least one more than the number of
 // significant bits in the difference"). `largest_acked` is 0 when nothing is
 // acknowledged yet.
-pub fn packet_number_len(pn u64, largest_acked u64) int {
+fn packet_number_len(pn u64, largest_acked u64) int {
 	// The sender must encode at least enough bits to distinguish pn from every
 	// packet the peer might still have outstanding; using the largest acked as
 	// the reference is the conservative standard choice.
@@ -166,7 +166,7 @@ pub fn packet_number_len(pn u64, largest_acked u64) int {
 // decode_packet_number reconstructs the full packet number from the truncated
 // wire value, the number of bytes it occupied, and the largest packet number
 // received so far on that level (RFC 9000 §17.1 / Appendix A.3).
-pub fn decode_packet_number(truncated u64, pn_len int, largest_pn u64) u64 {
+fn decode_packet_number(truncated u64, pn_len int, largest_pn u64) u64 {
 	pn_nbits := u64(pn_len * 8)
 	pn_win := u64(1) << pn_nbits
 	pn_hwin := pn_win / 2

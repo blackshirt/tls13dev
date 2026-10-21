@@ -37,15 +37,9 @@ pub fn (r &Reader) pos() int {
 	return r.cursor
 }
 
-// has_remaining reports whether at least `n` bytes are left, so callers can
-// validate framing before committing to a read.
-pub fn (r &Reader) has_remaining(n int) bool {
-	return n >= 0 && n <= r.data.len - r.cursor
-}
-
 // ensure checks that at least `n` bytes remain, so fixed-width accessors fail
 // with a framing error instead of indexing out of bounds. `what` names the item.
-pub fn (mut r Reader) ensure(n int, what string) ! {
+fn (mut r Reader) ensure(n int, what string) ! {
 	if n < 0 || n > r.data.len - r.cursor {
 		return error('wire.Reader: unexpected EOF reading ${what}')
 	}

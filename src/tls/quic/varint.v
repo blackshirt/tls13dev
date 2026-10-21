@@ -8,11 +8,11 @@ module quic
 
 // max_varint is the largest value a QUIC varint can carry: 2^62 - 1, the 62
 // value bits of the 8-byte form (RFC 9000 §16).
-pub const max_varint = u64(1 << 62) - 1
+const max_varint = u64(1 << 62) - 1
 
 // varint_len returns how many bytes encode v: the smallest of 1/2/4/8 that fits
 // (RFC 9000 §16). Values above max_varint cannot be encoded and report 0.
-pub fn varint_len(v u64) int {
+fn varint_len(v u64) int {
 	if v > max_varint {
 		return 0
 	}
@@ -29,7 +29,7 @@ pub fn varint_len(v u64) int {
 }
 
 // encode_varint writes v in its shortest QUIC varint form (RFC 9000 §16).
-pub fn encode_varint(v u64) ![]u8 {
+fn encode_varint(v u64) ![]u8 {
 	n := varint_len(v)
 	return match n {
 		1 { [u8(v)] }
@@ -62,7 +62,7 @@ pub fn encode_varint(v u64) ![]u8 {
 // bytes_consumed) (RFC 9000 §16). It errors on an empty buffer; a truncated
 // multi-byte field makes it read past the end, which is caught by the length
 // check.
-pub fn decode_varint(buf []u8) !(u64, int) {
+fn decode_varint(buf []u8) !(u64, int) {
 	if buf.len == 0 {
 		return error('quic: varint decode on empty buffer')
 	}

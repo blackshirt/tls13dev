@@ -23,8 +23,7 @@ const hp_sample_len = 16
 // ProtectionKeys is one direction's packet-protection material at one
 // encryption level (RFC 9001 §5.1): the AEAD packet key, the 12-byte
 // packet-number nonce base, and the header-protection key.
-pub struct ProtectionKeys {
-pub:
+struct ProtectionKeys {
 	key []u8
 	iv  []u8
 	hp  []u8
@@ -34,7 +33,7 @@ pub:
 // level: a cipher built from `key`, the nonce base `iv`, the header-protection
 // key `hp`, and the suite (which selects the AEAD and the mask algorithm).
 @[noinit]
-pub struct ProtectionState {
+struct ProtectionState {
 mut:
 	suite handshake.CipherSuite
 	aead  cipher.AEAD
@@ -44,7 +43,7 @@ mut:
 
 // new_initial_protection builds a ProtectionState for the Initial level, which
 // is always AES-128-GCM (RFC 9001 §5.2).
-pub fn new_initial_protection(k InitialKeys) !ProtectionState {
+fn new_initial_protection(k InitialKeys) !ProtectionState {
 	return new_protection(ProtectionKeys{
 		key: k.key
 		iv:  k.iv
@@ -54,7 +53,7 @@ pub fn new_initial_protection(k InitialKeys) !ProtectionState {
 
 // new_protection builds a ProtectionState for one direction at one level from
 // its ProtectionKeys and the negotiated suite.
-pub fn new_protection(k ProtectionKeys, suite handshake.CipherSuite) !ProtectionState {
+fn new_protection(k ProtectionKeys, suite handshake.CipherSuite) !ProtectionState {
 	if k.iv.len != handshake.aead_nonce_len {
 		return error('quic: nonce base must be ${handshake.aead_nonce_len} bytes, got ${k.iv.len}')
 	}
@@ -75,7 +74,7 @@ pub fn new_protection(k ProtectionKeys, suite handshake.CipherSuite) !Protection
 
 // overhead returns the AEAD tag length in bytes (16 for both AES-GCM and
 // ChaCha20-Poly1305), which the QUIC Length field must include.
-pub fn (s &ProtectionState) overhead() int {
+fn (s &ProtectionState) overhead() int {
 	return s.aead.overhead()
 }
 
@@ -160,7 +159,7 @@ fn (s &ProtectionState) remove_header_protection(mut packet []u8, pn_offset int,
 // (RFC 9001 §5.3/§5.4). `header` is the already-serialized header prefix through
 // the length field (from build_long_header / build_short_header); `pn` is the
 // packet number.
-pub fn (mut s ProtectionState) seal_packet(header []u8, pn u64, pn_len int, payload []u8) ![]u8 {
+fn (mut s ProtectionState) seal_packet(header []u8, pn u64, pn_len int, payload []u8) ![]u8 {
 	pn_bytes := encode_packet_number(pn, pn_len)!
 	mut packet := []u8{cap: header.len + pn_len + payload.len + 16}
 	packet << header
@@ -186,7 +185,7 @@ pub fn (mut s ProtectionState) seal_packet(header []u8, pn u64, pn_len int, payl
 // returns the packet-number length (RFC 9001 §5.4.1). After this call the first
 // byte and packet number are in the clear, so the caller can read the truncated
 // packet number, reconstruct the full value, and call decrypt_payload.
-pub fn (mut s ProtectionState) unprotect(mut packet []u8, pn_offset int) !int {
+fn (mut s ProtectionState) unprotect(mut packet []u8, pn_offset int) !int {
 	sample_off := pn_offset + 4
 	if sample_off + hp_sample_len > packet.len {
 		return error('quic: packet too short to remove header protection')
@@ -198,7 +197,7 @@ pub fn (mut s ProtectionState) unprotect(mut packet []u8, pn_offset int) !int {
 // (RFC 9001 §5.3). `pn_offset` is the start of the (now clear) packet number,
 // `pn_len` its length, and `full_pn` the reconstructed packet number that keys
 // the nonce.
-pub fn (mut s ProtectionState) decrypt_payload(packet []u8, pn_offset int, pn_len int, full_pn u64) ![]u8 {
+fn (mut s ProtectionState) decrypt_payload(packet []u8, pn_offset int, pn_len int, full_pn u64) ![]u8 {
 	header_total := pn_offset + pn_len
 	if header_total > packet.len {
 		return error('quic: packet number runs past packet end')

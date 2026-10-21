@@ -404,7 +404,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 
 // ecdsa_public_key reconstructs an ECDSA public key from the SPKI bit string
 // using the curve stored during certificate parsing.
-pub fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
+fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	if c.public_key_algo != .ecdsa {
 		return error('x509: certificate public key is not ECDSA')
 	}
