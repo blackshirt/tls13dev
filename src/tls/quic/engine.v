@@ -360,9 +360,9 @@ fn (mut e ClientEngine) drain_contiguous(ptype PacketType) ! {
 // queue_outbound places an outbound handshake message into the right level's
 // outbound CRYPTO buffer.
 fn (mut e ClientEngine) queue_outbound(m handshake.HandshakeMessage) ! {
-	match m.level {
-		.initial { e.tx_crypto_initial << m.msg }
-		.handshake { e.tx_crypto_hands << m.msg }
+	match m.level() {
+		.initial { e.tx_crypto_initial << m.msg() }
+		.handshake { e.tx_crypto_hands << m.msg() }
 		.application { return error('quic: handshake core produced .application CRYPTO') }
 	}
 }

@@ -249,7 +249,7 @@ fn (mut c Conn) do_handshake() ! {
 				// ClientHello after a HelloRetryRequest; like the first it travels
 				// as a plaintext handshake record plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
-					c.write_records([new_record(.handshake, m.msg), change_cipher_spec()])!
+					c.write_records([new_record(.handshake, m.msg()), change_cipher_spec()])!
 				}
 			}
 			.application_data {
@@ -277,7 +277,7 @@ fn (mut c Conn) do_handshake() ! {
 							// handshake keys (RFC 8446 §7.1). The core's application keys are
 							// cached but not installed yet, so this record simply continues
 							// the handshake-key sequence — no key change happens mid-flight.
-							enc := c.client_hs_cipher.encrypt_record(.handshake, m.msg)!
+							enc := c.client_hs_cipher.encrypt_record(.handshake, m.msg())!
 							c.write_records([enc])!
 						}
 					}

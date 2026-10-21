@@ -102,11 +102,21 @@ pub enum HandshakeState {
 // wire. The TCP adapter maps every level onto its single record stream.
 // Instances come from receive() or new_handshake_message(); @[noinit] keeps other
 // modules from pairing a valid 4-byte header with a body that does not match it.
+// The fields are module-private; consumers read them through level()/msg().
 @[noinit]
 pub struct HandshakeMessage {
-pub mut:
 	level SecretLevel
 	msg   []u8
+}
+
+// level returns the encryption level this message belongs to.
+pub fn (m &HandshakeMessage) level() SecretLevel {
+	return m.level
+}
+
+// msg returns the complete handshake message bytes (4-byte header included).
+pub fn (m &HandshakeMessage) msg() []u8 {
+	return m.msg
 }
 
 // new_handshake_message builds a HandshakeMessage for producers outside this
