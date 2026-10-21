@@ -143,12 +143,24 @@ fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 // one encryption level. The core caches them and hands copies out through
 // ClientHandshake.record_traffic_keys(); each adapter instantiates its own protection
 // from them (the TLS record layer builds cipher states, QUIC expands the same
-// material into packet keys), which is why the fields are the seam's public
-// payload.
+// material into packet keys). The fields are module-private and read-only from
+// outside: a delivered copy is never rewritten, and key material is released
+// only through the in-place wipe helper below (wipe_traffic_keys), never by a
+// caller poking the slices.
 pub struct TrafficKeys {
-pub mut:
+mut:
 	key []u8 // AEAD key, suite-length bytes (16 for AES-128-GCM, 32 for the others)
 	iv  []u8 // 12-byte nonce base; per-record nonces XOR in the sequence number
+}
+
+// key returns the AEAD key bytes.
+pub fn (t &TrafficKeys) key() []u8 {
+	return t.key
+}
+
+// iv returns the 12-byte nonce base.
+pub fn (t &TrafficKeys) iv() []u8 {
+	return t.iv
 }
 
 // derive_traffic_keys expands a traffic secret into an AEAD key and IV (RFC 8446

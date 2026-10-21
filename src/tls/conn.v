@@ -322,8 +322,8 @@ fn (mut c Conn) do_handshake() ! {
 // mutating an old one; this bridge is exactly where the record layer meets the
 // transport-neutral core and belongs to the adapter, not the core.
 fn cipher_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !RecordCipherState {
-	aead := handshake.new_aead_for_suite(suite, keys.key)!
-	return new_record_cipher_state(aead, keys.iv)!
+	aead := handshake.new_aead_for_suite(suite, keys.key())!
+	return new_record_cipher_state(aead, keys.iv())!
 }
 
 // install_handshake_ciphers builds both handshake-key record states from the
