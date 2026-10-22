@@ -253,7 +253,7 @@ fn (mut c Conn) do_handshake() ! {
 	// The core verified the server Finished; install this adapter's post-handshake protection.
 	c.install_application_ciphers()!
 	// Nothing may protect or decrypt at the handshake level now, so the core may destroy its secrets (RFC 8446 §7.5).
-	c.hs.on_handshake_confirmed()!
+	c.hs.zeroize_handshake_traffic_secrets()!
 }
 
 // ─── TCP transport: framing, write batching, dummy CCS ───

@@ -54,7 +54,7 @@ pub fn (h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(Tra
 	match level {
 		.handshake {
 			if h.client_hs_keys.key.len == 0 || h.server_hs_keys.key.len == 0 {
-				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
+				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_traffic_secrets)')
 			}
 			return clone_traffic_keys(h.client_hs_keys), clone_traffic_keys(h.server_hs_keys)
 		}
@@ -71,8 +71,8 @@ pub fn (h &RecordHandshaker) record_unconsumed_bytes(level HandshakeLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 
-pub fn (mut h RecordHandshaker) on_handshake_confirmed() ! {
-	h.HandshakeCore.on_handshake_confirmed()!
+pub fn (mut h RecordHandshaker) zeroize_handshake_traffic_secrets() ! {
+	h.HandshakeCore.zeroize_handshake_traffic_secrets()!
 	wipe_traffic_keys(mut h.client_hs_keys)
 	wipe_traffic_keys(mut h.server_hs_keys)
 }

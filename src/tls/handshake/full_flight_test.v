@@ -16,7 +16,7 @@ fn fixture_trusted_validator() pki.Validator {
 }
 
 // expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —
-// the expected state once on_handshake_confirmed() dropped the handshake material.
+// the expected state once zeroize_handshake_traffic_secrets() dropped the handshake material.
 fn expect_no_handshake_keys(h &RecordHandshaker) bool {
 	h.record_traffic_keys(.handshake) or {
 		return true
@@ -114,8 +114,8 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert sk.key.len == 16
 	assert sk.iv.len == 12
 
-	// on_handshake_confirmed() drops the handshake stage, keeping application material (RFC 8446 §7.5).
-	h.on_handshake_confirmed()!
+	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
+	h.zeroize_handshake_traffic_secrets()!
 	assert expect_no_handshake_keys(&h)
 	akc, aks := h.record_traffic_keys(.application)!
 	assert akc.key.len == 16

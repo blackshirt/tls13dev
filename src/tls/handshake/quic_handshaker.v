@@ -24,7 +24,7 @@ pub fn (h &QuicHandshaker) quic_traffic_secrets(level TrafficSecretLevel) !([]u8
 	match level {
 		.handshake {
 			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
-				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
+				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_handshake_traffic_secrets)')
 			}
 			return h.client_hs_traffic.clone(), h.server_hs_traffic.clone()
 		}

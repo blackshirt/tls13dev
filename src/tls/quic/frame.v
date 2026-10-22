@@ -10,7 +10,7 @@
 //   * PADDING (§19.1) — inflates a ClientHello packet to the 1200-byte minimum.
 //   * CONNECTION_CLOSE (§19.19) — carries a handshake failure's alert code.
 //   * HANDSHAKE_DONE (§19.20) — the server's signal that the handshake is
-//     confirmed, which is the engine's cue to call on_handshake_confirmed().
+//     confirmed, which is the engine's cue to zeroize handshake traffic secrets.
 //
 // Frames a client never needs here (STREAM, flow control, Retry, NEW_TOKEN,
 // etc.) are out of scope.

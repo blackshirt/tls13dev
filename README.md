@@ -105,11 +105,11 @@ failure_alert() AlertDescription  /  fail_and_destroy_secrets()  /  zeroize_app_
 record_unconsumed_bytes(level HandshakeLevel) int                     // §5.1 boundary hook
 record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
 record_update_read_traffic_keys() !  /  record_update_write_traffic_keys() !  // §7.2 ratchet
-on_handshake_confirmed() !                                           // record confirmation
+zeroize_handshake_traffic_secrets() !                                // record handshake secrets no longer needed
 
 // QuicHandshaker only
 quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
-on_handshake_confirmed() !                                 // QUIC confirmation
+zeroize_handshake_traffic_secrets() !                     // when QUIC no longer needs these secrets
 ```
 
 The shared implementation, including per-level receive buffers for each

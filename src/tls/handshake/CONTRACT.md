@@ -61,8 +61,9 @@ adapters use `state()` to observe progress and errors to detect invalid input.
   ServerHello record-boundary rule.
 - `record_update_read_traffic_keys()` and
   `record_update_write_traffic_keys()` implement TLS KeyUpdate.
-- `on_handshake_confirmed()` releases handshake-stage material at the record
-  adapter's confirmation point.
+- `zeroize_handshake_traffic_secrets()` destroys handshake traffic secrets once
+  the adapter no longer needs them; the record facade also wipes its cached
+  handshake keys. This is cleanup, not a handshake-confirmation signal.
 
 ## QUIC-only operations
 
@@ -71,8 +72,8 @@ method is implemented directly on the QUIC facade, which owns the transport-
 specific secret-level checks. The shared core contains no QUIC-specific secret
 accessor, and `RecordHandshaker` cannot expose one. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
-calls `on_handshake_confirmed()` only after QUIC confirms the handshake, so
-handshake keys remain available for the required period.
+calls `zeroize_handshake_traffic_secrets()` only when QUIC no longer needs the
+handshake keys, which may be after the handshake is confirmed.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 are absent from `QuicHandshaker`, rather than present as runtime-rejected calls.

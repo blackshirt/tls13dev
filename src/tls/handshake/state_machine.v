@@ -511,11 +511,11 @@ fn (h &HandshakeCore) unconsumed_bytes(level HandshakeLevel) int {
 	}
 }
 
-// on_handshake_confirmed destroys handshake-stage traffic secrets after the
-// adapter no longer needs them (RFC 8446 §7.5).
-pub fn (mut h HandshakeCore) on_handshake_confirmed() ! {
+// zeroize_handshake_traffic_secrets destroys the handshake traffic secrets once
+// the adapter no longer needs them (RFC 8446 §7.5).
+pub fn (mut h HandshakeCore) zeroize_handshake_traffic_secrets() ! {
 	if h.state != .connected {
-		return error('handshake: on_handshake_confirmed() runs only once the handshake reached .connected (state: ${h.state})')
+		return error('handshake: zeroize_handshake_traffic_secrets() runs only once the handshake reached .connected (state: ${h.state})')
 	}
 	for i in 0 .. h.client_hs_traffic.len {
 		h.client_hs_traffic[i] = 0

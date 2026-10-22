@@ -259,9 +259,8 @@ fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	assert false
 }
 
-// test_on_handshake_confirmed_drops_handshake_material checks that confirmation
-// wipes the cached handshake keys and traffic secrets.
-fn test_on_handshake_confirmed_drops_handshake_material() ! {
+// test_zeroize_handshake_traffic_secrets drops cached handshake keys and secrets.
+fn test_zeroize_handshake_traffic_secrets() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_hs_traffic = [u8(1), 2, 3]
 	h.server_hs_traffic = [u8(4), 5, 6]
@@ -269,7 +268,7 @@ fn test_on_handshake_confirmed_drops_handshake_material() ! {
 	h.server_hs_keys = TrafficKeys{ key: [u8(9)], iv: [u8(10)] }
 	h.state = .connected
 
-	h.on_handshake_confirmed()!
+	h.zeroize_handshake_traffic_secrets()!
 
 	assert h.client_hs_traffic.len == 0
 	assert h.server_hs_traffic.len == 0
@@ -282,13 +281,13 @@ fn test_on_handshake_confirmed_drops_handshake_material() ! {
 	assert false
 }
 
-// test_on_handshake_confirmed_requires_connected_state checks that confirming
-// early is refused with nothing wiped.
-fn test_on_handshake_confirmed_requires_connected_state() ! {
+// test_zeroize_handshake_traffic_secrets_requires_connected_state checks that
+// early cleanup is refused with nothing wiped.
+fn test_zeroize_handshake_traffic_secrets_requires_connected_state() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_hs_traffic = [u8(1), 2, 3]
 	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
-	h.on_handshake_confirmed() or {
+	h.zeroize_handshake_traffic_secrets() or {
 		assert err.msg().contains('reached .connected')
 		assert h.client_hs_traffic.len == 3
 		assert h.client_hs_keys.key.len == 1

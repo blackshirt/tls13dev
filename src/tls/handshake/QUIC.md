@@ -167,17 +167,17 @@ RFC 9001 §5.1 expansions itself:
 `QuicHandshaker` does not expose it. A QUIC engine uses
 `quic_traffic_secrets()` + the public `hkdf_expand_label()`.
 
-### 3.3 Handshake keys survive until confirmation
+### 3.3 Handshake keys survive until no longer needed
 
 A QUIC peer may keep sending at the Handshake level **until the handshake is
 confirmed** (HANDSHAKE_DONE or a 1-RTT acknowledgment, RFC 9001 §4.1.2), not
 merely until the client sends its Finished. So the core deliberately retains
 the handshake traffic secrets past `.connected`; the engine owns its derived
-packet keys and discards them only when it calls `on_handshake_confirmed()` —
-the §4.9.2 behavior.
-The TCP adapter calls `on_handshake_confirmed()` right after sending its Finished
-because record-based TLS has no such window; **a QUIC engine must not**, or it
-will strand keys it still needs.
+packet keys and calls `zeroize_handshake_traffic_secrets()` when QUIC no longer
+needs the TLS handshake traffic secrets (§4.9.2), usually after confirmation.
+The TCP adapter calls `zeroize_handshake_traffic_secrets()` after sending its
+Finished because record-based TLS has no such window; **a QUIC engine must not**
+zeroize them before it has finished using the Handshake packet keys.
 
 ### 3.4 KeyUpdate is replaced by Key Phase
 
@@ -267,7 +267,7 @@ for m in flight {
 
 // 8. Confirm the handshake only when QUIC says so (HANDSHAKE_DONE / 1-RTT ack),
 //    then release the handshake-stage material.
-hs.on_handshake_confirmed()!
+hs.zeroize_handshake_traffic_secrets()!
 
 // 9. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_passthrough_message and decode with parse_new_session_ticket.
@@ -313,7 +313,7 @@ When the core kills a handshake it takes two actions an adapter must respect:
    its packet-protection state. `fail_and_destroy_secrets()` parks the core in
    `.failed`. The success path wipes at `.connected`
    (`zeroize_handshake_secrets`) and at teardown (`zeroize_app_secrets`), with
-   the handshake stage deferred to `on_handshake_confirmed()` per §3.3 above.
+   the handshake stage deferred to `zeroize_handshake_traffic_secrets()` per §3.3 above.
 
 Your adapter should: read `failure_alert()`, convert it to a QUIC connection
 error, close the connection, and drop its own per-level protection state.
@@ -337,14 +337,14 @@ new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHa
 
 // QUIC facade only
 (h &QuicHandshaker) quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8) // (client, server)
-(mut h QuicHandshaker) on_handshake_confirmed() !
+(mut h QuicHandshaker) zeroize_handshake_traffic_secrets() !
 
 // Record facade only
 (h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)
 (h &RecordHandshaker) record_unconsumed_bytes(level HandshakeLevel) int
 (mut h RecordHandshaker) record_update_read_traffic_keys() !
 (mut h RecordHandshaker) record_update_write_traffic_keys() !
-(mut h RecordHandshaker) on_handshake_confirmed() !
+(mut h RecordHandshaker) zeroize_handshake_traffic_secrets() !
 
 // Shared lifecycle
 (mut h) fail_and_destroy_secrets()      // → .failed, wipes TLS handshake secrets

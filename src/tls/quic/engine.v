@@ -313,7 +313,7 @@ fn (mut e ClientEngine) handle_frames(ptype PacketType, payload []u8) ! {
 			}
 			frame_handshake_done {
 				e.confirmed = true
-				e.hs.on_handshake_confirmed()!
+				e.hs.zeroize_handshake_traffic_secrets()!
 				e.drop_handshake_keys()
 				off++
 			}
