@@ -72,7 +72,7 @@ fn (s &ProtectionState) compute_nonce(pn u64) []u8 {
 	return nonce
 }
 
-// compute_mask derives header-protection mask (RFC 9001 §5.4.1/§5.4.2).
+// compute_mask derives header-protection mask (RFC 9001 §5.4.3/§5.4.4).
 fn (s &ProtectionState) compute_mask(sample []u8) ![]u8 {
 	if sample.len < hp_sample_len {
 		return error('quic: header-protection sample needs ${hp_sample_len} bytes, got ${sample.len}')
@@ -85,9 +85,11 @@ fn (s &ProtectionState) compute_mask(sample []u8) ![]u8 {
 			return out[..5]
 		}
 		.tls_chacha20_poly1305_sha256 {
-			// ChaCha20 mask: first 4 bytes of hp as counter, first 12 bytes of sample as nonce (RFC 9001 §5.4.4).
-			counter := u32(s.hp[0]) | (u32(s.hp[1]) << 8) | (u32(s.hp[2]) << 16) | (u32(s.hp[3]) << 24)
-			mut c := chacha20.new_cipher(s.hp[4..], sample[..12], chacha20.Options{})!
+			// ChaCha20 mask (§5.4.4): the full hp key is the key, the first 4 bytes of
+			// the *sample* are the little-endian counter, the last 12 are the nonce.
+			samp := sample[..hp_sample_len]
+			counter := u32(samp[0]) | (u32(samp[1]) << 8) | (u32(samp[2]) << 16) | (u32(samp[3]) << 24)
+			mut c := chacha20.new_cipher(s.hp, samp[4..], chacha20.Options{})!
 			c.set_counter(u64(counter))
 			mut zeros := []u8{len: 5}
 			mut out := []u8{len: 5}

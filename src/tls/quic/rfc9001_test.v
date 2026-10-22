@@ -139,3 +139,36 @@ fn test_seal_open_roundtrip_initial() ! {
 	opened := receiver.decrypt_payload(rx, pn_offset, pn_len, 0)!
 	assert opened == payload
 }
+
+// RFC 9001 Appendix A.5: AEAD_CHACHA20_POLY1305 short-header packet material.
+const a5_key_hex = 'c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8'
+
+const a5_iv_hex = 'e0459b3474bdd0e44a41c144'
+
+const a5_hp_hex = '25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4'
+
+const a5_sample_hex = '5e5cd55c41f69080575d7999c25a5bfb'
+
+fn new_a5_protection() !ProtectionState {
+	return new_protection(ProtectionKeys{
+		key: hex.decode(a5_key_hex)!
+		iv:  hex.decode(a5_iv_hex)!
+		hp:  hex.decode(a5_hp_hex)!
+	}, .tls_chacha20_poly1305_sha256)
+}
+
+fn test_chacha20_header_protection_mask_appendix_a5() ! {
+	state := new_a5_protection()!
+	// RFC 9001 §5.4.4: counter = sample[0..3] (little-endian), nonce =
+	// sample[4..15], mask = ChaCha20 over five zero bytes.
+	mask := state.compute_mask(hex.decode(a5_sample_hex)!)!
+	assert hex.encode(mask) == 'aefefe7d03'
+}
+
+fn test_chacha20_short_header_packet_appendix_a5() ! {
+	mut state := new_a5_protection()!
+	// pn 654360564 on 3 bytes, a single PING frame: the AAD is the unprotected
+	// header 4200bff4 and the whole packet is 21 bytes (RFC 9001 §5.3/§5.4.2).
+	packet := state.seal_packet([u8(0x42)], 654360564, 3, [u8(0x01)])!
+	assert hex.encode(packet) == '4cfe4189655e5cd55c41f69080575d7999c25a5bfb'
+}
