@@ -19,8 +19,14 @@ mut:
 
 // new_record_handshake creates a TLS 1.3 record-layer handshaker.
 pub fn new_record_handshake(server_name string, alpn []string, validator pki.Validator) !RecordHandshaker {
+	return new_record_handshake_with_options(server_name, alpn, validator, ClientHelloOptions{})!
+}
+
+// new_record_handshake_with_options creates a record handshaker with explicit
+// ClientHello preferences.
+pub fn new_record_handshake_with_options(server_name string, alpn []string, validator pki.Validator, options ClientHelloOptions) !RecordHandshaker {
 	return RecordHandshaker{
-		HandshakeCore: new_handshake_core(server_name, alpn, validator)!
+		HandshakeCore: new_handshake_core(server_name, alpn, validator, options)!
 	}
 }
 

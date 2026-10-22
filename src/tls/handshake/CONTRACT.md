@@ -42,6 +42,13 @@ secrets; it does not close a socket or QUIC connection. `RecordHandshaker` also
 wipes its cached record keys during failure cleanup.
 
 `create_client_hello()` returns the initial, complete handshake message.
+Pass `ClientHelloOptions` to `new_record_handshake_with_options()` or
+`new_quic_handshake_with_options()` to select the initial key-share group,
+preference-ordered supported groups, TLS 1.3 cipher suites, and signature
+algorithms. Empty preference lists preserve the built-in defaults. An initial
+key-share group must also appear in `supported_groups`; a HelloRetryRequest may
+select another configured supported group. Explicit `legacy_session_id` and
+`random` values are intended only for deterministic test vectors.
 `receive()` accepts bytes at a `HandshakeLevel` (`plaintext` or `handshake`),
 reassembles complete messages, and returns outbound `HandshakeMessage` values
 tagged with that TLS phase. QUIC packet levels are translated by its engine;

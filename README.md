@@ -96,6 +96,8 @@ matching facade; framing and encryption decisions stay adapter-side:
 // shared (both facades)
 new_record_handshake(server_name, alpn, pki.Validator) !RecordHandshaker
 new_quic_handshake(server_name, alpn, pki.Validator) !QuicHandshaker
+new_record_handshake_with_options(server_name, alpn, pki.Validator, ClientHelloOptions) !RecordHandshaker
+new_quic_handshake_with_options(server_name, alpn, pki.Validator, ClientHelloOptions) !QuicHandshaker
 create_client_hello() ![]u8
 receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
@@ -127,6 +129,12 @@ TCP `Conn` encrypts each returned message under its matching record keys; the
 QUIC engine maps `.plaintext` to Initial CRYPTO and `.handshake` to Handshake
 CRYPTO. All security checks (size caps, HRR rules, transcript binding) live in
 the core, so both transports inherit them.
+
+`ClientHelloOptions` selects the key-share group, supported-group order,
+cipher-suite order, and signature schemes. Empty lists retain the existing
+defaults; deterministic `legacy_session_id` and `random` overrides are for test
+vectors only. `tls.Config.client_hello_options` configures the TCP dial path;
+the QUIC package provides `new_client_engine_with_options()`.
 
 ## Repository layout
 

@@ -27,6 +27,70 @@ fn test_build_client_hello() ! {
 	assert full_msg[3] == u8(body.len & 0xff)
 }
 
+fn client_hello_extension(full_msg []u8, wanted ExtensionType) ![]u8 {
+	mut r := wire.new_reader(full_msg[4..])
+	_ = r.read_u16()!
+	_ = r.read_bytes(client_hello_random_len)!
+	_ = r.read_vector_u8()!
+	_ = r.read_vector_u16()!
+	_ = r.read_vector_u8()!
+	ext_bytes := r.read_vector_u16()!
+	mut ext_reader := wire.new_reader(ext_bytes)
+	for ext_reader.remaining() > 0 {
+		typ := ext_reader.read_u16()!
+		data := ext_reader.read_vector_u16()!
+		if typ == u16(wanted) {
+			return data
+		}
+	}
+	return error('test: ClientHello extension ${wanted} not found')
+}
+
+fn test_build_client_hello_uses_configured_preferences() ! {
+	cfg := ClientHelloConfig{
+		client_share:         KeyShareEntry{
+			group:        .secp256r1
+			key_exchange: []u8{len: 65, init: 0x04}
+		}
+		supported_groups:     [.secp256r1, .x25519]
+		cipher_suites:        [.tls_aes_256_gcm_sha384, .tls_aes_128_gcm_sha256]
+		signature_algorithms: [.ed25519, .ecdsa_secp256r1_sha256]
+		session_id:           []u8{len: 32, init: 0x11}
+		random:               []u8{len: client_hello_random_len, init: 0x22}
+	}
+	_, full_msg := build_client_hello(cfg)!
+
+	mut groups_reader := wire.new_reader(client_hello_extension(full_msg, .supported_groups)!)
+	groups := groups_reader.read_vector_u16()!
+	mut group_reader := wire.new_reader(groups)
+	assert group_reader.read_u16()! == u16(NamedGroup.secp256r1)
+	assert group_reader.read_u16()! == u16(NamedGroup.x25519)
+	assert group_reader.remaining() == 0
+
+	mut key_share_reader := wire.new_reader(client_hello_extension(full_msg, .key_share)!)
+	shares := key_share_reader.read_vector_u16()!
+	mut share_reader := wire.new_reader(shares)
+	assert share_reader.read_u16()! == u16(NamedGroup.secp256r1)
+	assert share_reader.read_vector_u16()!.len == 65
+
+	mut suites := wire.new_reader(full_msg[4..])
+	_ = suites.read_u16()!
+	_ = suites.read_bytes(client_hello_random_len)!
+	assert suites.read_vector_u8()! == cfg.session_id
+	mut offered_suites := wire.new_reader(suites.read_vector_u16()!)
+	assert offered_suites.read_u16()! == u16(CipherSuite.tls_aes_256_gcm_sha384)
+	assert offered_suites.read_u16()! == u16(CipherSuite.tls_aes_128_gcm_sha256)
+	assert offered_suites.remaining() == 0
+
+	mut signature_reader := wire.new_reader(client_hello_extension(full_msg, .signature_algorithms)!)
+	schemes := signature_reader.read_vector_u16()!
+	mut scheme_reader := wire.new_reader(schemes)
+	assert scheme_reader.read_u16()! == u16(SignatureScheme.ed25519)
+	assert scheme_reader.read_u16()! == u16(SignatureScheme.ecdsa_secp256r1_sha256)
+	assert scheme_reader.remaining() == 0
+	assert full_msg[6..6 + client_hello_random_len] == cfg.random
+}
+
 // test_parse_rfc8448_server_hello checks that the RFC 8448 §3 ServerHello
 // example decodes to its suite and key share.
 fn test_parse_rfc8448_server_hello() ! {

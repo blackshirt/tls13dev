@@ -78,7 +78,13 @@ mut:
 // Destination Connection ID (8 bytes each) and derives the Initial keys from the
 // original DCID (RFC 9001 §5.2).
 pub fn new_client_engine(server_name string, alpn []string, validator pki.Validator) !ClientEngine {
-	hs := handshake.new_quic_handshake(server_name, alpn, validator)!
+	return new_client_engine_with_options(server_name, alpn, validator, handshake.ClientHelloOptions{})!
+}
+
+// new_client_engine_with_options constructs the QUIC engine with explicit
+// TLS ClientHello preferences.
+pub fn new_client_engine_with_options(server_name string, alpn []string, validator pki.Validator, options handshake.ClientHelloOptions) !ClientEngine {
+	hs := handshake.new_quic_handshake_with_options(server_name, alpn, validator, options)!
 	scid := random_cid(8)!
 	dcid := random_cid(8)!
 	mut eng := ClientEngine{
@@ -94,7 +100,14 @@ pub fn new_client_engine(server_name string, alpn []string, validator pki.Valida
 // new_client_engine_with_ids is new_client_engine with caller-chosen connection
 // IDs, for deterministic tests (e.g. the RFC 9001 Appendix A vectors).
 pub fn new_client_engine_with_ids(server_name string, alpn []string, validator pki.Validator, dcid []u8, scid []u8) !ClientEngine {
-	hs := handshake.new_quic_handshake(server_name, alpn, validator)!
+	return new_client_engine_with_ids_and_options(server_name, alpn, validator, dcid, scid,
+		handshake.ClientHelloOptions{})!
+}
+
+// new_client_engine_with_ids_and_options combines deterministic connection IDs
+// with explicit TLS ClientHello preferences.
+pub fn new_client_engine_with_ids_and_options(server_name string, alpn []string, validator pki.Validator, dcid []u8, scid []u8, options handshake.ClientHelloOptions) !ClientEngine {
+	hs := handshake.new_quic_handshake_with_options(server_name, alpn, validator, options)!
 	mut eng := ClientEngine{
 		hs:        hs
 		dcid:      dcid.clone()

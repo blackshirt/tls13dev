@@ -6,6 +6,7 @@
 module tls
 
 import time
+import tls.handshake
 import tls.pki
 
 // Config holds TLS client connection options, consumed by dial(). It is marked
@@ -17,6 +18,8 @@ pub:
 	server_name string
 	// alpn is the list of application protocols to offer; the server's pick must be one of them (RFC 7301 §3.1).
 	alpn []string = []string{}
+	// client_hello_options controls the TLS 1.3 groups, cipher suites, and signature schemes offered.
+	client_hello_options handshake.ClientHelloOptions = handshake.ClientHelloOptions{}
 	// insecure_skip_verify disables certificate chain and hostname validation (tests only).
 	insecure_skip_verify bool
 	// root_cas, when set, is used instead of the system trust store.
@@ -34,5 +37,6 @@ pub fn default_config(server_name string) Config {
 		server_name:          server_name
 		insecure_skip_verify: false
 		root_cas:             none
+		client_hello_options: handshake.ClientHelloOptions{}
 	}
 }

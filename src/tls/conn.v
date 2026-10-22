@@ -101,7 +101,8 @@ pub fn dial(address string, config Config) !&Conn {
 		validator_mut.set_min_rsa_bits(config.min_rsa_bits)
 	}
 
-	mut hs := handshake.new_record_handshake(server_name, config.alpn, validator_mut) or {
+	mut hs := handshake.new_record_handshake_with_options(server_name, config.alpn,
+		validator_mut, config.client_hello_options) or {
 		sock.close() or {}
 		return err
 	}

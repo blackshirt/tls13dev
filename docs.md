@@ -210,6 +210,8 @@ building a QUIC adapter. The API contract is documented in
 // shared handshake driving
 new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
 new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
+new_record_handshake_with_options(server_name string, alpn []string, pki.Validator, ClientHelloOptions) !RecordHandshaker
+new_quic_handshake_with_options(server_name string, alpn []string, pki.Validator, ClientHelloOptions) !QuicHandshaker
 (mut h) create_client_hello() ![]u8
 (mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
@@ -388,6 +390,7 @@ after the handshake has proven the server's choice was offered.
 
 ```v
 import time
+import tls.handshake
 
 @[params]
 pub struct Config {
@@ -397,6 +400,7 @@ pub:
 	insecure_skip_verify bool
 	root_cas             ?pki.TrustStore
 	min_rsa_bits         int
+	client_hello_options handshake.ClientHelloOptions
 	timeout              time.Duration = 30 * time.second
 }
 ```
@@ -412,6 +416,7 @@ build one up front from `default_config()`).
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
+| `client_hello_options` | defaults | ClientHello key-share group and preference-ordered supported groups, cipher suites, and signature algorithms. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]

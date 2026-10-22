@@ -115,6 +115,31 @@ fn test_record_and_quic_facades_share_handshake_state() ! {
 	assert quic.state() == .wait_server_hello
 }
 
+fn test_handshake_options_select_initial_key_share() ! {
+	options := ClientHelloOptions{
+		key_share_group:  .secp256r1
+		supported_groups: [.secp256r1]
+	}
+	mut h := new_record_handshake_with_options('example.com', []string{}, fixture_validator(),
+		options)!
+	assert h.ecdhe_group == .secp256r1
+	assert h.config.client_share.group == .secp256r1
+	assert h.config.client_share.key_exchange.len == 65
+	_ = h.create_client_hello()!
+}
+
+fn test_handshake_options_reject_unoffered_initial_group() ! {
+	new_record_handshake_with_options('example.com', []string{}, fixture_validator(),
+		ClientHelloOptions{
+			key_share_group:  .x25519
+			supported_groups: [.secp256r1]
+		}) or {
+		assert err.msg().contains('must be included in supported_groups')
+		return
+	}
+	assert false
+}
+
 fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	mut record := new_record_handshake('example.com', []string{}, fixture_validator())!
 	mut quic := new_quic_handshake('example.com', []string{}, fixture_validator())!

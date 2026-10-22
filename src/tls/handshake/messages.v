@@ -60,13 +60,13 @@ enum ExtensionType as u16 {
 
 // NamedGroup defines key exchange groups (RFC 8446 §4.2.7); only the two mandatory
 // ECDHE groups are supported.
-enum NamedGroup as u16 {
+pub enum NamedGroup as u16 {
 	secp256r1 = 0x0017
 	x25519    = 0x001d
 }
 
 // SignatureScheme defines cryptographic signature algorithms (RFC 8446 §4.2.3).
-enum SignatureScheme as u16 {
+pub enum SignatureScheme as u16 {
 	rsa_pkcs1_sha256       = 0x0401
 	ecdsa_secp256r1_sha256 = 0x0403
 	ecdsa_secp384r1_sha384 = 0x0503
@@ -74,6 +74,88 @@ enum SignatureScheme as u16 {
 	rsa_pss_rsae_sha384    = 0x0805
 	rsa_pss_rsae_sha512    = 0x0806
 	ed25519                = 0x0807
+}
+
+// ClientHelloOptions selects the supported key-exchange groups, initial key
+// share, cipher suites, and signature schemes offered by a TLS client.
+@[params]
+pub struct ClientHelloOptions {
+pub:
+	// key_share_group is the group used for the initial ECDHE share.
+	key_share_group NamedGroup = .x25519
+	// supported_groups is preference-ordered; empty uses X25519 then P-256.
+	supported_groups []NamedGroup
+	// cipher_suites is preference-ordered; empty uses the built-in TLS 1.3 suites.
+	cipher_suites []CipherSuite
+	// signature_algorithms is preference-ordered; empty uses the built-in list.
+	signature_algorithms []SignatureScheme
+	// legacy_session_id and random are for deterministic test vectors only.
+	legacy_session_id []u8
+	random            []u8
+}
+
+const default_supported_groups = [NamedGroup.x25519, .secp256r1]
+
+const default_signature_algorithms = [
+	SignatureScheme.rsa_pss_rsae_sha256,
+	.rsa_pss_rsae_sha384,
+	.rsa_pss_rsae_sha512,
+	.ecdsa_secp256r1_sha256,
+	.ecdsa_secp384r1_sha384,
+	.ed25519,
+	.rsa_pkcs1_sha256,
+]
+
+fn offered_supported_groups(groups []NamedGroup) []NamedGroup {
+	return if groups.len > 0 { groups } else { default_supported_groups }
+}
+
+fn offered_signature_algorithms(schemes []SignatureScheme) []SignatureScheme {
+	return if schemes.len > 0 { schemes } else { default_signature_algorithms }
+}
+
+fn validate_client_hello_options(options ClientHelloOptions) ! {
+	groups := offered_supported_groups(options.supported_groups)
+	if groups.len == 0 {
+		return error('handshake: supported_groups must not be empty')
+	}
+	mut seen_groups := []NamedGroup{}
+	for group in groups {
+		if !is_supported_group(group) {
+			return error('handshake: unsupported configured group ${group}')
+		}
+		if group in seen_groups {
+			return error('handshake: duplicate configured group ${group}')
+		}
+		seen_groups << group
+	}
+	if options.key_share_group !in groups {
+		return error('handshake: initial key_share_group ${options.key_share_group} must be included in supported_groups')
+	}
+	if options.cipher_suites.len > 0 {
+		mut seen_suites := []CipherSuite{}
+		for suite in options.cipher_suites {
+			if suite in seen_suites {
+				return error('handshake: duplicate configured cipher suite ${suite}')
+			}
+			seen_suites << suite
+		}
+	}
+	if options.signature_algorithms.len > 0 {
+		mut seen_schemes := []SignatureScheme{}
+		for scheme in options.signature_algorithms {
+			if scheme in seen_schemes {
+				return error('handshake: duplicate configured signature scheme ${scheme}')
+			}
+			seen_schemes << scheme
+		}
+	}
+	if options.legacy_session_id.len > legacy_session_id_len {
+		return error('handshake: configured legacy_session_id exceeds ${legacy_session_id_len} bytes')
+	}
+	if options.random.len > 0 && options.random.len != client_hello_random_len {
+		return error('handshake: configured ClientHello.random must be exactly ${client_hello_random_len} bytes')
+	}
 }
 
 // CipherSuite defines TLS 1.3 cipher suites (RFC 8446 §B.4).
@@ -243,6 +325,9 @@ mut:
 	cookie []u8
 	// cipher_suites defaults to the three TLS 1.3 AEAD suites when empty.
 	cipher_suites []CipherSuite
+	// supported_groups and signature_algorithms use defaults when empty.
+	supported_groups     []NamedGroup
+	signature_algorithms []SignatureScheme
 }
 
 // offered_cipher_suites returns the suites a client sends in its ClientHello:
@@ -252,6 +337,10 @@ fn offered_cipher_suites(cfg &ClientHelloConfig) []CipherSuite {
 		return cfg.cipher_suites
 	}
 	return default_cipher_suites()
+}
+
+fn offered_groups(cfg &ClientHelloConfig) []NamedGroup {
+	return offered_supported_groups(cfg.supported_groups)
 }
 
 // validate performs the ServerHello/HelloRetryRequest checks independent of the message
@@ -281,6 +370,14 @@ fn (sh ServerHello) is_offered_cipher_suite(cfg &ClientHelloConfig) bool {
 // build_client_hello generates the ClientHello of RFC 8446 §4.1.2, returning the
 // message body followed by the full handshake message (header + body).
 fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
+	validate_client_hello_options(ClientHelloOptions{
+		key_share_group:      cfg.client_share.group
+		supported_groups:     cfg.supported_groups
+		cipher_suites:        cfg.cipher_suites
+		signature_algorithms: cfg.signature_algorithms
+		legacy_session_id:    cfg.session_id
+		random:               cfg.random
+	})!
 	mut body := wire.new_writer(512)
 
 	// Legacy version 0x0303 (TLS 1.2) pinned for middleboxes; the real version comes from supported_versions (§4.2.1).
@@ -339,10 +436,12 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// supported_groups (RFC 8446 §4.2.7)
 	{
-		mut sg_w := wire.new_writer(5)
-		mut groups_w := wire.new_writer(4)
-		groups_w.write_u16(u16(NamedGroup.x25519))
-		groups_w.write_u16(u16(NamedGroup.secp256r1))
+		groups := offered_groups(&cfg)
+		mut sg_w := wire.new_writer(groups.len * 2 + 2)
+		mut groups_w := wire.new_writer(groups.len * 2)
+		for group in groups {
+			groups_w.write_u16(u16(group))
+		}
 		sg_w.write_vector_u16(groups_w.bytes())!
 
 		write_extension(mut ext_writer, .supported_groups, sg_w.bytes())!
@@ -350,19 +449,15 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// signature_algorithms (RFC 8446 §4.2.3)
 	{
-		schemes := [
-			u16(SignatureScheme.rsa_pss_rsae_sha256),
-			u16(SignatureScheme.rsa_pss_rsae_sha384),
-			u16(SignatureScheme.rsa_pss_rsae_sha512),
-			u16(SignatureScheme.ecdsa_secp256r1_sha256),
-			u16(SignatureScheme.ecdsa_secp384r1_sha384),
-			u16(SignatureScheme.ed25519),
-			u16(SignatureScheme.rsa_pkcs1_sha256),
-		]
+		schemes := if cfg.signature_algorithms.len > 0 {
+			cfg.signature_algorithms
+		} else {
+			default_signature_algorithms
+		}
 		mut sa_w := wire.new_writer(schemes.len * 2 + 2)
 		mut slist_w := wire.new_writer(schemes.len * 2)
 		for s in schemes {
-			slist_w.write_u16(s)
+			slist_w.write_u16(u16(s))
 		}
 		sa_w.write_vector_u16(slist_w.bytes())!
 

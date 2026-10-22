@@ -110,41 +110,46 @@ mut:
 	fail_alert AlertDescription = .internal_error
 }
 
-// new_handshake_core creates shared state offering an X25519 key share
-// (RFC 8446 §9.1), with certificate validation policy injected by the caller.
-fn new_handshake_core(server_name string, alpn []string, validator pki.Validator) !HandshakeCore {
-	// TLS 1.3 has no separate key-exchange round trip: the public share must ride in the initial ClientHello (§4.2.8).
-	mut priv_key := curve25519.PrivateKey.new()! // fresh 32-byte X25519 scalar
-	pub_key := priv_key.public_key()!
-	raw_pub := pub_key.bytes()! // 32-byte encoding placed verbatim in key_exchange
-	// Pin the session id and random now: the retry ClientHello must reproduce them byte-identically (§4.1.4).
-	session_id := rand.bytes(legacy_session_id_len)! // 32 bytes for middlebox compatibility (App. D.4)
-	random := rand.bytes(client_hello_random_len)!
-
-	// Assemble the initial hello with an X25519 key share; the cookie stays empty until a HelloRetryRequest supplies one.
-	cfg := ClientHelloConfig{
-		server_name:  server_name
-		alpn:         alpn
-		client_share: KeyShareEntry{
-			group:        .x25519
-			key_exchange: raw_pub
-		}
-		session_id:   session_id
-		random:       random
+// new_handshake_core creates shared state using the caller's ClientHello
+// preferences, with certificate validation policy injected by the caller.
+fn new_handshake_core(server_name string, alpn []string, validator pki.Validator, options ClientHelloOptions) !HandshakeCore {
+	validate_client_hello_options(options)!
+	// Pin random/session id at construction so HRR reuses them byte-identically (§4.1.4).
+	session_id := if options.legacy_session_id.len > 0 {
+		options.legacy_session_id.clone()
+	} else {
+		rand.bytes(legacy_session_id_len)!
+	}
+	random := if options.random.len > 0 {
+		options.random.clone()
+	} else {
+		rand.bytes(client_hello_random_len)!
 	}
 
-	return HandshakeCore{
+	mut core := HandshakeCore{
 		state:                .start
-		config:               cfg
+		config:               ClientHelloConfig{
+			server_name:          server_name
+			alpn:                 alpn
+			session_id:           session_id
+			random:               random
+			cipher_suites:        options.cipher_suites.clone()
+			supported_groups:     options.supported_groups.clone()
+			signature_algorithms: options.signature_algorithms.clone()
+		}
 		transcript:           new_transcript(.sha256)
 		hash_algo:            .sha256
 		key_len:              16
-		ecdhe_group:          .x25519
-		priv_x25519:          priv_key
 		validator:            validator
 		plaintext_reassembly: []u8{cap: 4096}
 		hs_reassembly:        []u8{cap: 4096}
 	}
+	core.generate_key_share(options.key_share_group)!
+	core.config.client_share = KeyShareEntry{
+		group:        options.key_share_group
+		key_exchange: core.public_share_bytes()!
+	}
+	return core
 }
 
 // state reports current handshake progress; adapters poll it to know
@@ -226,9 +231,9 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 		}
 		if sh.has_key_share {
 			// The requested group must be offered and differ from the one already sent a key share for (§4.2.8).
-			if !is_supported_group(sh.server_share.group) {
+			if sh.server_share.group !in offered_groups(&h.config) {
 				h.fail_alert = .illegal_parameter
-				return error('handshake: HelloRetryRequest requested unsupported group ${sh.server_share.group} (illegal_parameter)')
+				return error('handshake: HelloRetryRequest requested unoffered group ${sh.server_share.group} (illegal_parameter)')
 			}
 			if sh.server_share.group == h.config.client_share.group {
 				h.fail_alert = .illegal_parameter

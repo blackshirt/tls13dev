@@ -14,8 +14,14 @@ pub struct QuicHandshaker {
 
 // new_quic_handshake creates a QUIC handshaker.
 pub fn new_quic_handshake(server_name string, alpn []string, validator pki.Validator) !QuicHandshaker {
+	return new_quic_handshake_with_options(server_name, alpn, validator, ClientHelloOptions{})!
+}
+
+// new_quic_handshake_with_options creates a QUIC handshaker with explicit
+// ClientHello preferences.
+pub fn new_quic_handshake_with_options(server_name string, alpn []string, validator pki.Validator, options ClientHelloOptions) !QuicHandshaker {
 	return QuicHandshaker{
-		HandshakeCore: new_handshake_core(server_name, alpn, validator)!
+		HandshakeCore: new_handshake_core(server_name, alpn, validator, options)!
 	}
 }
 
