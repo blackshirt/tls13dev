@@ -128,6 +128,15 @@ fn test_record_and_quic_facades_share_handshake_state() ! {
 	assert quic.state() == .wait_server_hello
 }
 
+fn test_quic_handshaker_owns_quic_secret_accessor() ! {
+	mut quic := new_quic_handshake('example.com', []string{}, fixture_validator())!
+	_, _ := quic.quic_traffic_secrets(.initial) or {
+		assert err.msg().contains('QUIC destination connection ID')
+		return
+	}
+	assert false
+}
+
 fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	mut record := new_record_handshake('example.com', []string{}, fixture_validator())!
 	mut quic := new_quic_handshake('example.com', []string{}, fixture_validator())!
@@ -140,7 +149,7 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	assert record.HandshakeCore.initial_reassembly.len == 2
 	assert quic.HandshakeCore.initial_reassembly.len == 1
 	assert record.record_unconsumed_bytes(.initial) == 2
-	record.abort()
+	record.fail_and_destroy_secrets()
 	assert record.record_unconsumed_bytes(.initial) == 0
 	assert quic.HandshakeCore.initial_reassembly.len == 1
 }

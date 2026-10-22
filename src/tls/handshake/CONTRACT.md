@@ -33,9 +33,13 @@ state := hs.state()
 alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
 alert := hs.failure_alert()
-hs.abort()
+hs.fail_and_destroy_secrets()
 hs.zeroize_app_secrets()
 ```
+
+`fail_and_destroy_secrets()` marks the handshake failed and destroys derived
+secrets; it does not close a socket or QUIC connection. `RecordHandshaker`
+overrides the shared operation to also wipe its cached record keys.
 
 `create_client_hello()` returns the initial, complete handshake message.
 `receive()` accepts bytes at a TLS encryption level, reassembles complete
@@ -60,9 +64,12 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 ## QUIC-only operations
 
 `QuicHandshaker` exposes `quic_traffic_secrets()` instead of record keys. The
-QUIC adapter expands these secrets with the RFC 9001 `quic key`, `quic iv`, and
-`quic hp` labels. It calls `on_handshake_confirmed()` only after QUIC confirms
-the handshake, so handshake keys remain available for the required period.
+method is implemented on the QUIC facade; the shared core contains only
+transport-independent TLS handshake logic. `RecordHandshaker` therefore does
+not expose QUIC-specific secret access. The QUIC adapter expands these secrets
+with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It calls
+`on_handshake_confirmed()` only after QUIC confirms the handshake, so handshake
+keys remain available for the required period.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 are absent from `QuicHandshaker`, rather than present as runtime-rejected calls.

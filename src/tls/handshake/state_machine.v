@@ -439,13 +439,13 @@ pub fn (mut h HandshakeCore) receive(level SecretLevel, bytes []u8) ![]Handshake
 			}
 			h.initial_reassembly << bytes
 			out := h.drain_initial() or {
-				h.abort()
+				h.fail_and_destroy_secrets()
 				return err
 			}
 			// One receive may coalesce a consumed ServerHello with an oversized tail the loop no longer reaches; bound it even where drain cannot.
 			if h.initial_reassembly.len > 4 + max_handshake_message_len {
 				h.fail_alert = .decode_error
-				h.abort()
+				h.fail_and_destroy_secrets()
 				return error('handshake: Initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 			return out
@@ -453,13 +453,13 @@ pub fn (mut h HandshakeCore) receive(level SecretLevel, bytes []u8) ![]Handshake
 		.handshake {
 			h.hs_reassembly << bytes
 			out := h.drain_handshake() or {
-				h.abort()
+				h.fail_and_destroy_secrets()
 				return err
 			}
 			// Same bound for the Handshake level: late retransmits at .connected skip the drain loop, so the cap is the backstop.
 			if h.hs_reassembly.len > 4 + max_handshake_message_len {
 				h.fail_alert = .decode_error
-				h.abort()
+				h.fail_and_destroy_secrets()
 				return error('handshake: Handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 			return out
@@ -524,28 +524,6 @@ pub fn (mut h HandshakeCore) on_handshake_confirmed() ! {
 	}
 	h.client_hs_traffic = []u8{}
 	h.server_hs_traffic = []u8{}
-}
-
-// quic_traffic_secrets returns (client, server) clones of the §7.1 traffic
-// secrets for one level, to expand under the RFC 9001 §5.1 labels; .initial is refused.
-pub fn (h &HandshakeCore) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) {
-	match level {
-		.initial {
-			return error('handshake: initial secrets derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
-		}
-		.handshake {
-			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
-				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
-			}
-			return h.client_hs_traffic.clone(), h.server_hs_traffic.clone()
-		}
-		.application {
-			if h.client_ap_traffic.len == 0 || h.server_ap_traffic.len == 0 {
-				return error('handshake: application traffic secrets unavailable before the server Finished')
-			}
-			return h.client_ap_traffic.clone(), h.server_ap_traffic.clone()
-		}
-	}
 }
 
 // negotiated_cipher_suite reports the suite the server selected in ServerHello,
@@ -679,9 +657,9 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 	return []HandshakeMessage{}
 }
 
-// abort destroys every secret derived so far and parks the state machine in
-// .failed (RFC 8446 §1.3.1/§7.5); the only legal way for an adapter to reach .failed.
-pub fn (mut h HandshakeCore) abort() {
+// fail_and_destroy_secrets wipes derived secrets and parks the state machine
+// in .failed (RFC 8446 §1.3.1/§7.5).
+pub fn (mut h HandshakeCore) fail_and_destroy_secrets() {
 	for i in 0 .. h.handshake_secret.len {
 		h.handshake_secret[i] = 0
 	}
@@ -694,7 +672,7 @@ pub fn (mut h HandshakeCore) abort() {
 		h.server_hs_traffic[i] = 0
 	}
 	h.server_hs_traffic = []u8{}
-	// Defensive: application secrets cannot exist before .connected, but the wipe keeps abort() a single choke point.
+	// Defensive: application secrets cannot exist before .connected, but the wipe keeps failure cleanup in one place.
 	for i in 0 .. h.client_ap_traffic.len {
 		h.client_ap_traffic[i] = 0
 	}

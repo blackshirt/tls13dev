@@ -18,3 +18,24 @@ pub fn new_quic_handshake(server_name string, alpn []string, validator pki.Valid
 		HandshakeCore: new_handshake_core(server_name, alpn, validator)!
 	}
 }
+
+// quic_traffic_secrets returns copies for QUIC packet-key derivation.
+pub fn (h &QuicHandshaker) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) {
+	match level {
+		.initial {
+			return error('handshake: initial secrets derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
+		}
+		.handshake {
+			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
+				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
+			}
+			return h.client_hs_traffic.clone(), h.server_hs_traffic.clone()
+		}
+		.application {
+			if h.client_ap_traffic.len == 0 || h.server_ap_traffic.len == 0 {
+				return error('handshake: application traffic secrets unavailable before the server Finished')
+			}
+			return h.client_ap_traffic.clone(), h.server_ap_traffic.clone()
+		}
+	}
+}

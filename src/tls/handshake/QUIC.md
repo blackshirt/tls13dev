@@ -304,12 +304,13 @@ When the core kills a handshake it takes two actions an adapter must respect:
    with `quic_connection_error()` and raise a `CONNECTION_CLOSE` of type `0x1c`
    (RFC 9001 §4.8). There is no CRYPTO alert path.
 
-2. **It wipes every secret.** Any error that drives the machine to `failed`
-   calls `abort()`: the Handshake Secret, both traffic-secret generations, and
+2. **It wipes every secret.** Any protocol error that drives the machine to
+   `failed` calls the core's `fail_and_destroy_secrets()`: the Handshake Secret, both traffic-secret generations, and
    both ephemeral ECDHE private halves are destroyed (RFC 8446 §1.3.1/§7.5).
    `RecordHandshaker` also wipes its cached record keys; a QUIC adapter wipes
-   its packet-protection state. `abort()` is the only legal way for an adapter
-   to reach `.failed`. The success path wipes at `.connected`
+   its packet-protection state. `fail_and_destroy_secrets()` is promoted from
+   the shared core; it does not close the QUIC connection. The success path wipes at
+   `.connected`
    (`zeroize_handshake_secrets`) and at teardown (`zeroize_app_secrets`), with
    the handshake stage deferred to `on_handshake_confirmed()` per §3.3 above.
 
@@ -345,7 +346,7 @@ new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHa
 (mut h RecordHandshaker) on_handshake_confirmed() !
 
 // Shared lifecycle
-(mut h) abort()                         // → .failed, wipes all secrets
+(mut h) fail_and_destroy_secrets()      // → .failed, wipes TLS handshake secrets
 (mut h) zeroize_app_secrets()
 
 // Recordless framing + alert mapping

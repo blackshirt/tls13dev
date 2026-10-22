@@ -254,11 +254,10 @@ fn test_rejects_unoffered_alpn() ! {
 	assert false, 'an unoffered ALPN selection must abort the handshake'
 }
 
-// test_abort_before_secrets_is_safe checks that abort() tolerates being called
-// before anything has been derived.
-fn test_abort_before_secrets_is_safe() ! {
+// test_fail_before_secrets_is_safe checks failure cleanup before anything is derived.
+fn test_fail_before_secrets_is_safe() ! {
 	mut h := new_record_handshake(fakeserver.server_name, []string{}, fixture_trusted_validator())!
-	h.abort()
+	h.fail_and_destroy_secrets()
 	assert h.state() == .failed
 	assert expect_no_handshake_keys(h)
 	assert expect_no_exported_handshake_secrets(h)

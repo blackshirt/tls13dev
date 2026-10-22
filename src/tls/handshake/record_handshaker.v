@@ -32,14 +32,14 @@ pub fn (mut h RecordHandshaker) receive(level SecretLevel, bytes []u8) ![]Handsh
 		return err
 	}
 	h.sync_record_keys() or {
-		h.abort()
+		h.fail_and_destroy_secrets()
 		return err
 	}
 	return messages
 }
 
-pub fn (mut h RecordHandshaker) abort() {
-	h.HandshakeCore.abort()
+pub fn (mut h RecordHandshaker) fail_and_destroy_secrets() {
+	h.HandshakeCore.fail_and_destroy_secrets()
 	h.wipe_record_keys()
 }
 
@@ -89,7 +89,7 @@ pub fn (mut h RecordHandshaker) record_update_read_traffic_keys() ! {
 	new_secret := hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{},
 		h.hash_algo.hash_len())!
 	next := derive_traffic_keys(h.hash_algo, new_secret, h.key_len, aead_nonce_len) or {
-		h.abort()
+		h.fail_and_destroy_secrets()
 		return err
 	}
 	wipe_secret(mut h.server_ap_traffic)
@@ -107,7 +107,7 @@ pub fn (mut h RecordHandshaker) record_update_write_traffic_keys() ! {
 	new_secret := hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{},
 		h.hash_algo.hash_len())!
 	next := derive_traffic_keys(h.hash_algo, new_secret, h.key_len, aead_nonce_len) or {
-		h.abort()
+		h.fail_and_destroy_secrets()
 		return err
 	}
 	wipe_secret(mut h.client_ap_traffic)
