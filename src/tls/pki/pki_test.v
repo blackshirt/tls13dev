@@ -146,6 +146,21 @@ fn test_verify_certificate_chain_rejects_empty_hostname() ! {
 	assert false
 }
 
+fn test_chain_trust_anchor_can_precede_cross_signed_tail() {
+	root := Certificate{
+		raw:             [u8(0x01)]
+		not_before_unix: 1
+		not_after_unix:  200
+	}
+	chain := [
+		Certificate{ raw: [u8(0x02)] },
+		Certificate{ raw: [u8(0x01)] },
+		Certificate{ raw: [u8(0x03)] },
+	]
+	assert chain_has_trusted_anchor(chain, [root], 100)
+	assert !chain_has_trusted_anchor([chain[0], chain[2]], [root], 100)
+}
+
 // rsa_leaf_of_bits builds a leaf Certificate carrying an RSA public key whose
 // modulus is `bits` long, enough to exercise check_leaf_rsa_floor without a real
 // signed chain.

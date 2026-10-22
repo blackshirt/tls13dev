@@ -310,6 +310,42 @@ fn test_parse_certificate_message_rejects_overlong_chain() ! {
 	}
 }
 
+fn test_parse_certificate_message_rejects_malformed_certificate_extensions() ! {
+	mut cert_entry := wire.new_writer(16)
+	cert_entry.write_vector_u24([u8(0xab)])!
+	cert_entry.write_vector_u16([u8(0xff)])!
+
+	mut body := wire.new_writer(32)
+	body.write_vector_u8([]u8{})!
+	body.write_vector_u24(cert_entry.bytes())!
+	parse_certificate_message(body.bytes()) or {
+		assert err.msg().contains('unexpected EOF')
+		return
+	}
+	assert false
+}
+
+fn test_parse_certificate_message_rejects_duplicate_certificate_extensions() ! {
+	mut extensions := wire.new_writer(16)
+	for _ in 0 .. 2 {
+		extensions.write_u16(0x000a)
+		extensions.write_vector_u16([]u8{})!
+	}
+
+	mut cert_entry := wire.new_writer(32)
+	cert_entry.write_vector_u24([u8(0xab)])!
+	cert_entry.write_vector_u16(extensions.bytes())!
+
+	mut body := wire.new_writer(48)
+	body.write_vector_u8([]u8{})!
+	body.write_vector_u24(cert_entry.bytes())!
+	parse_certificate_message(body.bytes()) or {
+		assert err.msg().contains('duplicate extension type')
+		return
+	}
+	assert false
+}
+
 // test_parse_new_session_ticket_rejects_trailing_bytes checks that one stray
 // byte past the extension block is not silently accepted.
 fn test_parse_new_session_ticket_rejects_trailing_bytes() ! {

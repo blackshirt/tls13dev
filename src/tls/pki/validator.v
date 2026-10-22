@@ -144,34 +144,36 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		}
 	}
 
-	// Anchor to a trusted root: either a same-named stored root that verifies the top certificate, or a byte-identical stored root.
-	top_cert := chain[chain.len - 1]
-	mut root_found := false
-
-	for root in v.store.certs {
-		if top_cert.issuer_dn != root.subject_dn {
-			continue // name pair first: cheap string test that filters most roots out
-		}
-		if now < root.not_before_unix {
-			continue // skip not-yet-valid root
-		}
-		if now > root.not_after_unix {
-			continue // skip expired root
-		}
-		// A failed signature under this root is not fatal: another stored root may share the subject.
-		if verify_cert_signature(top_cert, root) or { false } {
-			root_found = true
-			break
-		}
-		if top_cert.raw == root.raw {
-			root_found = true
-			break
-		}
-	}
-
-	if !root_found {
+	// Anchor at any validated certificate in the peer chain. Servers may send
+	// cross-signed CA certificates after an intermediate; the trust path can
+	// terminate at that intermediate when its issuer is already trusted.
+	if !chain_has_trusted_anchor(chain, v.store.certs, now) {
 		return error('pki: certificate chain cannot be verified up to a trusted root CA')
 	}
+}
+
+// chain_has_trusted_anchor reports whether any certificate in the validated
+// peer chain is trusted directly or verifies under a valid stored root.
+fn chain_has_trusted_anchor(chain []Certificate, roots []Certificate, now i64) bool {
+	for cert in chain {
+		for root in roots {
+			if now < root.not_before_unix || now > root.not_after_unix {
+				continue
+			}
+			if cert.raw == root.raw {
+				return true
+			}
+			if cert.issuer_dn != root.subject_dn {
+				continue
+			}
+			// A failed signature under this root is not fatal: another stored
+			// root may share the subject.
+			if verify_cert_signature(cert, root) or { false } {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // check_leaf_rsa_floor enforces the minimum RSA modulus size for a leaf

@@ -159,6 +159,8 @@ fn (mut c Conn) do_handshake() ! {
 	ch := c.hs.create_client_hello()!
 	c.write_records([new_record(.handshake, ch), change_cipher_spec()])!
 
+	// The core's state machine is transport-neutral:
+	// it has no concept of record framing.
 	mut ccs_seen := 0
 	for c.hs.state() != .connected {
 		rec := c.read_raw_record()!

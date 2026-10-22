@@ -530,8 +530,8 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 			return error('handshake: certificate chain exceeds maximum depth ${pki.max_cert_chain_depth} (illegal_parameter)')
 		}
 		cert_data := cert_r.read_vector_u24()!
-		_ := cert_r.read_vector_u16()! // per-cert extensions (status_request etc.):
-		// ignored by this client, which uses no optional cert features.
+		cert_extensions := cert_r.read_vector_u16()!
+		_ := parse_extensions(cert_extensions)!
 		certs << cert_data
 	}
 
@@ -614,7 +614,7 @@ fn parse_certificate_request(body []u8) !CertificateRequest {
 // build_empty_certificate creates an empty Certificate message (RFC 8446 §4.4.2),
 // echoing the request context verbatim and framing certificate_list as u24 zero.
 fn build_empty_certificate(request_context []u8) []u8 {
-	mut body := []u8{}
+	mut body := []u8{cap: 1 + request_context.len + 3}
 	body << u8(request_context.len)
 	body << request_context
 	body << [u8(0), 0, 0] // u24 certificate_list length: empty
