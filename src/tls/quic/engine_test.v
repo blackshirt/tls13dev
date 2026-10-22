@@ -259,3 +259,26 @@ fn test_engine_initial_keys_match_appendix_a() ! {
 	assert first_byte_long(start[0])
 	assert eng.state() == .wait_server_hello
 }
+
+fn test_engine_handshake_with_asymmetric_cids() ! {
+	// RFC 9000 §7.2: each endpoint's Source Connection ID is what the peer puts in
+	// the Destination Connection ID of packets it sends. So a server's 1-RTT packets
+	// address the client's *own* SCID, and because a short header carries no length
+	// field (§17.3.1) that SCID's length is what fixes the packet-number offset.
+	// Equal-length CIDs hide this, so the IDs below are deliberately different sizes.
+	dcid := [u8(0x83), 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08] // 8 bytes, sent by the client
+	scid := [u8(0x01), 0x02, 0x03, 0x04, 0x05, 0x06] // 6 bytes, the client's own address
+	mut eng := new_client_engine_with_ids(fakeserver.server_name, ['h3'],
+		trusted_validator(), dcid, scid)!
+
+	start := eng.start()!
+	mut ferry := new_ferry_server(eng.original_dcid())!
+	flight := ferry.exchange(start)!
+	client_finished := eng.receive(flight)!
+	assert eng.state() == .connected, 'client should reach connected, got ${eng.state()}'
+
+	done := ferry.exchange(client_finished)!
+	assert ferry.dcid == scid, 'the ferry must address the client by its source CID'
+	_ = eng.receive(done)!
+	assert eng.confirmed(), 'HANDSHAKE_DONE must confirm the handshake at a 6-byte destination CID'
+}

@@ -227,7 +227,10 @@ fn (mut e ClientEngine) receive_short_packet(buf []u8) !int {
 	// Short headers have no length field: the packet runs to the end of the
 	// datagram. A client's 1-RTT packets are not coalesced here.
 	mut packet := buf.clone()
-	pn_offset := 1 + e.dcid.len
+	// RFC 9000 §7.2: a peer addresses us by the Source Connection ID we sent, so a
+	// server's DCID here is the client's own scid; a short header has no length field
+	// (§17.3.1), so that length — not the DCID the client sends — locates the PN.
+	pn_offset := 1 + e.scid.len
 	mut state := e.app_rx or { return error('quic: application receive keys missing') }
 	pn_len := state.unprotect(mut packet, pn_offset)!
 	truncated := read_truncated_pn(packet, pn_offset, pn_len)
