@@ -21,7 +21,8 @@ src/**/*_test
 # Project docs (not shipped)
 src/_docs/
 
-# Editors / OS
+# Editors / OS / CLI tool state
 .DS_Store
 .idea/
 .vscode/
+.qoder/
