@@ -97,18 +97,18 @@ matching facade; framing and encryption decisions stay adapter-side:
 new_record_handshake(server_name, alpn, pki.Validator) !RecordHandshaker
 new_quic_handshake(server_name, alpn, pki.Validator) !QuicHandshaker
 create_client_hello() ![]u8
-receive(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
+receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
-failure_alert() AlertDescription  /  abort()  /  zeroize_app_secrets()
+failure_alert() AlertDescription  /  fail_and_destroy_secrets()  /  zeroize_app_secrets()
 
 // RecordHandshaker only
-record_unconsumed_bytes(level SecretLevel) int                     // §5.1 boundary hook
-record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
+record_unconsumed_bytes(level HandshakeLevel) int                     // §5.1 boundary hook
+record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
 record_update_read_traffic_keys() !  /  record_update_write_traffic_keys() !  // §7.2 ratchet
 on_handshake_confirmed() !                                           // record confirmation
 
 // QuicHandshaker only
-quic_traffic_secrets(level SecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
+quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
 on_handshake_confirmed() !                                 // QUIC confirmation
 ```
 
@@ -118,13 +118,14 @@ defined in `record_handshaker.v` and `quic_handshaker.v`, respectively.
 Both facades share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
 `new_aead_for_suite`.
 
-`SecretLevel` (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags both
-`receive()` and the returned `HandshakeMessage`s. `receive()` appends level-tagged bytes to the core's per-level reassembly
-buffer and consumes as many complete messages as are available, returning
-outbound messages ready to send. The TCP `Conn`
-encrypts each returned message under the cipher matching its level; a QUIC
-adapter maps the same levels onto Initial/Handshake/Application packet-number
-spaces. All security checks (size caps, HRR rules, transcript binding) live in
+`HandshakeLevel` (`plaintext`/`handshake`) tags `receive()` and returned
+`HandshakeMessage`s; it describes TLS handshake phases, not QUIC packet levels.
+`TrafficSecretLevel` (`handshake`/`application`) selects TLS-derived secrets.
+`receive()` appends level-tagged bytes to the core's per-level reassembly buffer
+and consumes complete messages, returning outbound messages ready to send. The
+TCP `Conn` encrypts each returned message under its matching record keys; the
+QUIC engine maps `.plaintext` to Initial CRYPTO and `.handshake` to Handshake
+CRYPTO. All security checks (size caps, HRR rules, transcript binding) live in
 the core, so both transports inherit them.
 
 ## Repository layout

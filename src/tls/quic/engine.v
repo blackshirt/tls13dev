@@ -341,7 +341,7 @@ fn (mut e ClientEngine) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
 // drain_contiguous feeds every complete handshake message at the front of the
 // level's CRYPTO stream to the core, then installs any new keys the core exposes.
 fn (mut e ClientEngine) drain_contiguous(ptype PacketType) ! {
-	level := level_of(ptype)
+	level := level_of(ptype)!
 	mut produced := []handshake.HandshakeMessage{}
 	for {
 		mut ns := e.ns_mut(ptype)
@@ -372,9 +372,8 @@ fn (mut e ClientEngine) drain_contiguous(ptype PacketType) ! {
 // outbound CRYPTO buffer.
 fn (mut e ClientEngine) queue_outbound(m handshake.HandshakeMessage) ! {
 	match m.level() {
-		.initial { e.tx_crypto_initial << m.msg() }
+		.plaintext { e.tx_crypto_initial << m.msg() }
 		.handshake { e.tx_crypto_hands << m.msg() }
-		.application { return error('quic: handshake core produced .application CRYPTO') }
 	}
 }
 
@@ -573,13 +572,15 @@ fn (mut e ClientEngine) note_ack(ptype PacketType, ack AckFrame) {
 	_ = ack
 }
 
-// level_of maps a parsed packet type to the handshake SecretLevel.
-fn level_of(ptype PacketType) handshake.SecretLevel {
+// level_of maps QUIC packet protection levels to shared TLS handshake phases.
+fn level_of(ptype PacketType) !handshake.HandshakeLevel {
 	return match ptype {
-		.initial { .initial }
+		.initial { .plaintext }
 		.handshake { .handshake }
-		.one_rtt { .application }
-		.retry, .zero_rtt { .initial }
+		.one_rtt {
+			return error('quic: 1-RTT CRYPTO data is post-handshake traffic and is unsupported')
+		}
+		.retry, .zero_rtt { return error('quic: CRYPTO data is not accepted at ${ptype}') }
 	}
 }
 

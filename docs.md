@@ -197,90 +197,51 @@ the decrypted record stream even when a single message is split across records
 
 ### 1.5 Adapter contract (`tls.handshake`)
 
-`tls.handshake`'s `ClientHandshake` is the `pub` seam both the TCP record layer
-and an external QUIC engine drive. All framing and encryption decisions stay
-adapter-side; the core only sequences messages and ratchets keys. The
-step-by-step walkthrough of the QUIC engine's side of this contract —
-construction, CRYPTO-stream I/O, key derivation, confirmation timing, alerts,
-Key Update/Phase, and post-handshake messages — lives in the `state_machine.v`
-file preamble and, in full, in
+`tls.handshake` exposes separate `RecordHandshaker` and `QuicHandshaker`
+facades over shared TLS 1.3 handshake logic. Framing and encryption decisions
+stay adapter-side. The step-by-step walkthrough of the QUIC engine's side of
+this contract — construction, CRYPTO-stream I/O, key derivation, confirmation
+timing, alerts, Key Update/Phase, and post-handshake messages — lives in
 [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md), the dedicated guide to
-building a QUIC adapter. A proposal to make this contract more self-describing
-is in
+building a QUIC adapter. The API contract is documented in
 [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md).
 
 ```v
-// shared: transport-neutral handshake driving (both modes)
-new_record_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake   // mode = .record
-new_quic_handshake(server_name string, alpn []string, pki.Validator) !ClientHandshake     // mode = .quic
+// shared handshake driving
+new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
+new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
 (mut h) create_client_hello() ![]u8
-(mut h) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage
-     (h) mode() TransportMode
+(mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
      (h) failure_alert() AlertDescription
+(mut h) fail_and_destroy_secrets()   /   zeroize_app_secrets()
 (mut h) on_handshake_confirmed() !
-(mut h) abort()   /   zeroize_app_secrets()
 
 // TLS record path only
-     (h) record_unconsumed_bytes(level SecretLevel) int                         // §5.1 hook
-     (h) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
+     (h) record_unconsumed_bytes(level HandshakeLevel) int                         // §5.1 hook
+     (h) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
 (mut h) record_update_read_traffic_keys() !   /   (mut h) record_update_write_traffic_keys() !   // §7.2 ratchet
 
 // QUIC path only
-     (h) quic_traffic_secrets(level SecretLevel) !([]u8, []u8)
+     (h) quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8)
 ```
 
-The mode is fixed at construction (`new_record_handshake()` /
-`new_quic_handshake()`, or `new_client_handshake(..., TransportMode)`) and is
-enforced: a QUIC-mode handshake rejects `record_traffic_keys()`,
-`record_update_*_traffic_keys()` with an error and makes `record_unconsumed_bytes()`
-a no-op, while a record-mode handshake rejects `quic_traffic_secrets()`. So a
-TLS adapter can never pull QUIC secrets and vice versa. Both modes share the key
-helpers `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
-`new_aead_for_suite`.
-
-- **`SecretLevel`** (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags
-  every inbound and outbound message. `receive()` appends level-tagged bytes to a
-  per-level reassembly buffer and consumes as many complete handshake messages
-  as are available, returning the outbound messages ready to send (a retry
-  ClientHello at `.initial`, the client Finished at `.handshake`). Misuse —
-  feeding before `create_client_hello()` (which is single-shot: a second call
-  would duplicate the ClientHello in the transcript), Initial bytes outside the
-  ServerHello wait, or anything after a failure — is a hard error, and a
-  protocol error while parsing peer bytes parks the machine in the terminal
-  `.failed` state that `receive()` refuses; each level's reassembly buffer is
-  capped at one maximum-size message. A QUIC
-  adapter feeds reassembled CRYPTO-stream bytes per packet-number space
-  directly; the TCP `Conn` strips record framing first and feeds the plaintext.
-- **Keys leave the core as `TrafficKeys`, never as ciphers.** The state machine
-  caches the derived client/server handshake and application `TrafficKeys` but
-  installs no AEAD — the TCP `Conn` builds its `RecordProtector`s from
-  `record_traffic_keys()`, and a QUIC adapter runs the RFC 9001 §5.1
-  `"quic key"`/`"quic iv"`/`"quic hp"` expansions over `quic_traffic_secrets()`
-  (via the `pub hkdf_expand_label`). `record_update_*_traffic_keys()` ratchet the
-  application secrets through the TLS KeyUpdate label (§7.2) — the TCP
-  adapter's path only: QUIC forbids TLS KeyUpdate entirely (RFC 9001 §6) and
-  derives next-generation 1-RTT secrets itself with the `"quic ku"` label
-  (§6.1), keyed off its own Key Phase bit. Each adapter rebuilds its
-  protection state, so TLS's per-generation record-sequence reset (§5.3)
-  stays entirely on the TLS side.
-- **Secret lifecycle.** `on_handshake_confirmed()` drops the handshake-stage cached
-  keys/secrets once the adapter is done with them (the TCP `Conn` calls it
-  right after writing the client Finished; a QUIC adapter calls it per
-  RFC 9001 §4.1.2/§4.9.2, and before `.connected` it errors rather than
-  stranding the client Finished). `quic_traffic_secrets(.handshake)` stays valid until
-  then, so a QUIC stack can derive keys after the server Finished. Application
-  secrets *and* their cached `TrafficKeys` are released by
-  `zeroize_app_secrets()` at teardown.
-- **Alerts and errors.** `tls.handshake`'s `alert.v` carries the shared
-  `AlertDescription` vocabulary plus `quic_connection_error() → 0x100 + code`
-  (RFC 9001 §4.8). The `ContentType.alert`-stamping `alert_record` wrapper
-  stays in `tls`; alerts never travel on CRYPTO — a QUIC adapter maps them to
-  a `CONNECTION_CLOSE` frame of type 0x1c.
-- **Record-boundary independence.** Because the core has no notion of a TLS
-  record, `record_unconsumed_bytes(.initial)` is the only hook the TCP `Conn` needs to
-  enforce the §5.1 "ServerHello must end at a record boundary" rule; a QUIC
-  engine ignores it entirely.
+- **`HandshakeLevel`** (`plaintext`/`handshake`) tags TLS handshake input and
+  output independently of transport packet levels. `receive()` buffers
+  plaintext ServerHello/HelloRetryRequest input separately from handshake-phase
+  messages. QUIC maps Initial and Handshake CRYPTO streams to these phases;
+  TCP maps plaintext and decrypted records to them.
+- **Traffic-secret levels are separate.** `TrafficSecretLevel` (`handshake` /
+  `application`) selects TLS-derived secrets. QUIC Initial packet keys derive
+  from the destination connection ID and are not part of this TLS secret API.
+- **Keys stay adapter-owned.** `RecordHandshaker` caches record `TrafficKeys`
+  and implements TLS KeyUpdate ratchets. `QuicHandshaker` exposes TLS traffic
+  secrets for RFC 9001 packet-key derivation; the QUIC engine owns packet keys
+  and QUIC key updates.
+- **Lifecycle and framing stay explicit.** Both facades share failure cleanup
+  and handshake-confirmation lifecycle operations. `RecordHandshaker` alone
+  exposes the plaintext reassembly count needed for the TLS ServerHello record
+  boundary rule; QUIC maps alert descriptions to QUIC connection errors.
 
 ---
 

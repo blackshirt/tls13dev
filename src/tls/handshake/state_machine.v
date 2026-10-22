@@ -3,7 +3,7 @@
 // state_machine.v sequences the TLS 1.3 client handshake of RFC 8446, driving
 // messages.v, aead.v, the §7.1 key schedule (handshake_keys.v) and the
 // server-signature check (certificate_verify.v). Transport-neutral: it owns no
-// record, cipher or socket concept, only level-tagged bytes (RFC 9001 §4.1).
+// record, cipher, socket, or packet-level concept.
 //
 // Public transport facades live in record_handshaker.v and quic_handshaker.v;
 // this file owns the shared handshake state machine.
@@ -31,15 +31,15 @@ pub enum HandshakeState {
 }
 
 // HandshakeMessage is one outbound handshake message, unframed: level tags its
-// encryption level (RFC 9001 §4.1), msg holds the wire bytes, header included.
+// TLS protection phase, and msg holds the wire bytes, header included.
 @[noinit]
 pub struct HandshakeMessage {
-	level SecretLevel
+	level HandshakeLevel
 	msg   []u8
 }
 
-// level returns the encryption level this message belongs to.
-pub fn (m &HandshakeMessage) level() SecretLevel {
+// level returns the TLS protection phase this message belongs to.
+pub fn (m &HandshakeMessage) level() HandshakeLevel {
 	return m.level
 }
 
@@ -50,7 +50,7 @@ pub fn (m &HandshakeMessage) msg() []u8 {
 
 // new_handshake_message builds a HandshakeMessage for producers outside this
 // module; msg must be exactly one complete handshake message (RFC 8446 §4).
-pub fn new_handshake_message(level SecretLevel, msg []u8) !HandshakeMessage {
+pub fn new_handshake_message(level HandshakeLevel, msg []u8) !HandshakeMessage {
 	mut r := wire.new_reader(msg)
 	_, length := parse_handshake_header(mut r)!
 	if r.remaining() != length {
@@ -62,10 +62,15 @@ pub fn new_handshake_message(level SecretLevel, msg []u8) !HandshakeMessage {
 	}
 }
 
-// SecretLevel names a QUIC encryption level (RFC 9001 §4.1): each level has its
-// own CRYPTO stream and traffic secrets; the TCP transport uses .handshake only.
-pub enum SecretLevel {
-	initial
+// HandshakeLevel describes the TLS handshake protection phase independent of
+// transport packet levels: plaintext messages precede ServerHello keys.
+pub enum HandshakeLevel {
+	plaintext
+	handshake
+}
+
+// TrafficSecretLevel names the TLS 1.3 traffic-secret generations.
+pub enum TrafficSecretLevel {
 	handshake
 	application
 }
@@ -86,18 +91,18 @@ mut:
 	handshake_secret  []u8              // Early Secret → Handshake Secret stage (§7.1)
 	client_hs_traffic []u8              // client handshake traffic secret (§7.1)
 	server_hs_traffic []u8              // server handshake traffic secret (§7.1)
-	// Traffic secrets are shared by record and QUIC adapters.
+	// TLS traffic secrets feed transport-specific packet/record protection.
 	client_ap_traffic []u8 // client application traffic secret (§7.1), kept for KeyUpdate
 	server_ap_traffic []u8 // server application traffic secret (§7.1), kept for KeyUpdate
 	// TLS handshake streams are protocol state shared by the core's message
 	// processing, independent of the transport facade that owns this core.
-	initial_reassembly []u8
-	hs_reassembly      []u8
-	validator          pki.Validator     // trust anchors + hostname policy, injected at construction
-	server_certs       []pki.Certificate // chain sent by the server, leaf first, once Certificate is parsed
-	request_context    []u8              // certificate_request_context echoed from a server CertificateRequest (§4.3.2); drives the empty client Certificate (§4.4.2)
-	hrr_received       bool              // set after a HelloRetryRequest so the second CH is validated as such
-	hrr_cipher_suite   ?CipherSuite      // suite selected in the HelloRetryRequest; the final ServerHello must reuse it (§4.1.4)
+	plaintext_reassembly []u8
+	hs_reassembly        []u8
+	validator            pki.Validator     // trust anchors + hostname policy, injected at construction
+	server_certs         []pki.Certificate // chain sent by the server, leaf first, once Certificate is parsed
+	request_context      []u8              // certificate_request_context echoed from a server CertificateRequest (§4.3.2); drives the empty client Certificate (§4.4.2)
+	hrr_received         bool              // set after a HelloRetryRequest so the second CH is validated as such
+	hrr_cipher_suite     ?CipherSuite      // suite selected in the HelloRetryRequest; the final ServerHello must reuse it (§4.1.4)
 	// Progress and outcome fields adapters poll; surfaced through state() and negotiated_alpn() rather than made public directly.
 	state           HandshakeState
 	negotiated_alpn string // server's ALPN pick, '' if none; the RFC 7301 §3.1 check guarantees it was one of config.alpn
@@ -129,20 +134,20 @@ fn new_handshake_core(server_name string, alpn []string, validator pki.Validator
 	}
 
 	return HandshakeCore{
-		state:              .start
-		config:             cfg
-		transcript:         new_transcript(.sha256)
-		hash_algo:          .sha256
-		key_len:            16
-		ecdhe_group:        .x25519
-		priv_x25519:        priv_key
-		validator:          validator
-		initial_reassembly: []u8{cap: 4096}
-		hs_reassembly:      []u8{cap: 4096}
+		state:                .start
+		config:               cfg
+		transcript:           new_transcript(.sha256)
+		hash_algo:            .sha256
+		key_len:              16
+		ecdhe_group:          .x25519
+		priv_x25519:          priv_key
+		validator:            validator
+		plaintext_reassembly: []u8{cap: 4096}
+		hs_reassembly:        []u8{cap: 4096}
 	}
 }
 
-// state reports current handshake progress; the TCP adapter polls it to know
+// state reports current handshake progress; adapters poll it to know
 // when the handshake completed and which messages are still legal on the wire.
 pub fn (h &HandshakeCore) state() HandshakeState {
 	return h.state
@@ -154,7 +159,7 @@ pub fn (h &HandshakeCore) negotiated_alpn() string {
 }
 
 // failure_alert returns the alert description an adapter should surface when
-// this handshake dies (RFC 8446 §6); QUIC maps it with quic_connection_error (§4.8).
+// this handshake dies (RFC 8446 §6).
 pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
@@ -181,7 +186,7 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	return full_client_hello
 }
 
-// handle_server_hello_message consumes one complete Initial-level ServerHello
+// handle_server_hello_message consumes one complete plaintext-level ServerHello
 // or HelloRetryRequest and returns the follow-up messages (RFC 8446 §4.1.3).
 fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMessage {
 	if h.state != .wait_server_hello {
@@ -199,7 +204,7 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 		return error('handshake: expected ServerHello (2), got ${msg_type}')
 	}
 	body := r.read_bytes(length)! // body only; the header is re-added for the transcript
-	// §5.1's record-boundary rule is deliberately not checked here: reassembly already handed over exactly one complete handshake message, and QUIC has no record boundaries at all; the TCP adapter enforces it via record_unconsumed_bytes().
+	// Transport framing boundaries are enforced by adapters; reassembly hands this method one complete handshake message.
 	sh := parse_server_hello(body)! // §4.1.3 field decode plus the §4.2 extension allowlist
 	// Re-frame header + body so the transcript covers the exact wire layout.
 	full_sh_msg := wrap_handshake_message(.server_hello, body)
@@ -297,7 +302,7 @@ fn (mut h HandshakeCore) set_hash_algo(algo HashAlgorithm) {
 }
 
 // build_second_client_hello builds the ClientHello retried after a
-// HelloRetryRequest: identical to the first except key_share and cookie (RFC 8446 §4.1.2), level-tagged .initial.
+// HelloRetryRequest: identical to the first except key_share and cookie (RFC 8446 §4.1.2), level-tagged .plaintext.
 fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]HandshakeMessage {
 	if change_group {
 		h.generate_key_share(group)!
@@ -313,7 +318,7 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	h.transcript.update(full_ch2)
 
 	h.state = .wait_server_hello // rearm: the server now answers with the real ServerHello
-	return [new_handshake_message(.initial, full_ch2)!]
+	return [new_handshake_message(.plaintext, full_ch2)!]
 }
 
 // generate_key_share creates a fresh ephemeral private key for the requested group.
@@ -425,7 +430,7 @@ fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8
 
 // receive processes bytes using the encryption-level reassembly buffers owned
 // by the selected transport facade, returning any outbound messages triggered.
-pub fn (mut h HandshakeCore) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage {
+pub fn (mut h HandshakeCore) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: receive() before create_client_hello() — no ClientHello has been sent yet')
 	}
@@ -433,49 +438,46 @@ pub fn (mut h HandshakeCore) receive(level SecretLevel, bytes []u8) ![]Handshake
 		return error('handshake: state machine has failed; receive() refuses further messages')
 	}
 	match level {
-		.initial {
+		.plaintext {
 			if h.state != .wait_server_hello {
-				return error('handshake: Initial-level bytes are only expected while awaiting ServerHello (state: ${h.state})')
+				return error('handshake: plaintext handshake bytes are only expected while awaiting ServerHello (state: ${h.state})')
 			}
-			h.initial_reassembly << bytes
-			out := h.drain_initial() or {
-				h.abort()
+			h.plaintext_reassembly << bytes
+			out := h.drain_plaintext() or {
+				h.fail_and_destroy_secrets()
 				return err
 			}
 			// One receive may coalesce a consumed ServerHello with an oversized tail the loop no longer reaches; bound it even where drain cannot.
-			if h.initial_reassembly.len > 4 + max_handshake_message_len {
+			if h.plaintext_reassembly.len > 4 + max_handshake_message_len {
 				h.fail_alert = .decode_error
-				h.abort()
-				return error('handshake: Initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
+				h.fail_and_destroy_secrets()
+				return error('handshake: plaintext-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 			return out
 		}
 		.handshake {
 			h.hs_reassembly << bytes
 			out := h.drain_handshake() or {
-				h.abort()
+				h.fail_and_destroy_secrets()
 				return err
 			}
 			// Same bound for the Handshake level: late retransmits at .connected skip the drain loop, so the cap is the backstop.
 			if h.hs_reassembly.len > 4 + max_handshake_message_len {
 				h.fail_alert = .decode_error
-				h.abort()
+				h.fail_and_destroy_secrets()
 				return error('handshake: Handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 			return out
 		}
-		.application {
-			return error('handshake: application-level bytes are post-handshake traffic; parse them with handle_post_handshake (RFC 8446 §4.6)')
-		}
 	}
 }
 
-// drain_initial consumes the complete ServerHello/HelloRetryRequest from the
-// Initial-level buffer; leftover bytes are the adapter's concern (record_unconsumed_bytes).
-fn (mut h HandshakeCore) drain_initial() ![]HandshakeMessage {
+// drain_plaintext consumes the complete ServerHello/HelloRetryRequest from the
+// plaintext-level buffer; framing-boundary checks remain adapter policy.
+fn (mut h HandshakeCore) drain_plaintext() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state == .wait_server_hello {
-		msg := next_passthrough_message(mut h.initial_reassembly)!
+		msg := next_passthrough_message(mut h.plaintext_reassembly)!
 		if msg.len == 0 {
 			break // header or body still incomplete
 		}
@@ -502,16 +504,15 @@ fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 }
 
 // unconsumed_bytes reports bytes retained after complete TLS messages are consumed.
-fn (h &HandshakeCore) unconsumed_bytes(level SecretLevel) int {
+fn (h &HandshakeCore) unconsumed_bytes(level HandshakeLevel) int {
 	return match level {
-		.initial { h.initial_reassembly.len }
+		.plaintext { h.plaintext_reassembly.len }
 		.handshake { h.hs_reassembly.len }
-		.application { 0 }
 	}
 }
 
-// on_handshake_confirmed destroys the handshake-stage traffic secrets; run it
-// only once the handshake is confirmed (RFC 9001 §4.1.2/§4.9.2).
+// on_handshake_confirmed destroys handshake-stage traffic secrets after the
+// adapter no longer needs them (RFC 8446 §7.5).
 pub fn (mut h HandshakeCore) on_handshake_confirmed() ! {
 	if h.state != .connected {
 		return error('handshake: on_handshake_confirmed() runs only once the handshake reached .connected (state: ${h.state})')
@@ -526,30 +527,7 @@ pub fn (mut h HandshakeCore) on_handshake_confirmed() ! {
 	h.server_hs_traffic = []u8{}
 }
 
-// quic_traffic_secrets returns (client, server) clones of the §7.1 traffic
-// secrets for one level, to expand under the RFC 9001 §5.1 labels; .initial is refused.
-pub fn (h &HandshakeCore) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) {
-	match level {
-		.initial {
-			return error('handshake: initial secrets derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
-		}
-		.handshake {
-			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
-				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
-			}
-			return h.client_hs_traffic.clone(), h.server_hs_traffic.clone()
-		}
-		.application {
-			if h.client_ap_traffic.len == 0 || h.server_ap_traffic.len == 0 {
-				return error('handshake: application traffic secrets unavailable before the server Finished')
-			}
-			return h.client_ap_traffic.clone(), h.server_ap_traffic.clone()
-		}
-	}
-}
-
-// negotiated_cipher_suite reports the suite the server selected in ServerHello,
-// so the TCP adapter can build its AEAD from record_traffic_keys().
+// negotiated_cipher_suite reports the suite selected by the server in ServerHello.
 pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 	return h.cipher_suite
 }
@@ -679,9 +657,9 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 	return []HandshakeMessage{}
 }
 
-// abort destroys every secret derived so far and parks the state machine in
-// .failed (RFC 8446 §1.3.1/§7.5); the only legal way for an adapter to reach .failed.
-pub fn (mut h HandshakeCore) abort() {
+// fail_and_destroy_secrets wipes derived secrets and parks the state machine
+// in .failed (RFC 8446 §1.3.1/§7.5).
+pub fn (mut h HandshakeCore) fail_and_destroy_secrets() {
 	for i in 0 .. h.handshake_secret.len {
 		h.handshake_secret[i] = 0
 	}
@@ -694,7 +672,7 @@ pub fn (mut h HandshakeCore) abort() {
 		h.server_hs_traffic[i] = 0
 	}
 	h.server_hs_traffic = []u8{}
-	// Defensive: application secrets cannot exist before .connected, but the wipe keeps abort() a single choke point.
+	// Defensive: application secrets cannot exist before .connected, but failure cleanup remains a single choke point.
 	for i in 0 .. h.client_ap_traffic.len {
 		h.client_ap_traffic[i] = 0
 	}
@@ -703,7 +681,7 @@ pub fn (mut h HandshakeCore) abort() {
 		h.server_ap_traffic[i] = 0
 	}
 	h.server_ap_traffic = []u8{}
-	h.initial_reassembly = []u8{}
+	h.plaintext_reassembly = []u8{}
 	h.hs_reassembly = []u8{}
 	h.priv_x25519 = unsafe { nil }
 	h.priv_p256 = none

@@ -15,6 +15,16 @@ module quic
 import tls.fakeserver
 import tls.pki
 
+fn test_quic_packet_levels_map_to_shared_handshake_phases() ! {
+	assert level_of(.initial)! == .plaintext
+	assert level_of(.handshake)! == .handshake
+	level_of(.one_rtt) or {
+		assert err.msg().contains('post-handshake traffic')
+		return
+	}
+	assert false
+}
+
 // FerryServer is a minimal server endpoint bound to the client's Initial keys.
 @[noinit]
 struct FerryServer {

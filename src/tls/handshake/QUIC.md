@@ -54,23 +54,24 @@ Two properties make this work:
 
 2. **The public boundary is a small, level-tagged seam.** The unit the adapter
    exchanges with the core is a `HandshakeMessage` — a complete handshake
-   message (4-byte header included) tagged with the `SecretLevel` it belongs
+   message (4-byte header included) tagged with the `HandshakeLevel` it belongs
    to. Framing (records vs. CRYPTO frames) and protection (AEAD records vs.
    QUIC packet protection) are entirely adapter-side.
 
-`SecretLevel` comes straight from RFC 9001 §4.1:
+`HandshakeLevel` is transport-neutral:
 
 ```v
-pub enum SecretLevel {
-    initial      // CRYPTO carried in Initial packets
-    handshake    // CRYPTO carried in Handshake packets
-    application  // CRYPTO carried in 1-RTT packets (post-handshake only)
+pub enum HandshakeLevel {
+    plaintext    // handshake messages before handshake traffic keys are installed
+    handshake    // messages protected with handshake traffic keys
 }
 ```
 
-The TCP adapter collapses all three onto its single ordered record stream
-(always `.handshake` practically). QUIC keeps them distinct because each level
-has its own packet-number space and its own keys.
+The QUIC engine maps Initial packet CRYPTO to `.plaintext` and Handshake packet
+CRYPTO to `.handshake`; it rejects 1-RTT CRYPTO because post-handshake messages
+are handled separately. The TCP adapter maps plaintext handshake records to
+`.plaintext` and decrypted handshake records to `.handshake`. QUIC packet
+levels and packet-number spaces remain adapter-side.
 
 ---
 
@@ -113,10 +114,10 @@ violation moves the machine to `failed` and wipes all derived material (see
 `create_client_hello()` builds the first ClientHello: an X25519 `key_share`
 (mandatory to implement, §9.1), the three supported cipher suites, `SNI`,
 `ALPN`, `supported_groups`, `signature_algorithms`, and `supported_versions`.
-A HelloRetryRequest arrives as a pseudo-ServerHello at `.initial`; the core
-switches to the requested group, regenerates the share, echoes any cookie, and
-`receive()` **returns the second ClientHello** (tagged `.initial`) for the adapter
-to send. The transcript substitutes the first ClientHello with its
+A HelloRetryRequest is fed as plaintext handshake input; the core switches to
+the requested group, regenerates the share, echoes any cookie, and `receive()`
+**returns the second ClientHello** (tagged `.plaintext`) for the adapter to send.
+The transcript substitutes the first ClientHello with its
 `message_hash` (§4.4.1) so the Finished binds the whole two-round exchange.
 The retry suite is remembered (`hrr_cipher_suite`) and the final ServerHello
 must reuse it (§4.1.4).
@@ -145,10 +146,10 @@ and key-schedule state.
 
 ### 3.1 Initial secrets are not the core's business
 
-QUIC derives its **Initial** keys from the destination connection ID
-(RFC 9001 §5.2), not from the TLS key schedule. So the core exposes no initial
-material: `record_traffic_keys(.initial)` and `quic_traffic_secrets(.initial)` both
-refuse. The engine derives Initial keys itself, below this layer.
+QUIC derives its **Initial** packet keys from the destination connection ID
+(RFC 9001 §5.2), not from the TLS key schedule. Those packet keys are not
+represented by `TrafficSecretLevel`; the engine derives them itself, below this
+layer. The shared handshake API starts with plaintext ServerHello processing.
 
 ### 3.2 Secrets, not TrafficKeys, cross the boundary
 
@@ -204,7 +205,7 @@ record layer's parser — extracts one complete message from the front of a byte
 buffer, capping the declared length at `max_handshake_message_len` (1 MiB) from
 the header alone so a hostile peer cannot make the adapter buffer indefinitely.
 It is public precisely so an engine can reuse it engine-side. The shared core
-owns the TLS Initial and Handshake message buffers for each handshake instance.
+owns the TLS plaintext and Handshake message buffers for each handshake instance.
 
 ---
 
@@ -233,10 +234,10 @@ ch1 := hs.create_client_hello()!
 //    concatenate CRYPTO frame payloads into `initial_stream`.
 
 // 4. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
-msgs := hs.receive(.initial, initial_stream)!
+msgs := hs.receive(.plaintext, initial_stream)!
 for m in msgs {
-    // The only .initial output the core ever produces is the retry ClientHello
-    // after a HelloRetryRequest — send it in an Initial CRYPTO frame and loop.
+    // The only .plaintext output here is the retry ClientHello after a
+    // HelloRetryRequest — send it in an Initial CRYPTO frame and loop.
     _ = m
 }
 
@@ -279,17 +280,18 @@ hs.on_handshake_confirmed()!
   handshake core's level-specific reassembly buffer and consumes every complete
   message immediately. Separate handshaker instances have separate core state.
   Returned messages are the outbound follow-ups triggered by the peer's bytes.
-  Contract misuse (feeding before `create_client_hello()`, Initial bytes outside
-  the ServerHello wait, anything after `failed`) is refused with the state left
+  Contract misuse (feeding before `create_client_hello()`, plaintext bytes
+  outside the ServerHello wait, anything after `failed`) is refused with the state left
   untouched so you can fix your sequencing.
 - **`record_unconsumed_bytes(level)`** is available only on `RecordHandshaker`.
   The TCP adapter uses it for the §5.1 ServerHello record-boundary rule. The
   `QuicHandshaker` has no record-boundary accessor.
 - **`negotiated_alpn()`** returns the server's ALPN pick (`''` if none). The
   core already verified it was one you offered (RFC 7301 §3.1).
-- **`receive(.application, …)` refuses by contract**: application data never
-  rides CRYPTO (RFC 9001 §4.1.3). Reassemble post-handshake CRYPTO and decode it
-  yourself with `next_passthrough_message` + `parse_new_session_ticket`.
+- The shared `receive()` API only accepts `.plaintext` and `.handshake` TLS
+  phases. The QUIC engine rejects CRYPTO data carried in 1-RTT packets; reassemble
+  post-handshake CRYPTO and decode it with `next_passthrough_message` +
+  `parse_new_session_ticket`.
 
 ---
 
@@ -305,11 +307,11 @@ When the core kills a handshake it takes two actions an adapter must respect:
    (RFC 9001 §4.8). There is no CRYPTO alert path.
 
 2. **It wipes every secret.** Any error that drives the machine to `failed`
-   calls `abort()`: the Handshake Secret, both traffic-secret generations, and
+   calls `fail_and_destroy_secrets()`: the Handshake Secret, both traffic-secret generations, and
    both ephemeral ECDHE private halves are destroyed (RFC 8446 §1.3.1/§7.5).
    `RecordHandshaker` also wipes its cached record keys; a QUIC adapter wipes
-   its packet-protection state. `abort()` is the only legal way for an adapter
-   to reach `.failed`. The success path wipes at `.connected`
+   its packet-protection state. `fail_and_destroy_secrets()` parks the core in
+   `.failed`. The success path wipes at `.connected`
    (`zeroize_handshake_secrets`) and at teardown (`zeroize_app_secrets`), with
    the handshake stage deferred to `on_handshake_confirmed()` per §3.3 above.
 
@@ -325,7 +327,7 @@ error, close the connection, and drop its own per-level protection state.
 new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
 new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
 (mut h) create_client_hello() ![]u8
-(mut h) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
 
 // Observation
 (h) state() HandshakeState
@@ -334,18 +336,18 @@ new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHa
 (h) failure_alert() AlertDescription
 
 // QUIC facade only
-(h &QuicHandshaker) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) // (client, server)
+(h &QuicHandshaker) quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8) // (client, server)
 (mut h QuicHandshaker) on_handshake_confirmed() !
 
 // Record facade only
-(h &RecordHandshaker) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)
-(h &RecordHandshaker) record_unconsumed_bytes(level SecretLevel) int
+(h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)
+(h &RecordHandshaker) record_unconsumed_bytes(level HandshakeLevel) int
 (mut h RecordHandshaker) record_update_read_traffic_keys() !
 (mut h RecordHandshaker) record_update_write_traffic_keys() !
 (mut h RecordHandshaker) on_handshake_confirmed() !
 
 // Shared lifecycle
-(mut h) abort()                         // → .failed, wipes all secrets
+(mut h) fail_and_destroy_secrets()      // → .failed, wipes TLS handshake secrets
 (mut h) zeroize_app_secrets()
 
 // Recordless framing + alert mapping
@@ -357,8 +359,9 @@ parse_new_session_ticket(body []u8) !NewSessionTicket
 parse_key_update(body []u8) !bool
 
 // Supporting types
-SecretLevel { initial, handshake, application }
-HandshakeMessage { level SecretLevel  msg []u8 }          // msg = full message, header included
+HandshakeLevel { plaintext, handshake }
+TrafficSecretLevel { handshake, application }
+HandshakeMessage { level HandshakeLevel  msg []u8 }          // msg = full message, header included
 ```
 
 ---

@@ -24,14 +24,13 @@ fn wrap_hs(typ HandshakeType, body []u8) []u8 {
 	return w.bytes()
 }
 
-// ---- SecretLevel / HandshakeMessage contract ----
+// ---- Handshake and traffic-secret level contracts ----
 
-// test_secret_level_order pins the RFC 9001 §4.1 level order so adapters
-// indexing by level cannot silently drift.
-fn test_secret_level_order() ! {
-	assert u8(SecretLevel.initial) == 0
-	assert u8(SecretLevel.handshake) == 1
-	assert u8(SecretLevel.application) == 2
+fn test_handshake_level_order() ! {
+	assert u8(HandshakeLevel.plaintext) == 0
+	assert u8(HandshakeLevel.handshake) == 1
+	assert u8(TrafficSecretLevel.handshake) == 0
+	assert u8(TrafficSecretLevel.application) == 1
 }
 
 // test_handshake_message_carries_level_and_bytes checks that a message carries
@@ -57,7 +56,7 @@ fn test_new_handshake_message_rejects_length_mismatch() ! {
 // test_new_handshake_message_rejects_truncated_header checks that a message
 // shorter than its own header surfaces the header error.
 fn test_new_handshake_message_rejects_truncated_header() ! {
-	new_handshake_message(.initial, [u8(0x01), 0x00]) or {
+	new_handshake_message(.plaintext, [u8(0x01), 0x00]) or {
 		assert err.msg().contains('header truncated')
 		return
 	}
@@ -66,45 +65,33 @@ fn test_new_handshake_message_rejects_truncated_header() ! {
 
 // ---- receive() reassembly: split and coalesced delivery ----
 
-// test_feed_initial_buffers_incomplete_message checks that an incomplete frame
-// parks in the Initial buffer without parsing.
-fn test_feed_initial_buffers_incomplete_message() ! {
+// test_feed_plaintext_buffers_incomplete_message checks that an incomplete
+// ServerHello parks in the plaintext buffer without parsing.
+fn test_feed_plaintext_buffers_incomplete_message() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
 
 	full := wrap_hs(.server_hello, []u8{len: 10, init: 0xAA})
 	split := full.len / 2
 
-	first := h.receive(.initial, full[..split])!
+	first := h.receive(.plaintext, full[..split])!
 	assert first.len == 0
-	assert h.record_unconsumed_bytes(.initial) == split
+	assert h.record_unconsumed_bytes(.plaintext) == split
 
 	// Completing the frame consumes it; the garbage body then fails to parse.
-	h.receive(.initial, full[split..]) or {
-		assert h.record_unconsumed_bytes(.initial) == 0
+	h.receive(.plaintext, full[split..]) or {
+		assert h.record_unconsumed_bytes(.plaintext) == 0
 		return
 	}
 	assert false // a garbage ServerHello body must never parse cleanly
 }
 
-// test_feed_application_level_rejected checks that post-handshake
-// application-level bytes are refused.
-fn test_feed_application_level_rejected() ! {
-	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
-	_ = h.create_client_hello()!
-	// Application-level bytes are post-handshake traffic; feed refuses them.
-	h.receive(.application, [u8(1)]) or {
-		return
-	}
-	assert false
-}
-
-// test_record_unconsumed_bytes_levels_start_empty checks that the accessor
-// starts empty and tracks a parked fragment.
+// test_record_unconsumed_bytes_levels_start_empty checks that both handshake
+// reassembly buffers start empty and the accessor tracks a parked fragment.
 fn test_record_unconsumed_bytes_levels_start_empty() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	assert h.record_unconsumed_bytes(.handshake) == 0
-	assert h.record_unconsumed_bytes(.application) == 0
+	assert h.record_unconsumed_bytes(.plaintext) == 0
 	_ = h.create_client_hello()!
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
 	_ = h.receive(.handshake, [u8(2), 0x00])!
@@ -134,15 +121,15 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	_ = record.create_client_hello()!
 	_ = quic.create_client_hello()!
 
-	_ = record.receive(.initial, [u8(2), 0])!
-	_ = quic.receive(.initial, [u8(2)])!
+	_ = record.receive(.plaintext, [u8(2), 0])!
+	_ = quic.receive(.plaintext, [u8(2)])!
 
-	assert record.HandshakeCore.initial_reassembly.len == 2
-	assert quic.HandshakeCore.initial_reassembly.len == 1
-	assert record.record_unconsumed_bytes(.initial) == 2
-	record.abort()
-	assert record.record_unconsumed_bytes(.initial) == 0
-	assert quic.HandshakeCore.initial_reassembly.len == 1
+	assert record.HandshakeCore.plaintext_reassembly.len == 2
+	assert quic.HandshakeCore.plaintext_reassembly.len == 1
+	assert record.record_unconsumed_bytes(.plaintext) == 2
+	record.fail_and_destroy_secrets()
+	assert record.record_unconsumed_bytes(.plaintext) == 0
+	assert quic.HandshakeCore.plaintext_reassembly.len == 1
 }
 
 // test_state_progression_to_wait_server_hello checks that the machine starts at
@@ -186,7 +173,7 @@ fn test_create_client_hello_only_runs_once() ! {
 // ClientHello are refused as a contract error, leaving the state .start.
 fn test_feed_before_client_hello_refused() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
-	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
+	h.receive(.plaintext, wrap_hs(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('receive() before create_client_hello()')
 		assert h.state == .start
 		return
@@ -194,13 +181,13 @@ fn test_feed_before_client_hello_refused() ! {
 	assert false
 }
 
-// test_feed_initial_after_server_hello_refused checks that Initial-level bytes
+// test_feed_initial_after_server_hello_refused checks that plaintext-level bytes
 // after the ServerHello wait are refused, leaving the machine usable.
 fn test_feed_initial_after_server_hello_refused() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
 	h.state = .wait_encrypted_extensions
-	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
+	h.receive(.plaintext, wrap_hs(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('while awaiting ServerHello')
 		assert h.state == .wait_encrypted_extensions
 		return
@@ -215,10 +202,10 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	_ = h.create_client_hello()!
 	// A garbage ServerHello body fails to parse; the failure is terminal.
 	bad := wrap_hs(.server_hello, []u8{len: 8, init: 0x01})
-	h.receive(.initial, bad) or {
+	h.receive(.plaintext, bad) or {
 		assert h.state == .failed
 		// No later receive() may make progress against a dead machine.
-		h.receive(.initial, bad) or {
+		h.receive(.plaintext, bad) or {
 			assert err.msg().contains('state machine has failed')
 			return
 		}
@@ -255,16 +242,15 @@ fn test_traffic_keys_unavailable_before_derivation() ! {
 	assert false
 }
 
-// A rejected post-handshake input must not discard usable record keys unless
-// the handshake itself transitions to failed.
+// A rejected input at the wrong handshake phase must not discard usable keys.
 fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_app_keys = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
 	h.server_app_keys = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
 	h.state = .connected
 
-	h.receive(.application, [u8(0)]) or {
-		assert err.msg().contains('post-handshake traffic')
+	h.receive(.plaintext, [u8(0)]) or {
+		assert err.msg().contains('only expected while awaiting ServerHello')
 		assert h.state == .connected
 		assert h.client_app_keys.key.len == 1
 		assert h.server_app_keys.key.len == 1

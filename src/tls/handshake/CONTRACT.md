@@ -33,14 +33,21 @@ state := hs.state()
 alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
 alert := hs.failure_alert()
-hs.abort()
+hs.fail_and_destroy_secrets()
 hs.zeroize_app_secrets()
 ```
 
+`fail_and_destroy_secrets()` marks the handshake failed and destroys its derived
+secrets; it does not close a socket or QUIC connection. `RecordHandshaker` also
+wipes its cached record keys during failure cleanup.
+
 `create_client_hello()` returns the initial, complete handshake message.
-`receive()` accepts bytes at a TLS encryption level, reassembles complete
-messages, and returns outbound `HandshakeMessage` values tagged with their
-encryption level. Each handshake core owns its per-level reassembly buffers and
+`receive()` accepts bytes at a `HandshakeLevel` (`plaintext` or `handshake`),
+reassembles complete messages, and returns outbound `HandshakeMessage` values
+tagged with that TLS phase. QUIC packet levels are translated by its engine;
+they are not part of the shared handshake API. `TrafficSecretLevel`
+(`handshake` or `application`) independently selects TLS-derived secrets.
+Each handshake core owns its phase-specific reassembly buffers and
 consumes complete TLS messages. An empty result can mean that input is
 incomplete or that a message advanced the state without producing output;
 adapters use `state()` to observe progress and errors to detect invalid input.
@@ -60,9 +67,12 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 ## QUIC-only operations
 
 `QuicHandshaker` exposes `quic_traffic_secrets()` instead of record keys. The
-QUIC adapter expands these secrets with the RFC 9001 `quic key`, `quic iv`, and
-`quic hp` labels. It calls `on_handshake_confirmed()` only after QUIC confirms
-the handshake, so handshake keys remain available for the required period.
+method is implemented directly on the QUIC facade, which owns the transport-
+specific secret-level checks. The shared core contains no QUIC-specific secret
+accessor, and `RecordHandshaker` cannot expose one. The QUIC adapter expands
+these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
+calls `on_handshake_confirmed()` only after QUIC confirms the handshake, so
+handshake keys remain available for the required period.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 are absent from `QuicHandshaker`, rather than present as runtime-rejected calls.

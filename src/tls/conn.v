@@ -191,11 +191,11 @@ fn (mut c Conn) do_handshake() ! {
 					c.fail_alert = .unexpected_message
 					return error('tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
-				msgs := c.hs.receive(.initial, rec.payload)!
+				msgs := c.hs.receive(.plaintext, rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
-				if c.hs.record_unconsumed_bytes(.initial) != 0 {
+				if c.hs.record_unconsumed_bytes(.plaintext) != 0 {
 					c.fail_alert = .unexpected_message
-					return error('tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
+					return error('tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.plaintext)} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
 					c.fail_alert = .unexpected_message
@@ -640,7 +640,7 @@ pub fn (mut c Conn) close() ! {
 // wipe_on_failure destroys every secret a failed handshake may have derived: the
 // core's key-schedule material plus this adapter's record protectors.
 fn (mut c Conn) wipe_on_failure() {
-	c.hs.abort()
+	c.hs.fail_and_destroy_secrets()
 	wipe_record_protector(mut c.server_hs_cipher)
 	wipe_record_protector(mut c.client_hs_cipher)
 	wipe_record_protector(mut c.server_app_cipher)

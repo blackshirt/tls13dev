@@ -24,7 +24,7 @@ pub fn new_record_handshake(server_name string, alpn []string, validator pki.Val
 	}
 }
 
-pub fn (mut h RecordHandshaker) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage {
+pub fn (mut h RecordHandshaker) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage {
 	messages := h.HandshakeCore.receive(level, bytes) or {
 		if h.state() == .failed {
 			h.wipe_record_keys()
@@ -32,14 +32,14 @@ pub fn (mut h RecordHandshaker) receive(level SecretLevel, bytes []u8) ![]Handsh
 		return err
 	}
 	h.sync_record_keys() or {
-		h.abort()
+		h.fail_and_destroy_secrets()
 		return err
 	}
 	return messages
 }
 
-pub fn (mut h RecordHandshaker) abort() {
-	h.HandshakeCore.abort()
+pub fn (mut h RecordHandshaker) fail_and_destroy_secrets() {
+	h.HandshakeCore.fail_and_destroy_secrets()
 	h.wipe_record_keys()
 }
 
@@ -50,11 +50,8 @@ pub fn (mut h RecordHandshaker) zeroize_app_secrets() {
 
 // record_traffic_keys returns independent copies of the cached client/server
 // TrafficKeys at one TLS encryption level.
-pub fn (h &RecordHandshaker) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys) {
+pub fn (h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys) {
 	match level {
-		.initial {
-			return error('handshake: initial keys derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
-		}
 		.handshake {
 			if h.client_hs_keys.key.len == 0 || h.server_hs_keys.key.len == 0 {
 				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
@@ -70,7 +67,7 @@ pub fn (h &RecordHandshaker) record_traffic_keys(level SecretLevel) !(TrafficKey
 	}
 }
 
-pub fn (h &RecordHandshaker) record_unconsumed_bytes(level SecretLevel) int {
+pub fn (h &RecordHandshaker) record_unconsumed_bytes(level HandshakeLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 
@@ -89,7 +86,7 @@ pub fn (mut h RecordHandshaker) record_update_read_traffic_keys() ! {
 	new_secret := hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{},
 		h.hash_algo.hash_len())!
 	next := derive_traffic_keys(h.hash_algo, new_secret, h.key_len, aead_nonce_len) or {
-		h.abort()
+		h.fail_and_destroy_secrets()
 		return err
 	}
 	wipe_secret(mut h.server_ap_traffic)
@@ -107,7 +104,7 @@ pub fn (mut h RecordHandshaker) record_update_write_traffic_keys() ! {
 	new_secret := hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{},
 		h.hash_algo.hash_len())!
 	next := derive_traffic_keys(h.hash_algo, new_secret, h.key_len, aead_nonce_len) or {
-		h.abort()
+		h.fail_and_destroy_secrets()
 		return err
 	}
 	wipe_secret(mut h.client_ap_traffic)
