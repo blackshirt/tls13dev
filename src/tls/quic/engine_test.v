@@ -20,7 +20,7 @@ import tls.pki
 struct FerryServer {
 mut:
 	dcid         []u8            // the client's SCID (what the server addresses back)
-	scid         []u8            // the client's DCID (what the server sends as its SCID)
+	server_cid   []u8            // the ferry's own CID, sent as SCID and adopted by the client
 	initial_tx   ProtectionState // server sends with server Initial keys
 	initial_rx   ProtectionState // server receives with client Initial keys
 	handshake_tx ?ProtectionState
@@ -41,6 +41,9 @@ fn new_ferry_server(client_dcid []u8) !FerryServer {
 		initial_tx: new_initial_protection(sk)!
 		initial_rx: new_initial_protection(ck)!
 		srv:        fakeserver.new_server(alpn: ['h3'])!
+		// A server picks its own connection IDs (§7.2); it does not have to echo the
+		// client's guess, so the ferry sends a value the client never chose.
+		server_cid: [u8(0x51), 0x54, 0x9c, 0x0a, 0x1e, 0xb7, 0x3d, 0x66, 0x2f, 0x80]
 	}
 }
 
@@ -66,7 +69,6 @@ fn (mut f FerryServer) handle_packet(buf []u8) !int {
 	mut packet := buf[..total].clone()
 	if meta.scid.len > 0 && f.dcid.len == 0 {
 		f.dcid = meta.scid.clone()
-		f.scid = meta.dcid.clone()
 	}
 	mut rx := match meta.ptype {
 		.initial { f.initial_rx }
@@ -158,7 +160,7 @@ fn (mut f FerryServer) seal_initial(payload []u8) ! {
 	mut tx := f.initial_tx
 	pn := f.initial_pn
 	pn_len := packet_number_len(pn, 0)
-	header, _ := build_long_header(.initial, quic_version_1, f.dcid, f.scid, []u8{}, payload.len,
+	header, _ := build_long_header(.initial, quic_version_1, f.dcid, f.server_cid, []u8{}, payload.len,
 		pn_len, tx.overhead())!
 	packet := tx.seal_packet(header, pn, pn_len, payload)!
 	f.initial_tx = tx
@@ -172,7 +174,7 @@ fn (mut f FerryServer) seal_handshake(payload []u8) ! {
 	mut tx := f.handshake_tx or { return error('ferry: handshake tx keys missing') }
 	pn := f.handshake_pn
 	pn_len := packet_number_len(pn, 0)
-	header, _ := build_long_header(.handshake, quic_version_1, f.dcid, f.scid, []u8{},
+	header, _ := build_long_header(.handshake, quic_version_1, f.dcid, f.server_cid, []u8{},
 		payload.len, pn_len, tx.overhead())!
 	packet := tx.seal_packet(header, pn, pn_len, payload)!
 	f.handshake_tx = tx
@@ -281,4 +283,19 @@ fn test_engine_handshake_with_asymmetric_cids() ! {
 	assert ferry.dcid == scid, 'the ferry must address the client by its source CID'
 	_ = eng.receive(done)!
 	assert eng.confirmed(), 'HANDSHAKE_DONE must confirm the handshake at a 6-byte destination CID'
+}
+
+fn test_engine_adopts_server_source_cid() ! {
+	// RFC 9000 §7.2: the first Initial received from the server tells the client which
+	// connection ID to address it by, so every later client packet carries the server's
+	// Source CID as its Destination CID. The ferry sends a CID the client never chose,
+	// which is what a real server does; echoing the client's guess hides this.
+	mut eng := new_client_engine(fakeserver.server_name, ['h3'], trusted_validator())!
+	start := eng.start()!
+	mut ferry := new_ferry_server(eng.original_dcid())!
+	flight := ferry.exchange(start)!
+	client_next := eng.receive(flight)!
+
+	meta := long_packet_meta(client_next)!
+	assert meta.dcid == ferry.server_cid, 'client is still addressing its own original DCID'
 }

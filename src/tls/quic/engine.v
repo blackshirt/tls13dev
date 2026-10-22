@@ -51,6 +51,7 @@ mut:
 	dcid      []u8 // destination connection ID the engine uses when sending
 	scid      []u8 // source connection ID the engine uses when sending
 	orig_dcid []u8 // the very first DCID, which keys the Initial secrets
+	adopted   bool // the first received Initial has already fixed dcid (RFC 9000 §7.2)
 	// Per-level, per-direction protection. Sending and receiving have distinct
 	// keys, so each level keeps both. A level is unusable until keys are set.
 	initial_tx   ?ProtectionState
@@ -215,6 +216,13 @@ fn (mut e ClientEngine) receive_long_packet(buf []u8) !int {
 	payload := state.decrypt_payload(packet, pn_offset, pn_len, pn)!
 	e.store_rx(meta.ptype, state)
 	e.note_rx(meta.ptype, pn)
+	// RFC 9000 §7.2: the first Initial received from the server fixes the connection ID
+	// the client addresses it by; only NEW_CONNECTION_ID may change it afterwards.
+	// Adopted only after a successful decrypt, so junk cannot redirect the flight.
+	if meta.ptype == .initial && !e.adopted && meta.scid.len > 0 {
+		e.dcid = meta.scid.clone()
+		e.adopted = true
+	}
 	e.handle_frames(meta.ptype, payload)!
 	return total
 }
