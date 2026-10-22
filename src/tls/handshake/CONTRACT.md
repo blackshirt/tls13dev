@@ -1,171 +1,87 @@
-# Making the handshake adapter contract easier to use (proposal)
+# Handshake adapter contract
 
-**Status: naming pass and transport-mode guard done; the event stream is still a
-proposal.**
+The `tls.handshake` module has one private `HandshakeCore` for shared TLS 1.3
+semantics and two public facades for its transport adapters:
 
-The rename in the table below and the `TransportMode` guard (see below) are in
-the code. The larger changes (an event stream, or the four smaller additions)
-are not implemented yet.
+- `RecordHandshaker` for the TLS record adapter (`tls.Conn`).
+- `QuicHandshaker` for the QUIC adapter (`tls.quic.ClientEngine`).
 
-The `tls.handshake` core is driven through a small public API. It works, but it
-is not obvious to use: you have to already know *when* to call things and *why*
-the calls return what they do. This document explains the problem in plain
-terms and proposes a clearer contract.
+The facades contain the shared core but expose different transport-specific
+operations. A caller chooses its transport at construction, and does not need a
+runtime mode flag or a wrong-transport call that fails at runtime.
+Shared public core methods are promoted through the embedded core instead of
+being duplicated as forwarding methods on each facade. Facade methods remain
+where they add transport-specific behavior or expose transport-only operations.
 
----
+The implementation is split by ownership:
 
-## The problem
+- [`state_machine.v`](./state_machine.v) contains the private shared core.
+- [`record_handshaker.v`](./record_handshaker.v) defines and implements the
+  record facade and its cached TLS keys and KeyUpdate ratchets.
+- [`quic_handshaker.v`](./quic_handshaker.v) defines and implements the QUIC
+  facade and exposes TLS traffic secrets without deriving record keys.
 
-Here is what an adapter has to do today, using the real TCP loop as an example:
+## Shared behavior
 
-```v
-ch := hs.create_client_hello()!        // returns raw bytes
-send(ch)
-
-for hs.state() != .connected {          // check state to know when we're done
-    rec := read_record()
-    msgs := hs.receive(.initial, rec)!
-    if hs.record_unconsumed_bytes(.initial) != 0 { fail() }   // check: bad framing?
-    if msgs.len == 0 && hs.state() == .wait_server_hello { fail() }
-    if hs.state() == .wait_encrypted_extensions { install_keys() }  // check: install now?
-    for m in msgs { send(m.msg) }
-}
-hs.on_handshake_confirmed()!                 // must be called at the right time
-```
-
-Nothing here is wrong, but it is hard to learn from the signatures alone. The
-main annoyances:
-
-1. **`receive()` returns a list, but not the reason.** When it returns nothing you
-   must check `state()` and `record_unconsumed_bytes()` to find out why.
-2. **Two output shapes.** The first message is plain `[]u8`; later ones are a
-   tagged struct. You special-case the first.
-3. **Two key accessors that look the same.** `record_traffic_keys()` and
-   `quic_traffic_secrets()` both take a level and both return a client/server
-   pair. *(partly fixed: the transport mode now rejects the wrong one.)*
-4. **Timing you must remember.** `on_handshake_confirmed()` is right for TCP but
-   wrong for QUIC; `record_traffic_keys` works after ServerHello but not after
-   `on_handshake_confirmed`. The types don't say any of this.
-5. **Failure is in three places.** The error, `state() == .failed`, and
-   `failure_alert()`.
-6. **`record_unconsumed_bytes()` is a TCP-only concern** (the ServerHello record
-   boundary) sitting in the shared API. *(partly fixed: it is now a no-op off
-   the record path.)*
-
----
-
-## The idea
-
-Let `receive()` tell the adapter what to do, instead of making the adapter ask.
+Both facades expose the same handshake operations:
 
 ```v
-pub enum HandshakeEvent {
-    send     HandshakeMessage // put msg.msg on the wire at msg.level
-    keys     KeyStage         // install protection for this stage
-    complete                  // handshake done; application secrets are ready
-}
+mut hs := new_record_handshake(server_name, alpn, validator)! // or new_quic_handshake(...)
+client_hello := hs.create_client_hello()!
+messages := hs.receive(level, bytes)!
+state := hs.state()
+alpn := hs.negotiated_alpn()
+suite := hs.negotiated_cipher_suite()
+alert := hs.failure_alert()
+hs.abort()
+hs.zeroize_app_secrets()
 ```
 
-The loop then reads like a recipe, with no state poking:
+`create_client_hello()` returns the initial, complete handshake message.
+`receive()` accepts bytes at a TLS encryption level, reassembles complete
+messages, and returns outbound `HandshakeMessage` values tagged with their
+encryption level. Each handshake core owns its per-level reassembly buffers and
+consumes complete TLS messages. An empty result can mean that input is
+incomplete or that a message advanced the state without producing output;
+adapters use `state()` to observe progress and errors to detect invalid input.
 
-```v
-for ev in hs.begin() {
-    if ev is .send { send(ev.msg) }
-}
+## Record-only operations
 
-for {
-    rec := read_record()
-    for ev in hs.receive(.initial, rec) {
-        match ev {
-            .send { send(ev.msg) }
-            .keys { stage } { install(stage) }  // fires once per stage
-            .complete { done() }
-        }
-    }
-}
-```
+`RecordHandshaker` exposes operations needed by TLS over TCP:
 
-This fixes points 1, 2, and 4 in one move: one output shape, and the events
-carry the "why".
+- `record_traffic_keys()` returns derived record keys.
+- `record_unconsumed_bytes()` lets the record adapter enforce the
+  ServerHello record-boundary rule.
+- `record_update_read_traffic_keys()` and
+  `record_update_write_traffic_keys()` implement TLS KeyUpdate.
+- `on_handshake_confirmed()` releases handshake-stage material at the record
+  adapter's confirmation point.
 
----
+## QUIC-only operations
 
-## Smaller changes (if the rewrite is too big)
+`QuicHandshaker` exposes `quic_traffic_secrets()` instead of record keys. The
+QUIC adapter expands these secrets with the RFC 9001 `quic key`, `quic iv`, and
+`quic hp` labels. It calls `on_handshake_confirmed()` only after QUIC confirms
+the handshake, so handshake keys remain available for the required period.
 
-If changing `receive()`'s return type is too much for a tested core, these four
-additions remove most of the pain without touching existing calls:
+QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
+are absent from `QuicHandshaker`, rather than present as runtime-rejected calls.
 
-1. **`pending_key_stage() ?KeyStage`** — read why `receive()` advanced, instead of
-   comparing `state()` to enum values.
-2. **`create_client_hello_message() !HandshakeMessage`** — same shape as
-   everything else; keep the old `[]u8` version as a thin wrapper.
-3. **Transport-named key accessors** — renaming `traffic_keys` →
-   `record_traffic_keys` and `exported_secrets` → `quic_traffic_secrets` puts
-   the intended consumer in the name. *(done)*
-4. **`failure() ?HandshakeFailure`** — one accessor giving the alert and the
-   message, instead of three checks.
+## Ownership boundary
 
----
+The core owns TLS handshake ordering, transcript updates, certificate
+validation, the TLS key schedule, shared traffic secrets, and per-level TLS
+message reassembly buffers.
+`RecordHandshaker` derives and owns the cached TLS `TrafficKeys`; `QuicHandshaker`
+only exposes traffic secrets for QUIC key derivation. The record adapter owns
+TLS records and record protection. The QUIC adapter owns CRYPTO offset
+reassembly, packets, packet protection, and QUIC key updates. The core does not
+frame or encrypt transport records or packets.
 
-## Naming
+## Future API work
 
-**Applied.** These renames are in the code now:
-
-| Was | Now | Why |
-|---|---|---|
-| `feed` | `receive` | says the direction |
-| `traffic_keys` | `record_traffic_keys` | names the consumer |
-| `exported_secrets` | `quic_traffic_secrets` | names the consumer |
-| `confirm_handshake` | `on_handshake_confirmed` | it's a notification, not an action |
-| `buffered_bytes` | `record_unconsumed_bytes` | "unconsumed input" is clearer |
-| `update_read_traffic_keys` | `record_update_read_traffic_keys` | names the record path |
-| `update_write_traffic_keys` | `record_update_write_traffic_keys` | names the record path |
-| `RecordCipherState` | `RecordProtector` | it protects records, it is not the layer |
-| `cipher_from_keys` | `record_protector_from_keys` | says what it builds |
-
----
-
-## Transport mode guard
-
-**Applied.** The mode-specific half of the API is now gated instead of being
-documented-only. `TransportMode { record, quic }` is fixed at construction and
-enforced at every mode-specific call:
-
-```v
-new_record_handshake(server_name, alpn, validator) !ClientHandshake  // .record
-new_quic_handshake(server_name, alpn, validator) !ClientHandshake    // .quic
-(h) mode() TransportMode
-```
-
-- `.record` allows `record_traffic_keys()`, `record_unconsumed_bytes()`,
-  `record_update_read_traffic_keys()`, `record_update_write_traffic_keys()` and
-  refuses `quic_traffic_secrets()`.
-- `.quic` allows `quic_traffic_secrets()` and refuses every `record_*` accessor;
-  `record_unconsumed_bytes()` is a no-op returning `0`.
-
-This turns points 3 and 6 from "remember which one to call" into a rejected call,
-without the larger event-stream rewrite. `conn.v` builds with
-`new_record_handshake`; `quic.ClientEngine` with `new_quic_handshake`.
-
----
-
-## What stays the same
-
-Everything security-related: message ordering, transcript binding, size caps,
-alert classification, and the secret-zeroization lifecycle. This is only about
-how the same machine is presented to the adapter.
-
----
-
-## Recommendation
-
-- Do the **naming pass** now — cheap and clear.
-- Do the **four smaller additions** next, and update `conn.v` and the tests.
-- Treat the **event stream** as the eventual goal once one adapter has used it.
-
-## Questions
-
-1. Event stream, or are the four smaller additions enough?
-2. Should `create_client_hello` keep returning raw bytes for anyone who wants
-   them?
-3. Rename now, or wait and rename everything together with the event stream?
+`receive()` still returns only outbound messages. Adapters continue to observe
+`state()` to determine milestones such as handshake-key readiness. A structured
+progress result could make those milestones explicit later, once both adapters
+can migrate without changing message ordering, alert classification, or secret
+lifetimes.

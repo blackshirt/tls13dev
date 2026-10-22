@@ -88,41 +88,40 @@ drives the core.
 
 ### Adapter contract
 
-Both the TCP record layer and an external QUIC engine drive `tls.handshake`
-through the same small `pub` API on `ClientHandshake`; every framing and
-encryption decision stays adapter-side:
+The TCP record layer and QUIC engine use separate `tls.handshake` facades over
+the same private core. Transport-specific operations are only present on the
+matching facade; framing and encryption decisions stay adapter-side:
 
 ```v
-// shared (both modes)
-new_record_handshake(server_name, alpn, pki.Validator) !ClientHandshake  // mode = .record
-new_quic_handshake(server_name, alpn, pki.Validator) !ClientHandshake    // mode = .quic
-mode() TransportMode  /  create_client_hello() ![]u8
+// shared (both facades)
+new_record_handshake(server_name, alpn, pki.Validator) !RecordHandshaker
+new_quic_handshake(server_name, alpn, pki.Validator) !QuicHandshaker
+create_client_hello() ![]u8
 receive(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
-on_handshake_confirmed() !                                    // drop handshake-stage material
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 failure_alert() AlertDescription  /  abort()  /  zeroize_app_secrets()
 
-// TLS record path only
+// RecordHandshaker only
 record_unconsumed_bytes(level SecretLevel) int                     // §5.1 boundary hook
 record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
 record_update_read_traffic_keys() !  /  record_update_write_traffic_keys() !  // §7.2 ratchet
+on_handshake_confirmed() !                                           // record confirmation
 
-// QUIC path only
+// QuicHandshaker only
 quic_traffic_secrets(level SecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
+on_handshake_confirmed() !                                 // QUIC confirmation
 ```
 
-The mode is fixed at construction (`new_record_handshake()` /
-`new_quic_handshake()`, or `new_client_handshake(..., TransportMode)`) and is
-enforced: a QUIC-mode handshake rejects `record_traffic_keys()` and the
-`record_update_*_traffic_keys()` ratchets with an error, `record_unconsumed_bytes()`
-is a no-op, and a record-mode handshake rejects `quic_traffic_secrets()`. Both
-share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
+The shared implementation, including per-level receive buffers for each
+handshake instance, is in `state_machine.v`; the record and QUIC APIs are
+defined in `record_handshaker.v` and `quic_handshaker.v`, respectively.
+Both facades share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
 `new_aead_for_suite`.
 
 `SecretLevel` (`initial`/`handshake`/`application`, RFC 9001 §4.1) tags both
-`receive()` and the returned `HandshakeMessage`s. `receive()` appends level-tagged
-bytes to a per-level reassembly buffer and consumes as many complete messages
-as are available, returning outbound messages ready to send. The TCP `Conn`
+`receive()` and the returned `HandshakeMessage`s. `receive()` appends level-tagged bytes to the core's per-level reassembly
+buffer and consumes as many complete messages as are available, returning
+outbound messages ready to send. The TCP `Conn`
 encrypts each returned message under the cipher matching its level; a QUIC
 adapter maps the same levels onto Initial/Handshake/Application packet-number
 spaces. All security checks (size caps, HRR rules, transcript binding) live in
@@ -231,10 +230,14 @@ the all-zero one.
   level-tagged `receive`/`record_traffic_keys`/`quic_traffic_secrets` seam, and the
   `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
   only `tls.handshake` + `tls.pki` and never imports `tls`; the full
-  eight-step engine loop over that seam is walked through in the
-  `state_machine.v` file preamble and in
-  [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md), the dedicated
-  adapter guide
+  eight-step engine loop over that seam is walked through in
+  [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). The API contract and
+  the separate shared-core, record-facade, and QUIC-facade source files are
+  documented in
+  [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md),
+  [`state_machine.v`](src/tls/handshake/state_machine.v),
+  [`record_handshaker.v`](src/tls/handshake/record_handshaker.v), and
+  [`quic_handshaker.v`](src/tls/handshake/quic_handshaker.v).
 - A server mode — this library is client-only
 
 ## Testing
@@ -261,7 +264,7 @@ secrets, and TCP record (re)framing in the connection layer.
 
 The core flight is additionally exercised end to end against an in-repo fake
 TLS 1.3 server (`src/tls/fakeserver/`, a test-only module): tests drive the
-real `ClientHandshake` through a complete X25519 handshake byte by byte,
+real `RecordHandshaker` through a complete X25519 handshake byte by byte,
 asserting the client's ServerHello/Finished/alert bytes and the derived
 traffic keys, then the same handshake over a live loopback TCP socket through
 `tls.dial()` — including HelloRetryRequest, a CertificateRequest answered

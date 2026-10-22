@@ -38,8 +38,8 @@ const max_compat_ccs_records = 2
 @[noinit]
 pub struct Conn {
 mut:
-	sock &net.TcpConn              // underlying TCP transport
-	hs   handshake.ClientHandshake // transport-neutral handshake core, driven through receive()/record_traffic_keys()
+	sock &net.TcpConn               // underlying TCP transport
+	hs   handshake.RecordHandshaker // TLS handshake contract for the record adapter
 	// The four RecordProtectors are the record layer's own state; the core never sees them.
 	server_hs_cipher  RecordProtector // AEAD state for records the server sends under handshake keys
 	client_hs_cipher  RecordProtector // AEAD state for records we send under handshake keys

@@ -5,26 +5,8 @@
 // server-signature check (certificate_verify.v). Transport-neutral: it owns no
 // record, cipher or socket concept, only level-tagged bytes (RFC 9001 §4.1).
 //
-// The pub API below is the adapter contract, split by mode; the mode is fixed
-// once at construction via the TransportMode enum and a wrong-mode call is
-// rejected, never silently empty:
-//
-//   Shared (both modes)
-//     new_client_handshake, mode, state, negotiated_alpn,
-//     negotiated_cipher_suite, failure_alert, create_client_hello, receive,
-//     on_handshake_confirmed, abort, zeroize_app_secrets
-//
-//   TLS record path only (mode == .record; tls.Conn / conn.v)
-//     record_traffic_keys, record_unconsumed_bytes,
-//     record_update_read_traffic_keys, record_update_write_traffic_keys
-//
-//   QUIC path only (mode == .quic; tls.quic.ClientEngine and external engines)
-//     quic_traffic_secrets
-//
-// Construct with new_record_handshake() (.record) or new_quic_handshake()
-// (.quic) to pin the mode. Both modes also use the shared key helpers
-// hkdf_expand_label, suite_hash_algo, suite_key_len and new_aead_for_suite,
-// plus the HandshakeMessage and TrafficKeys types.
+// Public transport facades live in record_handshaker.v and quic_handshaker.v;
+// this file owns the shared handshake state machine.
 module handshake
 
 import crypto.ecdsa
@@ -33,56 +15,6 @@ import crypto.subtle
 import x.crypto.curve25519
 import tls.pki
 import tls.wire
-
-// ─── QUIC integration ──────────────────────────────────────────────────────
-// An engine imports tls.handshake (+ tls.pki for trust anchors), never tls, and
-// drives the same pub contract; no record, cipher or socket state lives here:
-//  1. Construct — new_quic_handshake(server_name, alpn, validator) pins .quic
-//     (conn.v's twin is new_record_handshake). Initial packet keys are NOT part
-//     of the TLS key schedule: QUIC derives them from the destination
-//     connection ID (RFC 9001 §5.2), so the .initial key/secret getters refuse.
-//  2. Outbound — create_client_hello() yields the first ClientHello; receive()
-//     later returns the level-tagged follow-ups (retry ClientHello at .initial,
-//     client Finished at .handshake), each HandshakeMessage.msg a complete
-//     handshake message (4-byte header included) to place verbatim into a
-//     CRYPTO frame. No dummy ChangeCipherSpec is ever produced: that is TCP
-//     middlebox compatibility only (RFC 8446 App. D.4) and QUIC packets are
-//     already opaque (RFC 9001 §4.1.3).
-//  3. Inbound — strip QUIC packet protection yourself, concatenate each
-//     encryption level's CRYPTO frames into that level's byte stream, and hand
-//     the bytes to receive(.initial | .handshake). Within a level the stream is
-//     self-framed handshake messages (RFC 9001 §4); next_passthrough_message
-//     (passthrough.v) is the core's own reassembly helper, reusable engine-side.
-//  4. Traffic keys — after ServerHello take quic_traffic_secrets() and expand
-//     the "quic key" / "quic iv" / "quic hp" labels over them with the pub
-//     hkdf_expand_label (RFC 9001 §5.1); the header-protection key comes from
-//     "quic hp". The core installs no AEAD anywhere.
-//  5. Confirmation — call on_handshake_confirmed() only once the handshake is
-//     confirmed (HANDSHAKE_DONE or a 1-RTT acknowledgment, RFC 9001 §4.1.2),
-//     NOT at client-Finished time like the TCP adapter: a peer may keep sending
-//     at Handshake level until confirmation, so the cached handshake keys must
-//     survive until then (they are discarded at §4.9.2).
-//  6. Alerts — never ride CRYPTO frames (RFC 9001 §4.1.3): map a received
-//     AlertDescription with quic_connection_error() (0x100 + description,
-//     RFC 9001 §4.8) and raise a CONNECTION_CLOSE of type 0x1c yourself.
-//  7. Key update — QUIC replaces TLS KeyUpdate entirely with its own Key Phase
-//     mechanism (RFC 9001 §6): an endpoint MUST NOT send a TLS KeyUpdate and
-//     MUST treat a received one as a connection error (0x010a). The next
-//     generation of 1-RTT secrets is therefore derived engine-side as
-//     HKDF-Expand-Label(secret, "quic ku", "", Hash.length) (§6.1) — not via
-//     update_read/write_traffic_keys(), whose "traffic upd" label is the TLS
-//     record path's; the header-protection key never updates.
-//  8. Post-handshake — receive(.application) refuses by contract: over QUIC TLS
-//     application data is never carried (RFC 9001 §4.1.3). NewSessionTicket
-//     arrives on the 1-RTT CRYPTO stream after the handshake (RFC 9001 §4.5);
-//     reassemble it with next_passthrough_message and decode with the pub
-//     parse_new_session_ticket codec (RFC 8446 §4.6.1) — the same pair the TCP
-//     adapter's handle_post_handshake consumes. A KeyUpdate on that stream is a
-//     connection error, per item 7.
-//
-// The TCP adapter (conn.v) is this loop's TLS-shaped twin: one ordered record
-// stream instead of three CRYPTO streams, records instead of packets,
-// "traffic upd" KeyUpdate instead of Key Phase.
 
 // HandshakeState tracks client progress; the wait_* order mirrors the fixed
 // post-ServerHello flight (RFC 8446 §1/§4.1), each handler asserting its state.
@@ -138,19 +70,10 @@ pub enum SecretLevel {
 	application
 }
 
-// TransportMode selects the adapter shape and is fixed at construction: a
-// mode-mismatched call is rejected, never silently operating on empty material.
-pub enum TransportMode {
-	record // TLS 1.3 record layer (tls.Conn): record_traffic_keys, record_unconsumed_bytes, record_update_*_traffic_keys
-	quic   // QUIC engine (tls.quic.ClientEngine): quic_traffic_secrets
-}
-
-// ClientHandshake orchestrates the TLS 1.3 client handshake state machine; its
-// pub methods are the adapter contract and every field stays private.
+// HandshakeCore owns shared TLS 1.3 handshake state and behavior.
 @[noinit]
-pub struct ClientHandshake {
+struct HandshakeCore {
 mut:
-	mode              TransportMode     // adapter shape; guards the mode-specific methods
 	config            ClientHelloConfig // inputs echoed/replayed when rebuilding the second ClientHello
 	transcript        Transcript        // running hash of all handshake messages (RFC 8446 §4.4.1)
 	hash_algo         HashAlgorithm     // hash of the negotiated suite; drives every key derivation
@@ -163,14 +86,11 @@ mut:
 	handshake_secret  []u8              // Early Secret → Handshake Secret stage (§7.1)
 	client_hs_traffic []u8              // client handshake traffic secret (§7.1)
 	server_hs_traffic []u8              // server handshake traffic secret (§7.1)
-	// The reusable state is the traffic secrets (RFC 8446 §7.2 rekeying); the TrafficKeys derived from them are cached only so adapters can pull per-direction keys through record_traffic_keys() — the core holds no cipher state.
-	client_ap_traffic []u8        // client application traffic secret (§7.1), kept for KeyUpdate
-	server_ap_traffic []u8        // server application traffic secret (§7.1), kept for KeyUpdate
-	client_hs_keys    TrafficKeys // cached client handshake keys, handed out by record_traffic_keys(.handshake)
-	server_hs_keys    TrafficKeys // cached server handshake keys, handed out by record_traffic_keys(.handshake)
-	client_app_keys   TrafficKeys // cached client application keys, handed out by record_traffic_keys(.application)
-	server_app_keys   TrafficKeys // cached server application keys, handed out by record_traffic_keys(.application)
-	// Handshake messages may be split across records (or, over QUIC, across many CRYPTO frames) and coalesced within one (RFC 8446 §5.2), so inbound bytes accumulate per encryption level for reassembly, mirroring the distinct CRYPTO streams of RFC 9001 §4.1.
+	// Traffic secrets are shared by record and QUIC adapters.
+	client_ap_traffic []u8 // client application traffic secret (§7.1), kept for KeyUpdate
+	server_ap_traffic []u8 // server application traffic secret (§7.1), kept for KeyUpdate
+	// TLS handshake streams are protocol state shared by the core's message
+	// processing, independent of the transport facade that owns this core.
 	initial_reassembly []u8
 	hs_reassembly      []u8
 	validator          pki.Validator     // trust anchors + hostname policy, injected at construction
@@ -185,9 +105,9 @@ mut:
 	fail_alert AlertDescription = .internal_error
 }
 
-// new_client_handshake creates a ClientHandshake offering an X25519 key share
-// (RFC 8446 §9.1); mode pins the adapter shape and the validator is injected here.
-pub fn new_client_handshake(server_name string, alpn []string, validator pki.Validator, mode TransportMode) !ClientHandshake {
+// new_handshake_core creates shared state offering an X25519 key share
+// (RFC 8446 §9.1), with certificate validation policy injected by the caller.
+fn new_handshake_core(server_name string, alpn []string, validator pki.Validator) !HandshakeCore {
 	// TLS 1.3 has no separate key-exchange round trip: the public share must ride in the initial ClientHello (§4.2.8).
 	mut priv_key := curve25519.PrivateKey.new()! // fresh 32-byte X25519 scalar
 	pub_key := priv_key.public_key()!
@@ -208,9 +128,8 @@ pub fn new_client_handshake(server_name string, alpn []string, validator pki.Val
 		random:       random
 	}
 
-	return ClientHandshake{
+	return HandshakeCore{
 		state:              .start
-		mode:               mode
 		config:             cfg
 		transcript:         new_transcript(.sha256)
 		hash_algo:          .sha256
@@ -223,43 +142,26 @@ pub fn new_client_handshake(server_name string, alpn []string, validator pki.Val
 	}
 }
 
-// new_record_handshake creates a TLS 1.3 record-layer handshake (tls.Conn): the
-// record_* methods are allowed, the QUIC-only ones are refused.
-pub fn new_record_handshake(server_name string, alpn []string, validator pki.Validator) !ClientHandshake {
-	return new_client_handshake(server_name, alpn, validator, .record)
-}
-
-// new_quic_handshake creates a QUIC handshake (tls.quic.ClientEngine): the
-// quic_traffic_secrets method is allowed, the record-layer ones are refused.
-pub fn new_quic_handshake(server_name string, alpn []string, validator pki.Validator) !ClientHandshake {
-	return new_client_handshake(server_name, alpn, validator, .quic)
-}
-
-// mode returns the adapter shape this handshake was built for.
-pub fn (h &ClientHandshake) mode() TransportMode {
-	return h.mode
-}
-
 // state reports current handshake progress; the TCP adapter polls it to know
 // when the handshake completed and which messages are still legal on the wire.
-pub fn (h &ClientHandshake) state() HandshakeState {
+pub fn (h &HandshakeCore) state() HandshakeState {
 	return h.state
 }
 
 // negotiated_alpn returns the ALPN protocol the server picked ('' when none).
-pub fn (h &ClientHandshake) negotiated_alpn() string {
+pub fn (h &HandshakeCore) negotiated_alpn() string {
 	return h.negotiated_alpn
 }
 
 // failure_alert returns the alert description an adapter should surface when
 // this handshake dies (RFC 8446 §6); QUIC maps it with quic_connection_error (§4.8).
-pub fn (h &ClientHandshake) failure_alert() AlertDescription {
+pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
 
 // create_client_hello generates the initial ClientHello, advances to
 // .wait_server_hello and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
-pub fn (mut h ClientHandshake) create_client_hello() ![]u8 {
+pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	// A second call would replay the first ClientHello into the transcript and corrupt every later hash; the retry ClientHello has its own path via receive().
 	if h.state != .start {
 		return error('handshake: create_client_hello() only runs once (state: ${h.state}); the retry ClientHello is produced by receive() during HelloRetryRequest handling')
@@ -281,7 +183,7 @@ pub fn (mut h ClientHandshake) create_client_hello() ![]u8 {
 
 // handle_server_hello_message consumes one complete Initial-level ServerHello
 // or HelloRetryRequest and returns the follow-up messages (RFC 8446 §4.1.3).
-fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]HandshakeMessage {
+fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMessage {
 	if h.state != .wait_server_hello {
 		// Strict ordering: a ServerHello is only legal while we await it (§4.4.1).
 		h.fail_alert = .unexpected_message
@@ -376,20 +278,13 @@ fn (mut h ClientHandshake) handle_server_hello_message(sh_msg []u8) ![]Handshake
 	h.client_hs_traffic = hs.client_traffic
 	h.server_hs_traffic = hs.server_traffic
 
-	// Both directions are cached for the adapter (record_traffic_keys(.handshake)); the core builds no protection state.
-	client_hs_keys := derive_traffic_keys(h.hash_algo, h.client_hs_traffic, h.key_len, aead_nonce_len)!
-	server_hs_keys := derive_traffic_keys(h.hash_algo, h.server_hs_traffic, h.key_len, aead_nonce_len)!
-
-	h.server_hs_keys = server_hs_keys
-	h.client_hs_keys = client_hs_keys
-
 	h.state = .wait_encrypted_extensions
 	return []HandshakeMessage{}
 }
 
 // set_hash_algo adopts the negotiated suite's hash, rebuilding the transcript
 // around it while keeping accumulated messages. A no-op when already matching.
-fn (mut h ClientHandshake) set_hash_algo(algo HashAlgorithm) {
+fn (mut h HandshakeCore) set_hash_algo(algo HashAlgorithm) {
 	if h.hash_algo == algo {
 		return // already on the target digest — the common SHA-256 case, no rebuild
 	}
@@ -403,7 +298,7 @@ fn (mut h ClientHandshake) set_hash_algo(algo HashAlgorithm) {
 
 // build_second_client_hello builds the ClientHello retried after a
 // HelloRetryRequest: identical to the first except key_share and cookie (RFC 8446 §4.1.2), level-tagged .initial.
-fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]HandshakeMessage {
+fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]HandshakeMessage {
 	if change_group {
 		h.generate_key_share(group)!
 		h.config.client_share = KeyShareEntry{
@@ -422,7 +317,7 @@ fn (mut h ClientHandshake) build_second_client_hello(change_group bool, group Na
 }
 
 // generate_key_share creates a fresh ephemeral private key for the requested group.
-fn (mut h ClientHandshake) generate_key_share(group NamedGroup) ! {
+fn (mut h HandshakeCore) generate_key_share(group NamedGroup) ! {
 	h.ecdhe_group = group
 	match group {
 		.x25519 {
@@ -438,7 +333,7 @@ fn (mut h ClientHandshake) generate_key_share(group NamedGroup) ! {
 
 // public_share_bytes serializes the public half of the current ephemeral key in
 // the wire form its group mandates (RFC 8446 §4.2.8.2).
-fn (mut h ClientHandshake) public_share_bytes() ![]u8 {
+fn (mut h HandshakeCore) public_share_bytes() ![]u8 {
 	match h.ecdhe_group {
 		.x25519 {
 			pub_key := h.priv_x25519.public_key()!
@@ -479,7 +374,7 @@ fn is_x25519_small_order(secret []u8) bool {
 
 // compute_shared_secret performs the ECDHE exchange against the server's key
 // share, returning the raw shared secret that seeds the key schedule.
-fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]u8 {
+fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8 {
 	// §4.2.8.2 fixes key_exchange size per group; gate it here so a wrong size yields a named protocol error.
 	expected_len := match server_share.group {
 		.x25519 { 32 }
@@ -528,9 +423,9 @@ fn (mut h ClientHandshake) compute_shared_secret(server_share KeyShareEntry) ![]
 	return error('handshake: unsupported key_share group ${server_share.group}')
 }
 
-// receive is the single inbound entry point: it appends level-tagged handshake
-// bytes to that level's reassembly buffer and returns the outbound messages they trigger.
-pub fn (mut h ClientHandshake) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage {
+// receive processes bytes using the encryption-level reassembly buffers owned
+// by the selected transport facade, returning any outbound messages triggered.
+pub fn (mut h HandshakeCore) receive(level SecretLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: receive() before create_client_hello() — no ClientHello has been sent yet')
 	}
@@ -577,7 +472,7 @@ pub fn (mut h ClientHandshake) receive(level SecretLevel, bytes []u8) ![]Handsha
 
 // drain_initial consumes the complete ServerHello/HelloRetryRequest from the
 // Initial-level buffer; leftover bytes are the adapter's concern (record_unconsumed_bytes).
-fn (mut h ClientHandshake) drain_initial() ![]HandshakeMessage {
+fn (mut h HandshakeCore) drain_initial() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state == .wait_server_hello {
 		msg := next_passthrough_message(mut h.initial_reassembly)!
@@ -594,7 +489,7 @@ fn (mut h ClientHandshake) drain_initial() ![]HandshakeMessage {
 
 // drain_handshake consumes the complete messages of the encrypted flight —
 // EE → Cert → CV → Finished — until the buffer runs dry or the handshake ends.
-fn (mut h ClientHandshake) drain_handshake() ![]HandshakeMessage {
+fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state != .connected && h.state != .failed {
 		msg := next_passthrough_message(mut h.hs_reassembly)!
@@ -606,62 +501,18 @@ fn (mut h ClientHandshake) drain_handshake() ![]HandshakeMessage {
 	return out
 }
 
-// record_traffic_keys returns the cached (client, server) TrafficKeys for one
-// level; TLS record path only, and .initial is refused (RFC 9001 §5.2).
-pub fn (h &ClientHandshake) record_traffic_keys(level SecretLevel) !(TrafficKeys, TrafficKeys) {
-	if h.mode != .record {
-		return error('handshake: record_traffic_keys() is TLS record path only; this handshake is in ${h.mode} mode (use quic_traffic_secrets())')
-	}
-	match level {
-		.initial {
-			return error('handshake: initial keys derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
-		}
-		.handshake {
-			if h.client_hs_keys.key.len == 0 || h.server_hs_keys.key.len == 0 {
-				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by on_handshake_confirmed)')
-			}
-			return clone_traffic_keys(h.client_hs_keys), clone_traffic_keys(h.server_hs_keys)
-		}
-		.application {
-			if h.client_app_keys.key.len == 0 || h.server_app_keys.key.len == 0 {
-				return error('handshake: application traffic keys unavailable before the server Finished')
-			}
-			return clone_traffic_keys(h.client_app_keys), clone_traffic_keys(h.server_app_keys)
-		}
-	}
-}
-
-// clone_traffic_keys copies one direction's key/iv buffers so callers never
-// alias the core's cached material, which the ratchet wipes in place.
-fn clone_traffic_keys(k TrafficKeys) TrafficKeys {
-	return TrafficKeys{
-		key: k.key.clone()
-		iv:  k.iv.clone()
-	}
-}
-
-// record_unconsumed_bytes reports the incomplete bytes parked in one level's
-// reassembly buffer, for the ServerHello boundary rule (RFC 8446 §5.1).
-pub fn (h &ClientHandshake) record_unconsumed_bytes(level SecretLevel) int {
-	if h.mode != .record {
-		return 0
-	}
+// unconsumed_bytes reports bytes retained after complete TLS messages are consumed.
+fn (h &HandshakeCore) unconsumed_bytes(level SecretLevel) int {
 	return match level {
-		.initial {
-			h.initial_reassembly.len
-		}
-		.handshake {
-			h.hs_reassembly.len
-		}
-		.application {
-			0
-		}
+		.initial { h.initial_reassembly.len }
+		.handshake { h.hs_reassembly.len }
+		.application { 0 }
 	}
 }
 
-// on_handshake_confirmed destroys the handshake-stage traffic secrets and
-// cached keys; run it only once the handshake is confirmed (RFC 9001 §4.1.2/§4.9.2).
-pub fn (mut h ClientHandshake) on_handshake_confirmed() ! {
+// on_handshake_confirmed destroys the handshake-stage traffic secrets; run it
+// only once the handshake is confirmed (RFC 9001 §4.1.2/§4.9.2).
+pub fn (mut h HandshakeCore) on_handshake_confirmed() ! {
 	if h.state != .connected {
 		return error('handshake: on_handshake_confirmed() runs only once the handshake reached .connected (state: ${h.state})')
 	}
@@ -673,16 +524,11 @@ pub fn (mut h ClientHandshake) on_handshake_confirmed() ! {
 	}
 	h.client_hs_traffic = []u8{}
 	h.server_hs_traffic = []u8{}
-	wipe_traffic_keys(mut h.client_hs_keys)
-	wipe_traffic_keys(mut h.server_hs_keys)
 }
 
 // quic_traffic_secrets returns (client, server) clones of the §7.1 traffic
 // secrets for one level, to expand under the RFC 9001 §5.1 labels; .initial is refused.
-pub fn (h &ClientHandshake) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) {
-	if h.mode != .quic {
-		return error('handshake: quic_traffic_secrets() is QUIC path only; this handshake is in ${h.mode} mode (use record_traffic_keys())')
-	}
+pub fn (h &HandshakeCore) quic_traffic_secrets(level SecretLevel) !([]u8, []u8) {
 	match level {
 		.initial {
 			return error('handshake: initial secrets derive from the QUIC destination connection ID (RFC 9001 §5.2), not the TLS key schedule')
@@ -704,13 +550,13 @@ pub fn (h &ClientHandshake) quic_traffic_secrets(level SecretLevel) !([]u8, []u8
 
 // negotiated_cipher_suite reports the suite the server selected in ServerHello,
 // so the TCP adapter can build its AEAD from record_traffic_keys().
-pub fn (h &ClientHandshake) negotiated_cipher_suite() CipherSuite {
+pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 	return h.cipher_suite
 }
 
 // handle_handshake_message processes one complete message of the encrypted
 // flight — EE → Certificate → CertificateVerify → Finished — from receive().
-fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeMessage {
+fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMessage {
 	// The message is complete by construction (reassembly framed it by its own header), so peel type/length and split the body off.
 	mut r := wire.new_reader(full_msg)
 	msg_type, length := parse_handshake_header(mut r)!
@@ -809,17 +655,10 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 			h.client_ap_traffic = ap.client_traffic
 			h.server_ap_traffic = ap.server_traffic
 
-			client_app_keys := derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
-			server_app_keys := derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, aead_nonce_len)!
-
 			// The client Finished uses the handshake traffic secret over the transcript now including server Finished, sent under the (still active) handshake keys.
 			client_verify_data := compute_finished_verify_data(h.hash_algo, h.client_hs_traffic, th_sfin)!
 			client_fin_msg := build_finished(client_verify_data)
 			h.transcript.update(client_fin_msg)
-
-			// Cache the application TrafficKeys for the adapter to install its own protection from; the handshake keys/secrets stay until on_handshake_confirmed().
-			h.server_app_keys = server_app_keys
-			h.client_app_keys = client_app_keys
 
 			if h.hs_reassembly.len > 0 {
 				h.fail_alert = .decode_error
@@ -840,49 +679,9 @@ fn (mut h ClientHandshake) handle_handshake_message(full_msg []u8) ![]HandshakeM
 	return []HandshakeMessage{}
 }
 
-// record_update_read_traffic_keys ratchets the server application traffic secret
-// to its next generation (RFC 8446 §7.2); TLS record path only (RFC 9001 §6 forbids it in QUIC).
-pub fn (mut h ClientHandshake) record_update_read_traffic_keys() ! {
-	if h.mode != .record {
-		return error('handshake: record_update_read_traffic_keys() is TLS record path only; this handshake is in ${h.mode} mode')
-	}
-	// Ratchet forward: new_secret = HKDF-Expand-Label(old, "traffic upd", "", Hash) (§7.2).
-	if h.server_ap_traffic.len == 0 {
-		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
-	}
-	// Advance first, then destroy the superseded generation in place: the old secret and its keys must not survive the ratchet.
-	new_secret := hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
-	for i in 0 .. h.server_ap_traffic.len {
-		h.server_ap_traffic[i] = 0
-	}
-	h.server_ap_traffic = new_secret
-	wipe_traffic_keys(mut h.server_app_keys)
-	h.server_app_keys = derive_traffic_keys(h.hash_algo, h.server_ap_traffic, h.key_len, aead_nonce_len)!
-}
-
-// record_update_write_traffic_keys ratchets the client application traffic secret
-// to its next generation (RFC 8446 §7.2); TLS record path only (RFC 9001 §6 forbids it in QUIC).
-pub fn (mut h ClientHandshake) record_update_write_traffic_keys() ! {
-	if h.mode != .record {
-		return error('handshake: record_update_write_traffic_keys() is TLS record path only; this handshake is in ${h.mode} mode')
-	}
-	// §4.6.3 requires the KeyUpdate notice to go out under the old keys; the TCP adapter then restarts its record sequence number at 0 (§5.3).
-	if h.client_ap_traffic.len == 0 {
-		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
-	}
-	// Same supersession rule as the read side: compute the next generation from the old secret, then wipe the old secret and its cached keys.
-	new_secret := hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{}, h.hash_algo.hash_len())!
-	for i in 0 .. h.client_ap_traffic.len {
-		h.client_ap_traffic[i] = 0
-	}
-	h.client_ap_traffic = new_secret
-	wipe_traffic_keys(mut h.client_app_keys)
-	h.client_app_keys = derive_traffic_keys(h.hash_algo, h.client_ap_traffic, h.key_len, aead_nonce_len)!
-}
-
 // abort destroys every secret derived so far and parks the state machine in
 // .failed (RFC 8446 §1.3.1/§7.5); the only legal way for an adapter to reach .failed.
-pub fn (mut h ClientHandshake) abort() {
+pub fn (mut h HandshakeCore) abort() {
 	for i in 0 .. h.handshake_secret.len {
 		h.handshake_secret[i] = 0
 	}
@@ -895,8 +694,6 @@ pub fn (mut h ClientHandshake) abort() {
 		h.server_hs_traffic[i] = 0
 	}
 	h.server_hs_traffic = []u8{}
-	wipe_traffic_keys(mut h.client_hs_keys)
-	wipe_traffic_keys(mut h.server_hs_keys)
 	// Defensive: application secrets cannot exist before .connected, but the wipe keeps abort() a single choke point.
 	for i in 0 .. h.client_ap_traffic.len {
 		h.client_ap_traffic[i] = 0
@@ -906,8 +703,8 @@ pub fn (mut h ClientHandshake) abort() {
 		h.server_ap_traffic[i] = 0
 	}
 	h.server_ap_traffic = []u8{}
-	wipe_traffic_keys(mut h.client_app_keys)
-	wipe_traffic_keys(mut h.server_app_keys)
+	h.initial_reassembly = []u8{}
+	h.hs_reassembly = []u8{}
 	h.priv_x25519 = unsafe { nil }
 	h.priv_p256 = none
 	h.state = .failed
@@ -915,7 +712,7 @@ pub fn (mut h ClientHandshake) abort() {
 
 // zeroize_handshake_secrets destroys the key-schedule intermediate and the dead
 // ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the handshake traffic secrets.
-fn (mut h ClientHandshake) zeroize_handshake_secrets() {
+fn (mut h HandshakeCore) zeroize_handshake_secrets() {
 	// Scrub the buffer in place before releasing it: reassignment alone would hand the allocator the original bytes untouched.
 	for i in 0 .. h.handshake_secret.len {
 		h.handshake_secret[i] = 0
@@ -926,9 +723,9 @@ fn (mut h ClientHandshake) zeroize_handshake_secrets() {
 	h.priv_p256 = none
 }
 
-// zeroize_app_secrets destroys the application traffic secrets and the
-// TrafficKeys derived from them once the connection is finished (RFC 8446 §1.3.1/§7.5).
-pub fn (mut h ClientHandshake) zeroize_app_secrets() {
+// zeroize_app_secrets destroys the application traffic secrets once the
+// connection is finished (RFC 8446 §1.3.1/§7.5).
+pub fn (mut h HandshakeCore) zeroize_app_secrets() {
 	for i in 0 .. h.client_ap_traffic.len {
 		h.client_ap_traffic[i] = 0
 	}
@@ -937,18 +734,4 @@ pub fn (mut h ClientHandshake) zeroize_app_secrets() {
 	}
 	h.client_ap_traffic = []u8{}
 	h.server_ap_traffic = []u8{}
-	wipe_traffic_keys(mut h.client_app_keys)
-	wipe_traffic_keys(mut h.server_app_keys)
-}
-
-// wipe_traffic_keys zeroes a cached TrafficKeys byte by byte before releasing
-// it, since reassignment alone would hand the allocator the key material intact.
-fn wipe_traffic_keys(mut keys TrafficKeys) {
-	for i in 0 .. keys.key.len {
-		keys.key[i] = 0
-	}
-	for i in 0 .. keys.iv.len {
-		keys.iv[i] = 0
-	}
-	keys = TrafficKeys{}
 }

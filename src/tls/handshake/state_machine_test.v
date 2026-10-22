@@ -113,6 +113,38 @@ fn test_record_unconsumed_bytes_levels_start_empty() ! {
 
 // ---- state machine accessor ----
 
+fn test_record_and_quic_facades_share_handshake_state() ! {
+	mut record := new_record_handshake('example.com', []string{}, fixture_validator())!
+	mut quic := new_quic_handshake('example.com', []string{}, fixture_validator())!
+
+	assert record.state() == .start
+	assert quic.state() == .start
+	assert record.failure_alert() == .internal_error
+	assert quic.failure_alert() == .internal_error
+
+	_ = record.create_client_hello()!
+	_ = quic.create_client_hello()!
+	assert record.state() == .wait_server_hello
+	assert quic.state() == .wait_server_hello
+}
+
+fn test_reassembly_is_owned_by_each_handshake_core() ! {
+	mut record := new_record_handshake('example.com', []string{}, fixture_validator())!
+	mut quic := new_quic_handshake('example.com', []string{}, fixture_validator())!
+	_ = record.create_client_hello()!
+	_ = quic.create_client_hello()!
+
+	_ = record.receive(.initial, [u8(2), 0])!
+	_ = quic.receive(.initial, [u8(2)])!
+
+	assert record.HandshakeCore.initial_reassembly.len == 2
+	assert quic.HandshakeCore.initial_reassembly.len == 1
+	assert record.record_unconsumed_bytes(.initial) == 2
+	record.abort()
+	assert record.record_unconsumed_bytes(.initial) == 0
+	assert quic.HandshakeCore.initial_reassembly.len == 1
+}
+
 // test_state_progression_to_wait_server_hello checks that the machine starts at
 // .start and moves to .wait_server_hello once the ClientHello is built.
 fn test_state_progression_to_wait_server_hello() ! {
@@ -210,42 +242,6 @@ fn test_feed_reassembly_is_bounded_after_connected() ! {
 	assert false
 }
 
-// ---- transport mode guard (white-box) ----
-
-// test_mode_guards_reject_cross_transport_calls checks that a record-mode
-// handshake refuses the QUIC-only accessor.
-fn test_mode_guards_reject_cross_transport_calls() ! {
-	mut rec := new_record_handshake('example.com', []string{}, fixture_validator())!
-	assert rec.mode() == .record
-	_, _ = rec.quic_traffic_secrets(.handshake) or {
-		assert err.msg().contains('QUIC path only')
-		return
-	}
-	assert false, 'record-mode handshake handed out QUIC secrets'
-}
-
-// test_mode_guard_rejects_record_calls_in_quic_mode checks that a QUIC-mode
-// handshake refuses every record-layer accessor.
-fn test_mode_guard_rejects_record_calls_in_quic_mode() ! {
-	mut q := new_quic_handshake('example.com', []string{}, fixture_validator())!
-	assert q.mode() == .quic
-	_, _ = q.record_traffic_keys(.handshake) or {
-		assert err.msg().contains('TLS record path only')
-		q.record_update_read_traffic_keys() or {
-			assert err.msg().contains('TLS record path only')
-			q.record_update_write_traffic_keys() or {
-				assert err.msg().contains('TLS record path only')
-				// record_unconsumed_bytes is a no-op off the record path.
-				assert q.record_unconsumed_bytes(.initial) == 0
-				return
-			}
-			return
-		}
-		return
-	}
-	assert false, 'QUIC-mode handshake handed out record keys'
-}
-
 // ---- traffic_keys / quic_traffic_secrets lifecycle (white-box) ----
 
 // test_traffic_keys_unavailable_before_derivation checks that the accessors
@@ -254,6 +250,24 @@ fn test_traffic_keys_unavailable_before_derivation() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
 	_, _ := h.record_traffic_keys(.handshake) or {
+		return
+	}
+	assert false
+}
+
+// A rejected post-handshake input must not discard usable record keys unless
+// the handshake itself transitions to failed.
+fn test_nonfatal_receive_error_preserves_record_keys() ! {
+	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
+	h.client_app_keys = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
+	h.server_app_keys = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
+	h.state = .connected
+
+	h.receive(.application, [u8(0)]) or {
+		assert err.msg().contains('post-handshake traffic')
+		assert h.state == .connected
+		assert h.client_app_keys.key.len == 1
+		assert h.server_app_keys.key.len == 1
 		return
 	}
 	assert false

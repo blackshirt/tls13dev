@@ -2,7 +2,7 @@
 //
 // server.v is a minimal, adaptive TLS 1.3 server flight generator for tests:
 // it parses the client's real ClientHello and emits a byte-correct ServerHello
-// plus encrypted flight (RFC 8446 §7.1), so a ClientHandshake can be driven
+// plus encrypted flight (RFC 8446 §7.1), so a record handshaker can be driven
 // to .connected without a socket. Scope: TLS_AES_128_GCM_SHA256 only.
 module fakeserver
 

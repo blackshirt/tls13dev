@@ -41,13 +41,13 @@ mut:
 	reasm      CryptoReasm // reassembled inbound CRYPTO stream for this level
 }
 
-// ClientEngine is a QUIC client handshake. It wraps a `handshake.ClientHandshake`
+// ClientEngine is a QUIC client handshake. It wraps a `handshake.QuicHandshaker`
 // and the packet layer around it. Construct it with new_client_engine, feed it
 // datagrams, and take the datagrams it returns to send.
 @[noinit]
 pub struct ClientEngine {
 mut:
-	hs        handshake.ClientHandshake
+	hs        handshake.QuicHandshaker
 	dcid      []u8 // destination connection ID the engine uses when sending
 	scid      []u8 // source connection ID the engine uses when sending
 	orig_dcid []u8 // the very first DCID, which keys the Initial secrets
@@ -371,29 +371,27 @@ fn (mut e ClientEngine) queue_outbound(m handshake.HandshakeMessage) ! {
 // exported traffic secrets as soon as each level becomes available
 // (RFC 9001 §5.1). It is idempotent: keys are only installed once.
 fn (mut e ClientEngine) install_exported_keys() ! {
-	if e.handshake_tx == none && e.handshake_rx == none {
-		ck, sk := e.hs.quic_traffic_secrets(.handshake) or { []u8{}, []u8{} }
-		if ck.len > 0 && sk.len > 0 {
-			suite := e.hs.negotiated_cipher_suite()
-			chash := handshake.suite_hash_algo(suite)
-			klen := handshake.suite_key_len(suite)
-			client_keys := expand_direction(chash, ck, klen)!
-			server_keys := expand_direction(chash, sk, klen)!
-			e.handshake_tx = new_protection(client_keys, suite)!
-			e.handshake_rx = new_protection(server_keys, suite)!
-		}
+	state := e.hs.state()
+	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none
+		&& state != .start && state != .wait_server_hello {
+		ck, sk := e.hs.quic_traffic_secrets(.handshake)!
+		suite := e.hs.negotiated_cipher_suite()
+		chash := handshake.suite_hash_algo(suite)
+		klen := handshake.suite_key_len(suite)
+		client_keys := expand_direction(chash, ck, klen)!
+		server_keys := expand_direction(chash, sk, klen)!
+		e.handshake_tx = new_protection(client_keys, suite)!
+		e.handshake_rx = new_protection(server_keys, suite)!
 	}
-	if e.app_tx == none && e.app_rx == none {
-		ck, sk := e.hs.quic_traffic_secrets(.application) or { []u8{}, []u8{} }
-		if ck.len > 0 && sk.len > 0 {
-			suite := e.hs.negotiated_cipher_suite()
-			chash := handshake.suite_hash_algo(suite)
-			klen := handshake.suite_key_len(suite)
-			client_keys := expand_direction(chash, ck, klen)!
-			server_keys := expand_direction(chash, sk, klen)!
-			e.app_tx = new_protection(client_keys, suite)!
-			e.app_rx = new_protection(server_keys, suite)!
-		}
+	if e.hs.state() == .connected && e.app_tx == none && e.app_rx == none {
+		ck, sk := e.hs.quic_traffic_secrets(.application)!
+		suite := e.hs.negotiated_cipher_suite()
+		chash := handshake.suite_hash_algo(suite)
+		klen := handshake.suite_key_len(suite)
+		client_keys := expand_direction(chash, ck, klen)!
+		server_keys := expand_direction(chash, sk, klen)!
+		e.app_tx = new_protection(client_keys, suite)!
+		e.app_rx = new_protection(server_keys, suite)!
 	}
 }
 

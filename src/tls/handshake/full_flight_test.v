@@ -17,7 +17,7 @@ fn fixture_trusted_validator() pki.Validator {
 
 // expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —
 // the expected state once on_handshake_confirmed() dropped the handshake material.
-fn expect_no_handshake_keys(h &ClientHandshake) bool {
+fn expect_no_handshake_keys(h &RecordHandshaker) bool {
 	h.record_traffic_keys(.handshake) or {
 		return true
 	}
@@ -26,13 +26,13 @@ fn expect_no_handshake_keys(h &ClientHandshake) bool {
 
 // expect_no_exported_handshake_secrets reports whether the handshake traffic
 // secrets are gone — the expected state once they were wiped.
-fn expect_no_exported_handshake_secrets(h &ClientHandshake) bool {
+fn expect_no_exported_handshake_secrets(h &RecordHandshaker) bool {
 	return h.client_hs_traffic.len == 0 && h.server_hs_traffic.len == 0
 }
 
 // assert_handshake_material_destroyed checks the failure-path contract: after a
 // failed feed the machine is .failed and every derived secret is gone (RFC 8446 §7.5).
-fn assert_handshake_material_destroyed(h &ClientHandshake) {
+fn assert_handshake_material_destroyed(h &RecordHandshaker) {
 	assert h.state() == .failed
 	assert expect_no_handshake_keys(h), 'handshake TrafficKeys survived a failed feed'
 	assert expect_no_exported_handshake_secrets(h), 'handshake traffic secrets survived a failed feed'
@@ -40,7 +40,7 @@ fn assert_handshake_material_destroyed(h &ClientHandshake) {
 
 // feed_encrypted_flight feeds the whole server flight one byte at a time and
 // returns every outbound message, exercising reassembly at every split point.
-fn feed_encrypted_flight(mut h ClientHandshake, flight []u8) ![]HandshakeMessage {
+fn feed_encrypted_flight(mut h RecordHandshaker, flight []u8) ![]HandshakeMessage {
 	mut produced := []HandshakeMessage{}
 	for i in 0 .. flight.len {
 		msgs := h.receive(.handshake, [flight[i]])!
