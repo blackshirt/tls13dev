@@ -99,7 +99,7 @@ new_quic_handshake(server_name, alpn, pki.Validator) !QuicHandshaker
 create_client_hello() ![]u8
 receive(level SecretLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
-failure_alert() AlertDescription  /  fail_and_destroy_secrets()  /  zeroize_app_secrets()
+failure_alert() AlertDescription  /  abort()  /  zeroize_app_secrets()
 
 // RecordHandshaker only
 record_unconsumed_bytes(level SecretLevel) int                     // §5.1 boundary hook

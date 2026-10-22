@@ -640,7 +640,7 @@ pub fn (mut c Conn) close() ! {
 // wipe_on_failure destroys every secret a failed handshake may have derived: the
 // core's key-schedule material plus this adapter's record protectors.
 fn (mut c Conn) wipe_on_failure() {
-	c.hs.fail_and_destroy_secrets()
+	c.hs.abort()
 	wipe_record_protector(mut c.server_hs_cipher)
 	wipe_record_protector(mut c.client_hs_cipher)
 	wipe_record_protector(mut c.server_app_cipher)
