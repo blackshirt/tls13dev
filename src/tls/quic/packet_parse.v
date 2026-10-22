@@ -64,10 +64,10 @@ fn long_packet_meta(buf []u8) !LongPacketMeta {
 	// (RFC 9000 §17.2), so the packet ends at payload_off + length.
 	length, n := decode_varint(buf[o..])!
 	payload_off := o + n // first byte of the packet number
-	total := payload_off + int(length)
-	if total > buf.len {
-		return error('quic: long packet length ${total} exceeds buffer ${buf.len}')
+	if length > u64(buf.len - payload_off) {
+		return error('quic: long packet length ${length} exceeds remaining buffer ${buf.len - payload_off}')
 	}
+	total := payload_off + int(length)
 	return LongPacketMeta{
 		ptype:       ptype
 		version:     version

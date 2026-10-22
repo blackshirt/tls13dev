@@ -47,15 +47,16 @@ fn read_cid(buf []u8, off int) !([]u8, int) {
 
 // read_varint_field reads a varint-length-prefixed field (RFC 9000 §17.2).
 fn read_varint_field(buf []u8, off int) !([]u8, int) {
-	if off >= buf.len {
+	if off < 0 || off >= buf.len {
 		return error('quic: truncated varint field')
 	}
 	n, consumed := decode_varint(buf[off..])!
 	start := off + consumed
-	if start + int(n) > buf.len {
+	if n > u64(buf.len - start) {
 		return error('quic: truncated varint field body (wanted ${n} bytes)')
 	}
-	return buf[start..start + int(n)], start + int(n)
+	end := start + int(n)
+	return buf[start..end], end
 }
 
 // build_long_header serializes a long header prefix through the length field,

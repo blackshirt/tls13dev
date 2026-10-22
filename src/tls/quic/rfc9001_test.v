@@ -94,6 +94,26 @@ fn test_long_header_build_and_parse_roundtrip() ! {
 	assert meta.total_len == pn_off + 2 + 30
 }
 
+fn test_varint_field_rejects_out_of_bounds_lengths() ! {
+	// Maximal 8-byte varint lengths must be rejected before integer conversion
+	// or slice arithmetic can overflow.
+	if _, _ := read_varint_field([u8(0)], -1) {
+		assert false
+	}
+
+	mut initial := [u8(0xc0), 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]
+	initial << [u8(0xff), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+	if _ := long_packet_meta(initial) {
+		assert false
+	}
+
+	mut handshake := [u8(0xe0), 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]
+	handshake << [u8(0xff), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+	if _ := long_packet_meta(handshake) {
+		assert false
+	}
+}
+
 fn test_seal_open_roundtrip_initial() ! {
 	dcid := hex.decode(app_a_dcid_hex)!
 	ck, _ := derive_initial_keys(dcid)!

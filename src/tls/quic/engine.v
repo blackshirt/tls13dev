@@ -323,7 +323,7 @@ fn (mut e ClientEngine) handle_frames(ptype PacketType, payload []u8) ! {
 // and drives the handshake core with any newly-complete messages.
 fn (mut e ClientEngine) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
 	mut ns := e.ns_mut(ptype)
-	ns.reasm.insert(cf.offset, cf.data)
+	ns.reasm.insert(cf.offset, cf.data)!
 	e.drain_contiguous(ptype)!
 }
 
