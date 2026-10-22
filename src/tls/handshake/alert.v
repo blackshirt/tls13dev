@@ -1,17 +1,13 @@
 // Copyright (c) 2026 blackshirt.
 //
-// alert.v models the RFC 8446 §6 alert protocol vocabulary: the
-// AlertLevel/AlertDescription enums and their wire encoding. The enums are
-// shared transport vocabulary — the TLS record layer frames alerts as records
-// (that framing lives in tls' record layer), while QUIC never carries an alert
-// on the handshake stream and instead maps the description to a CRYPTO_ERROR
-// connection-close code (0x100 + description) via quic_connection_error
-// (RFC 9001 §4.8).
+// alert.v models the RFC 8446 §6 alert vocabulary: the AlertLevel/AlertDescription
+// enums and their wire encoding, shared transport vocabulary. TLS frames alerts in
+// its own layer; QUIC maps the description to a CRYPTO_ERROR connection-close code
+// (0x100 + description) via quic_connection_error (RFC 9001 §4.8).
 module handshake
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).
-// In TLS 1.3 the warning level exists only for close_notify; every other alert
-// must be fatal, since a recoverable error signal was removed from 1.2's design.
+// In TLS 1.3 only close_notify may be a warning; every other alert is fatal.
 pub enum AlertLevel as u8 {
 	warning = 1
 	fatal   = 2
@@ -48,10 +44,8 @@ pub enum AlertDescription as u8 {
 	no_application_protocol         = 120
 }
 
-// Alert is the 2-byte TLS alert payload. Its fields are read-only outside this
-// module: an adapter inspects the peer's alert but never rewrites it. @[noinit]
-// keeps a caller from fabricating an Alert with an out-of-range level (0 is not
-// a valid AlertLevel); only parse_alert/new_alert produce one.
+// Alert is the 2-byte TLS alert payload, read-only outside this module; @[noinit]
+// keeps a caller from fabricating an out-of-range level.
 @[noinit]
 pub struct Alert {
 pub:
@@ -76,9 +70,7 @@ pub fn parse_alert(data []u8) !Alert {
 			return error('handshake: invalid alert level ${data[0]}')
 		}
 	}
-	// The cast is unsafe on purpose: the received byte may be a description this
-	// enum does not enumerate. RFC 8446 §6 treats unknown alert types as error
-	// alerts, so the raw byte is preserved and classified by the receiving caller.
+	// The cast is unsafe on purpose: RFC 8446 §6 treats unknown alert types as error alerts.
 	desc := unsafe { AlertDescription(data[1]) }
 	return Alert{
 		level:       level
@@ -86,21 +78,14 @@ pub fn parse_alert(data []u8) !Alert {
 	}
 }
 
-// quic_connection_error maps an alert to the QUIC CRYPTO_ERROR application
-// error code (RFC 9001 §4.8): a peer closing a connection because of this
-// alert signals 0x100 plus the alert description byte. Over QUIC alerts never
-// travel on the handshake stream — the record layer's job of decrypting and
-// routing an inner alert simply does not exist — so this mapping is the whole
-// surface the shared AlertDescription vocabulary needs to be usable by a QUIC
-// adapter while the core stays transport-neutral.
+// quic_connection_error maps an alert to the QUIC CRYPTO_ERROR application error code
+// (RFC 9001 §4.8): 0x100 plus the alert description byte.
 pub fn (d AlertDescription) quic_connection_error() u32 {
 	return 0x100 + u32(d)
 }
 
-// new_alert builds an alert with the given description. It is the send-side
-// twin of parse_alert: RFC 8446 §6 makes every alert except close_notify fatal,
-// so close_notify is the only description emitted at warning level (RFC 8446
-// §6.1) and needs no separate constructor.
+// new_alert builds an alert with the given description; RFC 8446 §6 makes every alert
+// except close_notify fatal, so close_notify is the only warning-level description.
 pub fn new_alert(description AlertDescription) Alert {
 	return Alert{
 		level:       if description == .close_notify { .warning } else { .fatal }

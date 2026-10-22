@@ -2,22 +2,17 @@
 //
 // keys.v is the fakeserver's private copy of the RFC 8446 §7.1 key-schedule
 // primitives (HKDF-Extract/Expand/Expand-Label, Derive-Secret, traffic keys,
-// Finished verify_data), pinned to SHA-256 / TLS_AES_128_GCM_SHA256. It
-// deliberately does NOT import tls.handshake: the handshake module's own test
-// files import tls.fakeserver, so a handshake import here would form an import
-// cycle. The duplicated HKDF is a handful of lines and the duplication keeps
-// the two test layers decoupled.
+// Finished verify_data), pinned to SHA-256 / TLS_AES_128_GCM_SHA256. It does NOT
+// import tls.handshake: that would form an import cycle with the handshake tests.
 module fakeserver
 
 import crypto.hmac
 import crypto.sha256
 
-// hash_len is the SHA-256 digest size; TLS_AES_128_GCM_SHA256 pins the suite
-// hash (RFC 8446 §9.1).
+// hash_len is the SHA-256 digest size; the suite pins the hash (RFC 8446 §9.1).
 const hash_len = 32
 
-// key_len / iv_len are the TLS_AES_128_GCM_SHA256 traffic-key sizes (RFC 8446
-// §7.1 + AES-GCM's 128-bit key; the IV is the suite-wide 12-byte nonce base).
+// key_len / iv_len are the TLS_AES_128_GCM_SHA256 traffic-key sizes (RFC 8446 §7.1).
 const key_len = 16
 const iv_len = 12
 
@@ -34,16 +29,15 @@ fn hmac_sha256(key []u8, data []u8) []u8 {
 	return hmac.new(key, data, sha256.sum256, hmac_block_size)
 }
 
-// hkdf_extract implements HKDF-Extract(salt, IKM) (RFC 5869 §2.2). An empty
-// salt means Hash.length zero bytes, the RFC 5869 default the TLS 1.3 Early
-// Secret relies on.
+// hkdf_extract implements HKDF-Extract(salt, IKM) (RFC 5869 §2.2); an empty salt
+// means Hash.length zero bytes, the default the TLS 1.3 Early Secret relies on.
 fn hkdf_extract(salt []u8, ikm []u8) []u8 {
 	effective_salt := if salt.len == 0 { []u8{len: hash_len} } else { salt }
 	return hmac_sha256(effective_salt, ikm)
 }
 
 // hkdf_expand implements HKDF-Expand(prk, info, length) (RFC 5869 §2.3):
-// T(1) || T(2) || ... where T(i) = HMAC(PRK, T(i-1) || info || i).
+// T(i) = HMAC(PRK, T(i-1) || info || i).
 fn hkdf_expand(prk []u8, info []u8, length int) ![]u8 {
 	if length < 0 || length > 255 * hash_len {
 		return error('fakeserver: HKDF-Expand length ${length} out of range 0..${255 * hash_len}')
@@ -66,8 +60,7 @@ fn hkdf_expand(prk []u8, info []u8, length int) ![]u8 {
 }
 
 // hkdf_expand_label implements RFC 8446 §7.1 HKDF-Expand-Label: the label is
-// prefixed with the fixed "tls13 " string that domain-separates TLS 1.3
-// derivations from every other HKDF user.
+// prefixed with "tls13 ", domain-separating TLS 1.3 derivations.
 fn hkdf_expand_label(secret []u8, label string, context []u8, length int) ![]u8 {
 	full_label := 'tls13 ${label}'
 	if full_label.len > 255 {
@@ -87,22 +80,20 @@ fn hkdf_expand_label(secret []u8, label string, context []u8, length int) ![]u8 
 }
 
 // derive_secret implements Derive-Secret(Secret, Label, Messages) =
-// HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
-// (RFC 8446 §7.1).
+// HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length) (RFC 8446 §7.1).
 fn derive_secret(secret []u8, label string, transcript_hash []u8) ![]u8 {
 	return hkdf_expand_label(secret, label, transcript_hash, hash_len)
 }
 
-// finished_verify_data computes a Finished message's verify_data
-// (RFC 8446 §4.4.4): HMAC(finished_key, Transcript-Hash) where
-// finished_key = HKDF-Expand-Label(base_key, "finished", "", Hash.length).
+// finished_verify_data computes a Finished verify_data (RFC 8446 §4.4.4):
+// HMAC(finished_key, Transcript-Hash), finished_key = Expand-Label(base_key, "finished", "").
 fn finished_verify_data(base_key []u8, transcript_hash []u8) ![]u8 {
 	finished_key := hkdf_expand_label(base_key, 'finished', []u8{}, hash_len)!
 	return hmac_sha256(finished_key, transcript_hash)
 }
 
-// traffic_keys expands a traffic secret into the AEAD key and 12-byte IV that
-// protect records in one direction (RFC 8446 §7.1 "key" / "iv" labels).
+// traffic_keys expands a traffic secret into the AEAD key and 12-byte IV for
+// one direction (RFC 8446 §7.1 "key" / "iv" labels).
 fn traffic_keys(secret []u8) !([]u8, []u8) {
 	key := hkdf_expand_label(secret, 'key', []u8{}, key_len)!
 	iv := hkdf_expand_label(secret, 'iv', []u8{}, iv_len)!

@@ -74,7 +74,7 @@ tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
 
 | Module          | Responsibility                                                                              |
 |-----------------|---------------------------------------------------------------------------------------------|
-| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `cipher_state`, `tcp_transport` |
+| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `cipher_state` |
 | `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC passthrough framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
 | `tls.pki`       | Trust & parsing: `asn1`, `x509`, `validator`, `hostname`, `trust_store`, `rsa`              |
 | `tls.wire`      | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)                       |
@@ -83,7 +83,7 @@ Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
 only of certificates, and `tls.handshake` owns **no record, cipher, or socket
 concept** — a grep gate over `src/tls/handshake/` (`Record`, `RecordProtector`,
 `ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
-`conn.v`/`tcp_transport.v` in the `tls` module are the reference adapter that
+`conn.v` in the `tls` module is the reference adapter that
 drives the core.
 
 ### Adapter contract

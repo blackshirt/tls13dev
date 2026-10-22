@@ -1,16 +1,15 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Codec tests for the handshake message layer: ClientHello construction is
-// re-parsed field by field, server-side messages decode from small hand-built
-// payloads plus the RFC 8448 §3 ServerHello worked example, the §4.4.3
-// CertificateVerify signed-content layout is checked byte by byte, and the
-// shared extensions-block framing (parse_extensions) is exercised including its
-// §4.2 duplicate-rejection rule.
+// Codec tests for the handshake message layer: ClientHello construction, server
+// message decoding from hand-built payloads plus the RFC 8448 §3 ServerHello
+// example, the §4.4.3 CertificateVerify layout, and extensions framing.
 module handshake
 
 import encoding.hex
 import tls.wire
 
+// test_build_client_hello checks that the 4-byte handshake header and the body
+// length agree with the built ClientHello.
 fn test_build_client_hello() ! {
 	cfg := ClientHelloConfig{
 		server_name:  'example.com'
@@ -28,8 +27,9 @@ fn test_build_client_hello() ! {
 	assert full_msg[3] == u8(body.len & 0xff)
 }
 
+// test_parse_rfc8448_server_hello checks that the RFC 8448 §3 ServerHello
+// example decodes to its suite and key share.
 fn test_parse_rfc8448_server_hello() ! {
-	// RFC 8448 Section 3 ServerHello message (including 4-byte header)
 	raw_sh_hex := '020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304'
 	raw_sh := hex.decode(raw_sh_hex)!
 
@@ -41,6 +41,8 @@ fn test_parse_rfc8448_server_hello() ! {
 	assert hex.encode(sh.server_share.key_exchange) == 'c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f'
 }
 
+// test_parse_certificate_chain checks that an empty request_context plus a
+// one-certificate list decodes to the single certificate.
 fn test_parse_certificate_chain() ! {
 	// request_context (empty) + certificate_list holding one 2-byte cert with no extensions
 	body := [u8(0x00), 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0xde, 0xad, 0x00, 0x00]
@@ -49,20 +51,19 @@ fn test_parse_certificate_chain() ! {
 	assert certs[0] == [u8(0xde), 0xad]
 }
 
+// test_parse_encrypted_extensions_no_alpn checks that an empty extension list
+// yields no ALPN selection.
 fn test_parse_encrypted_extensions_no_alpn() ! {
 	body := [u8(0x00), 0x00] // empty extension list
 	assert parse_encrypted_extensions(body)! == ''
 }
 
 // test_parse_encrypted_extensions_extension_policy checks the §4.3.1 placement
-// rules: an extension that never belongs in EncryptedExtensions (key_share —
-// it lives in ServerHello) must abort, while RFC 5746 renegotiation_info stays
-// tolerated because OpenSSL servers send it unoffered.
+// rules: a key_share extension must abort, while renegotiation_info stays tolerated.
 fn test_parse_encrypted_extensions_extension_policy() ! {
 	// extensions vector (len 6) = key_share entry with 2 bytes of data
 	bad := [u8(0x00), 0x06, 0x00, 0x33, 0x00, 0x02, 0xaa, 0xbb]
 	if _ := parse_encrypted_extensions(bad) {
-		// then-branch = success; reaching it means the rejection did not happen
 		assert false // 'bad' must be rejected per §4.3.1
 	}
 	// extensions vector (len 5) = renegotiation_info (0xff01), 1 byte of data
@@ -70,10 +71,8 @@ fn test_parse_encrypted_extensions_extension_policy() ! {
 	assert parse_encrypted_extensions(ok)! == ''
 }
 
-// test_parse_encrypted_extensions_server_name_ack pins the RFC 6066 §3 SNI
-// acknowledgment a §4.2-registered EncryptedExtensions entry: an empty
-// server_name extension is accepted as a harmless ack, while a non-empty one
-// (the server asserting a hostname we never chose) must be rejected.
+// test_parse_encrypted_extensions_server_name_ack checks that an empty
+// server_name is a harmless ack, a non-empty one is rejected (RFC 6066 §3).
 fn test_parse_encrypted_extensions_server_name_ack() ! {
 	// extensions vector (len 4) = server_name (0x0000) with zero-length data
 	empty := [u8(0x00), 0x04, 0x00, 0x00, 0x00, 0x00]
@@ -85,19 +84,17 @@ fn test_parse_encrypted_extensions_server_name_ack() ! {
 	}
 }
 
-// test_parse_encrypted_extensions_single_alpn pins the happy path of the
-// RFC 7301 §3.1 exactly-one rule: a well-formed ALPN extension selecting
-// "http/1.1" is returned verbatim.
+// test_parse_encrypted_extensions_single_alpn checks the RFC 7301 §3.1
+// exactly-one rule: a well-formed ALPN extension is returned verbatim.
 fn test_parse_encrypted_extensions_single_alpn() ! {
-	// ext_block(0x0f) = alpn(0x0010), data len 0x0b = u16 list len 0x09 ||
-	// [len 0x08]"http/1.1"
+	// ext_block(0x0f) = alpn(0x0010), list len 0x09 || [len 0x08]"http/1.1"
 	body := [u8(0x00), 0x0f, 0x00, 0x10, 0x00, 0x0b, 0x00, 0x09, 0x08, 0x68, 0x74, 0x74, 0x70,
 		0x2f, 0x31, 0x2e, 0x31]
 	assert parse_encrypted_extensions(body)! == 'http/1.1'
 }
 
-// test_parse_encrypted_extensions_rejects_empty_alpn: an ALPN extension with a
-// zero-length protocol list selects nothing, which RFC 7301 §3.1 forbids.
+// test_parse_encrypted_extensions_rejects_empty_alpn checks that a zero-length
+// protocol list selects nothing, which RFC 7301 §3.1 forbids.
 fn test_parse_encrypted_extensions_rejects_empty_alpn() ! {
 	body := [u8(0x00), 0x06, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00]
 	if _ := parse_encrypted_extensions(body) {
@@ -105,9 +102,8 @@ fn test_parse_encrypted_extensions_rejects_empty_alpn() ! {
 	}
 }
 
-// test_parse_encrypted_extensions_rejects_multi_alpn: RFC 7301 §3.1 says the
-// server picks exactly one protocol; a second entry must not be silently
-// dropped behind the first (it could dodge the offered-list check).
+// test_parse_encrypted_extensions_rejects_multi_alpn checks that a second
+// protocol entry is refused, not silently dropped (RFC 7301 §3.1).
 fn test_parse_encrypted_extensions_rejects_multi_alpn() ! {
 	// list(0x0c) = [2]"h2" [8]"http/1.1"
 	body := [u8(0x00), 0x12, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68,
@@ -117,10 +113,8 @@ fn test_parse_encrypted_extensions_rejects_multi_alpn() ! {
 	}
 }
 
-// test_parse_encrypted_extensions_rejects_renegotiation_info_content: the
-// interop tolerance still holds for the empty case, but a non-empty
-// renegotiated_connection asserts a renegotiation that never happened
-// (RFC 5746 §3.4) and is now rejected rather than discarded unseen.
+// test_parse_encrypted_extensions_rejects_renegotiation_info_content checks
+// that a non-empty renegotiated_connection is rejected (RFC 5746 §3.4).
 fn test_parse_encrypted_extensions_rejects_renegotiation_info_content() ! {
 	// renegotiation_info(0xff01), data len 4 = [len 3]"abc"
 	body := [u8(0x00), 0x08, 0xff, 0x01, 0x00, 0x04, 0x03, 0x61, 0x62, 0x63]
@@ -129,9 +123,8 @@ fn test_parse_encrypted_extensions_rejects_renegotiation_info_content() ! {
 	}
 }
 
-// test_parse_server_hello_rejects_unpermitted_extension feeds a well-formed
-// ServerHello body carrying supported_versions plus renegotiation_info — a
-// TLS 1.2-era extension §4.2 does not allow in ServerHello at all.
+// test_parse_server_hello_rejects_unpermitted_extension checks that
+// supported_versions plus renegotiation_info is refused in ServerHello (§4.2).
 fn test_parse_server_hello_rejects_unpermitted_extension() ! {
 	mut body := []u8{len: 0, cap: 64}
 	body << 0x03
@@ -158,14 +151,12 @@ fn test_parse_server_hello_rejects_unpermitted_extension() ! {
 	body << 0x01
 	body << 0x00
 	if _ := parse_server_hello(body) {
-		// then-branch = success; reaching it means the rejection did not happen
 		assert false // renegotiation_info in ServerHello must be rejected per §4.2
 	}
 }
 
-// test_parse_server_hello_rejects_trailing_key_share_bytes builds an HRR whose
-// key_share extension carries one byte past the 2-byte selected_group — §4.1.4
-// fixes that structure exactly, so the surplus must fail the decode.
+// test_parse_server_hello_rejects_trailing_key_share_bytes checks that one byte
+// past the selected_group is refused (§4.1.4).
 fn test_parse_server_hello_rejects_trailing_key_share_bytes() ! {
 	mut body := []u8{len: 0, cap: 64}
 	body << 0x03
@@ -198,7 +189,8 @@ fn test_parse_server_hello_rejects_trailing_key_share_bytes() ! {
 	}
 }
 
-// KeyUpdate codec tests: verify §4.6.3 wire bytes update_not_requested(0) / update_requested(1).
+// test_parse_key_update checks the §4.6.3 wire bytes: update_not_requested(0)
+// and update_requested(1) round-trip.
 fn test_parse_key_update() ! {
 	assert parse_key_update(build_key_update(true)[4..])! == true
 	assert parse_key_update(build_key_update(false)[4..])! == false
@@ -212,18 +204,17 @@ fn test_parse_key_update() ! {
 	}
 }
 
-// CertificateVerify codec tests (§4.4.3): body is scheme u16 + signature vector;
-// unknown schemes, empty signatures, and trailing bytes must all be refused.
+// test_parse_certificate_verify checks that a scheme plus signature vector
+// decodes, pinning the scheme mapping and the vector payload (§4.4.3).
 fn test_parse_certificate_verify() ! {
-	// ed25519 (0x0807) with a two-byte signature decodes cleanly, pinning both
-	// the scheme mapping and the vector payload.
 	cv := parse_certificate_verify([u8(0x08), 0x07, 0x00, 0x02, 0xaa, 0xbb])!
 	assert cv.algorithm == .ed25519
 	assert cv.signature == [u8(0xaa), 0xbb]
 }
 
+// test_parse_certificate_verify_rejects_unknown_scheme checks that a scheme
+// outside the supported list never reaches the verifier.
 fn test_parse_certificate_verify_rejects_unknown_scheme() ! {
-	// A code outside the client's supported list never reaches the verifier.
 	parse_certificate_verify([u8(0x08), 0x99, 0x00, 0x01, 0x00]) or {
 		assert err.msg().contains('unsupported signature scheme')
 		return
@@ -231,6 +222,8 @@ fn test_parse_certificate_verify_rejects_unknown_scheme() ! {
 	assert false
 }
 
+// test_parse_certificate_verify_rejects_empty_signature checks that a
+// zero-length signature vector is refused.
 fn test_parse_certificate_verify_rejects_empty_signature() ! {
 	parse_certificate_verify([u8(0x08), 0x07, 0x00, 0x00]) or {
 		assert err.msg().contains('empty signature')
@@ -239,9 +232,9 @@ fn test_parse_certificate_verify_rejects_empty_signature() ! {
 	assert false
 }
 
+// test_parse_certificate_verify_rejects_trailing_bytes checks that one octet
+// past the signature vector is rejected (§4.4.3).
 fn test_parse_certificate_verify_rejects_trailing_bytes() ! {
-	// §4.4.3 fixes the body shape; one octet past the signature vector means a
-	// desynced parse and must be rejected rather than silently absorbed.
 	parse_certificate_verify([u8(0x08), 0x07, 0x00, 0x01, 0x42, 0x00]) or {
 		assert err.msg().contains('trailing bytes in CertificateVerify')
 		return
@@ -275,8 +268,8 @@ fn test_client_hello_ip_literal_omits_sni() ! {
 	assert !full_ipv6.bytestr().contains('2001:db8::1')
 }
 
-// test_parse_certificate_rejects_non_empty_request_context pins RFC 8446 §4.4.2:
-// in the server Certificate message, certificate_request_context MUST be zero-length.
+// test_parse_certificate_rejects_non_empty_request_context checks that a
+// non-zero-length certificate_request_context is refused (RFC 8446 §4.4.2).
 fn test_parse_certificate_rejects_non_empty_request_context() ! {
 	// request_context of length 1 (value 0x01) followed by a 1-cert list
 	bad_cert_msg := [u8(0x01), 0xaa, 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0xde, 0xad, 0x00, 0x00]
@@ -299,10 +292,8 @@ fn test_parse_new_session_ticket_bounds() ! {
 	}
 }
 
-// test_parse_certificate_message_rejects_overlong_chain pins the parse-time depth
-// cap: a well-framed list of more than max_cert_chain_depth single-byte certs is
-// refused before the state machine ASN.1-parses each entry, closing the
-// amplification where a 1 MiB Certificate message packs thousands of tiny certs.
+// test_parse_certificate_message_rejects_overlong_chain checks the parse-time
+// depth cap: a chain longer than max_cert_chain_depth is refused.
 fn test_parse_certificate_message_rejects_overlong_chain() ! {
 	mut list := []u8{}
 	for _ in 0 .. 33 {
@@ -319,9 +310,8 @@ fn test_parse_certificate_message_rejects_overlong_chain() ! {
 	}
 }
 
-// test_parse_new_session_ticket_rejects_trailing_bytes checks the strict-framing
-// guard: a well-formed ticket with one stray byte past the extension block must
-// not be silently accepted.
+// test_parse_new_session_ticket_rejects_trailing_bytes checks that one stray
+// byte past the extension block is not silently accepted.
 fn test_parse_new_session_ticket_rejects_trailing_bytes() ! {
 	mut w := wire.new_writer(64)
 	w.write_u32(3600) // valid lifetime
@@ -338,6 +328,8 @@ fn test_parse_new_session_ticket_rejects_trailing_bytes() ! {
 	assert false
 }
 
+// test_certificate_verify_signed_content checks the §4.4.3 signed-content
+// layout: 64 spaces, the context string, a 0x00, and the transcript hash.
 fn test_certificate_verify_signed_content() {
 	th := [u8(0x01), 0x02, 0x03, 0x04]
 	content := certificate_verify_signed_content(th)
@@ -352,9 +344,8 @@ fn test_certificate_verify_signed_content() {
 	assert content[98..] == th
 }
 
-// test_parse_extensions_frames_each_type decodes a mixed extensions block and
-// checks framing survives intact: type, exact data slice, and order preserved;
-// an empty block yields an empty list rather than an error.
+// test_parse_extensions_frames_each_type checks that a mixed extensions block
+// decodes with type, exact data slice, and order preserved.
 fn test_parse_extensions_frames_each_type() ! {
 	// supported_versions(0x002b)=0304 followed by cookie(0x002c)=aabb
 	block := [u8(0x00), 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x2c, 0x00, 0x02, 0xaa, 0xbb]
@@ -369,9 +360,8 @@ fn test_parse_extensions_frames_each_type() ! {
 	assert empty.len == 0
 }
 
-// test_parse_extensions_rejects_duplicate pins RFC 8446 §4.2: a message with
-// two instances of the same extension type must be rejected outright — not
-// silently last-wins, which would let a duplicate overwrite a validated value.
+// test_parse_extensions_rejects_duplicate checks that two instances of one
+// extension type are rejected outright (RFC 8446 §4.2).
 fn test_parse_extensions_rejects_duplicate() ! {
 	dup := [u8(0x00), 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x05]
 	if _ := parse_extensions(dup) {
@@ -379,10 +369,9 @@ fn test_parse_extensions_rejects_duplicate() ! {
 	}
 }
 
+// test_parse_finished_requires_hash_length checks that a wrong-sized
+// verify_data body is a framing error (RFC 8446 §4.4.4).
 fn test_parse_finished_requires_hash_length() ! {
-	// §4.4.4 fixes verify_data at Hash.length: a wrong-sized body is a framing
-	// error pinned here, where it belongs, before a later comparison could
-	// misread it as a transcript mismatch.
 	good := parse_finished([]u8{len: 32}, 32)!
 	assert good.len == 32
 	parse_finished([]u8{len: 31}, 32) or {

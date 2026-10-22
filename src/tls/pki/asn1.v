@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// asn1.v is a minimal DER reader for the ASN.1 subset x509.v needs: tag/length/value
-// elements, object-identifier decoding, and integer payload extraction. It performs no
-// validation of the certificate semantics layered on top.
+// asn1.v is a minimal DER reader for the ASN.1 subset x509.v needs: tag/length/value,
+// object identifiers and integer payload extraction. It performs no certificate
+// semantics validation.
 module pki
 
 import tls.wire
@@ -14,9 +14,8 @@ struct Asn1Element {
 	data         []u8 // value octets; children for constructed, raw bytes for primitive
 }
 
-// read_asn1_element parses a single ASN.1 TLV (Tag-Length-Value). Only
-// definite-length encodings are supported, which DER mandates; bit 0x20 of the
-// tag marks a constructed value, and length uses the short or long form.
+// read_asn1_element parses a single ASN.1 TLV; only definite-length encodings
+// (DER) are supported. bit 0x20 marks constructed values; length uses short or long form.
 fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 	if r.remaining() < 2 {
 		return error('asn1: truncated element header')
@@ -34,8 +33,7 @@ fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 		// Long form: low 7 bits count the big-endian length octets that follow.
 		num_len_bytes := int(len_byte & 0x7f)
 		if num_len_bytes == 0 || num_len_bytes > 4 {
-			// 0 is reserved (indefinite length, illegal in DER); >4 would overflow
-			// the u32 accumulator, and no real certificate needs it.
+			// 0 is reserved (indefinite length, illegal in DER); >4 would overflow u32 and is not needed.
 			return error('asn1: invalid or unsupported length octets (${num_len_bytes})')
 		}
 		if r.remaining() < num_len_bytes {
@@ -49,10 +47,7 @@ fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 			}
 			length = (length << 8) | u32(b)
 		}
-		// DER mandates the minimal length encoding (X.690 §10.1): a long form is
-		// only legal when the value is ≥ 0x80 and carries no leading zero octets.
-		// Accepting non-minimal forms lets one byte stream parse two ways, which
-		// is the classic signature/separation forgery channel.
+		// DER mandates minimal length encoding (X.690 §10.1): long form is only legal when the value is ≥ 0x80 and carries no leading zero octet.
 		if first_len_byte == 0 {
 			return error('asn1: non-minimal DER length (leading zero octet)')
 		}
@@ -85,14 +80,12 @@ fn parse_sequence(data []u8) ![]Asn1Element {
 }
 
 // parse_oid decodes an ASN.1 object identifier into canonical dotted-decimal
-// form, giving a stable key for the string matches in x509/validator. The first
-// subidentifier packs the first two arcs as (arc1 * 40 + arc2); like every other
-// subidentifier it is a base-128 varint and may span several bytes (RFC 5280 §A.1).
+// form (RFC 5280 §A.1). The first subidentifier packs arcs 1 and 2 as (arc1*40+arc2).
 fn parse_oid(data []u8) string {
 	if data.len == 0 {
 		return ''
 	}
-	// The final byte of an ASN.1 OID must have bit 7 clear (indicating termination)
+	// The final byte of an ASN.1 OID must have bit 7 clear.
 	if (data[data.len - 1] & 0x80) != 0 {
 		return ''
 	}

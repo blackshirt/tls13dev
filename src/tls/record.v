@@ -1,11 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// record.v frames and (re)assembles plaintext and protected records of the TLS 1.3
-// record layer (RFC 8446 §5), and cipher_state.v carries per-direction AEAD
-// sequence state across the handshake-to-application key transition. The
-// recordless QUIC CRYPTO-stream reassembly (RFC 9001 §4) lives in tls.handshake's passthrough
-// framing; this module keeps only the ContentType-tagged record plumbing the
-// TLS transport owns.
+// record.v frames and (re)assembles the TLS 1.3 record layer (RFC 8446 §5),
+// while cipher_state.v carries per-direction AEAD sequence state across the
+// handshake-to-application key transition. The recordless QUIC CRYPTO-stream
+// reassembly (RFC 9001 §4) lives in tls.handshake's passthrough framing.
 module tls
 
 import tls.wire
@@ -31,14 +29,12 @@ fn content_type_from_u8(b u8) !ContentType {
 	}
 }
 
-// Legacy record version mandated by RFC 8446 §5.1 for middlebox compatibility.
-// TLS 1.3 always writes 0x0303 (TLS 1.2) in the record header; the real version
-// lives inside the handshake.
+// Legacy record version mandated by RFC 8446 §5.1 for middlebox compatibility;
+// TLS 1.3 always writes 0x0303 (TLS 1.2) in the record header.
 const legacy_record_version = u16(0x0303) // TLS 1.2
 
-// Wire-size limits for a single record (RFC 8446 §5.2). A plaintext record
-// carries at most 2^14 bytes; a ciphertext record may be larger by the inner
-// content type byte, the AEAD tag, and any padding.
+// Wire-size limits for a single record (RFC 8446 §5.2): a plaintext record carries
+// at most 2^14 bytes, a ciphertext record more by inner type byte, tag and padding.
 const record_header_len = 5
 const max_plaintext_record_len = 16384 // 2^14 bytes
 const max_record_overhead = 256 // inner type byte + AEAD tag + padding (§5.2)
@@ -67,11 +63,8 @@ fn change_cipher_spec() Record {
 	return new_record(.change_cipher_spec, [u8(0x01)])
 }
 
-// serialize_into appends the record's wire form —
-// [1 byte ContentType] [2 bytes Legacy Version] [2 bytes Length] [Payload] —
-// directly onto the end of `out`. It is the single encoding used by all
-// senders; callers batching several records append through it instead of
-// allocating and cloning one owned buffer per record via serialize().
+// serialize_into appends the record's wire form — [1 byte ContentType] [2 bytes
+// Legacy Version] [2 bytes Length] [Payload] — onto the end of `out`.
 fn (r &Record) serialize_into(mut out []u8) {
 	out << u8(r.content_type)
 	out << u8((r.legacy_version >> 8) & 0xff)
@@ -81,9 +74,8 @@ fn (r &Record) serialize_into(mut out []u8) {
 	out << r.payload
 }
 
-// serialize encodes the record into its own wire-format byte slice; the length
-// is cast without a re-check because every caller bounds the payload by
-// construction, so an oversized payload would be a bug above, not input.
+// serialize encodes the record into its own wire-format byte slice; the length is
+// cast without a re-check because every caller bounds the payload by construction.
 fn (r &Record) serialize() []u8 {
 	mut buf := []u8{cap: record_header_len + r.payload.len}
 	r.serialize_into(mut buf)
@@ -91,18 +83,14 @@ fn (r &Record) serialize() []u8 {
 }
 
 // parse_record reads a single TLS record: a 5-byte header (content type, legacy
-// version, payload length) followed by `length` payload bytes. It rejects
-// undersized buffers and oversized length fields (RFC 8446 §5.2).
+// version, payload length) followed by `length` payload bytes (RFC 8446 §5.2).
 fn parse_record(mut r wire.Reader) !Record {
 	if r.remaining() < record_header_len {
 		return error('record: buffer too short for TLS record header (${r.remaining()} < ${record_header_len})')
 	}
 	raw_type := r.read_u8()!
 	content_type := content_type_from_u8(raw_type)!
-	// The version is stored but deliberately not validated: RFC 8446 §5.1 says
-	// the record-layer version is meaningless (compatibility records may show
-	// 0x0301). The real version gate is parse_server_hello requiring
-	// supported_versions = 0x0304, which also catches 1.2 downgrade attempts.
+	// The version is stored but not validated: RFC 8446 §5.1 says it is meaningless.
 	version := r.read_u16()!
 	length := int(r.read_u16()!)
 

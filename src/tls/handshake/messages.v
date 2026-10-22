@@ -2,7 +2,7 @@
 //
 // messages.v encodes and decodes the RFC 8446 §4 handshake structures — ClientHello,
 // ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished and the
-// extension blocks — relying on the wire reader/writer for the framing arithmetic.
+// extension blocks — using the wire reader/writer for framing arithmetic.
 module handshake
 
 import crypto.rand
@@ -21,8 +21,7 @@ pub enum HandshakeType as u8 {
 	certificate_verify   = 15
 	finished             = 20
 	key_update           = 24
-	// Synthetic type that never appears on the wire: after a HelloRetryRequest,
-	// ClientHello1 is replaced by a message_hash in the transcript (RFC 8446 §4.4.1).
+	// Synthetic: after a HelloRetryRequest, ClientHello1 becomes a message_hash (RFC 8446 §4.4.1).
 	message_hash         = 254
 }
 
@@ -45,10 +44,9 @@ fn handshake_type_from_u8(b u8) !HandshakeType {
 }
 
 // ExtensionType represents TLS 1.3 extension codes (RFC 8446 §4.2), assigned by
-// the IANA TLS ExtensionType Registry and matched byte-for-byte on the wire.
+// the IANA TLS ExtensionType Registry.
 enum ExtensionType as u16 {
-	// server_name rides in the ClientHello as SNI and may be echoed empty in
-	// EncryptedExtensions as the server's acknowledgment (RFC 6066 §3).
+	// server_name carries SNI in ClientHello, echoed empty in EncryptedExtensions (RFC 6066 §3).
 	server_name          = 0
 	supported_groups     = 10
 	signature_algorithms = 13
@@ -56,13 +54,12 @@ enum ExtensionType as u16 {
 	supported_versions   = 43
 	cookie               = 44
 	key_share            = 51
-	// RFC 5746 §4.1, not an RFC 8446 extension: TLS 1.3 servers carry it in
-	// EncryptedExtensions even when unoffered (see parse_encrypted_extensions).
+	// RFC 5746 §4.1, not an RFC 8446 extension: TLS 1.3 servers carry it in EncryptedExtensions even when unoffered.
 	renegotiation_info   = 65281 // 0xff01
 }
 
-// NamedGroup defines key exchange groups (RFC 8446 §4.2.7), from the IANA
-// Supported Groups registry; only the two mandatory ECDHE groups are supported.
+// NamedGroup defines key exchange groups (RFC 8446 §4.2.7); only the two mandatory
+// ECDHE groups are supported.
 enum NamedGroup as u16 {
 	secp256r1 = 0x0017
 	x25519    = 0x001d
@@ -86,12 +83,8 @@ pub enum CipherSuite as u16 {
 	tls_chacha20_poly1305_sha256 = 0x1303
 }
 
-// default_cipher_suites returns the suite list offered when the caller does not
-// configure one (all TLS 1.3 AEAD suites we implement). Servers that honor the
-// client's order take the first suite they support, so this list is our
-// performance preference: ChaCha20-Poly1305 leads because the AEAD backend is
-// software-only, where ChaCha reliably outruns AES-GCM; revisit the order if a
-// hardware-AES (AES-NI/OpenSSL) backend is ever introduced.
+// default_cipher_suites returns the suite list offered when the caller configures none.
+// ChaCha20-Poly1305 leads because the AEAD backend is software-only.
 fn default_cipher_suites() []CipherSuite {
 	return [
 		CipherSuite.tls_chacha20_poly1305_sha256,
@@ -127,8 +120,7 @@ fn signature_scheme_from_u16(raw u16) !SignatureScheme {
 // client_hello_random_len is the fixed ClientHello.random size (RFC 8446 §4.1.2).
 const client_hello_random_len = 32
 
-// legacy_session_id_len is the 32-byte legacy session id used for middlebox
-// compatibility (RFC 8446 App. D.4).
+// legacy_session_id_len is the 32-byte legacy session id for middlebox compatibility (RFC 8446 App. D.4).
 const legacy_session_id_len = 32
 
 // KeyShareEntry holds a group and public key share (RFC 8446 §4.2.8).
@@ -138,27 +130,22 @@ mut:
 	key_exchange []u8       // X25519 32-byte share, or P-256 uncompressed point (0x04 || X || Y)
 }
 
-// HelloRetryRequest sentinel random string (RFC 8446 §4.1.3).
-// HRR is syntactically a ServerHello (same msg_type 2) and is identified only
-// by this fixed random value, so the message type alone cannot distinguish them.
+// hello_retry_request_random is the HRR sentinel random (RFC 8446 §4.1.3); an HRR is
+// a ServerHello, so only this fixed value tells them apart.
 const hello_retry_request_random = [u8(0xcf), 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d,
 	0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e,
 	0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c]
 
-// ServerHello holds the parsed ServerHello/HelloRetryRequest fields the client
-// acts on. Extension extraction obeys the §4.2 placement allowlist; semantic
-// checks live on the type itself (validate); key-schedule effects are the state
-// machine's job.
+// ServerHello holds the parsed ServerHello/HelloRetryRequest fields the client acts on.
+// Extension extraction obeys the §4.2 placement allowlist; semantic checks live on validate.
 struct ServerHello {
 mut:
 	session_id_echo []u8          // legacy_session_id echoed from the ClientHello (middlebox compatibility)
 	cipher_suite    CipherSuite   // suite selected by the server
 	server_share    KeyShareEntry // server's ECDHE public share
-	// is_hello_retry_req is set solely by the §4.1.3 sentinel-random comparison;
-	// an HRR parses into this same struct because the wire layout is identical.
+	// is_hello_retry_req is set solely by the §4.1.3 sentinel-random comparison; an HRR parses into this struct.
 	is_hello_retry_req bool
-	// has_key_share reports whether a key_share extension was present. For an HRR
-	// it distinguishes a group-change request from a cookie-only request.
+	// has_key_share reports whether a key_share was present; for an HRR it separates a group change from a cookie-only request.
 	has_key_share bool
 	// cookie holds the cookie value from a HelloRetryRequest, empty otherwise.
 	cookie []u8
@@ -181,10 +168,8 @@ fn wrap_handshake_message(typ HandshakeType, body []u8) []u8 {
 	return w.bytes()
 }
 
-// write_extension appends a TLS extension: 2-byte type followed by the
-// 2-byte-length-prefixed data. It does not de-duplicate — build_client_hello
-// writes each extension at most once, and §4.2 forbids repeats (the parser
-// enforces that).
+// write_extension appends a 2-byte extension type plus 2-byte-length-prefixed data.
+// It does not de-duplicate: §4.2 forbids repeats and the parser enforces that.
 fn write_extension(mut w wire.Writer, typ ExtensionType, data []u8) ! {
 	w.write_u16(u16(typ))
 	w.write_vector_u16(data)!
@@ -199,18 +184,15 @@ fn named_group_from_u16(raw u16) !NamedGroup {
 	}
 }
 
-// WireExtension is a raw type/value pair from an extensions block (RFC 8446 §4.2).
-// The value stays undecoded: interpretation differs per message and call site.
+// WireExtension is a raw, undecoded type/value pair from an extensions block (RFC 8446 §4.2).
 struct WireExtension {
 mut:
 	typ  u16
 	data []u8 // extension_data, already length-bounded by the framing read
 }
 
-// parse_extensions decodes an extensions block: repeated
-// [u16 extension_type][u16 length][extension_data]. A duplicated extension type
-// is rejected, since §4.2 forbids repeats and a later instance could otherwise
-// overwrite a validated value. Unknown types are returned verbatim.
+// parse_extensions decodes an extensions block of [u16 type][u16 length][data].
+// Duplicate types are rejected: §4.2 forbids repeats. Unknown types are returned verbatim.
 fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	mut r := wire.new_reader(ext_bytes)
 	mut out := []WireExtension{}
@@ -232,10 +214,8 @@ fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	return out
 }
 
-// parse_handshake_header reads the 4-byte header from a reader. Pub so the
-// TCP adapter can dispatch post-handshake messages through the same
-// framing the core uses; the bytes it reads are handshake-message framing,
-// which both transports share.
+// parse_handshake_header reads the 4-byte handshake header from a reader.
+// Pub so adapters can dispatch post-handshake messages through the core's framing.
 pub fn parse_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
 	if r.remaining() < 4 {
 		return error('handshake: message header truncated')
@@ -255,11 +235,9 @@ mut:
 	alpn []string
 	// client_share is the single key_share offered (§4.2.8).
 	client_share KeyShareEntry
-	// session_id is echoed across HelloRetryRequest; generated if empty (the
-	// state machine pins the generated value back into config for §4.1.4 reuse).
+	// session_id is echoed across HelloRetryRequest; generated if empty and pinned back for §4.1.4 reuse.
 	session_id []u8
-	// random is the ClientHello.random; generated (and pinned into config) if
-	// empty — an explicit value exists solely to replay RFC test vectors.
+	// random is the ClientHello.random, generated if empty; an explicit value replays RFC test vectors.
 	random []u8
 	// cookie is echoed from HelloRetryRequest when present.
 	cookie []u8
@@ -276,17 +254,14 @@ fn offered_cipher_suites(cfg &ClientHelloConfig) []CipherSuite {
 	return default_cipher_suites()
 }
 
-// validate performs the ServerHello/HelloRetryRequest checks that do not depend
-// on the message variant (RFC 8446 §4.1.3): the echoed legacy session ID must
-// match the ClientHello, and the selected cipher suite must have been offered.
+// validate performs the ServerHello/HelloRetryRequest checks independent of the message
+// variant (RFC 8446 §4.1.3): the echoed session id must match and the suite must be offered.
 fn (sh ServerHello) validate(cfg &ClientHelloConfig) ! {
-	// A session-id mismatch means the hello we answer is not the one we sent — a
-	// renegotiation/off-path injection signal (illegal_parameter).
+	// A session-id mismatch means the hello we answer is not the one we sent (illegal_parameter).
 	if sh.session_id_echo != cfg.session_id {
 		return error('handshake: legacy_session_id_echo does not match ClientHello (illegal_parameter)')
 	}
-	// The server must pick a suite we offered; an unoffered choice would let an
-	// attacker downgrade us to a suite the state machine never configured.
+	// An unoffered suite would let an attacker downgrade us to one the state machine never configured.
 	if !sh.is_offered_cipher_suite(cfg) {
 		return error('handshake: server selected unoffered cipher suite ${sh.cipher_suite} (illegal_parameter)')
 	}
@@ -308,14 +283,10 @@ fn (sh ServerHello) is_offered_cipher_suite(cfg &ClientHelloConfig) bool {
 fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	mut body := wire.new_writer(512)
 
-	// Legacy version 0x0303 (TLS 1.2): TLS 1.3 pins this field so version-sensitive
-	// middleboxes keep parsing; the real version is negotiated via the
-	// supported_versions extension (§4.2.1).
+	// Legacy version 0x0303 (TLS 1.2) pinned for middleboxes; the real version comes from supported_versions (§4.2.1).
 	body.write_u16(0x0303)
 
-	// Random: an explicit cfg.random replays RFC test vectors byte-for-byte; real
-	// handshakes leave it empty so the state machine pre-generates and pins the
-	// value for HRR reuse (§4.1.4).
+	// An explicit cfg.random replays RFC test vectors; real handshakes leave it empty (§4.1.4).
 	random_bytes := if cfg.random.len == client_hello_random_len {
 		cfg.random.clone()
 	} else {
@@ -323,8 +294,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	}
 	body.write_bytes(random_bytes)
 
-	// Legacy session id for middlebox compatibility (App. D.4); its only real
-	// job is to be echoed in ServerHello for the legacy_session_id_echo check.
+	// Legacy session id for middlebox compatibility (App. D.4); echoed in ServerHello for the legacy_session_id_echo check.
 	session_id := if cfg.session_id.len > 0 {
 		cfg.session_id.clone()
 	} else {
@@ -332,7 +302,6 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	}
 	body.write_vector_u8(session_id)!
 
-	// Cipher Suites
 	suites := if cfg.cipher_suites.len > 0 {
 		cfg.cipher_suites.clone()
 	} else {
@@ -347,14 +316,12 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	// Legacy compression methods: clients must offer only the null method (§4.2).
 	body.write_vector_u8([u8(0x00)])!
 
-	// Extensions
 	mut ext_writer := wire.new_writer(256)
 
 	// server_name (SNI, RFC 6066 §3): literal IP addresses are forbidden.
 	if cfg.server_name.len > 0 && !pki.is_ip_literal(cfg.server_name) {
 		mut sni_w := wire.new_writer(cfg.server_name.len + 5)
-		// Two nested u16 vectors per RFC 6066 §3: ServerNameList and, inside it,
-		// the per-entry host_name length.
+		// Two nested u16 vectors per RFC 6066 §3: ServerNameList and the host_name length.
 		mut snl_w := wire.new_writer(cfg.server_name.len + 3)
 		snl_w.write_u8(0x00) // HostName type
 		snl_w.write_vector_u16(cfg.server_name.bytes())!
@@ -402,8 +369,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		write_extension(mut ext_writer, .signature_algorithms, sa_w.bytes())!
 	}
 
-	// key_share (RFC 8446 §4.2.8): client_shares is a u16 vector of entries, each
-	// a group (u16) plus a u16-length-prefixed key_exchange.
+	// key_share (RFC 8446 §4.2.8): a u16 vector of group (u16) plus u16-length-prefixed key_exchange entries.
 	{
 		mut ks_w := wire.new_writer(cfg.client_share.key_exchange.len + 6)
 		mut entry_w := wire.new_writer(cfg.client_share.key_exchange.len + 4)
@@ -441,15 +407,11 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 }
 
 // parse_server_hello decodes a ServerHello message body (RFC 8446 §4.1.3).
-// Enforces the §4.2 extension placement rules: only supported_versions,
-// key_share, and (HelloRetryRequest only) cookie may appear; anything else
-// aborts instead of silently steering client state.
+// §4.2 placement rules: only supported_versions, key_share and (HRR only) cookie may appear.
 fn parse_server_hello(body []u8) !ServerHello {
-	// The body follows §4.1.3's fixed field order; each read advances the cursor,
-	// so any reordering or length mismatch desyncs the rest and is caught here.
+	// The body follows §4.1.3's fixed field order; a length mismatch desyncs the rest and is caught here.
 	mut r := wire.new_reader(body)
-	// legacy_version is pinned to 0x0303 (TLS 1.2); the real version is in
-	// supported_versions and is confirmed below (§4.2.1).
+	// legacy_version is pinned to 0x0303 (TLS 1.2); the real version is in supported_versions (§4.2.1).
 	legacy_version := r.read_u16()!
 	if legacy_version != 0x0303 {
 		return error('handshake: ServerHello legacy_version must be 0x0303, got 0x${legacy_version:04x}')
@@ -458,8 +420,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 	random := r.read_bytes(client_hello_random_len)!
 	// legacy_session_id_echo: must echo our ClientHello's session id (checked in validate).
 	session_id_echo := r.read_vector_u8()!
-	// cipher_suite: exactly one 2-byte suite, and it must be one we offered
-	// (checked in validate); cipher_suite_from_u16 rejects non-TLS-1.3 codes.
+	// cipher_suite: exactly one 2-byte suite, and one we offered (checked in validate).
 	cs_raw := r.read_u16()!
 	cipher_suite := cipher_suite_from_u16(cs_raw)!
 	// legacy_compression_method: TLS 1.3 fixes this to the null method (0).
@@ -468,7 +429,6 @@ fn parse_server_hello(body []u8) !ServerHello {
 		return error('handshake: compression method must be 0, got ${compression}')
 	}
 
-	// Extensions
 	ext_bytes := r.read_vector_u16()!
 
 	mut selected_version := u16(0)
@@ -483,8 +443,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 
 		match ext.typ {
 			u16(ExtensionType.supported_versions) {
-				// In ServerHello this extension is a bare u16 version, not a
-				// length-prefixed vector as in ClientHello (§4.2.1).
+				// A bare u16 version here, not a length-prefixed vector as in ClientHello (§4.2.1).
 				selected_version = data_r.read_u16()!
 				if data_r.remaining() != 0 {
 					return error('handshake: trailing bytes in supported_versions extension')
@@ -520,8 +479,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 				if !is_hrr {
 					return error('handshake: cookie extension in a normal ServerHello (unsupported_extension)')
 				}
-				// data_r already wraps this extension's bytes; reuse it rather than
-				// opening a second reader over the same input.
+				// data_r already wraps this extension's bytes; reuse it.
 				cookie = data_r.read_vector_u16()!
 				if cookie.len == 0 {
 					return error('handshake: HelloRetryRequest cookie must be non-empty')
@@ -531,15 +489,13 @@ fn parse_server_hello(body []u8) !ServerHello {
 				}
 			}
 			else {
-				// The allowlist is the §4.2 one; TLS 1.2 leftovers or unoffered
-				// extensions must never reach client state.
+				// The §4.2 allowlist: TLS 1.2 leftovers must never reach client state.
 				return error('handshake: extension 0x${ext.typ:04x} not permitted in ServerHello (unsupported_extension)')
 			}
 		}
 	}
 
-	// TLS 1.3 hides its real version behind legacy_version=0x0303, so the
-	// negotiated version MUST be confirmed via supported_versions = 0x0304.
+	// The negotiated version MUST be confirmed via supported_versions = 0x0304.
 	if selected_version != 0x0304 {
 		return error('handshake: ServerHello negotiated version must be 0x0304 (TLS 1.3), got 0x${selected_version:04x}')
 	}
@@ -555,13 +511,11 @@ fn parse_server_hello(body []u8) !ServerHello {
 }
 
 // parse_certificate_message decodes the Certificate message body (RFC 8446 §4.4.2)
-// and returns the DER-encoded certificate chain. It is distinct from
-// pki.parse_certificate, which decodes a single X.509 DER certificate.
+// and returns the DER-encoded chain; pki.parse_certificate decodes a single certificate.
 fn parse_certificate_message(body []u8) ![][]u8 {
 	mut r := wire.new_reader(body)
 	req_ctx := r.read_vector_u8()!
-	// §4.4.2: in a server Certificate, certificate_request_context SHALL be zero
-	// length; a nonzero value is illegal_parameter.
+	// §4.4.2: a server Certificate's certificate_request_context SHALL be zero length.
 	if req_ctx.len > 0 {
 		return error('handshake: non-empty certificate_request_context in server Certificate (illegal_parameter)')
 	}
@@ -571,16 +525,13 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 	mut cert_r := wire.new_reader(cert_list_bytes)
 	mut certs := [][]u8{}
 	for cert_r.remaining() > 0 {
-		// Reject an over-long chain here, before the state machine ASN.1-parses
-		// every entry: the list is bounded only by the 1 MiB message cap, so a
-		// peer could otherwise pack thousands of tiny entries and force thousands
-		// of parse_certificate calls before the depth limit is ever consulted.
+		// Reject an over-long chain before every entry is ASN.1-parsed, so a peer cannot pack thousands of tiny entries.
 		if certs.len >= pki.max_cert_chain_depth {
 			return error('handshake: certificate chain exceeds maximum depth ${pki.max_cert_chain_depth} (illegal_parameter)')
 		}
 		cert_data := cert_r.read_vector_u24()!
 		_ := cert_r.read_vector_u16()! // per-cert extensions (status_request etc.):
-		// ignored, this client uses no optional cert features.
+		// ignored by this client, which uses no optional cert features.
 		certs << cert_data
 	}
 
@@ -611,15 +562,8 @@ fn parse_certificate_verify(body []u8) !ParsedCertificateVerify {
 	}
 }
 
-// certificate_verify_signed_content constructs the exact bytes signed in
-// CertificateVerify (RFC 8446 §4.4.3):
-//
-//	content = 0x20 * 64 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash
-//
-// The 64 leading space octets fill one hash block so the signed data does not
-// start with attacker-controlled content, and the context string
-// domain-separates CertificateVerify from Finished so a signature valid for one
-// purpose can never be replayed as the other.
+// certificate_verify_signed_content constructs the bytes signed in CertificateVerify
+// (RFC 8446 §4.4.3): 0x20 * 64 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash.
 fn certificate_verify_signed_content(transcript_hash []u8) []u8 {
 	context_string := 'TLS 1.3, server CertificateVerify'.bytes()
 	mut out := []u8{cap: 64 + context_string.len + 1 + transcript_hash.len}
@@ -633,10 +577,7 @@ fn certificate_verify_signed_content(transcript_hash []u8) []u8 {
 }
 
 // parse_finished reads the verify_data from a Finished message (RFC 8446 §4.4.4).
-// The body is exactly verify_data with no length prefix or other fields; its
-// length is fixed at Hash.length, so a wrong-sized body fails here as a framing
-// problem rather than surfacing later as a verify_data mismatch that would
-// blame the transcript instead of the encoding.
+// The body is exactly verify_data, so its length is fixed at Hash.length.
 fn parse_finished(body []u8, hash_len int) ![]u8 {
 	if body.len != hash_len {
 		return error('handshake: Finished verify_data is ${body.len} bytes, expected ${hash_len} (Hash.length, RFC 8446 §4.4.4)')
@@ -649,23 +590,14 @@ fn build_finished(verify_data []u8) []u8 {
 	return wrap_handshake_message(.finished, verify_data)
 }
 
-// CertificateRequest is the outcome of decoding a server CertificateRequest
-// (RFC 8446 §4.3.2). This client holds no certificate, so the fields exist to
-// validate the message's structure (and to prove we understood it) rather than
-// to select a credential; only the request context must be echoed verbatim. The
-// type and its fields are module-private: it never reaches the public surface.
+// CertificateRequest is the decoded form of a server CertificateRequest (RFC 8446 §4.3.2);
+// this client holds no certificate, so only the request context must be echoed verbatim.
 struct CertificateRequest {
 	request_context []u8 // echoed verbatim in the responding Certificate (§4.4.2)
 }
 
-// parse_certificate_request decodes the CertificateRequest body (RFC 8446
-// §4.3.2): certificate_request_context<0..2^8-1> plus the extensions block.
-// The extensions (signature_algorithms, certificate_authorities, ...) constrain
-// a client credential we do not have, so their content is not interpreted here,
-// but the block itself must be well-formed and bounded — a malformed or
-// oversized request is a decode error, never silently ignored. §4.3.2 also
-// requires signature_algorithms to be present in TLS 1.3; the caller enforces
-// that, since only it knows the whole negotiated context.
+// parse_certificate_request decodes the CertificateRequest body (RFC 8446 §4.3.2).
+// The extensions must be well-formed and bounded; their content is not interpreted here.
 fn parse_certificate_request(body []u8) !CertificateRequest {
 	mut r := wire.new_reader(body)
 	request_context := r.read_vector_u8()!
@@ -679,11 +611,8 @@ fn parse_certificate_request(body []u8) !CertificateRequest {
 	}
 }
 
-// build_empty_certificate creates a Certificate message with no certificates
-// (RFC 8446 §4.4.2), the legal response of a client that holds no credential
-// after the server sent a CertificateRequest. The certificate_list is a u24
-// length of zero and the certificate_request_context echoes the request's own
-// context verbatim (§4.4.2 requires the exact bytes back).
+// build_empty_certificate creates an empty Certificate message (RFC 8446 §4.4.2),
+// echoing the request context verbatim and framing certificate_list as u24 zero.
 fn build_empty_certificate(request_context []u8) []u8 {
 	mut body := []u8{}
 	body << u8(request_context.len)
@@ -693,12 +622,7 @@ fn build_empty_certificate(request_context []u8) []u8 {
 }
 
 // parse_encrypted_extensions decodes EncryptedExtensions (RFC 8446 §4.3.1) and
-// returns the negotiated ALPN protocol (empty when none). Per §4.3.1 only
-// client-offered extensions belong here; the tolerated echoes are the empty
-// server_name SNI acknowledgment (RFC 6066 §3), the redundant supported_groups
-// list, and RFC 5746 renegotiation_info (see the loop). Whether ALPN was
-// actually offered is the caller's check — only the state machine knows the
-// config.
+// returns the negotiated ALPN protocol (empty when none); only client-offered extensions belong here.
 fn parse_encrypted_extensions(body []u8) !string {
 	mut r := wire.new_reader(body)
 	ext_bytes := r.read_vector_u16()!
@@ -719,31 +643,19 @@ fn parse_encrypted_extensions(body []u8) !string {
 			}
 			alpn = pl_r.read_vector_u8()!.bytestr()
 			if pl_r.remaining() != 0 {
-				// RFC 7301 §3.1: the server picks exactly one protocol; a second
-				// entry could hide behind the first and dodge the offered-list check.
+				// RFC 7301 §3.1: exactly one protocol; a second would dodge the offered-list check.
 				return error('handshake: ALPN extension carried more than one protocol')
 			}
 		} else if ext.typ == u16(ExtensionType.server_name) {
-			// RFC 8446 §4.2 registers server_name for EncryptedExtensions as the SNI
-			// acknowledgment of RFC 6066 §3: a server that accepted our hostname
-			// echoes an EMPTY server_name extension. The ack asserts nothing, so
-			// require empty extension_data — a non-empty value would have the server
-			// asserting a name we never chose.
+			// RFC 8446 §4.2 / RFC 6066 §3: the SNI acknowledgment is an EMPTY server_name extension.
 			if ext.data.len != 0 {
 				return error('handshake: server sent a non-empty server_name in EncryptedExtensions')
 			}
 		} else if ext.typ == u16(ExtensionType.supported_groups) {
-			// Interop carve-out: §4.2 registers supported_groups as ClientHello-only,
-			// yet some servers still echo it here. It was offered (§4.3.1's real
-			// requirement) and the negotiated group is already pinned by the
-			// ServerHello key_share, so the echo carries no authority — ignore it
-			// rather than aborting an otherwise valid handshake.
+			// Interop carve-out: §4.2 makes supported_groups ClientHello-only, but some servers echo it; it carries no authority.
 			continue
 		} else if ext.typ == u16(ExtensionType.renegotiation_info) {
-			// Interop carve-out (see the enum member): OpenSSL sends this unoffered,
-			// so it must not be rejected. RFC 5746 §3.4 fixes its TLS 1.3 content to
-			// the empty renegotiated_connection case; a non-empty value asserts a
-			// renegotiation this single-shot client never performed.
+			// Interop carve-out: OpenSSL sends this unoffered; RFC 5746 §3.4 fixes the content to an empty renegotiated_connection.
 			mut ri_r := wire.new_reader(ext.data)
 			if ri_r.remaining() > 0 {
 				renegotiated := ri_r.read_vector_u8()!
@@ -763,11 +675,8 @@ fn parse_encrypted_extensions(body []u8) !string {
 	return alpn
 }
 
-// parse_key_update decodes a KeyUpdate body (RFC 8446 §4.6.3) and reports
-// whether the sender requested that we also update our keys.
-// Wire enum: update_not_requested(0), update_requested(1). Pub so the TCP
-// adapter can parse the post-handshake message its transport decrypted; the
-// ratchet itself is the core's (update_read/write_traffic_keys).
+// parse_key_update decodes a KeyUpdate body (RFC 8446 §4.6.3) and reports whether
+// the sender requested that we also update our keys.
 pub fn parse_key_update(body []u8) !bool {
 	if body.len != 1 {
 		return error('handshake: KeyUpdate body must be 1 byte')
@@ -779,19 +688,14 @@ pub fn parse_key_update(body []u8) !bool {
 }
 
 // build_key_update creates a KeyUpdate handshake message carrying the §4.6.3
-// request_update byte (1 = update_requested, 0 = update_not_requested). Pub for
-// the same reason as parse_key_update: sending the notice is adapter policy,
-// the message body is shared codec.
+// request_update byte (1 = update_requested, 0 = update_not_requested).
 pub fn build_key_update(request_update bool) []u8 {
 	val := if request_update { u8(1) } else { u8(0) }
 	return wrap_handshake_message(.key_update, [val])
 }
 
-// NewSessionTicket holds a parsed NewSessionTicket (RFC 8446 §4.6.1). Its fields
-// are module-private: ticket handling is deliberate adapter/upper-layer policy
-// and the internals are not part of the public surface. Adapters reach the
-// values through the read-only accessors below. @[noinit] ensures a ticket can
-// only come from the parser, never from a fabricated empty literal.
+// NewSessionTicket holds a parsed NewSessionTicket (RFC 8446 §4.6.1); its fields are
+// module-private and reachable only through the accessors below.
 @[noinit]
 pub struct NewSessionTicket {
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
@@ -815,15 +719,12 @@ fn (t &NewSessionTicket) nonce() []u8 {
 	return t.ticket_nonce
 }
 
-// bytes returns the opaque ticket (the resumption token) so a caller can store
-// it for a future ClientHello.
+// bytes returns the opaque ticket (the resumption token) to store for a future ClientHello.
 pub fn (t &NewSessionTicket) bytes() []u8 {
 	return t.ticket
 }
 
-// parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1).
-// Pub so the TCP adapter can collect tickets; whether to keep them at all
-// is adapter policy — resumption itself stays unimplemented, and ticket
+// parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1); ticket
 // storage belongs to the stack above this core (RFC 9001 §4.5).
 pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	mut r := wire.new_reader(body)
@@ -841,8 +742,7 @@ pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	_ := r.read_vector_u16()! // extensions (max_early_data, …): unused while
 	// resumption is unimplemented (see Conn.session_tickets on the tls side)
 	if r.remaining() != 0 {
-		// Strict framing like every other parser: leftover bytes mean the ticket
-		// was misframed or carries data past the extension block.
+		// Strict framing: leftover bytes mean the ticket was misframed.
 		return error('handshake: trailing bytes in NewSessionTicket (decode_error)')
 	}
 	return NewSessionTicket{

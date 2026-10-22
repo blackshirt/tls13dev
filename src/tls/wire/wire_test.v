@@ -1,8 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Wire codec tests: big-endian primitives and length-prefixed vectors must read
-// back exactly what was written, and truncated reads must fail with the bounds
-// error instead of indexing past the buffer.
+// Wire codec tests: primitives and vectors must read back exactly what was
+// written, and truncated reads must fail instead of indexing past the buffer.
 module wire
 
 fn test_wire_roundtrip_primitives() ! {
@@ -51,7 +50,7 @@ fn test_wire_reader_bounds_check() {
 }
 
 // test_wire_writer_u8_vector_boundary exercises new_writer's capacity<=0 fallback
-// and proves a full 255-byte payload (the largest u8 prefix) round-trips intact.
+// and proves a full 255-byte payload round-trips intact.
 fn test_wire_writer_u8_vector_boundary() ! {
 	data := []u8{len: 255, init: 0x7f}
 	mut w := new_writer(0) // cap<=0 → default capacity; growth must still fit 256 bytes
@@ -65,8 +64,7 @@ fn test_wire_writer_u8_vector_boundary() ! {
 }
 
 // test_wire_writer_rejects_oversized_u8_vector: a u8-prefixed vector cannot
-// encode more than 255 bytes, and silently truncating the length would corrupt
-// the frame, so it must be rejected outright.
+// encode more than 255 bytes, so it must be rejected rather than truncated.
 fn test_wire_writer_rejects_oversized_u8_vector() ! {
 	over := []u8{len: 256}
 	mut w := new_writer(64)
@@ -78,7 +76,7 @@ fn test_wire_writer_rejects_oversized_u8_vector() ! {
 }
 
 // test_wire_reader_read_bytes_negative: a negative count must be rejected as a
-// framing error rather than attempting an invalid slice of the buffer.
+// framing error rather than slicing the buffer invalidly.
 fn test_wire_reader_read_bytes_negative() ! {
 	mut r := new_reader([u8(1), 2, 3])
 	assert r.remaining() == 3
@@ -90,8 +88,7 @@ fn test_wire_reader_read_bytes_negative() ! {
 }
 
 // test_wire_reader_truncated_vector: the 1-byte prefix declares 5 payload bytes
-// but only 2 are present, so the vector read must fail the bounds check instead
-// of returning a short slice.
+// but only 2 are present, so the read must fail the bounds check.
 fn test_wire_reader_truncated_vector() ! {
 	mut r := new_reader([u8(5), 1, 2])
 	r.read_vector_u8() or {
@@ -101,9 +98,8 @@ fn test_wire_reader_truncated_vector() ! {
 	assert false
 }
 
-// test_wire_reader_pos tracks the walked distance as reads succeed: the X.509
-// TBS extraction (tls.pki) slices regions relative to pos(), so it must equal
-// bytes consumed from the front of the buffer, not the remainder.
+// test_wire_reader_pos tracks the walked distance as reads succeed: it must
+// equal bytes consumed from the front of the buffer, not the remainder.
 fn test_wire_reader_pos() ! {
 	mut r := new_reader([u8(1), 2, 3, 4, 5, 6, 7, 8])
 	assert r.pos() == 0

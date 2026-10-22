@@ -42,9 +42,9 @@ The core was therefore split so that the carrier is always someone else's job:
         │                                      │                                      │
    ┌────┴──────────────┐              ┌───────┴───────────┐               ┌─────────┴──────────┐
    │ tls TCP adapter   │              │ a QUIC engine     │               │ tests / other      │
-   │ conn.v +          │              │ (RFC 9001)        │               │ transports         │
-   │ tcp_transport.v   │              │ CRYPTO frames +   │               │                    │
-   │ records + sockets │              │ packet protection │               │                    │
+   │ conn.v            │              │ (RFC 9001)        │               │ transports         │
+   │ records + sockets │              │ CRYPTO frames +   │               │                    │
+   │                   │              │ packet protection │               │                    │
    └───────────────────┘              └───────────────────┘               └────────────────────┘
 ```
 
@@ -393,7 +393,7 @@ has to be a transport.
 - `src/tls/handshake/passthrough.v` — CRYPTO-stream reassembly (RFC 9001 §4).
 - `src/tls/handshake/alert.v` — `AlertDescription` + `quic_connection_error()`.
 - `src/tls/handshake/key_schedule.v` — `hkdf_expand_label`, the §7.1 ladder.
-- `src/tls/conn.v` / `src/tls/tcp_transport.v` — the reference TCP adapter: the
+- `src/tls/conn.v` — the reference TCP adapter: the
   same seam driven over records and sockets, useful as a worked example of every
   adapter responsibility.
 - RFC 9001 §4 (carrying TLS), §4.1 (interface), §4.8 (alerts), §5 (packet

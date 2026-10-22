@@ -1,9 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// x509.v decodes DER-encoded X.509 v3 certificates into a Certificate, pulling
-// out the subject/issuer names, validity window, public key, signature
-// algorithm, and the SAN/basic-constraints extensions that validator.v and
-// hostname.v consume.
+// x509.v decodes DER-encoded X.509 v3 certificates into a Certificate: subject
+// and issuer names, validity window, public key, signature algorithm and the
+// SAN/basic-constraints extensions validator.v and hostname.v consume.
 module pki
 
 import crypto.ecdsa
@@ -18,17 +17,12 @@ pub enum PublicKeyAlgorithm {
 	unknown
 }
 
-// Certificate represents a decoded X.509 certificate (RFC 5280). Instances come
-// from parse_certificate(); @[noinit] keeps other modules from fabricating one
-// whose fields disagree with what the parser would have produced — a forged SAN
-// list, raw/tbs_raw skew, or a has_* flag claiming an absent extension — and the
-// read-only `pub:` fields keep a delivered instance from being rewritten after
-// the fact: outside tls.pki a certificate is inspect-only, never mutable.
+// Certificate represents a decoded X.509 certificate (RFC 5280); only
+// parse_certificate may produce one (@[noinit], read-only fields).
 @[noinit]
 pub struct Certificate {
 pub:
-	// Read-only outside tls.pki; consumed by the CertificateVerify check (the
-	// tls.handshake module) and the chain/hostname validation inside this module.
+	// Read-only outside tls.pki; consumed by the CertificateVerify check and this module's chain/hostname validation.
 	public_key_algo    PublicKeyAlgorithm
 	public_key_raw     []u8          // SubjectPublicKeyInfo BIT STRING contents
 	rsa_public_key     ?RsaPublicKey // set when public_key_algo is .rsa
@@ -38,25 +32,20 @@ pub:
 	version            int           // X.509 version (3 = v3); encoded value is version-1
 	serial_number      []u8          // issuer-assigned serial, big-endian
 	signature_algo_oid string        // OID of the signature AlgorithmIdentifier
-	// signature_hash_oid holds the hash algorithm OID for PSS signatures
-	// (parsed from AlgorithmIdentifier parameters when OID is id-RSASSA-PSS).
+	// signature_hash_oid holds the hash algorithm OID for PSS signatures.
 	signature_hash_oid string
 	issuer_cn          string // commonName of the issuer
 	subject_cn         string // commonName of the subject
-	// issuer_dn and subject_dn hold the DER-encoded RDNSequence contents of the
-	// Name fields, used to chain a certificate to its issuer.
+	// issuer_dn and subject_dn hold the DER-encoded RDNSequence contents of the Name fields.
 	issuer_dn       []u8
 	subject_dn      []u8
 	not_before      string // validity start, RFC 5280 UTCTime/GeneralizedTime as written
 	not_after       string // validity end, same encoding as not_before
 	not_before_unix i64    // not_before in Unix seconds, for easy comparison
 	not_after_unix  i64    // not_after in Unix seconds
-	// sans holds dNSName SAN entries only; rfc822Name is deliberately excluded
-	// because RFC 6125 §2.1 matches TLS server identities against dNSName, not
-	// email names, so accepting rfc822Name would widen the accepted-name set.
+	// sans holds dNSName SAN entries only; rfc822Name is excluded (RFC 6125 §2.1).
 	sans []string
-	// ip_sans holds the raw bytes of each iPAddress SAN (4 bytes for IPv4,
-	// 16 for IPv6), used to verify connections made to an IP literal.
+	// ip_sans holds the raw bytes of each iPAddress SAN (4 bytes IPv4, 16 IPv6).
 	ip_sans         [][]u8
 	has_san         bool // the SAN extension was present at all (RFC 6125 §6.4.4 CN precedence)
 	is_ca           bool // basicConstraints CA flag; intermediates must have it
@@ -65,11 +54,8 @@ pub:
 	key_usage       []u8 // BIT STRING contents of keyUsage, big-endian named bits
 	has_eku         bool // an extendedKeyUsage extension was present at all
 	eku_server_auth bool // EKU includes id-kp-serverAuth, required for TLS servers
-	// name_constraints, when the CA asserts it, restricts the namespace of names
-	// a subordinate certificate may carry (RFC 5280 §4.2.1.10). permitted_dns /
-	// permitted_ip are the permittedSubtrees for dNSName and iPAddress
-	// respectively; excluded_dns / excluded_ip are the excludedSubtrees. A
-	// subtree is enforced only for the name forms it lists.
+	// name_constraints restricts the namespace of subordinate names (RFC 5280
+	// §4.2.1.10); permitted_* / excluded_* hold the subtrees per name form.
 	name_constraints_present bool
 	permitted_dns            []string
 	excluded_dns             []string
@@ -79,11 +65,7 @@ pub:
 }
 
 // parse_certificate decodes an X.509 DER certificate.
-//
-//	Certificate ::= SEQUENCE {
-//	    tbsCertificate       TBSCertificate,
-//	    signatureAlgorithm   AlgorithmIdentifier,
-//	    signatureValue       BIT STRING }
+// Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
 pub fn parse_certificate(der []u8) !Certificate {
 	mut r := wire.new_reader(der)
 	cert_seq := read_asn1_element(mut r)!
@@ -93,18 +75,15 @@ pub fn parse_certificate(der []u8) !Certificate {
 	if r.remaining() != 0 {
 		return error('x509: trailing data after certificate')
 	}
-	// Re-parse the contents to capture the TBSCertificate's exact DER encoding
-	// (tag + length + value); this byte range is the message that was signed.
+	// Re-parse to capture the TBSCertificate's exact DER bytes: the message the issuer signed.
 	mut inner := wire.new_reader(cert_seq.data)
 	tbs_start := inner.pos()
 	tbs_elem := read_asn1_element(mut inner)!
-	// This element should be a sequence-d tag
 	if tbs_elem.tag != 0x30 {
 		return error('x509: TBSCertificate must be a SEQUENCE')
 	}
 	tbs_raw := cert_seq.data[tbs_start..inner.pos()].clone()
-	// RFC 5280 §4.1.2.3: the outer signatureAlgorithm must match
-	// TBSCertificate.signature.
+	// RFC 5280 §4.1.2.3: the outer signatureAlgorithm must match TBSCertificate.signature.
 	outer_sig_alg_elem := read_asn1_element(mut inner)!
 	if outer_sig_alg_elem.tag != 0x30 {
 		return error('x509: outer signatureAlgorithm must be a SEQUENCE')
@@ -119,16 +98,14 @@ pub fn parse_certificate(der []u8) !Certificate {
 	}
 
 	tbs_elements := parse_sequence(tbs_elem.data)!
-	// Minimum 6 elements = serial, signature alg, issuer, validity, subject, SPKI;
-	// version is optional ([0] EXPLICIT, absent in v1) and extensions follow after.
+	// Minimum 6 elements: serial, signature alg, issuer, validity, subject, SPKI.
 	if tbs_elements.len < 6 {
 		return error('x509: malformed TBSCertificate (${tbs_elements.len} elements)')
 	}
 
 	mut idx := 0
 
-	// 1. Version [0] EXPLICIT. The field is absent for v1 certificates (the
-	// default), so only consume it when the first element carries context tag 0.
+	// 1. Version [0] EXPLICIT, absent for v1 (the default): consume it only when the first element carries context tag 0.
 	mut version := 1
 	if (tbs_elements[0].tag & 0x1f) == 0 {
 		mut version_r := wire.new_reader(tbs_elements[0].data)
@@ -140,13 +117,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 		idx++
 	}
 
-	// The six mandatory fields that follow the optional version — serial,
-	// signatureAlgorithm, issuer, validity, subject, SPKI — must all be present.
-	// The earlier len<6 check does not cover a v3 certificate: the version element
-	// shifts every index up by one, so a TBS with a version but exactly six
-	// elements is missing SPKI and would index tbs_elements[idx] past the end here,
-	// panicking on attacker-controlled handshake input rather than failing the
-	// decode. Measuring against the post-version idx closes that gap.
+	// The six mandatory fields after the optional version must all be present: measuring against the post-version idx closes the v3 index-shift gap.
 	if tbs_elements.len - idx < 6 {
 		return error('x509: malformed TBSCertificate (need 6 fields after version, have ${tbs_elements.len - idx})')
 	}
@@ -165,13 +136,11 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut tbs_sig_hash_oid := ''
 	if sig_alg_inner.len > 0 {
 		tbs_sig_algo_oid = parse_oid(sig_alg_inner[0].data)
-		// For id-RSASSA-PSS (1.2.840.113549.1.1.10), extract the hash OID from the
-		// RSASSA-PSS-params SEQUENCE's hashAlgorithm [0] field.
+		// For id-RSASSA-PSS (1.2.840.113549.1.1.10), extract the hash OID from the RSASSA-PSS-params SEQUENCE's hashAlgorithm [0] field.
 		if tbs_sig_algo_oid == '1.2.840.113549.1.1.10' && sig_alg_inner.len >= 2 {
 			pss_params := parse_sequence(sig_alg_inner[1].data) or { []Asn1Element{} }
 			for param in pss_params {
-				// [0] EXPLICIT -- hashAlgorithm: 0xa0 = context-specific class +
-				// constructed bit, and & 0x1f == 0 pins the tag number to [0].
+				// [0] EXPLICIT -- hashAlgorithm: 0xa0 = context-specific class + constructed bit, & 0x1f == 0 pins the tag to [0].
 				if (param.tag & 0xe0) == 0xa0 && (param.tag & 0x1f) == 0 {
 					hash_alg_inner := parse_sequence(param.data) or { []Asn1Element{} }
 					if hash_alg_inner.len > 0 {
@@ -191,9 +160,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 
 	// 5. Validity (SEQUENCE: notBefore, notAfter)
 	val_elems := parse_sequence(tbs_elements[idx].data)!
-	// RFC 5280 §4.1.2.5: both fields are mandatory. An unparseable time is a
-	// fatal decode error rather than a stored 0, so the validator can never
-	// silently skip expiry enforcement on a certificate whose dates are junk.
+	// RFC 5280 §4.1.2.5: both fields are mandatory; an unparseable time is a fatal decode error, never a stored 0.
 	if val_elems.len < 2 {
 		return error('x509: validity must hold notBefore and notAfter (${val_elems.len} elements)')
 	}
@@ -225,7 +192,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 				}
 				'1.2.840.10045.2.1' { // id-ecPublicKey
 					pk_algo = .ecdsa
-					// Parse the named curve OID from AlgorithmIdentifier.parameters
+					// Parse the named curve OID from AlgorithmIdentifier.parameters.
 					if alg_seq.len >= 2 {
 						curve_oid := parse_oid(alg_seq[1].data)
 						if curve_oid == '1.2.840.10045.3.1.7' {
@@ -242,14 +209,12 @@ pub fn parse_certificate(der []u8) !Certificate {
 					pk_algo = .ed25519
 				}
 				else {
-					// Leave pk_algo == .unknown: verify_cert_signature's catch-all then
-					// rejects the cert instead of us guessing a key type from raw bytes.
+					// Leave pk_algo == .unknown; verify_cert_signature's catch-all rejects the cert.
 				}
 			}
 		}
 
-		// The key lives in a BIT STRING whose first byte is the number of unused
-		// trailing bits; it is always 0 here, so skip it to get the key bytes.
+		// The BIT STRING's first byte is the unused-bits count (always 0 here); skip it.
 		bit_string := spki_elems[1].data
 		if bit_string.len > 1 {
 			raw_pk_bytes = bit_string[1..].clone()
@@ -263,11 +228,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 	}
 	idx++
 
-	// Extensions [3] EXPLICIT (optional; absent in v1 certificates).
-	//   Extensions ::= SEQUENCE OF Extension
-	//   Extension  ::= SEQUENCE { extnID OBJECT IDENTIFIER,
-	//                             critical BOOLEAN DEFAULT FALSE,
-	//                             extnValue OCTET STRING }
+	// Extensions [3] EXPLICIT (optional; absent in v1).
+	// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue }
 	mut sans := []string{}
 	mut ip_sans := [][]u8{}
 	mut has_san := false
@@ -282,9 +244,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut excluded_dns := []string{}
 	mut permitted_ip := [][]u8{}
 	mut excluded_ip := [][]u8{}
-	// RFC 5280 §4.2: each extension OID must appear at most once. Tracking seen
-	// OIDs stops a duplicate (e.g. a second SAN) from silently overwriting the
-	// first, which could drop names the issuer actually asserted.
+	// RFC 5280 §4.2: each extension OID may appear at most once; a duplicate must not overwrite the first.
 	mut seen_ext_oids := []string{}
 
 	for i in idx .. tbs_elements.len {
@@ -303,10 +263,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 						return error('x509: duplicate extension ${ext_oid}')
 					}
 					seen_ext_oids << ext_oid
-					// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT
-					// FALSE, extnValue }. The critical flag is present only when
-					// there are three elements; when omitted the value defaults
-					// to FALSE and extnValue sits at index 1, otherwise index 2.
+					// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue }: with the critical flag omitted extnValue sits at index 1, else index 2.
 					mut critical := false
 					ext_val_bytes := if parts.len == 2 {
 						parts[1].data
@@ -320,8 +277,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 
 					match ext_oid {
 						'2.5.29.17' { // Subject Alternative Name (SAN)
-							// Presence of the extension — even with no usable
-							// names — disables the CN fallback (RFC 6125 §6.4.4).
+							// Presence of the extension — even with no usable names — disables the CN fallback (RFC 6125 §6.4.4).
 							has_san = true
 							sans, ip_sans = parse_san_extension(ext_val_bytes)
 						}
@@ -343,12 +299,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 							permitted_dns, excluded_dns, permitted_ip, excluded_ip = parse_name_constraints(ext_val_bytes)
 						}
 						else {
-							// RFC 5280 §4.2: a certificate carrying a critical
-							// extension this implementation does not understand
-							// MUST be rejected. Ignoring one (notably critical
-							// nameConstraints or policyConstraints on an
-							// intermediate) would let a constrained CA issue for
-							// names outside its sandbox.
+							// RFC 5280 §4.2: an unknown critical extension MUST be rejected (a constrained CA must not issue outside its sandbox).
 							if critical {
 								return error('x509: unsupported critical extension ${ext_oid}')
 							}
@@ -402,8 +353,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 	}
 }
 
-// ecdsa_public_key reconstructs an ECDSA public key from the SPKI bit string
-// using the curve stored during certificate parsing.
+// ecdsa_public_key reconstructs an ECDSA public key from the SPKI bit string and the parsed curve.
 fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	if c.public_key_algo != .ecdsa {
 		return error('x509: certificate public key is not ECDSA')
@@ -411,15 +361,12 @@ fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	if c.public_key_raw.len == 0 {
 		return error('x509: empty ECDSA public key')
 	}
-	// For EC keys public_key_raw is already the uncompressed 0x04||X||Y point this
-	// constructor expects; the curve NID stored at parse time completes the input.
+	// public_key_raw is already the uncompressed 0x04||X||Y point; the stored curve NID completes the input.
 	return ecdsa.PublicKey.from_uncompressed_bytes(c.public_key_raw, nid: c.ecdsa_curve)!
 }
 
-// is_digits reports whether s is non-empty and every byte is an ASCII digit.
-// parse_asn1_time uses it to reject a time whose fixed-width fields are
-// non-numeric before slicing them, so a malformed value fails the decode rather
-// than being coerced by str.int() into a bogus-but-parseable date.
+// is_digits reports whether s is non-empty and all ASCII digits, so
+// parse_asn1_time rejects a malformed time before slicing its fields.
 fn is_digits(s string) bool {
 	if s.len == 0 {
 		return false
@@ -432,15 +379,8 @@ fn is_digits(s string) bool {
 	return true
 }
 
-// parse_asn1_time parses UTCTime (tag 0x17) or GeneralizedTime (tag 0x18) to unix
-// seconds. RFC 5280 §4.1.2.5 mandates both forms across the 1950–2049 boundary;
-// the two-digit UTCTime year uses the RFC 5280 pivot (YY ≥ 50 ⇒ 19xx, else 20xx).
-// The widths are enforced exactly: UTCTime is YYMMDDhhmmssZ (13) and
-// GeneralizedTime is YYYYMMDDhhmmssZ (15), all digits plus a trailing 'Z'. A
-// longer payload (fractional seconds, +/-hhmm offsets) or a non-digit field is a
-// DER violation, not a value to guess at — slicing blindly at fixed offsets would
-// silently misparse it into a wrong validity window the validator then trusts
-// unconditionally (it never re-checks the calendar values behind *_unix).
+// parse_asn1_time parses UTCTime (0x17) or GeneralizedTime (0x18) to unix seconds
+// (RFC 5280 §4.1.2.5, YY ≥ 50 ⇒ 19xx); widths and digits are enforced exactly.
 fn parse_asn1_time(el Asn1Element) !i64 {
 	s := el.data.bytestr()
 	// UTCTime YYMMDDhhmmssZ: six 2-digit fields + trailing 'Z' (UTC)
@@ -457,9 +397,7 @@ fn parse_asn1_time(el Asn1Element) !i64 {
 }
 
 // unwrap_octet_string returns the contents of an OCTET STRING TLV, or the input
-// unchanged when not wrapped. RFC 5280 encodes extnValue as an OCTET STRING
-// containing the extension's DER, but some callers hand us the inner bytes
-// directly, so both forms are accepted.
+// unchanged when not wrapped (RFC 5280 wraps extnValue in an OCTET STRING).
 fn unwrap_octet_string(data []u8) []u8 {
 	if data.len > 0 && data[0] == 0x04 {
 		mut r := wire.new_reader(data)
@@ -469,9 +407,8 @@ fn unwrap_octet_string(data []u8) []u8 {
 	return data
 }
 
-// parse_eku_server_auth reports whether an Extended Key Usage extension value
-// (RFC 5280 §4.2.1.12) permits TLS server authentication: the list must contain
-// id-kp-serverAuth or the wildcard anyExtendedKeyUsage.
+// parse_eku_server_auth reports whether an EKU extension value (RFC 5280
+// §4.2.1.12) permits server authentication (id-kp-serverAuth or anyExtendedKeyUsage).
 fn parse_eku_server_auth(ext_bytes []u8) bool {
 	data := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(data)
@@ -507,7 +444,7 @@ fn extract_cn_from_name(name_bytes []u8) string {
 				oid := parse_oid(attr_parts[0].data)
 				if oid == '2.5.4.3' { // commonName
 					val := attr_parts[1].data
-					// Disallow null bytes (CVE-2009-2408 null byte injection attack)
+					// Disallow null bytes (CVE-2009-2408 null byte injection).
 					if val.contains(0) {
 						return ''
 					}
@@ -520,8 +457,7 @@ fn extract_cn_from_name(name_bytes []u8) string {
 }
 
 // parse_san_extension extracts dNSName strings and raw iPAddress bytes (4 for
-// IPv4, 16 for IPv6) from a Subject Alternative Name extension (RFC 5280
-// §4.2.1.6).
+// IPv4, 16 for IPv6) from a SAN extension (RFC 5280 §4.2.1.6).
 fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	mut dns := []string{}
 	mut ip := [][]u8{}
@@ -534,10 +470,7 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 
 	for general_names_r.remaining() > 0 {
 		gn := read_asn1_element(mut general_names_r) or { break }
-		// GeneralName choices are context-specific and primitive (dNSName [2] =
-		// 0x82, iPAddress [7] = 0x87). Requiring class 0x80 and a clear
-		// constructed bit stops a low-5-bits collision — a universal INTEGER
-		// (0x02) or a constructed [2] (0xa2) — from being read as a name.
+		// GeneralName choices are context-specific and primitive ([2] = 0x82, [7] = 0x87); a clear constructed bit stops a tag collision.
 		if (gn.tag & 0xc0) != 0x80 || (gn.tag & 0x20) != 0 {
 			continue
 		}
@@ -560,14 +493,8 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	return dns, ip
 }
 
-// parse_name_constraints decodes the NameConstraints extension value
-// (RFC 5280 §4.2.1.10) into the permitted/excluded dNSName and iPAddress
-// subtrees. The value may be wrapped in an OCTET STRING (an extension)'s inner
-// value already is the DER NameConstraints, but unwrap is applied for symmetry
-// with parse_san_extension). Only dNSName and iPAddress subtrees are retained:
-// the client validates TLS server identities, which are exactly those two name
-// forms. A GeneralSubtree minimum/maximum (BaseDistance) is parsed past, since
-// RFC 5280 §4.2.1.10 forbids a non-zero minimum for the name forms we enforce.
+// parse_name_constraints decodes the NameConstraints value (RFC 5280 §4.2.1.10)
+// into the permitted/excluded dNSName and iPAddress subtrees (the only forms kept).
 fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 	mut permitted_dns := []string{}
 	mut excluded_dns := []string{}
@@ -581,16 +508,14 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 
 	for body.remaining() > 0 {
 		field := read_asn1_element(mut body) or { break }
-		// [0] permittedSubtrees and [1] excludedSubtrees are context-specific
-		// CONSTRUCTED tags: 0xa0 and 0xa1. A different tag is skipped.
+		// [0] permittedSubtrees and [1] excludedSubtrees are context-specific CONSTRUCTED tags (0xa0, 0xa1).
 		is_permitted := field.tag == 0xa0
 		is_excluded := field.tag == 0xa1
 		if !is_permitted && !is_excluded {
 			continue
 		}
 		mut subtrees := wire.new_reader(field.data)
-		// GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree: the [0]/[1]
-		// field wraps this SEQUENCE, whose contents are the GeneralSubtree entries.
+		// GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree, wrapped by the [0]/[1] field.
 		if subtrees.remaining() == 0 {
 			continue
 		}
@@ -598,8 +523,7 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 		mut entries := wire.new_reader(list.data)
 		for entries.remaining() > 0 {
 			gs := read_asn1_element(mut entries) or { break }
-			// Each GeneralSubtree is a SEQUENCE whose first element is the base
-			// GeneralName.
+			// Each GeneralSubtree is a SEQUENCE whose first element is the base GeneralName.
 			mut gs_body := wire.new_reader(gs.data)
 			if gs_body.remaining() == 0 {
 				continue
@@ -621,9 +545,7 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 					}
 				}
 				7 { // [7] iPAddress
-					// In nameConstraints an iPAddress subtree is address+mask: 8
-					// bytes for IPv4 (4+4), 32 for IPv6 (16+16). Unlike a SAN
-					// iPAddress (bare 4/16), the mask form is what we store.
+					// In nameConstraints an iPAddress subtree is address+mask (8 bytes IPv4, 32 IPv6), not the bare 4/16 of a SAN.
 					if base.data.len == 8 || base.data.len == 32 {
 						if is_permitted {
 							permitted_ip << base.data.clone()
@@ -640,11 +562,8 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 }
 
 // parse_path_len_constraint decodes a BasicConstraints pathLenConstraint INTEGER,
-// enforcing the RFC 5280 §4.2.1.9 (0..MAX) range and DER minimal encoding. Any
-// invalid encoding — empty, oversized (>4 octets), a negative sign bit, or a
-// redundant leading 0x00 — collapses to 0 (no intermediate certificates permitted
-// below this CA), never -1, because the sentinel -1 means "unlimited" and would
-// silently widen the depth limit validator.v relies on for a junk pathLen.
+// enforcing the RFC 5280 §4.2.1.9 (0..MAX) range and DER minimal encoding;
+// any invalid/negative/non-minimal/oversized form collapses to 0 (never -1).
 fn parse_path_len_constraint(data []u8) int {
 	if data.len == 0 || data.len > 4 {
 		return 0
@@ -667,14 +586,8 @@ fn parse_path_len_constraint(data []u8) int {
 	return int(v)
 }
 
-// parse_basic_constraints parses the cA boolean and pathLenConstraint from a
-// BasicConstraints extension value (RFC 5280 §4.2.1.9):
-//
-//	BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
-//	                               pathLenConstraint INTEGER (0..MAX) OPTIONAL }
-//
-// The returned path limit is -1 only when the INTEGER is absent, meaning
-// unlimited; a present-but-malformed one yields 0 (see parse_path_len_constraint).
+// parse_basic_constraints parses the cA boolean and pathLenConstraint (RFC 5280 §4.2.1.9).
+// The path limit is -1 only when the INTEGER is absent (unlimited); a present-but-malformed one yields 0.
 fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(inner)
@@ -696,14 +609,12 @@ fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 			path_len = parse_path_len_constraint(el.data)
 		}
 	}
-	// cA has DEFAULT FALSE, so it can be absent entirely: scanning for the first
-	// BOOLEAN and finding none yields the default "not a CA".
+	// cA has DEFAULT FALSE, so an absent BOOLEAN means "not a CA".
 	return ca, path_len
 }
 
 // parse_key_usage returns the BIT STRING contents of a keyUsage extension
-// (RFC 5280 §4.2.1.3), big-endian named bits with the unused-bits count checked.
-// An empty result means "extension present but asserts no usage".
+// (RFC 5280 §4.2.1.3), big-endian named bits; an empty result means "no usage asserted".
 fn parse_key_usage(ext_bytes []u8) []u8 {
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(inner)
@@ -713,17 +624,14 @@ fn parse_key_usage(ext_bytes []u8) []u8 {
 	}
 	unused_bits := seq.data[0]
 	bits := seq.data[1..]
-	// BIT STRING constraint of X.690 §10.5: unused bits must fit in the last
-	// octet; a violation makes the whole extension untrustworthy.
+	// BIT STRING constraint of X.690 §10.5: unused bits must fit in the last octet; a violation makes the whole extension untrustworthy.
 	if unused_bits > 7 || (bits.len == 0 && unused_bits != 0) {
 		return []u8{}
 	}
 	return bits.clone()
 }
 
-// key_usage_bit reports whether named bit `n` (0 = digitalSignature, count from
-// the MSB of the first octet per RFC 5280 §4.2.1.3) is asserted. Bits beyond the
-// encoded length are simply not asserted.
+// key_usage_bit reports whether named bit `n` (0 = digitalSignature, from the MSB of the first octet per RFC 5280 §4.2.1.3) is asserted.
 fn key_usage_bit(ku []u8, n int) bool {
 	byte_idx := n >> 3
 	if byte_idx >= ku.len {

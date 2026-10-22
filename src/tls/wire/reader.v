@@ -1,17 +1,12 @@
 // Copyright (c) 2026 blackshirt.
 //
 // wire is the bottom layer of the TLS stack: a bounds-checked cursor (Reader)
-// and a big-endian appender (Writer) over byte buffers. There is no TLS
-// semantics here, only framing arithmetic shared by every parser and encoder
-// in tls, tls.pki, and tls.handshake; every out-of-bounds or oversized access
-// is an error.
+// and a big-endian appender (Writer) doing framing arithmetic only; every
+// out-of-bounds or oversized access is an error.
 module wire
 
 // Reader is a bounds-checked cursor over TLS wire data.
-// Every read validates its length first: parsers face hostile input and must
-// reject truncation or malformed framing rather than panic (RFC 8446 §4).
-// @[noinit] enforces construction through new_reader, so a cursor always starts
-// over an explicit buffer rather than a silently empty one.
+// @[noinit]: construct via new_reader; every read length-checks first (RFC 8446 §4).
 @[noinit]
 pub struct Reader {
 	data []u8 // buffer being parsed; never mutated, only walked
@@ -34,14 +29,13 @@ pub fn (r &Reader) remaining() int {
 }
 
 // pos returns the offset of the next unread byte from the start of the buffer.
-// Callers (e.g. the X.509 TBS extraction) need the walked distance itself, not
-// just the remainder, to slice regions relative to where parsing has reached.
+// Callers slice regions relative to the walked distance, not the remainder.
 pub fn (r &Reader) pos() int {
 	return r.cursor
 }
 
-// ensure checks that at least `n` bytes remain, so fixed-width accessors fail
-// with a framing error instead of indexing out of bounds. `what` names the item.
+// ensure checks that at least `n` bytes remain, failing with a framing error
+// instead of indexing out of bounds; `what` names the item.
 fn (mut r Reader) ensure(n int, what string) ! {
 	if n < 0 || n > r.data.len - r.cursor {
 		return error('wire.Reader: unexpected EOF reading ${what}')
@@ -65,8 +59,7 @@ pub fn (mut r Reader) read_u16() !u16 {
 }
 
 // read_u24 reads a 24-bit big-endian unsigned integer as u32.
-// TLS has no native u24, but 24-bit lengths are pervasive (§4 handshake body
-// length, §4.4.2 certificate vectors), so it gets its own accessor.
+// TLS has no native u24, but 24-bit lengths are pervasive (§4, §4.4.2).
 pub fn (mut r Reader) read_u24() !u32 {
 	r.ensure(3, 'u24')!
 	v := (u32(r.data[r.cursor]) << 16) | (u32(r.data[r.cursor + 1]) << 8) | u32(r.data[r.cursor + 2])
@@ -90,9 +83,8 @@ pub fn (mut r Reader) read_u64() !u64 {
 	return v
 }
 
-// read_bytes reads exactly `n` bytes from the stream.
-// The result is cloned, not a subslice: callers (e.g. record payloads) outlive
-// this reader's buffer, and aliasing would let later reads overwrite it.
+// read_bytes reads exactly `n` bytes into a fresh (cloned) slice.
+// Callers outlive this reader's buffer, so aliasing is avoided; short reads fail.
 pub fn (mut r Reader) read_bytes(n int) ![]u8 {
 	if n < 0 || n > r.data.len - r.cursor {
 		return error('wire.Reader: unexpected EOF reading ${n} bytes (only ${r.remaining()} available)')
@@ -102,8 +94,7 @@ pub fn (mut r Reader) read_bytes(n int) ![]u8 {
 	return slice
 }
 
-// The read_vector_* methods decode the `opaque T<V>` vector syntax of RFC 8446
-// §3: a length prefix (V = 8, 16, or 24 bits) followed by that many bytes.
+// Vector accessors decode the `opaque T<V>` syntax: length prefix + bytes (RFC 8446 §3).
 
 // read_vector_u8 reads a vector prefixed with a 1-byte length.
 pub fn (mut r Reader) read_vector_u8() ![]u8 {
@@ -117,8 +108,8 @@ pub fn (mut r Reader) read_vector_u16() ![]u8 {
 	return r.read_bytes(len)
 }
 
-// read_vector_u24 reads a vector prefixed with a 3-byte big-endian length,
-// used for certificate_list chains that can exceed a u16 prefix (§4.4.2).
+// read_vector_u24 reads a vector prefixed with a 3-byte big-endian length.
+// Used for certificate_list chains that can exceed a u16 prefix (§4.4.2).
 pub fn (mut r Reader) read_vector_u24() ![]u8 {
 	len := int(r.read_u24()!)
 	return r.read_bytes(len)

@@ -1,9 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
 // certificate_verify.v checks the server's CertificateVerify signature over the
-// §4.4.3 transcript content. It is separate from state_machine.v because
-// verification is a pure function of (leaf key, signature, content) that never
-// advances protocol state.
+// §4.4.3 transcript content, as a pure function that never advances protocol state.
 module handshake
 
 import crypto.ecdsa
@@ -11,12 +9,8 @@ import crypto.ed25519
 import crypto.sha512
 import tls.pki
 
-// LeafKey is the slice of a certificate that CertificateVerify verification
-// consumes: key algorithm, curve and raw point bytes, and the optional parsed
-// RSA key. Splitting it out from pki.Certificate (whose construction is gated
-// by @[noinit], instances coming only from parse_certificate) keeps
-// verify_certificate_verify a pure function of its three arguments and lets the
-// policy tests pin keyless or mismatched leaves directly.
+// LeafKey is the slice of a certificate that CertificateVerify verification consumes:
+// key algorithm, curve, raw point bytes and the optional parsed RSA key.
 struct LeafKey {
 	public_key_algo pki.PublicKeyAlgorithm
 	ecdsa_curve     ecdsa.Nid
@@ -35,9 +29,8 @@ fn leaf_key(c pki.Certificate) LeafKey {
 	}
 }
 
-// ecdsa_public_key reconstructs the ECDSA public key from the stored curve and
-// raw 0x04||X||Y point bytes — the same reconstruction
-// pki.Certificate.ecdsa_public_key performs for parsed certificates.
+// ecdsa_public_key reconstructs the ECDSA public key from the stored curve and raw
+// 0x04||X||Y point bytes.
 fn (k LeafKey) ecdsa_public_key() !ecdsa.PublicKey {
 	if k.public_key_raw.len == 0 {
 		return error('handshake: empty ECDSA public key')
@@ -55,11 +48,8 @@ fn hash_for_digest(digest_type string, data []u8) []u8 {
 	}
 }
 
-// verify_certificate_verify checks the server's CertificateVerify signature
-// against the leaf key material (extracted with leaf_key) over the §4.4.3
-// signed content (see certificate_verify_signed_content). RSA branches hash the
-// content first and verify a digest, while the ECDSA/Ed25519 APIs take the raw
-// message and hash internally per their own scheme.
+// verify_certificate_verify checks the server's CertificateVerify signature against
+// the leaf key material over the §4.4.3 signed content (see certificate_verify_signed_content).
 fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_content []u8) ! {
 	match cv.algorithm {
 		.rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 {
@@ -79,10 +69,7 @@ fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_co
 			}
 		}
 		.rsa_pkcs1_sha256 {
-			// RFC 8446 §4.2.3/§4.4.3: rsa_pkcs1_* schemes refer to signatures in
-			// certificates only and MUST NOT be used for the CertificateVerify
-			// signature, whose RSA instances are RSASSA-PSS exclusively. A server
-			// selecting it here is non-compliant; refuse rather than verify.
+			// RFC 8446 §4.2.3/§4.4.3: rsa_pkcs1_* schemes MUST NOT be used for the CertificateVerify signature.
 			return error('handshake: rsa_pkcs1_sha256 is not permitted for TLS 1.3 CertificateVerify (RFC 8446 §4.4.3)')
 		}
 		.ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 {

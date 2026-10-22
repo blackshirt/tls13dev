@@ -1,19 +1,15 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Core-contract suite for the transport-neutral handshake (module tls.handshake),
-// where the ClientHandshake private fields stay reachable. It exercises the
-// adapter seam the TCP record layer and a QUIC engine share: level-tagged receive()
-// reassembly across adversarial splits, record_unconsumed_bytes(), the confirm/zeroize
-// secret lifecycle, the traffic_keys/quic_traffic_secrets guards before derivation,
-// and the recordless passthrough framing. No sockets, no records.
+// Core-contract suite for the transport-neutral handshake: level-tagged receive()
+// reassembly across adversarial splits, the unconsumed-bytes accessor, the
+// confirm/zeroize secret lifecycle, and the traffic-keys guards.
 module handshake
 
 import tls.pki
 import tls.wire
 
 // fixture_validator builds a Validator over an empty trust store; none of these
-// tests reach chain verification (receive() stops earlier or no Certificate message
-// is ever fed), so it only has to be a well-formed injected value.
+// tests reach chain verification.
 fn fixture_validator() pki.Validator {
 	return pki.new_validator(pki.new_trust_store(), false)
 }
@@ -30,23 +26,24 @@ fn wrap_hs(typ HandshakeType, body []u8) []u8 {
 
 // ---- SecretLevel / HandshakeMessage contract ----
 
+// test_secret_level_order pins the RFC 9001 §4.1 level order so adapters
+// indexing by level cannot silently drift.
 fn test_secret_level_order() ! {
-	// The enum order is the RFC 9001 §4.1 level order; pin the implicit ordinals
-	// so adapters that index by level cannot silently drift.
 	assert u8(SecretLevel.initial) == 0
 	assert u8(SecretLevel.handshake) == 1
 	assert u8(SecretLevel.application) == 2
 }
 
+// test_handshake_message_carries_level_and_bytes checks that a message carries
+// its level tag and the full framed bytes.
 fn test_handshake_message_carries_level_and_bytes() ! {
 	m := new_handshake_message(.handshake, [u8(0x14), 0x00, 0x00, 0x01, 0xff])!
 	assert m.level == .handshake
 	assert m.msg.len == 5
 }
 
-// The @[noinit] gate leaves new_handshake_message as the only way in, and it
-// refuses bytes whose 4-byte header disagrees with the body it is carrying —
-// a well-formed header must never vouch for truncated or padded message bytes.
+// test_new_handshake_message_rejects_length_mismatch checks that a header
+// disagreeing with the body it carries is refused.
 fn test_new_handshake_message_rejects_length_mismatch() ! {
 	// Finished header declaring a 5-byte body, message carrying only 1.
 	bad := [u8(0x14), 0x00, 0x00, 0x05, 0xff]
@@ -57,8 +54,8 @@ fn test_new_handshake_message_rejects_length_mismatch() ! {
 	assert false
 }
 
-// A message shorter than its own header cannot even be parsed, so the
-// constructor surfaces the header error rather than building a shell.
+// test_new_handshake_message_rejects_truncated_header checks that a message
+// shorter than its own header surfaces the header error.
 fn test_new_handshake_message_rejects_truncated_header() ! {
 	new_handshake_message(.initial, [u8(0x01), 0x00]) or {
 		assert err.msg().contains('header truncated')
@@ -69,12 +66,12 @@ fn test_new_handshake_message_rejects_truncated_header() ! {
 
 // ---- receive() reassembly: split and coalesced delivery ----
 
+// test_feed_initial_buffers_incomplete_message checks that an incomplete frame
+// parks in the Initial buffer without parsing.
 fn test_feed_initial_buffers_incomplete_message() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
 
-	// An incomplete ServerHello frame must park in the Initial buffer without
-	// parsing — the record-boundary-independence proof at the reassembly layer.
 	full := wrap_hs(.server_hello, []u8{len: 10, init: 0xAA})
 	split := full.len / 2
 
@@ -82,8 +79,7 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 	assert first.len == 0
 	assert h.record_unconsumed_bytes(.initial) == split
 
-	// Completing the frame consumes it from the buffer; the garbage body then
-	// fails to parse, proving the whole message was taken off the stream.
+	// Completing the frame consumes it; the garbage body then fails to parse.
 	h.receive(.initial, full[split..]) or {
 		assert h.record_unconsumed_bytes(.initial) == 0
 		return
@@ -91,6 +87,8 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 	assert false // a garbage ServerHello body must never parse cleanly
 }
 
+// test_feed_application_level_rejected checks that post-handshake
+// application-level bytes are refused.
 fn test_feed_application_level_rejected() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
@@ -101,6 +99,8 @@ fn test_feed_application_level_rejected() ! {
 	assert false
 }
 
+// test_record_unconsumed_bytes_levels_start_empty checks that the accessor
+// starts empty and tracks a parked fragment.
 fn test_record_unconsumed_bytes_levels_start_empty() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	assert h.record_unconsumed_bytes(.handshake) == 0
@@ -113,6 +113,8 @@ fn test_record_unconsumed_bytes_levels_start_empty() ! {
 
 // ---- state machine accessor ----
 
+// test_state_progression_to_wait_server_hello checks that the machine starts at
+// .start and moves to .wait_server_hello once the ClientHello is built.
 fn test_state_progression_to_wait_server_hello() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	assert h.state() == .start
@@ -120,12 +122,11 @@ fn test_state_progression_to_wait_server_hello() ! {
 	assert h.state() == .wait_server_hello
 }
 
+// test_feed_rejects_out_of_order_message checks that a Certificate arriving
+// while the ServerHello is awaited is rejected before parsing.
 fn test_feed_rejects_out_of_order_message() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
-	// A Certificate at the Handshake level while still awaiting the ServerHello:
-	// the wait-order guards reject it before parsing, and the consumed frame
-	// leaves nothing parked behind.
 	cert := wrap_hs(.certificate, []u8{len: 4, init: 0x01})
 	h.receive(.handshake, cert) or {
 		assert h.record_unconsumed_bytes(.handshake) == 0
@@ -136,11 +137,11 @@ fn test_feed_rejects_out_of_order_message() ! {
 
 // ---- receive() phase guards & failure semantics ----
 
+// test_create_client_hello_only_runs_once checks that the single-shot entry
+// point refuses a second call that would poison the transcript.
 fn test_create_client_hello_only_runs_once() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
-	// A second call would inject a duplicate ClientHello into the transcript and
-	// poison every later hash with it — the single-shot entry point refuses.
 	h.create_client_hello() or {
 		assert err.msg().contains('only runs once')
 		assert h.state == .wait_server_hello
@@ -149,10 +150,10 @@ fn test_create_client_hello_only_runs_once() ! {
 	assert false
 }
 
+// test_feed_before_client_hello_refused checks that peer bytes before the
+// ClientHello are refused as a contract error, leaving the state .start.
 fn test_feed_before_client_hello_refused() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
-	// Nothing has been sent yet, so there is nothing for peer bytes to answer;
-	// the refusal is a contract error, not a failure — state stays .start.
 	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('receive() before create_client_hello()')
 		assert h.state == .start
@@ -161,11 +162,11 @@ fn test_feed_before_client_hello_refused() ! {
 	assert false
 }
 
+// test_feed_initial_after_server_hello_refused checks that Initial-level bytes
+// after the ServerHello wait are refused, leaving the machine usable.
 fn test_feed_initial_after_server_hello_refused() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
-	// The ServerHello wait is over: further Initial-level bytes have no legal
-	// meaning, and refusing them leaves the machine usable (state untouched).
 	h.state = .wait_encrypted_extensions
 	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('while awaiting ServerHello')
@@ -175,15 +176,16 @@ fn test_feed_initial_after_server_hello_refused() ! {
 	assert false
 }
 
+// test_feed_marks_failed_and_refuses_after_protocol_error checks that a parse
+// failure is terminal: the state becomes .failed and later feeds are refused.
 fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
-	// A ServerHello carrying a garbage body fails to parse; that failure is
-	// terminal, so the documented .failed state must actually be set ...
+	// A garbage ServerHello body fails to parse; the failure is terminal.
 	bad := wrap_hs(.server_hello, []u8{len: 8, init: 0x01})
 	h.receive(.initial, bad) or {
 		assert h.state == .failed
-		// ... and no later receive() may make progress against a dead machine.
+		// No later receive() may make progress against a dead machine.
 		h.receive(.initial, bad) or {
 			assert err.msg().contains('state machine has failed')
 			return
@@ -194,12 +196,11 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	assert false
 }
 
+// test_feed_reassembly_is_bounded_after_connected checks that late bytes after
+// .connected trip the reassembly cap instead of growing memory.
 fn test_feed_reassembly_is_bounded_after_connected() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
-	// Late Handshake-level retransmits after .connected skip the drain loop, so
-	// without the cap an unbounded stream would park in hs_reassembly; the cap
-	// must trip first and fail the machine rather than grow memory.
 	h.state = .connected
 	h.receive(.handshake, []u8{len: 4 + max_handshake_message_len + 1, init: 0xAA}) or {
 		assert err.msg().contains('reassembly exceeds')
@@ -211,10 +212,9 @@ fn test_feed_reassembly_is_bounded_after_connected() ! {
 
 // ---- transport mode guard (white-box) ----
 
+// test_mode_guards_reject_cross_transport_calls checks that a record-mode
+// handshake refuses the QUIC-only accessor.
 fn test_mode_guards_reject_cross_transport_calls() ! {
-	// A record-mode handshake refuses the QUIC-only accessor, and a QUIC-mode
-	// handshake refuses every record-layer accessor, so an adapter cannot pull
-	// material the other transport never populates.
 	mut rec := new_record_handshake('example.com', []string{}, fixture_validator())!
 	assert rec.mode() == .record
 	_, _ = rec.quic_traffic_secrets(.handshake) or {
@@ -224,6 +224,8 @@ fn test_mode_guards_reject_cross_transport_calls() ! {
 	assert false, 'record-mode handshake handed out QUIC secrets'
 }
 
+// test_mode_guard_rejects_record_calls_in_quic_mode checks that a QUIC-mode
+// handshake refuses every record-layer accessor.
 fn test_mode_guard_rejects_record_calls_in_quic_mode() ! {
 	mut q := new_quic_handshake('example.com', []string{}, fixture_validator())!
 	assert q.mode() == .quic
@@ -233,8 +235,7 @@ fn test_mode_guard_rejects_record_calls_in_quic_mode() ! {
 			assert err.msg().contains('TLS record path only')
 			q.record_update_write_traffic_keys() or {
 				assert err.msg().contains('TLS record path only')
-				// record_unconsumed_bytes is a no-op off the record path rather
-				// than a read of reassembly state a QUIC engine owns itself.
+				// record_unconsumed_bytes is a no-op off the record path.
 				assert q.record_unconsumed_bytes(.initial) == 0
 				return
 			}
@@ -247,22 +248,21 @@ fn test_mode_guard_rejects_record_calls_in_quic_mode() ! {
 
 // ---- traffic_keys / quic_traffic_secrets lifecycle (white-box) ----
 
+// test_traffic_keys_unavailable_before_derivation checks that the accessors
+// refuse until the handshake derives keys.
 fn test_traffic_keys_unavailable_before_derivation() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	_ = h.create_client_hello()!
-	// No level has cached keys yet: .handshake/.application refuse until
-	// ServerHello / server Finished derive them. Reaching an `assert false`
-	// would mean an accessor wrongly handed back material.
 	_, _ := h.record_traffic_keys(.handshake) or {
 		return
 	}
 	assert false
 }
 
+// test_on_handshake_confirmed_drops_handshake_material checks that confirmation
+// wipes the cached handshake keys and traffic secrets.
 fn test_on_handshake_confirmed_drops_handshake_material() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
-	// Plant cached handshake keys/secrets directly (white-box, same module) to
-	// observe exactly what on_handshake_confirmed() destroys.
 	h.client_hs_traffic = [u8(1), 2, 3]
 	h.server_hs_traffic = [u8(4), 5, 6]
 	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
@@ -282,13 +282,12 @@ fn test_on_handshake_confirmed_drops_handshake_material() ! {
 	assert false
 }
 
+// test_on_handshake_confirmed_requires_connected_state checks that confirming
+// early is refused with nothing wiped.
 fn test_on_handshake_confirmed_requires_connected_state() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_hs_traffic = [u8(1), 2, 3]
 	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
-	// The transport still owes the client Finished to the handshake keys;
-	// destroying them early must be refused with nothing wiped, so the
-	// handshake can proceed after the caller corrects its ordering.
 	h.on_handshake_confirmed() or {
 		assert err.msg().contains('reached .connected')
 		assert h.client_hs_traffic.len == 3
@@ -298,6 +297,8 @@ fn test_on_handshake_confirmed_requires_connected_state() ! {
 	assert false
 }
 
+// test_zeroize_app_secrets_clears_and_refuses checks that zeroization forgets
+// the application secrets and their cached keys (§7.5).
 fn test_zeroize_app_secrets_clears_and_refuses() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_ap_traffic = [u8(11), 12]
@@ -309,8 +310,7 @@ fn test_zeroize_app_secrets_clears_and_refuses() ! {
 
 	assert h.client_ap_traffic.len == 0
 	assert h.server_ap_traffic.len == 0
-	// §7.5 says forget the secret values *and* the keys: the cached
-	// TrafficKeys die with them, so no accessor hands them out afterward.
+	// §7.5 says forget the secret values *and* the keys: the cached TrafficKeys die with them.
 	assert h.client_app_keys.key.len == 0
 	assert h.client_app_keys.iv.len == 0
 	assert h.server_app_keys.key.len == 0
@@ -320,11 +320,10 @@ fn test_zeroize_app_secrets_clears_and_refuses() ! {
 	assert false
 }
 
+// test_record_update_traffic_keys_refuse_missing_secrets checks that the
+// ratchet refuses while the application traffic secrets are still empty.
 fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
-	// No server Finished has been processed, so both application traffic
-	// secrets are still empty; expanding an empty secret would install junk
-	// keys that look just like real ones.
 	h.record_update_read_traffic_keys() or {
 		assert err.msg().contains('server application traffic secret')
 		h.record_update_write_traffic_keys() or {
@@ -337,10 +336,10 @@ fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
 	assert false
 }
 
+// test_record_update_traffic_keys_ratchet_forward checks that the ratchet
+// advances the secrets and rebuilds the cached keys (§7.2).
 fn test_record_update_traffic_keys_ratchet_forward() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
-	// With live secrets present the ratchet must actually advance them (§7.2)
-	// and rebuild the cached keys the adapter reads back through record_traffic_keys().
 	h.server_ap_traffic = []u8{len: 32, init: 1}
 	h.client_ap_traffic = []u8{len: 32, init: 2}
 	old_server := h.server_ap_traffic.clone()
@@ -355,13 +354,13 @@ fn test_record_update_traffic_keys_ratchet_forward() ! {
 	assert keys.key.len > 0
 }
 
+// test_record_update_traffic_keys_refuses_after_zeroize checks that a ratchet
+// after teardown is refused instead of resurrecting the secret.
 fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_ap_traffic = [u8(1), 2, 3]
 	h.client_app_keys = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
 	h.zeroize_app_secrets()
-	// A ratchet after teardown would resurrect the destroyed secret as a new
-	// generation of keys; the guard names the teardown as the cause.
 	h.record_update_write_traffic_keys() or {
 		assert err.msg().contains('destroyed by zeroize_app_secrets')
 		return
@@ -371,10 +370,9 @@ fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
 
 // ---- HRR second-hello identity (§4.1.4) via the codec ----
 
+// test_second_hello_reproduces_pinned_random checks that the retry ClientHello
+// carries the same pinned random as the first (§4.1.4).
 fn test_second_hello_reproduces_pinned_random() ! {
-	// The retry ClientHello must carry the same pinned random as the first
-	// (§4.1.4); build_client_hello with a fixed config is deterministic except
-	// for the cookie, so compare the random field across two builds.
 	mut cfg := ClientHelloConfig{
 		server_name:  'example.com'
 		session_id:   [u8(0xAA), 0xBB]
@@ -388,8 +386,7 @@ fn test_second_hello_reproduces_pinned_random() ! {
 	cfg.cookie = [u8(0xC0), 0x69, 0x65] // a retry hello carries a cookie
 	_, full2 := build_client_hello(cfg)!
 	assert full1 != full2 // the cookie changes the bytes
-	// Both hellos still embed the identical 32-byte random (§4.1.4 identity).
-	// Layout: [type 1][len 3][legacy_version 2][random 32] ⇒ random at offset 6.
+	// Both hellos embed the identical 32-byte random (§4.1.4); layout puts it at offset 6.
 	random1 := full1[6..6 + 32]
 	random2 := full2[6..6 + 32]
 	assert random1 == cfg.random
@@ -398,9 +395,9 @@ fn test_second_hello_reproduces_pinned_random() ! {
 
 // ---- recordless passthrough framing ----
 
+// test_next_passthrough_splits_one_byte_cadence checks that a message
+// materializes exactly once, at the final byte (RFC 9001 §4).
 fn test_next_passthrough_splits_one_byte_cadence() ! {
-	// Drive reassembly at a 1-byte cadence: the message materializes exactly
-	// once, at the final byte (RFC 9001 §4 self-framing).
 	mut buf := []u8{}
 	full := wrap_hs(.finished, [u8(0xDE), 0xAD, 0xBE, 0xEF])
 	mut got := 0
@@ -416,9 +413,10 @@ fn test_next_passthrough_splits_one_byte_cadence() ! {
 	assert got == 1
 }
 
+// test_next_passthrough_two_messages_sequential checks that two coalesced
+// messages are extracted one at a time.
 fn test_next_passthrough_two_messages_sequential() ! {
-	// Two coalesced messages are extracted one at a time; `+` cannot join []u8
-	// in V, so the second frame is appended with the `<<` accumulation operator.
+	// `+` cannot join []u8 in V, so the second frame is appended with `<<`.
 	mut buf := wrap_hs(.encrypted_extensions, [u8(0x00)])
 	buf << wrap_hs(.certificate, [u8(0x01), 0x02])
 	m1 := next_passthrough_message(mut buf)!
@@ -428,9 +426,9 @@ fn test_next_passthrough_two_messages_sequential() ! {
 	assert buf.len == 0
 }
 
+// test_next_passthrough_rejects_oversize_length checks that a length above
+// max_handshake_message_len aborts at the header.
 fn test_next_passthrough_rejects_oversize_length() ! {
-	// A declared length above max_handshake_message_len must abort at the header,
-	// not allocate toward a gigantic message.
 	mut w := wire.new_writer(4)
 	w.write_u8(u8(HandshakeType.certificate))
 	w.write_u24(u32(max_handshake_message_len + 1))
@@ -441,13 +439,13 @@ fn test_next_passthrough_rejects_oversize_length() ! {
 	assert false
 }
 
+// test_traffic_keys_returns_independent_copies checks that the accessor returns
+// copies, so a ratchet cannot wipe keys an adapter still holds.
 fn test_traffic_keys_returns_independent_copies() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.client_hs_keys = TrafficKeys{ key: [u8(1), 2, 3], iv: [u8(4), 5] }
 	h.server_hs_keys = TrafficKeys{ key: [u8(6), 7], iv: [u8(8)] }
 	ck, sk := h.record_traffic_keys(.handshake)!
-	// Aliasing the core's buffers would let a KeyUpdate ratchet — which wipes
-	// the superseded generation in place — destroy keys an adapter still holds.
 	assert unsafe { voidptr(&ck.key[0]) } != unsafe { voidptr(&h.client_hs_keys.key[0]) }
 	assert unsafe { voidptr(&ck.iv[0]) } != unsafe { voidptr(&h.client_hs_keys.iv[0]) }
 	assert unsafe { voidptr(&sk.key[0]) } != unsafe { voidptr(&h.server_hs_keys.key[0]) }
@@ -455,6 +453,8 @@ fn test_traffic_keys_returns_independent_copies() ! {
 	assert sk.key == [u8(6), 7]
 }
 
+// test_record_update_traffic_keys_wipes_superseded_generation checks that the
+// superseded generation is zeroed in place after the ratchet.
 fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
 	mut h := new_record_handshake('example.com', []string{}, fixture_validator())!
 	h.server_ap_traffic = []u8{len: 32, init: 7}
@@ -465,8 +465,7 @@ fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
 
 	h.record_update_read_traffic_keys()!
 
-	// The ratchet computes the successor first, then zeroes the superseded
-	// material in place — free storage must not keep a live old generation.
+	// The ratchet computes the successor first, then zeroes the superseded material in place.
 	assert old_secret.len == 32
 	for b in old_secret {
 		assert b == 0

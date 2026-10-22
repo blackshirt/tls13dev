@@ -1,32 +1,14 @@
 // Copyright (c) 2026 blackshirt.
 //
-// packet.v implements QUIC packet header framing (RFC 9000 §17) and the
-// truncated packet-number encoding (§17.1). It is responsible only for the
-// cleartext header bytes: protection (AEAD + header masking) lives in
-// protection.v, which calls into this file to know where each region begins.
-//
-// Two header shapes matter for a client handshake:
-//
-//   * Long headers — Initial, Handshake, 0-RTT, Retry. Carried on every
-//     non-1-RTT packet during the handshake. First byte has the long-header bit
-//     (0x80) set; the low two bits give the type in the top nibble.
-//   * Short headers — 1-RTT. First byte has 0x40 set, 0x80 clear. A client
-//     never sends one before the handshake completes, but the engine must parse
-//     them afterward (HANDSHAKE_DONE, NewSessionTicket's ACK, application).
-//
-// The client only ever *builds* Initial, Handshake and 1-RTT packets; it never
-// sends a Retry.
+// QUIC packet headers (RFC 9000 §17). Protection lives in protection.v.
 module quic
 
-// long_header_form / fixed_bit / short_header_form are the fixed bits of the
-// first byte (RFC 9000 §17.2). The header-form bit distinguishes long (1) from
-// short (0) headers; the fixed bit is 1 in every valid v1 packet.
+// Header form/fixed bits (RFC 9000 §17.2).
 const long_header_form = u8(0x80)
 const fixed_bit = u8(0x40)
 const short_header_form = u8(0x00)
 
-// LongPacketType is the 2-bit type in a long header's first byte
-// (RFC 9000 §17.2), shifted up by two bits in the wire byte.
+// LongPacketType is the 2-bit type in a long header (RFC 9000 §17.2).
 enum LongPacketType {
 	initial   = 0
 	zero_rtt  = 1
@@ -46,8 +28,7 @@ enum PacketType {
 	one_rtt
 }
 
-// first_byte_long reports whether the first byte marks a long header
-// (RFC 9000 §17.2).
+// first_byte_long reports if first byte is a long header (RFC 9000 §17.2).
 fn first_byte_long(b u8) bool {
 	return b & long_header_form != 0
 }
@@ -64,8 +45,7 @@ fn read_cid(buf []u8, off int) !([]u8, int) {
 	return buf[off + 1..off + 1 + n], off + 1 + n
 }
 
-// read_varint_field reads a varint (length-prefixed token) at offset off and
-// returns (bytes, next_offset) (RFC 9000 §17.2 Initial token).
+// read_varint_field reads a varint-length-prefixed field (RFC 9000 §17.2).
 fn read_varint_field(buf []u8, off int) !([]u8, int) {
 	if off >= buf.len {
 		return error('quic: truncated varint field')

@@ -1,16 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// server.v is a minimal, adaptive TLS 1.3 server flight generator for tests.
-// It parses the client's real ClientHello, selects what the test needs (suite,
-// group, ALPN, HelloRetryRequest shape), and emits a byte-correct ServerHello
-// plus encrypted flight — computed against the same RFC 8446 §7.1 schedule the
-// client core runs — so a ClientHandshake can be driven to .connected without
-// a socket, an OpenSSL process, or any production-code test seam. Negative
-// scenarios (corrupted Finished, corrupted CertificateVerify) are one config
-// flag away.
-//
-// Scope: TLS_AES_128_GCM_SHA256 only, no client authentication, no 0-RTT,
-// no key update. Enough for the regression suite, nothing more.
+// server.v is a minimal, adaptive TLS 1.3 server flight generator for tests:
+// it parses the client's real ClientHello and emits a byte-correct ServerHello
+// plus encrypted flight (RFC 8446 §7.1), so a ClientHandshake can be driven
+// to .connected without a socket. Scope: TLS_AES_128_GCM_SHA256 only.
 module fakeserver
 
 import crypto.ecdsa
@@ -42,8 +35,7 @@ const ext_key_share = u16(51)
 const group_secp256r1 = u16(0x0017)
 const group_x25519 = u16(0x001d)
 
-// The only cipher suite the fakeserver implements (RFC 8446 §B.4): SHA-256
-// key schedule, 16-byte AEAD key, 12-byte IV.
+// The only cipher suite the fakeserver implements (RFC 8446 §B.4): SHA-256, 16-byte key, 12-byte IV.
 const suite_tls_aes_128_gcm_sha256 = u16(0x1301)
 
 // TLS 1.3's real version, hidden behind legacy 0x0303 on the wire (§4.2.1).
@@ -54,12 +46,12 @@ const hrr_random = [u8(0xcf), 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x
 	0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
 	0xc8, 0xa8, 0x33, 0x9c]
 
-// hrr_cookie is the opaque cookie the cookie-only HelloRetryRequest carries and
-// the client must echo verbatim (RFC 8446 §4.2.2).
+// hrr_cookie is the opaque cookie the cookie-only HelloRetryRequest carries; the
+// client must echo it verbatim (RFC 8446 §4.2.2).
 const hrr_cookie = 'fakeserver-hrr-cookie-v1'.bytes()
 
 // ClientHello is the subset of RFC 8446 §4.1.2 the fakeserver needs to pick a
-// flight: everything else (SNI, signature_algorithms, ...) is parsed past.
+// flight; everything else (SNI, signature_algorithms, ...) is parsed past.
 struct ClientHello {
 mut:
 	random      []u8
@@ -85,24 +77,21 @@ pub enum HrrMode {
 @[params]
 pub struct Config {
 pub:
-	// alpn is the server's preference-ordered protocol list; the first protocol
-	// the client also offered is selected (RFC 7301 §3.1).
+	// alpn is the server's preference-ordered protocol list (RFC 7301 §3.1).
 	alpn []string = []string{}
 	// hrr requests a HelloRetryRequest round trip before the real flight.
 	hrr HrrMode = .none
-	// bad_finished flips the last byte of the server Finished verify_data so
-	// the client's Finished check must reject the flight.
+	// bad_finished flips the last byte of the server Finished verify_data so the
+	// client's Finished check must reject the flight.
 	bad_finished bool
 	// bad_certificate_verify corrupts the CertificateVerify signature so the
 	// client's Ed25519 check must reject the flight.
 	bad_certificate_verify bool
 	// force_alpn puts this protocol into EncryptedExtensions regardless of what
-	// the client offered, so tests can prove the RFC 7301 §3.1 check aborts on
-	// an unoffered selection. Empty (the default) means "pick normally".
+	// the client offered, proving the RFC 7301 §3.1 check aborts on an unoffered selection.
 	force_alpn string
-	// client_auth sends a CertificateRequest after EncryptedExtensions and
-	// expects the client's empty Certificate response (RFC 8446 §4.3.2/§4.4.2)
-	// folded into the transcript before the server Certificate.
+	// client_auth sends a CertificateRequest after EncryptedExtensions and expects
+	// the client's empty Certificate (RFC 8446 §4.3.2/§4.4.2) in the transcript.
 	client_auth bool
 }
 
@@ -115,8 +104,8 @@ enum Stage {
 	done                   // client Finished verified; connection logically complete
 }
 
-// Server is one adaptive fakeserver instance. It is single-use per handshake:
-// create it, feed it the client's ClientHello(s), then its Finished.
+// Server is one adaptive fakeserver instance, single-use per handshake:
+// feed it the client's ClientHello(s), then its Finished.
 @[noinit]
 pub struct Server {
 mut:
@@ -133,16 +122,13 @@ mut:
 	server_hs_traffic   []u8
 	client_ap_traffic   []u8
 	server_ap_traffic   []u8
-	// pending_tail holds the server-flight messages that follow a client
-	// CertificateRequest/response exchange (Certificate, CertificateVerify,
-	// Finished), deferred until the client's empty Certificate is folded into
-	// the transcript so the Finished binds the correct running hash.
+	// pending_tail holds the server-flight messages deferred until the client's
+	// empty Certificate is folded into the transcript.
 	pending_tail [][]u8
 }
 
-// Flight is one server response: the (possibly HelloRetryRequest) ServerHello
-// as a plaintext message, plus the remaining flight messages (empty for HRR)
-// the caller must protect with the handshake keys.
+// Flight is one server response: the (possibly HelloRetryRequest) ServerHello in
+// plaintext, plus the remaining messages the caller must protect.
 pub struct Flight {
 pub:
 	is_hrr       bool
@@ -150,22 +136,19 @@ pub:
 	rest         [][]u8
 }
 
-// Transcript is a SHA-256 transcript of full handshake messages
-// (RFC 8446 §4.4.1). It keeps raw messages because a HelloRetryRequest
-// rewrites ClientHello1 into the synthetic message_hash.
+// Transcript is a SHA-256 transcript of full handshake messages (RFC 8446 §4.4.1).
+// It keeps raw messages because an HRR rewrites ClientHello1 into message_hash.
 struct Transcript {
 mut:
 	msgs [][]u8
 }
 
-// append adds one complete handshake message (header included) to the
-// transcript.
+// append adds one complete handshake message (header included) to the transcript.
 fn (mut t Transcript) append(msg []u8) {
 	t.msgs << msg.clone()
 }
 
-// hash returns the running Transcript-Hash: SHA-256 over the concatenation of
-// every message appended so far.
+// hash returns the running Transcript-Hash: SHA-256 over all appended messages.
 fn (t &Transcript) hash() []u8 {
 	mut total := []u8{}
 	for m in t.msgs {
@@ -174,9 +157,8 @@ fn (t &Transcript) hash() []u8 {
 	return sha256_digest(total)
 }
 
-// apply_hello_retry_request replaces ClientHello1 with the synthetic
-// message_hash and keeps the HelloRetryRequest (RFC 8446 §4.4.1):
-// [message_hash, HRR, ClientHello2, ...].
+// apply_hello_retry_request replaces ClientHello1 with the synthetic message_hash
+// and keeps the HRR: [message_hash, HRR, ClientHello2, ...] (RFC 8446 §4.4.1).
 fn (mut t Transcript) apply_hello_retry_request(client_hello1 []u8, hrr []u8) {
 	ch1_hash := sha256_digest(client_hello1)
 	mut synthetic := []u8{cap: 4 + ch1_hash.len}
@@ -199,8 +181,7 @@ pub fn new_server(cfg Config) !Server {
 }
 
 // handle_client_hello consumes one complete ClientHello (or its retry) and
-// returns the flight the client must next process. The first call may produce
-// a HelloRetryRequest; the retry call always produces the real flight.
+// returns the flight to process next; the first call may yield an HRR.
 pub fn (mut s Server) handle_client_hello(msg []u8) !Flight {
 	ch := parse_client_hello(msg)!
 	if !ch.versions.contains(tls13_version) {
@@ -239,8 +220,8 @@ pub fn (mut s Server) handle_client_hello(msg []u8) !Flight {
 	}
 }
 
-// send_hello_retry_request emits the HelloRetryRequest for the configured HrrMode,
-// rewrites the transcript per RFC 8446 §4.4.1, and advances to the retry wait.
+// send_hello_retry_request emits the HRR for the configured HrrMode, rewrites the
+// transcript (RFC 8446 §4.4.1), and advances to the retry wait.
 fn (mut s Server) send_hello_retry_request(ch ClientHello, ch1_msg []u8) !Flight {
 	mut req_group := u16(0)
 	mut cookie := []u8{}
@@ -260,9 +241,8 @@ fn (mut s Server) send_hello_retry_request(ch ClientHello, ch1_msg []u8) !Flight
 	}
 }
 
-// pick_hrr_group chooses the group an HRR requests: secp256r1 when the client
-// offered it alongside its current share, else any other supported offered
-// group that differs from the current one (RFC 8446 §4.2.8).
+// pick_hrr_group chooses the group an HRR requests: secp256r1 when offered
+// alongside the current share, else another offered group (RFC 8446 §4.2.8).
 fn pick_hrr_group(groups []u16, current u16) !u16 {
 	for g in groups {
 		if g == group_secp256r1 && g != current {
@@ -278,20 +258,14 @@ fn pick_hrr_group(groups []u16, current u16) !u16 {
 }
 
 // finish_flight performs the (EC)DHE exchange, builds ServerHello, derives the
-// handshake secrets, and emits EncryptedExtensions + Certificate +
-// CertificateVerify + Finished over the growing transcript. When client_auth is
-// set the flight is split: EncryptedExtensions + CertificateRequest go out
-// immediately, the rest is deferred to handle_client_certificate so the
-// client's empty Certificate sits between CertificateRequest and Certificate in
-// the transcript (RFC 8446 §4.4.1/§4.4.2).
+// handshake secrets and emits the flight (RFC 8446 §4.4.1/§4.4.2).
 fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	server_share, shared := server_ecdhe(ch.share_group, ch.share)!
 	s.shared_secret = shared
 	s.share_group = ch.share_group
 
 	sh := build_server_hello(s.session_id, ch.share_group, server_share)!
-	// Transcript now covers ClientHello2 (or 1) and ServerHello; this is the
-	// th_ch_sh the handshake secrets bind to (§7.1).
+	// Transcript now covers ClientHello2 (or 1) and ServerHello (th_ch_sh, §7.1).
 	s.transcript.append(ch_msg)
 	s.transcript.append(sh)
 	s.derive_handshake_secrets()!
@@ -305,8 +279,7 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	s.transcript.append(ee)
 
 	if s.cfg.client_auth {
-		// §4.3.2: request client credentials, then WAIT for the client's empty
-		// Certificate before emitting the authenticated server tail.
+		// §4.3.2: wait for the client's empty Certificate before the server tail.
 		creq := build_certificate_request()!
 		s.transcript.append(creq)
 		s.stage = .expect_client_cert
@@ -330,8 +303,7 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 }
 
 // build_server_tail builds Certificate + CertificateVerify + Finished over the
-// transcript as it currently stands (after EncryptedExtensions, and after a
-// client Certificate when client_auth is set).
+// current transcript (after EncryptedExtensions, and the client Certificate if any).
 fn (mut s Server) build_server_tail() ![][]u8 {
 	cert := build_certificate(leaf_der() or {
 		return error('fakeserver: cannot decode embedded leaf certificate (${err.msg()})')
@@ -361,15 +333,13 @@ fn (mut s Server) build_server_tail() ![][]u8 {
 	fin := wrap_handshake(hs_finished, verify_data)
 	s.transcript.append(fin)
 
-	// Application secrets bind to the transcript including server Finished
-	// (th_sfin after appending Finished, §7.1).
+	// Application secrets bind to the transcript including server Finished (§7.1).
 	s.derive_application_secrets()!
 	return [cert, cv, fin]
 }
 
-// handle_client_certificate consumes the client's empty Certificate response to
-// a CertificateRequest, folds it into the transcript, and returns the deferred
-// server tail (Certificate + CertificateVerify + Finished).
+// handle_client_certificate consumes the client's empty Certificate response,
+// folds it into the transcript, and returns the deferred server tail.
 pub fn (mut s Server) handle_client_certificate(msg []u8) ![][]u8 {
 	if s.stage != .expect_client_cert {
 		return error('fakeserver: client Certificate is unexpected in stage ${s.stage}')
@@ -403,8 +373,8 @@ pub fn (mut s Server) handle_client_certificate(msg []u8) ![][]u8 {
 	return tail
 }
 
-// handle_client_finished verifies the client Finished against the transcript
-// now covering the whole server flight, completing the handshake.
+// handle_client_finished verifies the client Finished against the full transcript,
+// completing the handshake.
 pub fn (mut s Server) handle_client_finished(msg []u8) ! {
 	if s.stage != .expect_client_finished {
 		return error('fakeserver: client Finished is unexpected in stage ${s.stage}')
@@ -431,9 +401,8 @@ pub fn (mut s Server) handle_client_finished(msg []u8) ! {
 	s.stage = .done
 }
 
-// derive_handshake_secrets runs the §7.1 handshake phase: zero-PSK Early
-// Secret, Handshake Secret mixing in the ECDHE shared secret, and the
-// client/server handshake traffic secrets over th_ch_sh.
+// derive_handshake_secrets runs the §7.1 handshake phase: Early Secret, Handshake
+// Secret mixing in the ECDHE shared secret, and the traffic secrets over th_ch_sh.
 fn (mut s Server) derive_handshake_secrets() ! {
 	zeros := []u8{len: hash_len}
 	empty := sha256_digest([]u8{})
@@ -443,14 +412,12 @@ fn (mut s Server) derive_handshake_secrets() ! {
 	th := s.transcript.hash()
 	s.client_hs_traffic = derive_secret(handshake_secret, 'c hs traffic', th)!
 	s.server_hs_traffic = derive_secret(handshake_secret, 's hs traffic', th)!
-	// Retained because the Master Secret derives from it in the application
-	// phase (§7.1); the client core keeps the same value for the same reason.
+	// Retained: the Master Secret derives from it in the application phase (§7.1).
 	s.handshake_secret = handshake_secret
 }
 
 // derive_application_secrets runs the §7.1 application phase from the retained
-// Handshake Secret: Master Secret, then client/server application traffic
-// secrets over the transcript including server Finished.
+// Handshake Secret: Master Secret, then the application traffic secrets.
 fn (mut s Server) derive_application_secrets() ! {
 	empty := sha256_digest([]u8{})
 	derived_hs := derive_secret(s.handshake_secret, 'derived', empty)!
@@ -461,8 +428,8 @@ fn (mut s Server) derive_application_secrets() ! {
 	s.server_ap_traffic = derive_secret(master_secret, 's ap traffic', th)!
 }
 
-// server_handshake_keys returns the fakeserver's server-direction handshake
-// traffic key and IV, so the test transport can encrypt the flight records.
+// server_handshake_keys returns the server-direction handshake key and IV, so the
+// test transport can encrypt the flight records.
 pub fn (s &Server) server_handshake_keys() !([]u8, []u8) {
 	if s.server_hs_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
@@ -470,8 +437,8 @@ pub fn (s &Server) server_handshake_keys() !([]u8, []u8) {
 	return traffic_keys(s.server_hs_traffic)
 }
 
-// client_handshake_keys returns the fakeserver's client-direction handshake
-// traffic key and IV, so the test transport can decrypt the client Finished.
+// client_handshake_keys returns the client-direction handshake key and IV, so the
+// test transport can decrypt the client Finished.
 pub fn (s &Server) client_handshake_keys() !([]u8, []u8) {
 	if s.client_hs_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
@@ -480,8 +447,7 @@ pub fn (s &Server) client_handshake_keys() !([]u8, []u8) {
 }
 
 // server_handshake_secret returns the raw §7.1 server handshake traffic secret,
-// so a QUIC test peer can run its own RFC 9001 §5.1 "quic key"/"quic iv"/
-// "quic hp" expansions instead of the TLS record "key"/"iv" ones.
+// for a QUIC test peer's RFC 9001 §5.1 "quic key"/"quic iv"/"quic hp" expansions.
 pub fn (s &Server) server_handshake_secret() ![]u8 {
 	if s.server_hs_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
@@ -490,7 +456,7 @@ pub fn (s &Server) server_handshake_secret() ![]u8 {
 }
 
 // client_handshake_secret returns the raw §7.1 client handshake traffic secret,
-// for a QUIC test peer to derive packet protection from.
+// for a QUIC test peer to derive packet protection.
 pub fn (s &Server) client_handshake_secret() ![]u8 {
 	if s.client_hs_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
@@ -498,9 +464,8 @@ pub fn (s &Server) client_handshake_secret() ![]u8 {
 	return s.client_hs_traffic.clone()
 }
 
-// server_app_keys returns the fakeserver's server-direction application traffic
-// key and IV, so the test transport can send post-handshake records (tickets,
-// application data) the client will accept.
+// server_app_keys returns the server-direction application key and IV, so the
+// test transport can send post-handshake records the client will accept.
 pub fn (s &Server) server_app_keys() !([]u8, []u8) {
 	if s.server_ap_traffic.len == 0 {
 		return error('fakeserver: application secrets not derived yet (server Finished not built)')
@@ -508,8 +473,8 @@ pub fn (s &Server) server_app_keys() !([]u8, []u8) {
 	return traffic_keys(s.server_ap_traffic)
 }
 
-// server_app_secret returns the raw §7.1 server application traffic secret, for
-// a QUIC test peer to derive 1-RTT packet protection from.
+// server_app_secret returns the raw §7.1 server application traffic secret, for a
+// QUIC test peer to derive 1-RTT packet protection.
 pub fn (s &Server) server_app_secret() ![]u8 {
 	if s.server_ap_traffic.len == 0 {
 		return error('fakeserver: application secrets not derived yet (server Finished not built)')
@@ -517,8 +482,8 @@ pub fn (s &Server) server_app_secret() ![]u8 {
 	return s.server_ap_traffic.clone()
 }
 
-// new_session_ticket builds a minimal but valid NewSessionTicket (RFC 8446
-// §4.6.1) the client's post-handshake parser must accept and store.
+// new_session_ticket builds a valid NewSessionTicket (RFC 8446 §4.6.1) the
+// client's post-handshake parser must accept and store.
 pub fn (s &Server) new_session_ticket() ![]u8 {
 	mut body := wire.new_writer(64)
 	body.write_u32(3600) // ticket_lifetime (<= 604800)
@@ -529,8 +494,7 @@ pub fn (s &Server) new_session_ticket() ![]u8 {
 	return wrap_handshake(hs_new_session_ticket, body.bytes())
 }
 
-// flatten concatenates flight messages into one byte stream, the order a
-// sender would place them into successive records.
+// flatten concatenates flight messages into one byte stream, in send order.
 pub fn flatten(msgs [][]u8) []u8 {
 	mut out := []u8{}
 	for m in msgs {
@@ -550,9 +514,7 @@ fn wrap_handshake(typ u8, body []u8) []u8 {
 }
 
 // parse_client_hello decodes the RFC 8446 §4.1.2 fields the fakeserver needs
-// and walks the extension block for groups, key_share, ALPN, versions and
-// cookie. Every framing error is returned; the fakeserver never parses past a
-// malformed ClientHello.
+// (groups, key_share, ALPN, versions, cookie); every framing error is returned.
 fn parse_client_hello(msg []u8) !ClientHello {
 	mut r := wire.new_reader(msg)
 	typ := r.read_u8()!
@@ -630,8 +592,7 @@ fn parse_client_hello(msg []u8) !ClientHello {
 		} else if etyp == ext_cookie {
 			ch.cookie = d.read_vector_u16()!
 		} else if etyp == ext_key_share {
-			// u16 vector of KeyShareEntry: group (u16) + key_exchange (u16 vec).
-			// The client sends exactly one entry (§4.2.8); take the first.
+			// u16 vector of KeyShareEntry (group + key_exchange); take the first entry (§4.2.8).
 			ks := d.read_vector_u16()!
 			mut kr := wire.new_reader(ks)
 			if kr.remaining() >= 4 {
@@ -641,15 +602,13 @@ fn parse_client_hello(msg []u8) !ClientHello {
 		} else if etyp == ext_signature_algorithms {
 			// Offered; not needed for a server-auth-only flight.
 		}
-		// server_name (0) and anything else: ignored; SNI is not verified by
-		// this test server (the client already pins it via config.server_name).
+		// server_name (0) and anything else: ignored; SNI is not verified here.
 	}
 	return ch
 }
 
 // pick_alpn selects the first of the server's preference-ordered protocols the
-// client also offered; '' when there is no overlap or the server offers none
-// (RFC 7301 §3.1).
+// client also offered, or '' when there is no overlap (RFC 7301 §3.1).
 fn pick_alpn(server_list []string, client_list []string) string {
 	for p in server_list {
 		if client_list.contains(p) {
@@ -659,9 +618,8 @@ fn pick_alpn(server_list []string, client_list []string) string {
 	return ''
 }
 
-// server_ecdhe generates the server's ephemeral key pair for the negotiated
-// group and computes the shared secret against the client's key share,
-// returning (server public key_exchange, shared secret).
+// server_ecdhe generates the server's ephemeral key pair for the negotiated group
+// and computes the shared secret, returning (public key_exchange, shared secret).
 fn server_ecdhe(group u16, client_share []u8) !([]u8, []u8) {
 	if group == group_x25519 {
 		if client_share.len != 32 {
@@ -711,9 +669,8 @@ fn server_ecdhe(group u16, client_share []u8) !([]u8, []u8) {
 	return error('fakeserver: unsupported key_share group 0x${group:04x}')
 }
 
-// build_server_hello emits a TLS 1.3 ServerHello echoing the client's session
-// id, selecting the fixed suite and the group whose share we just generated
-// (RFC 8446 §4.1.3).
+// build_server_hello emits a TLS 1.3 ServerHello echoing the session id and
+// selecting the fixed suite and group (RFC 8446 §4.1.3).
 fn build_server_hello(session_id []u8, share_group u16, server_share []u8) ![]u8 {
 	mut body := wire.new_writer(128)
 	body.write_u16(0x0303) // legacy_version (§4.1.3)
@@ -728,10 +685,7 @@ fn build_server_hello(session_id []u8, share_group u16, server_share []u8) ![]u8
 	// supported_versions: bare u16 in ServerHello (§4.2.1).
 	ext.write_u16(ext_supported_versions)
 	ext.write_vector_u16([u8(tls13_version >> 8), u8(tls13_version & 0xff)])!
-	// key_share: the extension_data is exactly one KeyShareEntry — group (u16)
-	// followed by key_exchange (u16 vec) — with NO outer vector wrapper
-	// (RFC 8446 §4.2.8: ServerHello carries a single KeyShareEntry, unlike
-	// ClientHello's client_shares vector).
+	// key_share: extension_data is one KeyShareEntry, no outer vector wrapper (RFC 8446 §4.2.8).
 	mut entry := wire.new_writer(server_share.len + 4)
 	entry.write_u16(share_group)
 	entry.write_vector_u16(server_share)!
@@ -742,9 +696,8 @@ fn build_server_hello(session_id []u8, share_group u16, server_share []u8) ![]u8
 	return wrap_handshake(hs_server_hello, body.bytes())
 }
 
-// build_hrr emits a HelloRetryRequest: a ServerHello message whose random is
-// the fixed §4.1.3 sentinel, carrying either a selected_group (change_group
-// mode) or a cookie (cookie_only mode).
+// build_hrr emits a HelloRetryRequest: a ServerHello whose random is the fixed
+// §4.1.3 sentinel, carrying a selected_group or a cookie.
 fn build_hrr(session_id []u8, req_group u16, cookie []u8) ![]u8 {
 	mut body := wire.new_writer(128)
 	body.write_u16(0x0303)
@@ -764,10 +717,7 @@ fn build_hrr(session_id []u8, req_group u16, cookie []u8) ![]u8 {
 		ext.write_vector_u16(kg.bytes())!
 	}
 	if cookie.len > 0 {
-		// RFC 8446 §4.2.2: the cookie extension_data is itself
-		// opaque cookie<1..2^16-1> — a u16 length prefix inside the
-		// extension's own length framing, which parse_server_hello reads back
-		// with its second read_vector_u16.
+		// RFC 8446 §4.2.2: extension_data is itself a u16-length-prefixed cookie.
 		mut cookie_w := wire.new_writer(cookie.len + 2)
 		cookie_w.write_vector_u16(cookie)!
 		ext.write_u16(ext_cookie)
@@ -779,7 +729,7 @@ fn build_hrr(session_id []u8, req_group u16, cookie []u8) ![]u8 {
 }
 
 // build_encrypted_extensions emits an EncryptedExtensions body carrying the
-// negotiated ALPN (when one was picked) and nothing else (RFC 8446 §4.3.1).
+// negotiated ALPN and nothing else (RFC 8446 §4.3.1).
 fn build_encrypted_extensions(alpn_proto string) ![]u8 {
 	mut ext := wire.new_writer(32)
 	if alpn_proto.len > 0 {
@@ -795,8 +745,8 @@ fn build_encrypted_extensions(alpn_proto string) ![]u8 {
 	return wrap_handshake(hs_encrypted_extensions, body.bytes())
 }
 
-// build_certificate emits a server Certificate message with a single leaf
-// entry and an empty certificate_request_context (RFC 8446 §4.4.2).
+// build_certificate emits a server Certificate with a single leaf entry and an
+// empty certificate_request_context (RFC 8446 §4.4.2).
 fn build_certificate(leaf []u8) ![]u8 {
 	mut cert_list := wire.new_writer(leaf.len + 8)
 	cert_list.write_vector_u24(leaf)!
@@ -808,7 +758,7 @@ fn build_certificate(leaf []u8) ![]u8 {
 }
 
 // server_signed_content builds the RFC 8446 §4.4.3 CertificateVerify input:
-// 64 space octets || context string || 0x00 || transcript hash.
+// 64 space octets || context || 0x00 || transcript hash.
 fn server_signed_content(transcript_hash []u8) []u8 {
 	context := 'TLS 1.3, server CertificateVerify'.bytes()
 	mut out := []u8{cap: 64 + context.len + 1 + transcript_hash.len}
@@ -821,8 +771,8 @@ fn server_signed_content(transcript_hash []u8) []u8 {
 	return out
 }
 
-// build_certificate_verify emits a CertificateVerify carrying an Ed25519
-// signature over signed_content (RFC 8446 §4.4.3).
+// build_certificate_verify emits a CertificateVerify carrying an Ed25519 signature
+// over signed_content (RFC 8446 §4.4.3).
 fn build_certificate_verify(signature []u8) ![]u8 {
 	mut body := wire.new_writer(signature.len + 4)
 	body.write_u16(0x0807) // ed25519 (§4.2.3)
@@ -830,9 +780,8 @@ fn build_certificate_verify(signature []u8) ![]u8 {
 	return wrap_handshake(hs_certificate_verify, body.bytes())
 }
 
-// build_certificate_request emits a CertificateRequest (RFC 8446 §4.3.2) with
-// an empty request context and just the mandatory signature_algorithms
-// extension (Ed25519), the minimal well-formed request.
+// build_certificate_request emits a CertificateRequest (RFC 8446 §4.3.2) with an
+// empty request context and only the signature_algorithms extension (Ed25519).
 fn build_certificate_request() ![]u8 {
 	// signature_algorithms: a u16-length list of schemes, here just Ed25519.
 	mut sa_body := wire.new_writer(4)

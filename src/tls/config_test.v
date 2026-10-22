@@ -1,15 +1,14 @@
 // Copyright (c) 2026 blackshirt.
 //
-// default_config regression test: after Config moved to @[params], `alpn` and
-// `timeout` are no longer assigned inside default_config — they must inherit the
-// field-level defaults declared on the struct. This pins that a default Config
-// still carries the intended conservative values (empty ALPN offer, 30s timeout,
-// verification strictly on), so a future edit to the field defaults that breaks
-// the constructor's contract surfaces here.
+// default_config regression test: with Config on @[params], `alpn` and `timeout`
+// are no longer assigned inside default_config and must inherit the field-level
+// defaults declared on the struct.
 module tls
 
 import time
 
+// test_default_config_applies_field_defaults checks a default Config still
+// carries the conservative values (empty ALPN offer, 30s timeout, verification on).
 fn test_default_config_applies_field_defaults() {
 	cfg := default_config('example.com')
 	assert cfg.server_name == 'example.com'

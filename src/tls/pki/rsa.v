@@ -1,8 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// rsa.v implements raw RSA / RSASSA-PKCS1-v1_5 verification over math.big integers,
-// covering the classic RSA signature schemes the crypto standard-library helpers do
-// not expose. ECDSA and PSS paths route through the crypto packages instead.
+// rsa.v implements raw RSA / RSASSA-PKCS1-v1_5 verification over math.big integers;
+// ECDSA and PSS paths route through the crypto packages.
 module pki
 
 import math.big
@@ -12,10 +11,8 @@ import crypto.sha512
 import crypto.subtle
 import tls.wire
 
-// RsaPublicKey represents a decoded RSA public key. Its fields are module-private
-// and can only be populated by the parser. @[noinit] blocks a zero-value
-// RsaPublicKey{} (n=0, e=0, size_bytes=0), which would otherwise be a
-// constructed-out-of-thin-air key feeding signature verification.
+// RsaPublicKey represents a decoded RSA public key; populated only by the parser.
+// @[noinit] blocks a fabricated zero-value key.
 @[noinit]
 pub struct RsaPublicKey {
 mut:
@@ -24,18 +21,11 @@ mut:
 	size_bytes int         // key size in bytes (modulus length), used to bound signatures
 }
 
-// max_rsa_modulus_bytes bounds the accepted RSA modulus (8192 bits). Verifying a
-// signature against an enormous modulus is CPU-expensive (big-integer modexp), so
-// without a ceiling a certificate carrying a multi-megabit key is a cheap CPU
-// denial-of-service lever. 8192 bits is comfortably above any key in real use.
+// max_rsa_modulus_bytes bounds the accepted RSA modulus (8192 bits) to avoid CPU DoS.
 const max_rsa_modulus_bytes = 1024
 
 // parse_rsa_public_key parses an RSA public key from ASN.1 DER (PKCS #1 RSAPublicKey).
-//
-//	RSAPublicKey ::= SEQUENCE {
-//	    modulus           INTEGER,  -- n
-//	    publicExponent    INTEGER   -- e
-//	}
+// RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
 fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	// der is the full DER-encoded SEQUENCE (tag 0x30 + length + contents).
 	// Unwrap the outer SEQUENCE to get its contents, then parse the two INTEGERs.
@@ -52,23 +42,20 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	e_elem := elements[1]
 
 	mut n_bytes := n_elem.data.clone()
-	// Strip leading zero byte if present (ASN.1 positive integer sign indicator)
+	// Strip leading zero byte if present (ASN.1 positive integer sign indicator).
 	if n_bytes.len > 0 && n_bytes[0] == 0 {
 		n_bytes = n_bytes[1..].clone()
 	}
 	if n_bytes.len == 0 {
 		return error('rsa: empty modulus')
 	}
-	// Reject an oversized modulus BEFORE any hex encoding or big-Integer import:
-	// each verification does a big-integer exponentiation whose cost grows with
-	// key size, so a multi-megabit modulus would otherwise be a cheap CPU DoS.
+	// Reject an oversized modulus before hex/big-integer import (CPU DoS guard).
 	if n_bytes.len > max_rsa_modulus_bytes {
 		return error('rsa: modulus ${n_bytes.len * 8} bits exceeds maximum supported ${max_rsa_modulus_bytes * 8} bits')
 	}
 
 	n_hex := hex.encode(n_bytes)
-	// hex string as intermediate: V's big.Integer consumes radix strings, not raw
-	// byte slices — the radix-16 path is the supported way to import DER INTEGERs.
+	// hex string as intermediate: V's big.Integer consumes radix strings, not raw byte slices.
 	n := big.integer_from_radix(n_hex, 16) or {
 		return error('rsa: failed to parse modulus: ${err.msg()}')
 	}
@@ -83,17 +70,11 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	if e == 0 {
 		return error('rsa: public exponent must be non-zero')
 	}
-	// RFC 8017 §5.1.3 / FIPS 186-5: a valid public exponent is odd and >= 3.
-	// e == 1 makes RSAVP1 the identity (m = s^1 mod n = s), so any key-length byte
-	// string would "verify" — a universal forgery. Kept as its own branch so the
-	// distinct rationale stays visible next to its error.
+	// RFC 8017 §5.1.3 / FIPS 186-5: a valid public exponent is odd and >= 3; e == 1 makes RSAVP1 the identity (universal forgery).
 	if e == 1 {
 		return error('rsa: public exponent 1 is degenerate')
 	}
-	// Any even exponent (e == 2, 4, …) is rejected: an even value is not invertible
-	// mod n (gcd(e, φ(n)) ≠ 1), so it is not a valid RSA public exponent and would
-	// admit malformed keys the policy above promises to refuse. Odd e >= 3 (real
-	// keys use 3 or 65537) passes.
+	// Any even exponent is rejected (not invertible mod n).
 	if e % 2 == 0 {
 		return error('rsa: public exponent ${e} must be odd')
 	}
@@ -105,10 +86,7 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	}
 }
 
-// rsa_verify_raw computes m = s^e mod n — the raw textbook RSA public-key
-// primitive (RFC 8017 §5.2.1, RSAVP1) with no padding validation, which belongs
-// to the PKCS#1 v1.5 / PSS callers. The result is left-zero-padded back to key
-// size because hex-encoding drops leading 0x00 octets the padding needs.
+// rsa_verify_raw computes m = s^e mod n (RFC 8017 §5.2.1); result is left-zero-padded to key size.
 fn (k &RsaPublicKey) rsa_verify_raw(sig []u8) ![]u8 {
 	if sig.len != k.size_bytes {
 		return error('rsa: signature length (${sig.len}) does not match key size (${k.size_bytes})')
@@ -121,8 +99,7 @@ fn (k &RsaPublicKey) rsa_verify_raw(sig []u8) ![]u8 {
 		return error('rsa: signature representative out of range')
 	}
 
-	// RFC 8017 §5.2.1 (RSAVP1): m = s^e mod n. No constant-time concern: every
-	// input is public in a verification, and the private key never touches here.
+	// RFC 8017 §5.2.1 (RSAVP1): m = s^e mod n; all inputs public so not constant-time.
 	m := s.mod_pow(k.e, k.n)
 	mut m_hex := m.radix_str(16)
 	if m_hex.len % 2 != 0 {
@@ -142,9 +119,7 @@ fn (k &RsaPublicKey) rsa_verify_raw(sig []u8) ![]u8 {
 	return m_bytes
 }
 
-// mgf1 implements Mask Generation Function 1 (RFC 8017 Appendix B.2.1),
-// parameterized by the hash so it can serve SHA-256/384/512 PSS: Hash(seed ||
-// counter) is iterated with an incrementing counter to fill mask_len bytes.
+// mgf1 implements Mask Generation Function 1 (RFC 8017 Appendix B.2.1).
 fn mgf1(seed []u8, mask_len int, hash_fn fn ([]u8) []u8) []u8 {
 	mut out := []u8{cap: mask_len}
 	mut counter := u32(0)
@@ -157,8 +132,7 @@ fn mgf1(seed []u8, mask_len int, hash_fn fn ([]u8) []u8) []u8 {
 		data << u8(counter & 0xff)
 
 		digest := hash_fn(data)
-		// RFC 8017 §B.2.1 step 2c: concatenate full hash blocks, then truncate to
-		// exactly mask_len — the final block is normally only partially used.
+		// RFC 8017 §B.2.1 step 2c: concatenate full hash blocks, then truncate to exactly mask_len.
 		needed := mask_len - out.len
 		to_take := if needed < digest.len { needed } else { digest.len }
 		out << digest[..to_take]
@@ -167,8 +141,7 @@ fn mgf1(seed []u8, mask_len int, hash_fn fn ([]u8) []u8) []u8 {
 	return out
 }
 
-// digest_bytes hashes data with the named digest ("sha256"/"sha384"/"sha512"),
-// the only schemes TLS certificates use; shared with validator.v.
+// digest_bytes hashes data with the named digest ("sha256"/"sha384"/"sha512").
 fn digest_bytes(digest_type string, data []u8) ![]u8 {
 	return match digest_type {
 		'sha256' { sha256.sum256(data) }
@@ -178,8 +151,7 @@ fn digest_bytes(digest_type string, data []u8) ![]u8 {
 	}
 }
 
-// mgf1_for runs MGF1 under the hash named by digest_type: RSASSA-PSS requires the
-// mask-generation hash to match the signature hash (RFC 8017 §9.1.1/§A.2.3).
+// mgf1_for runs MGF1 under the hash named by digest_type (RFC 8017 §9.1.1).
 fn mgf1_for(digest_type string, seed []u8, mask_len int) ![]u8 {
 	mask := match digest_type {
 		'sha256' { mgf1(seed, mask_len, sha256.sum256) }
@@ -192,10 +164,7 @@ fn mgf1_for(digest_type string, seed []u8, mask_len int) ![]u8 {
 	return mask
 }
 
-// verify_pss verifies an RSASSA-PSS signature (RFC 8017 §8.1.2 & §9.1.2). TLS
-// 1.3 lists PSS first (RFC 8446 §4.2.3); its randomized encoding has a provable
-// reduction and avoids v1.5's deterministic-padding pitfalls. The strict
-// structure checks enforce encoding uniqueness.
+// verify_pss verifies an RSASSA-PSS signature (RFC 8017 §8.1.2 & §9.1.2), TLS 1.3 first (RFC 8446 §4.2.3).
 pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool {
 	h_len := match digest_type {
 		'sha256' { 32 }

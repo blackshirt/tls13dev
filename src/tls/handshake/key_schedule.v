@@ -1,9 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// The handshake core derives every handshake and application key through the
-// RFC 8446 §7.1 schedule: key_schedule.v runs the HKDF-Extract/Expand ladder
-// over the (EC)DHE and traffic-secret stages, transcript.v maintains the
-// running message hash the schedule and CertificateVerify both consume.
+// key_schedule.v runs the RFC 8446 §7.1 HKDF-Extract/Expand ladder over the
+// (EC)DHE and traffic-secret stages, deriving every handshake and application key.
 module handshake
 
 import crypto.hmac
@@ -11,9 +9,7 @@ import crypto.sha256
 import crypto.sha512
 
 // HashAlgorithm specifies the hash function used by the negotiated cipher suite.
-// Pub because the hkdf_expand_label seam is only callable with it: a QUIC
-// engine expands the RFC 9001 §5.1 labels over exported secrets itself and must
-// name the negotiated suite's hash to do so.
+// Pub because hkdf_expand_label needs it, and a QUIC engine names the suite's hash to expand the RFC 9001 §5.1 labels.
 pub enum HashAlgorithm {
 	sha256
 	sha384
@@ -48,21 +44,17 @@ fn (h HashAlgorithm) compute_hmac(key []u8, data []u8) []u8 {
 }
 
 // hkdf_extract implements HKDF-Extract(salt, ikm) (RFC 5869 §2.2).
-// An empty salt means a string of Hash.length zeros, the RFC 5869 default; TLS
-// 1.3 uses that for the Early Secret (salt=0, IKM=0 without a PSK). The Master
-// Secret likewise passes an all-zero IKM but a real salt (the handshake secret).
+// An empty salt means a string of Hash.length zeros, the RFC 5869 default.
 fn hkdf_extract(hash HashAlgorithm, salt []u8, ikm []u8) []u8 {
 	effective_salt := if salt.len == 0 { []u8{len: hash.hash_len()} } else { salt }
 	return hash.compute_hmac(effective_salt, ikm)
 }
 
-// hkdf_expand implements HKDF-Expand(prk, info, length) (RFC 5869 §2.3).
-// Output is T(1) || T(2) || … where T(i) = HMAC(PRK, T(i-1) || info || i); the
-// 1-byte counter is why the request limit is 255 * HashLen.
+// hkdf_expand implements HKDF-Expand(prk, info, length) (RFC 5869 §2.3), producing
+// T(1) || T(2) || … where T(i) = HMAC(PRK, T(i-1) || info || i).
 fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 	hash_len := hash.hash_len()
-	// At most 255 blocks are reachable (one byte of counter); asking for more
-	// would wrap the counter and repeat a block (RFC 5869 §2.3).
+	// At most 255 blocks are reachable (one byte of counter); more would repeat a block (RFC 5869 §2.3).
 	if length > 255 * hash_len {
 		return error('handshake: HKDF-Expand requested length ${length} exceeds maximum (${255 * hash_len})')
 	}
@@ -71,16 +63,14 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 	mut counter := u8(1) // blocks are indexed from 1; appended to every HMAC input
 
 	for out.len < length {
-		// T(i) = HMAC(PRK, T(i-1) || info || i): each round depends on all
-		// earlier rounds and is unique to its index.
+		// T(i) = HMAC(PRK, T(i-1) || info || i): each round is unique to its index.
 		mut step_input := []u8{cap: prev.len + info.len + 1}
 		step_input << prev
 		step_input << info
 		step_input << counter
 
 		prev = hash.compute_hmac(prk, step_input)
-		// Append only the bytes still required; the last block is usually consumed
-		// partially, so this lands `out` on exactly `length`.
+		// Append only the bytes still required, landing `out` on exactly `length`.
 		needed := length - out.len
 		to_copy := if needed < prev.len { needed } else { prev.len }
 		out << prev[..to_copy]
@@ -89,22 +79,8 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 	return out
 }
 
-// hkdf_expand_label implements RFC 8446 §7.1:
-//
-//	HKDF-Expand-Label(Secret, Label, Context, Length) =
-//	    HKDF-Expand(Secret, HkdfLabel, Length)
-//
-//	struct {
-//	    uint16 length = Length;
-//	    opaque label<7..255> = "tls13 " + Label;
-//	    opaque context<0..255> = Context;
-//	} HkdfLabel;
-//
-// The "tls13 " prefix domain-separates these derivations from HKDF use by other
-// protocols and from older TLS versions. Exported because a QUIC engine
-// performs its own labelled expansions over the exported level secrets (the
-// RFC 9001 §5.1 "quic key"/"quic iv"/"quic hp" derivations) with this exact
-// primitive.
+// hkdf_expand_label implements HKDF-Expand-Label (RFC 8446 §7.1), prefixing the
+// label with "tls13 "; pub for the RFC 9001 §5.1 quic key/iv/hp derivations.
 pub fn hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context []u8, length int) ![]u8 {
 	full_label := 'tls13 ' + label
 	if full_label.len > 255 {
@@ -125,28 +101,19 @@ pub fn hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context 
 	return hkdf_expand(hash, secret, hkdf_label, length)!
 }
 
-// derive_secret implements RFC 8446 §7.1:
-//
-//	Derive-Secret(Secret, Label, Messages) =
-//	    HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
+// derive_secret implements Derive-Secret (RFC 8446 §7.1):
+// HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length).
 fn derive_secret(hash HashAlgorithm, secret []u8, label string, transcript_hash []u8) ![]u8 {
 	return hkdf_expand_label(hash, secret, label, transcript_hash, hash.hash_len())!
 }
 
-// empty_transcript_hash returns the hash of an empty input (RFC 8446 §7.1
-// "derived" steps).
+// empty_transcript_hash returns the hash of an empty input (RFC 8446 §7.1 "derived" steps).
 fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 	return hash.compute_hash([]u8{})
 }
 
-// TrafficKeys holds the derived AEAD key and IV for one traffic direction at
-// one encryption level. The core caches them and hands copies out through
-// ClientHandshake.record_traffic_keys(); each adapter instantiates its own protection
-// from them (the TLS record layer builds cipher states, QUIC expands the same
-// material into packet keys). The fields are module-private and read-only from
-// outside: a delivered copy is never rewritten, and key material is released
-// only through the in-place wipe helper below (wipe_traffic_keys), never by a
-// caller poking the slices.
+// TrafficKeys holds the derived AEAD key and IV for one traffic direction at one
+// encryption level; its fields are module-private and read-only from outside.
 pub struct TrafficKeys {
 mut:
 	key []u8 // AEAD key, suite-length bytes (16 for AES-128-GCM, 32 for the others)
@@ -164,9 +131,7 @@ pub fn (t &TrafficKeys) iv() []u8 {
 }
 
 // derive_traffic_keys expands a traffic secret into an AEAD key and IV (RFC 8446
-// §7.1, "key"/"iv" labels). The IV is the static nonce base the adapter's
-// protection consumes; per-record nonces then XOR in the sequence number
-// (§5.3), so no IV travels on the wire.
+// §7.1, "key"/"iv" labels); the IV is the static nonce base the adapter consumes.
 fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int) !TrafficKeys {
 	key := hkdf_expand_label(hash, secret, 'key', []u8{}, key_len)!
 	iv := hkdf_expand_label(hash, secret, 'iv', []u8{}, iv_len)!
@@ -176,16 +141,14 @@ fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int)
 	}
 }
 
-// derive_finished_key computes finished_key = HKDF-Expand-Label(BaseKey,
-// "finished", "", Hash.length), the MAC key RFC 8446 §4.4.4 binds to a Finished
-// message; compute_finished_verify_data HMACs it over the transcript.
+// derive_finished_key computes the finished_key = HKDF-Expand-Label(BaseKey, "finished",
+// "", Hash.length) MAC key RFC 8446 §4.4.4 binds to a Finished message.
 fn derive_finished_key(hash HashAlgorithm, base_key []u8) ![]u8 {
 	return hkdf_expand_label(hash, base_key, 'finished', []u8{}, hash.hash_len())!
 }
 
 // compute_finished_verify_data derives finished_key and computes HMAC over
-// transcript_hash (RFC 8446 §4.4.4). The traffic secret is never used directly
-// as an HMAC key, keeping the MAC key domain-separated from the record keys.
+// transcript_hash (RFC 8446 §4.4.4).
 fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_hash []u8) ![]u8 {
 	finished_key := derive_finished_key(hash, base_key)!
 	return hash.compute_hmac(finished_key, transcript_hash)

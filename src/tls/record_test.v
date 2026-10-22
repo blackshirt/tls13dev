@@ -1,16 +1,17 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Record layer tests: wire framing round-trips through serialize/parse, the
-// AEAD cipher state encrypts and decrypts in sequence-number lockstep across
-// records, a single flipped ciphertext byte must fail the tag check, and the
-// §5.5 per-key record limit plus the §5.2 inner-plaintext shape are refused
-// rather than mishandled. The QUIC CRYPTO passthrough framing is tested in
-// tls.handshake's passthrough_test.v.
+// Record layer tests: wire framing round-trips through serialize/parse, the AEAD
+// cipher state advances in sequence-number lockstep, a flipped ciphertext byte
+// fails the tag check, and the §5.5 per-key record limit plus the §5.2
+// inner-plaintext shape are refused. The QUIC CRYPTO passthrough framing is
+// tested in tls.handshake's passthrough_test.v.
 module tls
 
 import crypto.aes
 import tls.wire
 
+// test_record_serialization_roundtrip checks that serialize/parse preserve the
+// header fields and the payload.
 fn test_record_serialization_roundtrip() ! {
 	payload := [u8(1), 2, 3, 4, 5]
 	rec := new_record(.handshake, payload)
@@ -30,6 +31,8 @@ fn test_record_serialization_roundtrip() ! {
 	assert parsed.payload == payload
 }
 
+// test_record_cipher_state_aes_gcm_roundtrip checks that encrypt/decrypt
+// round-trip and that both sequence numbers advance in lockstep.
 fn test_record_cipher_state_aes_gcm_roundtrip() ! {
 	key := [u8(0x01), 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
 		0x0f, 0x10]
@@ -51,7 +54,7 @@ fn test_record_cipher_state_aes_gcm_roundtrip() ! {
 	assert enc_state.seq_num == 1
 	assert dec_state.seq_num == 1
 
-	// Test second record (verifies sequence number increments and stays in sync)
+	// Second record: the sequence numbers increment and stay in sync.
 	msg2 := 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
 	encrypted_rec2 := enc_state.encrypt_record(.application_data, msg2)!
 	decrypted_rec2 := dec_state.decrypt_record(encrypted_rec2)!
@@ -61,6 +64,8 @@ fn test_record_cipher_state_aes_gcm_roundtrip() ! {
 	assert dec_state.seq_num == 2
 }
 
+// test_record_cipher_state_tamper_detection checks that a single flipped
+// ciphertext byte fails the AEAD tag check.
 fn test_record_cipher_state_tamper_detection() ! {
 	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
 		0xff, 0x00]
@@ -75,7 +80,6 @@ fn test_record_cipher_state_tamper_detection() ! {
 	msg := 'Secret data'.bytes()
 	mut encrypted_rec := enc_state.encrypt_record(.application_data, msg)!
 
-	// Corrupt one byte of ciphertext
 	encrypted_rec.payload[0] ^= 0x55
 
 	dec_state.decrypt_record(encrypted_rec) or {
@@ -154,10 +158,8 @@ fn test_parse_record_rejects_incomplete_payload() ! {
 	assert false
 }
 
-// test_decrypt_record_rejects_empty_inner_plaintext: a tag-only record decrypts
-// to zero inner plaintext. The content-type byte search must not run `len - 1`
-// into an integer underflow — malformed input stays a named error, never a
-// panic (RFC 8446 §5.2).
+// test_decrypt_record_rejects_empty_inner_plaintext checks that a tag-only
+// record stays a named error, never a panic (RFC 8446 §5.2).
 fn test_decrypt_record_rejects_empty_inner_plaintext() ! {
 	key := [u8(0x31), 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
 		0x3f, 0x40]
@@ -166,8 +168,7 @@ fn test_decrypt_record_rejects_empty_inner_plaintext() ! {
 	gcm_dec := aes.new_aes_gcm(key)!
 	mut dec_state := new_record_protector(gcm_dec, iv)!
 
-	// Forge the peer's tag-only record: an empty plaintext encrypted under
-	// nonce 0 with AAD whose length field matches the 16-byte GCM tag.
+	// Forge a tag-only record: empty plaintext under nonce 0 with AAD length 16.
 	gcm_rogue := aes.new_aes_gcm(key)!
 	aad := record_aad(.application_data, legacy_record_version, 16)
 	ct := gcm_rogue.encrypt([]u8{}, dec_state.compute_nonce(0), aad)!
@@ -185,10 +186,8 @@ fn test_decrypt_record_rejects_empty_inner_plaintext() ! {
 	assert false
 }
 
-// test_record_seq_limit_backstops_sender: at the 2^24 per-key-generation bound
-// (RFC 8446 §5.5) the cipher state must refuse further records instead of
-// wearing out the AEAD key; the round limit itself is pinned literally so a
-// silent widening cannot slip in.
+// test_record_seq_limit_backstops_sender checks that the cipher state refuses
+// records past the 2^24 per-key limit (RFC 8446 §5.5).
 fn test_record_seq_limit_backstops_sender() ! {
 	assert record_seq_limit == 16777216
 
@@ -210,9 +209,8 @@ fn test_record_seq_limit_backstops_sender() ! {
 	assert false
 }
 
-// test_record_seq_limit_backstops_receiver: the receive side aborts on the same
-// bound even for a correctly-tagged record — a peer that outlives its key
-// without rekeying is fatal record_overflow territory (§5.5).
+// test_record_seq_limit_backstops_receiver checks that the receive side aborts
+// at the same 2^24 bound (§5.5).
 fn test_record_seq_limit_backstops_receiver() ! {
 	key := [u8(0x51), 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e,
 		0x5f, 0x60]
@@ -225,15 +223,11 @@ fn test_record_seq_limit_backstops_receiver() ! {
 	enc_state.seq_num = record_seq_limit - 1
 	dec_state.seq_num = record_seq_limit - 1
 
-	// At limit-1 a well-formed record still decrypts — the bound must not bite
-	// a full record early. This advances dec_state.seq_num to exactly the limit.
+	// At limit-1 a well-formed record still decrypts, advancing the counter to the limit.
 	rec_last := enc_state.encrypt_record(.application_data, 'ok'.bytes())!
 	dec_state.decrypt_record(rec_last)!
 
-	// Now at the limit, the next record the peer sends must be refused outright
-	// by the §5.5 receiver backstop. The guard runs before any tag/nonce work, so
-	// the record's contents are irrelevant — reusing rec_last still trips it. A
-	// peer delivering records past its key budget is fatal record_overflow.
+	// At the limit the next record is refused outright, contents irrelevant.
 	dec_state.decrypt_record(rec_last) or {
 		assert err.msg().contains('sequence limit')
 		return
@@ -241,12 +235,8 @@ fn test_record_seq_limit_backstops_receiver() ! {
 	assert false
 }
 
-// test_record_uninitialized_cipher_state_fails_closed: a zero-value
-// RecordProtector (no keys installed) must return an error, never panic.
-// Feeding an encrypted record to the handshake before ServerHello installs the
-// server handshake keys previously reached compute_nonce with a zero-length IV
-// (index out of range panic) or a nil AEAD interface. This pins the fail-closed
-// guard that turns that unauthenticated DoS into a plain protocol error.
+// test_record_uninitialized_cipher_state_fails_closed checks that a zero-value
+// RecordProtector (no keys installed) errors instead of panicking.
 fn test_record_uninitialized_cipher_state_fails_closed() ! {
 	mut uninit := RecordProtector{ aead: unsafe { nil } }
 	mut decrypt_rejected := false

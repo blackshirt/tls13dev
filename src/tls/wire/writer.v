@@ -1,14 +1,11 @@
 // Copyright (c) 2026 blackshirt.
 //
-// writer.v appends TLS wire data to an in-memory buffer, emitting big-endian integers
-// and length-prefixed vectors for the handshake and record encoders. Every multi-byte
-// value is network order regardless of the host's native endianness.
+// writer.v appends TLS wire data to an in-memory buffer, emitting big-endian
+// integers and length-prefixed vectors for the handshake and record encoders.
 module wire
 
-// Writer appends TLS wire data to an in-memory buffer.
-// All multi-byte integers use network byte order (big-endian, RFC 8446 §2),
-// regardless of the host's native endianness. @[noinit] enforces construction
-// through new_writer so the buffer's starting capacity is always explicit.
+// Writer appends TLS wire data to an in-memory buffer, in network byte order
+// (RFC 8446 §2); @[noinit] forces construction through new_writer.
 @[noinit]
 pub struct Writer {
 mut:
@@ -16,8 +13,7 @@ mut:
 }
 
 // new_writer creates a Writer with an optional preallocated capacity.
-// Preallocating the exact frame size avoids repeated grow-and-copy while
-// appending; capacity <= 0 falls back to a modest default.
+// Preallocating the frame size avoids grow-and-copy; capacity <= 0 uses a default.
 pub fn new_writer(capacity int) Writer {
 	cap_size := if capacity > 0 { capacity } else { 128 }
 	return Writer{
@@ -47,8 +43,7 @@ pub fn (mut w Writer) write_u16(v u16) {
 }
 
 // write_u24 appends a 24-bit big-endian unsigned integer (lower 3 bytes of v).
-// The upper byte of v is dropped: u24 fields cannot exceed 0xffffff and callers
-// pass pre-validated lengths.
+// The upper byte is dropped: callers pass pre-validated lengths <= 0xffffff.
 pub fn (mut w Writer) write_u24(v u32) {
 	w.buf << u8((v >> 16) & 0xff)
 	w.buf << u8((v >> 8) & 0xff)
@@ -80,10 +75,7 @@ pub fn (mut w Writer) write_bytes(data []u8) {
 	w.buf << data
 }
 
-// The write_vector_* methods produce the `opaque T<V>` vector framing of RFC
-// 8446 §3 (length prefix + bytes) consumed by the matching Reader accessors.
-// Each validates its length against the prefix width: silently truncating an
-// oversized length would corrupt the frame and desync the peer's parser.
+// Vector writers produce the `opaque T<V>` framing of RFC 8446 §3 (length prefix + bytes).
 
 // write_vector_u8 appends a byte slice prefixed with its 1-byte length.
 pub fn (mut w Writer) write_vector_u8(data []u8) ! {

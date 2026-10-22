@@ -1,16 +1,11 @@
 // Copyright (c) 2026 blackshirt.
 //
 // transcript.v owns the running handshake transcript that the §7.1 key schedule and
-// CertificateVerify both hash over; it records raw messages so history can be rewritten
-// at the HelloRetryRequest checkpoint rather than maintained as a rolling digest.
+// CertificateVerify hash over; it records raw messages so history can be rewritten at HRR.
 module handshake
 
-// Transcript maintains the running handshake transcript and computes
-// Transcript-Hash per RFC 8446 §4.4.1.
-// It stores raw messages rather than a rolling digest because a
-// HelloRetryRequest requires rewriting history (ClientHello1 is replaced by a
-// synthetic message_hash, §4.4.1) and because the hash is needed at several
-// checkpoints, each recomputed over the bytes accumulated so far.
+// Transcript maintains the running handshake transcript and computes Transcript-Hash
+// per RFC 8446 §4.4.1, storing raw messages so the HRR checkpoint can rewrite history.
 struct Transcript {
 mut:
 	hash_algo HashAlgorithm // digest the transcript is hashed with; follows the negotiated suite
@@ -36,13 +31,8 @@ fn (t &Transcript) current_hash() []u8 {
 	return t.hash_algo.compute_hash(t.messages)
 }
 
-// apply_hello_retry_request replaces ClientHello1 in the transcript with the
-// synthetic message_hash per RFC 8446 §4.4.1:
-//
-//	message_hash = HandshakeType.message_hash (0xfe) || Length (3 bytes: 0x00, 0x00, hash_len) || Hash(ClientHello1)
-//
-// The transcript restarts from [message_hash, HRR] so both peers hash the same
-// logical sequence without retaining the full first ClientHello.
+// apply_hello_retry_request replaces ClientHello1 with the synthetic message_hash
+// (RFC 8446 §4.4.1), restarting the transcript from [message_hash, HRR].
 fn (mut t Transcript) apply_hello_retry_request(client_hello1 []u8, hello_retry_request []u8) {
 	ch1_hash := t.hash_algo.compute_hash(client_hello1)
 	hash_len := t.hash_algo.hash_len()

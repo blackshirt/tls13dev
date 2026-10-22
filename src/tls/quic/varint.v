@@ -1,17 +1,12 @@
 // Copyright (c) 2026 blackshirt.
 //
-// varint.v implements the QUIC variable-length integer encoding (RFC 9000 §16):
-// the two most significant bits of the first byte select a 1, 2, 4, or 8-byte
-// field, leaving 6, 14, 30, or 62 value bits. Packet numbers, frame lengths,
-// stream offsets and connection IDs' lengths all use it.
+// QUIC variable-length integer encoding (RFC 9000 §16).
 module quic
 
-// max_varint is the largest value a QUIC varint can carry: 2^62 - 1, the 62
-// value bits of the 8-byte form (RFC 9000 §16).
+// max_varint is 2^62-1 (RFC 9000 §16).
 const max_varint = u64(1 << 62) - 1
 
-// varint_len returns how many bytes encode v: the smallest of 1/2/4/8 that fits
-// (RFC 9000 §16). Values above max_varint cannot be encoded and report 0.
+// varint_len returns smallest 1/2/4/8-byte form; returns 0 if v > max_varint (RFC 9000 §16).
 fn varint_len(v u64) int {
 	if v > max_varint {
 		return 0
@@ -28,7 +23,7 @@ fn varint_len(v u64) int {
 	return 8
 }
 
-// encode_varint writes v in its shortest QUIC varint form (RFC 9000 §16).
+// encode_varint encodes v in shortest QUIC varint form (RFC 9000 §16).
 fn encode_varint(v u64) ![]u8 {
 	n := varint_len(v)
 	return match n {
@@ -58,10 +53,7 @@ fn encode_varint(v u64) ![]u8 {
 	}
 }
 
-// decode_varint reads one varint from the front of buf and returns (value,
-// bytes_consumed) (RFC 9000 §16). It errors on an empty buffer; a truncated
-// multi-byte field makes it read past the end, which is caught by the length
-// check.
+// decode_varint reads one varint; returns (value, bytes_consumed) (RFC 9000 §16).
 fn decode_varint(buf []u8) !(u64, int) {
 	if buf.len == 0 {
 		return error('quic: varint decode on empty buffer')

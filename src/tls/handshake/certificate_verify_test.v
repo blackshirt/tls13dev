@@ -1,14 +1,14 @@
 // Copyright (c) 2026 blackshirt.
 //
 // Binding tests for verify_certificate_verify's scheme dispatch: every signature
-// scheme must pair with the leaf's key type, and each ECDSA scheme with its exact
-// curve (RFC 8446 §4.2.3). These policy checks run before any key material is
-// consumed, so keyless dummy leaves pin every rejection message — they are the
-// guards an attacker presenting a mismatched CertificateVerify hits first.
+// scheme must pair with the leaf's key type and exact ECDSA curve
+// (RFC 8446 §4.2.3).
 module handshake
 
 import crypto.ecdsa
 
+// test_verify_certificate_verify_requires_matching_key_type checks that each
+// scheme is refused against a leaf of the wrong key type (RFC 8446 §4.2.3).
 fn test_verify_certificate_verify_requires_matching_key_type() ! {
 	content := 'x'.bytes()
 	sig := [u8(0x01)]
@@ -43,10 +43,9 @@ fn test_verify_certificate_verify_requires_matching_key_type() ! {
 	assert false
 }
 
+// test_verify_certificate_verify_binds_ecdsa_curve checks that each ECDSA
+// scheme requires its exact curve on the leaf (RFC 8446 §4.2.3).
 fn test_verify_certificate_verify_binds_ecdsa_curve() ! {
-	// RFC 8446 §4.2.3: ecdsa_secp256r1_sha256 and ecdsa_secp384r1_sha384 each
-	// require their matching curve on the leaf; a cross-curve pairing would let
-	// a signature made under one curve authenticate a key on another.
 	content := 'x'.bytes()
 	sig := [u8(0x30), 0x03, 0x02, 0x01, 0x01]
 
@@ -71,12 +70,13 @@ fn test_verify_certificate_verify_binds_ecdsa_curve() ! {
 	assert false
 }
 
+// test_verify_certificate_verify_rejects_missing_or_malformed_keys checks that
+// a missing SPKI key and a short Ed25519 raw are named errors, not panics.
 fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 	content := 'x'.bytes()
 	sig := [u8(0x01)]
 
-	// .rsa leaf whose SPKI parse never produced an RsaPublicKey: the optional
-	// unwrap must name the missing key, not panic on a nil dereference.
+	// The SPKI parse produced no RsaPublicKey: name it, never deref nil.
 	rsa_leaf := LeafKey{
 		public_key_algo: .rsa
 	}
@@ -86,8 +86,7 @@ fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 	}
 	assert false
 
-	// Ed25519 keys are exactly 32 bytes; a short raw must be refused before the
-	// fixed-size ed25519.PublicKey cast.
+	// Ed25519 keys are exactly 32 bytes; a short raw must be refused.
 	short_leaf := LeafKey{
 		public_key_algo: .ed25519
 		public_key_raw:  []u8{len: 31, init: 0xaa}
@@ -99,11 +98,8 @@ fn test_verify_certificate_verify_rejects_missing_or_malformed_keys() ! {
 	assert false
 }
 
-// test_verify_certificate_verify_rejects_rsa_pkcs1: RFC 8446 §4.4.3 removes
-// RSASSA-PKCS1-v1_5 from CertificateVerify (RSA there is PSS-only), even though
-// the scheme may still be offered in signature_algorithms for certificate
-// signatures. Selecting it for the handshake signature is refused before any
-// key material is touched, so a keyless RSA leaf is enough to pin the rejection.
+// test_verify_certificate_verify_rejects_rsa_pkcs1 checks that PKCS#1 is
+// refused for CertificateVerify, where TLS 1.3 RSA is PSS-only (RFC 8446 §4.4.3).
 fn test_verify_certificate_verify_rejects_rsa_pkcs1() ! {
 	content := 'x'.bytes()
 	rsa_leaf := LeafKey{

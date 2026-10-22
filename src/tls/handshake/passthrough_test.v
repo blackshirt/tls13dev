@@ -1,13 +1,12 @@
 // Copyright (c) 2026 blackshirt.
 //
 // CRYPTO-stream reassembly tests (RFC 9001 §4): next_passthrough_message
-// extracts one complete 4-byte-headered handshake message at a time from a
-// buffer that may hold fragments or coalesced messages, awaiting more bytes
-// until a full frame is present and capping the declared length before it can
-// drive a gigantic allocation. They live in the importable handshake core
-// because a QUIC engine reuses exactly this plumbing.
+// extracts one complete 4-byte-headered message at a time from a buffer holding
+// fragments or coalesced messages, and caps the declared length.
 module handshake
 
+// test_next_passthrough_message_reassembles_fragments checks that a fragmented
+// message is withheld until its header and body are complete.
 fn test_next_passthrough_message_reassembles_fragments() ! {
 	mut buf := [u8(0x08), 0x00, 0x00] // EncryptedExtensions, declared len 5; header short
 	assert next_passthrough_message(mut buf)!.len == 0
@@ -25,10 +24,9 @@ fn test_next_passthrough_message_reassembles_fragments() ! {
 	assert buf.len == 0
 }
 
+// test_next_passthrough_message_splits_coalesced checks that coalesced
+// messages are extracted one at a time, the remainder staying buffered.
 fn test_next_passthrough_message_splits_coalesced() ! {
-	// Two messages delivered in one run of CRYPTO bytes are extracted one at a
-	// time, the remainder staying buffered — the recordless twin of records
-	// coalesced into one TCP read.
 	mut buf := [u8(0x08), 0x00, 0x00, 0x01, 0xaa, 0x14, 0x00, 0x00, 0x02, 0xbb, 0xcc]
 
 	first := next_passthrough_message(mut buf)!
@@ -42,10 +40,9 @@ fn test_next_passthrough_message_splits_coalesced() ! {
 	assert buf.len == 0
 }
 
+// test_next_passthrough_message_rejects_oversized_length checks that the
+// declared length fails at the header, before a gigantic message is buffered.
 fn test_next_passthrough_message_rejects_oversized_length() ! {
-	// The declared length must fail at the header, before further fragments can
-	// be buffered toward a gigantic message — the same DoS cap parse_record
-	// enforces for TCP records.
 	mut buf := [u8(0x08), 0xff, 0xff, 0xff, 0x00] // declares ~16 MiB
 	next_passthrough_message(mut buf) or {
 		assert err.msg().contains('exceeds maximum')
