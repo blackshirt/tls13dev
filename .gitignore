@@ -20,6 +20,7 @@ src/**/*_test
 
 # Project docs (not shipped)
 src/_docs/
+.qoder/
 
 # Editors / OS / CLI tool state
 .DS_Store
