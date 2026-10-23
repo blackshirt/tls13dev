@@ -69,7 +69,7 @@ mut:
 	tx_crypto_hands   []u8
 	confirmed         bool
 	closed            bool
-	close_error       u32
+	close_error       u64
 }
 
 // new_client_engine constructs a QUIC client engine. Handshake behavior is
@@ -86,9 +86,13 @@ pub fn new_client_engine(server_name string, alpn []string, validator pki.Valida
 // new_client_engine_with_options constructs the QUIC engine with explicit
 // handshake options.
 pub fn new_client_engine_with_options(server_name string, options handshake.HandshakeOptions) !ClientEngine {
-	hs := handshake.new_quic_handshake(server_name, options)!
 	scid := random_cid(8)!
 	dcid := random_cid(8)!
+	mut hs_options := options
+	hs_options.quic_transport_parameters = handshake.QuicTransportParameters{
+		initial_source_connection_id: scid.clone()
+	}
+	hs := handshake.new_quic_handshake(server_name, hs_options)!
 	mut eng := ClientEngine{
 		hs:        hs
 		dcid:      dcid.clone()
@@ -111,7 +115,11 @@ pub fn new_client_engine_with_ids(server_name string, alpn []string, validator p
 // new_client_engine_with_ids_and_options combines deterministic connection
 // IDs with explicit TLS handshake options.
 pub fn new_client_engine_with_ids_and_options(server_name string, dcid []u8, scid []u8, options handshake.HandshakeOptions) !ClientEngine {
-	hs := handshake.new_quic_handshake(server_name, options)!
+	mut hs_options := options
+	hs_options.quic_transport_parameters = handshake.QuicTransportParameters{
+		initial_source_connection_id: scid.clone()
+	}
+	hs := handshake.new_quic_handshake(server_name, hs_options)!
 	mut eng := ClientEngine{
 		hs:        hs
 		dcid:      dcid.clone()
@@ -170,7 +178,7 @@ pub fn (e &ClientEngine) failure_alert() handshake.AlertDescription {
 
 // close_error_code returns the QUIC transport error code the engine last closed
 // with (a CRYPTO_ERROR, 0x100 + alert, on a handshake failure).
-pub fn (e &ClientEngine) close_error_code() u32 {
+pub fn (e &ClientEngine) close_error_code() u64 {
 	return e.close_error
 }
 
@@ -200,7 +208,13 @@ pub fn (mut e ClientEngine) receive(datagram []u8) ![]u8 {
 		}
 		off += consumed
 	}
-	return e.flush()!
+	out := e.flush()!
+	if params := e.hs.peer_transport_parameters() {
+		if params.initial_source_connection_id != e.dcid {
+			return error('quic: server initial_source_connection_id does not match its source connection ID')
+		}
+	}
+	return out
 }
 
 // receive_packet handles one coalesced packet at the front of `buf`, returning
@@ -236,7 +250,7 @@ fn (mut e ClientEngine) receive_long_packet(buf []u8) !int {
 	// RFC 9000 §7.2: the first Initial received from the server fixes the connection ID
 	// the client addresses it by; only NEW_CONNECTION_ID may change it afterwards.
 	// Adopted only after a successful decrypt, so junk cannot redirect the flight.
-	if meta.ptype == .initial && !e.adopted && meta.scid.len > 0 {
+	if meta.ptype == .initial && !e.adopted {
 		e.dcid = meta.scid.clone()
 		e.adopted = true
 	}
@@ -319,12 +333,20 @@ fn (mut e ClientEngine) handle_frames(ptype PacketType, payload []u8) ! {
 				off++
 			}
 			frame_ack, frame_ack_ecn {
-				ack, used := parse_ack_frame(body)!
+				ack, used := parse_ack_frame(body, frame_type == frame_ack_ecn) or {
+					return error('quic: invalid ${if frame_type == frame_ack_ecn {
+						'ACK_ECN'
+					} else {
+						'ACK'
+					}} frame: ${err.msg()}')
+				}
 				e.note_ack(ptype, ack)
 				off += 1 + used
 			}
 			frame_crypto {
-				cf, used := parse_crypto_frame(body)!
+				cf, used := parse_crypto_frame(body) or {
+					return error('quic: invalid CRYPTO frame: ${err.msg()}')
+				}
 				e.deliver_crypto(ptype, cf)!
 				off += 1 + used
 			}
@@ -334,17 +356,30 @@ fn (mut e ClientEngine) handle_frames(ptype PacketType, payload []u8) ! {
 				e.drop_handshake_keys()
 				off++
 			}
-			frame_connection_close_transport {
-				cc := parse_connection_close(body)!
+			frame_connection_close_transport, frame_connection_close_application {
+				is_application := frame_type == frame_connection_close_application
+				if is_application && ptype != .one_rtt {
+					return error('quic: application CONNECTION_CLOSE is only valid in 1-RTT packets')
+				}
+				cc := parse_connection_close(body, is_application) or {
+					return error('quic: invalid CONNECTION_CLOSE frame: ${err.msg()}')
+				}
 				e.closed = true
 				e.close_error = cc.error_code
-				return error('quic: peer closed the connection (${cc.error_code}): ${cc.reason.bytestr()}')
+				return error('quic: peer closed the connection (${describe_connection_error(cc.error_code)}) during ${e.hs.state()}: ${cc.reason.bytestr()}')
 			}
 			else {
 				return error('quic: unsupported frame type 0x${frame_type:02x} during handshake')
 			}
 		}
 	}
+}
+
+fn describe_connection_error(code u64) string {
+	if code >= 0x100 && code <= 0x1ff {
+		return 'CRYPTO_ERROR (TLS alert ${code - 0x100})'
+	}
+	return 'QUIC error ${code}'
 }
 
 // deliver_crypto inserts a CRYPTO frame's bytes into the level's reassembler
@@ -389,7 +424,7 @@ fn (mut e ClientEngine) drain_contiguous(ptype PacketType) ! {
 // outbound CRYPTO buffer.
 fn (mut e ClientEngine) queue_outbound(m handshake.HandshakeMessage) ! {
 	match m.level() {
-		.plaintext { e.tx_crypto_initial << m.msg() }
+		.initial { e.tx_crypto_initial << m.msg() }
 		.handshake { e.tx_crypto_hands << m.msg() }
 	}
 }
@@ -506,7 +541,7 @@ fn (mut e ClientEngine) seal(ptype PacketType, mut tx ProtectionState, pn u64, p
 // fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR and
 // records it (RFC 9001 §4.8). The caller emits a CONNECTION_CLOSE with this code.
 fn (mut e ClientEngine) fail_close() ! {
-	e.close_error = e.hs.failure_alert().quic_connection_error()
+	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
 	e.closed = true
 }
 
@@ -517,7 +552,7 @@ fn (mut e ClientEngine) fail_close() ! {
 pub fn (mut e ClientEngine) close(error_code u32, reason string) ![]u8 {
 	e.closed = true
 	e.close_error = error_code
-	frame := encode_connection_close(error_code, 0, reason.bytes())!
+	frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
 	if e.app_tx != none {
 		return e.seal_raw(.one_rtt, frame)!
 	}
@@ -590,9 +625,9 @@ fn (mut e ClientEngine) note_ack(ptype PacketType, ack AckFrame) {
 }
 
 // level_of maps QUIC packet protection levels to shared TLS handshake phases.
-fn level_of(ptype PacketType) !handshake.HandshakeLevel {
+fn level_of(ptype PacketType) !handshake.EncryptionLevel {
 	return match ptype {
-		.initial { .plaintext }
+		.initial { .initial }
 		.handshake { .handshake }
 		.one_rtt {
 			return error('quic: 1-RTT CRYPTO data is post-handshake traffic and is unsupported')

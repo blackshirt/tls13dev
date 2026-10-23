@@ -66,10 +66,10 @@ fn encode_ack_frame(largest u64, delay u64) ![]u8 {
 	return out
 }
 
-// parse_ack_frame parses an ACK frame body (after the type byte)
-// (RFC 9000 §19.3). It reads the count and ranges to advance correctly, but
-// only exposes the contiguous high range; a client engine needs no more.
-fn parse_ack_frame(body []u8) !(AckFrame, int) {
+// parse_ack_frame parses an ACK or ACK_ECN body (after the type byte)
+// (RFC 9000 §19.3, §19.4). It reads the ranges and optional ECN counters to
+// advance correctly, but only exposes the contiguous high range.
+fn parse_ack_frame(body []u8, with_ecn bool) !(AckFrame, int) {
 	mut off := 0
 	largest, n := decode_varint(body[off..])!
 	off += n
@@ -90,6 +90,14 @@ fn parse_ack_frame(body []u8) !(AckFrame, int) {
 		_ = range_len
 		ranges++
 	}
+	if with_ecn {
+		_, n_ect0 := decode_varint(body[o..])!
+		o += n_ect0
+		_, n_ect1 := decode_varint(body[o..])!
+		o += n_ect1
+		_, n_ce := decode_varint(body[o..])!
+		o += n_ce
+	}
 	return AckFrame{
 		largest_acked: largest
 		ack_delay:     delay
@@ -101,8 +109,12 @@ fn parse_ack_frame(body []u8) !(AckFrame, int) {
 // parse_crypto_frame parses a CRYPTO frame body (after the type byte),
 // returning the frame and the number of body bytes consumed (RFC 9000 §19.6).
 fn parse_crypto_frame(body []u8) !(CryptoFrame, int) {
-	offset, n := decode_varint(body)!
-	length, n2 := decode_varint(body[n..])!
+	offset, n := decode_varint(body) or {
+		return error('quic: invalid CRYPTO frame offset: ${err.msg()}')
+	}
+	length, n2 := decode_varint(body[n..]) or {
+		return error('quic: invalid CRYPTO frame length: ${err.msg()}')
+	}
 	off := n + n2
 	if off + int(length) > body.len {
 		return error('quic: CRYPTO frame length ${length} exceeds remaining ${body.len - off} bytes')
@@ -114,41 +126,43 @@ fn parse_crypto_frame(body []u8) !(CryptoFrame, int) {
 }
 
 // encode_connection_close serializes a transport CONNECTION_CLOSE frame
-// (RFC 9000 §19.19) carrying a QUIC transport error code (e.g. a CRYPTO_ERROR
-// from AlertDescription.quic_connection_error()).
-fn encode_connection_close(error_code u32, frame_type u64, reason []u8) ![]u8 {
+// (RFC 9000 §19.19).
+fn encode_connection_close(error_code u64, frame_type u64, reason []u8) ![]u8 {
 	mut out := []u8{cap: reason.len + 16}
 	out << frame_connection_close_transport
-	mut code_bytes := []u8{len: 4}
-	for i in 0 .. 4 {
-		shift := (3 - i) * 8
-		code_bytes[i] = u8((error_code >> shift) & 0xff)
-	}
-	out << code_bytes
+	out << encode_varint(error_code)!
 	out << encode_varint(frame_type)!
 	out << encode_varint(u64(reason.len))!
 	out << reason
 	return out
 }
 
-// ConnectionClose is a parsed transport CONNECTION_CLOSE frame
-// (RFC 9000 §19.19).
+// ConnectionClose is a parsed transport or application CONNECTION_CLOSE frame.
 struct ConnectionClose {
-	error_code u32
-	frame_type u64
+	error_code u64
+	frame_type ?u64
 	reason     []u8
 }
 
-// parse_connection_close parses a transport CONNECTION_CLOSE body (after the
-// type byte) (RFC 9000 §19.19).
-fn parse_connection_close(body []u8) !ConnectionClose {
-	if body.len < 4 {
-		return error('quic: CONNECTION_CLOSE truncated error code')
+// parse_connection_close parses a CONNECTION_CLOSE body after the type byte
+// (RFC 9000 §19.19-20).
+fn parse_connection_close(body []u8, application bool) !ConnectionClose {
+	error_code, code_len := decode_varint(body) or {
+		return error('quic: CONNECTION_CLOSE truncated error code: ${err.msg()}')
 	}
-	error_code := (u32(body[0]) << 24) | (u32(body[1]) << 16) | (u32(body[2]) << 8) | u32(body[3])
-	frame_type, n := decode_varint(body[4..])!
-	reason_len, n2 := decode_varint(body[4 + n..])!
-	off := 4 + n + n2
+	mut off := code_len
+	mut frame_type := ?u64(none)
+	if !application {
+		parsed_frame_type, n := decode_varint(body[off..]) or {
+			return error('quic: CONNECTION_CLOSE truncated triggering frame type: ${err.msg()}')
+		}
+		frame_type = parsed_frame_type
+		off += n
+	}
+	reason_len, n2 := decode_varint(body[off..]) or {
+		return error('quic: CONNECTION_CLOSE truncated reason length: ${err.msg()}')
+	}
+	off += n2
 	if off + int(reason_len) > body.len {
 		return error('quic: CONNECTION_CLOSE reason length ${reason_len} exceeds body')
 	}

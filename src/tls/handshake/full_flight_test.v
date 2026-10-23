@@ -58,7 +58,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
 	assert !fl.is_hrr
-	h.receive(.plaintext, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	// EE + CertificateRequest: the client must emit exactly its empty Certificate.
 	assert fl.rest.len == 2
@@ -91,7 +91,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert !fl.is_hrr
 
 	// Plaintext ServerHello on the Initial level; nothing outbound yet.
-	out := h.receive(.plaintext, fl.server_hello)!
+	out := h.receive(.initial, fl.server_hello)!
 	assert out.len == 0
 	assert h.state() == .wait_encrypted_extensions
 
@@ -134,14 +134,14 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 	assert fl1.is_hrr
 
 	// The HRR arrives at Initial level; the core answers with the retry ClientHello.
-	out := h.receive(.plaintext, fl1.server_hello)!
+	out := h.receive(.initial, fl1.server_hello)!
 	assert out.len == 1
-	assert out[0].level == .plaintext
+	assert out[0].level == .initial
 	assert h.state() == .wait_server_hello
 
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
-	out2 := h.receive(.plaintext, fl2.server_hello)!
+	out2 := h.receive(.initial, fl2.server_hello)!
 	assert out2.len == 0
 	assert h.state() == .wait_encrypted_extensions
 
@@ -162,13 +162,13 @@ fn test_hello_retry_request_cookie_only_reaches_connected() ! {
 	fl1 := srv.handle_client_hello(ch)!
 	assert fl1.is_hrr
 
-	out := h.receive(.plaintext, fl1.server_hello)!
+	out := h.receive(.initial, fl1.server_hello)!
 	assert out.len == 1
 	// The retry ClientHello must carry the echoed cookie; the fakeserver verifies it.
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
 
-	out2 := h.receive(.plaintext, fl2.server_hello)!
+	out2 := h.receive(.initial, fl2.server_hello)!
 	assert out2.len == 0
 	produced := h.receive(.handshake, fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1
@@ -184,7 +184,7 @@ fn test_rejects_bad_server_finished() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive(.plaintext, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('Finished verify_data mismatch')
@@ -203,7 +203,7 @@ fn test_rejects_bad_certificate_verify() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive(.plaintext, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('Ed25519 CertificateVerify failed')
@@ -222,7 +222,7 @@ fn test_rejects_out_of_order_certificate() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive(.plaintext, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	// fl.rest is [EE, Cert, CV, Fin]; feed Certificate where EncryptedExtensions is expected.
 	assert fl.rest.len == 4
@@ -243,7 +243,7 @@ fn test_rejects_unoffered_alpn() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive(.plaintext, fl.server_hello)!
+	h.receive(.initial, fl.server_hello)!
 
 	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('not offered by client')
@@ -269,7 +269,7 @@ fn test_malformed_server_hello_aborts_and_destroys() ! {
 	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	_ := h.create_client_hello()!
 	// A complete ServerHello header with an empty body: parse fails before the key schedule ran.
-	h.receive(.plaintext, [u8(0x02), 0x00, 0x00, 0x00]) or {
+	h.receive(.initial, [u8(0x02), 0x00, 0x00, 0x00]) or {
 		assert h.state() == .failed
 		assert expect_no_handshake_keys(h)
 		return

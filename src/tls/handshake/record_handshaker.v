@@ -19,11 +19,11 @@ mut:
 // can be supplied as optional named arguments after server_name.
 pub fn new_record_handshake(server_name string, options HandshakeOptions) !RecordHandshaker {
 	return RecordHandshaker{
-		HandshakeCore: new_handshake_core(server_name, options)!
+		HandshakeCore: new_handshake_core(server_name, options, false)!
 	}
 }
 
-pub fn (mut h RecordHandshaker) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage {
+pub fn (mut h RecordHandshaker) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	messages := h.HandshakeCore.receive(level, bytes) or {
 		if h.state() == .failed {
 			h.wipe_record_keys()
@@ -49,8 +49,11 @@ pub fn (mut h RecordHandshaker) zeroize_app_secrets() {
 
 // record_traffic_keys returns independent copies of the cached client/server
 // TrafficKeys at one TLS encryption level.
-pub fn (h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys) {
+pub fn (h &RecordHandshaker) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys) {
 	match level {
+		.initial {
+			return error('handshake: initial level has no traffic keys')
+		}
 		.handshake {
 			if h.client_hs_keys.key.len == 0 || h.server_hs_keys.key.len == 0 {
 				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_traffic_secrets)')
@@ -66,7 +69,7 @@ pub fn (h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(Tra
 	}
 }
 
-pub fn (h &RecordHandshaker) record_unconsumed_bytes(level HandshakeLevel) int {
+pub fn (h &RecordHandshaker) record_unconsumed_bytes(level EncryptionLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 

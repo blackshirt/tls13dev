@@ -14,13 +14,25 @@ pub struct QuicHandshaker {
 // be supplied as optional named arguments after server_name.
 pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshaker {
 	return QuicHandshaker{
-		HandshakeCore: new_handshake_core(server_name, options)!
+		HandshakeCore: new_handshake_core(server_name, options, true)!
+	}
+}
+
+// peer_transport_parameters returns the server's QUIC transport parameters,
+// parsed from EncryptedExtensions once the server sends them.
+pub fn (h &QuicHandshaker) peer_transport_parameters() ?QuicTransportParameters {
+	params := h.peer_quic_transport_parameters or { return none }
+	return QuicTransportParameters{
+		initial_source_connection_id: params.initial_source_connection_id.clone()
 	}
 }
 
 // quic_traffic_secrets returns copies of TLS traffic secrets for QUIC packet-key derivation.
-pub fn (h &QuicHandshaker) quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8) {
+pub fn (h &QuicHandshaker) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
 	match level {
+		.initial {
+			return error('handshake: initial level has no traffic secrets')
+		}
 		.handshake {
 			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
 				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_handshake_traffic_secrets)')

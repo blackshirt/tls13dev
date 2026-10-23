@@ -27,6 +27,55 @@ fn test_build_client_hello() ! {
 	assert full_msg[3] == u8(body.len & 0xff)
 }
 
+fn test_build_client_hello_includes_quic_transport_parameters() ! {
+	cfg := ClientHelloConfig{
+		client_share:              KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+		quic_transport_parameters: QuicTransportParameters{
+			initial_source_connection_id: [u8(0x12), 0x34]
+		}
+	}
+	_, full_msg := build_client_hello(cfg)!
+	assert client_hello_extension(full_msg, .quic_transport_parameters)! == [u8(0x0f), 0x02, 0x12,
+		0x34]
+}
+
+fn test_parse_quic_transport_parameters() ! {
+	params := parse_quic_transport_parameters([u8(0x0f), 0x02, 0x12, 0x34])!
+	assert params.initial_source_connection_id == [u8(0x12), 0x34]
+}
+
+fn test_parse_quic_transport_parameters_requires_source_id() {
+	if _ := parse_quic_transport_parameters([]u8{}) {
+		assert false
+	}
+}
+
+fn test_parse_quic_transport_parameters_rejects_duplicate_ids() {
+	if _ := parse_quic_transport_parameters([u8(0x0f), 0x00, 0x0f, 0x00]) {
+		assert false
+	}
+}
+
+fn test_parse_encrypted_extensions_quic_transport_parameters() ! {
+	// extension block: quic_transport_parameters = { initial_source_connection_id: [0x12, 0x34] }
+	body := [u8(0x00), 0x08, 0x00, 0x39, 0x00, 0x04, 0x0f, 0x02, 0x12, 0x34]
+	alpn, params := parse_encrypted_extensions_for_transport(body, true)!
+	assert alpn == ''
+	assert params or { panic('expected server QUIC transport parameters') }.initial_source_connection_id == [
+		u8(0x12),
+		0x34,
+	]
+}
+
+fn test_parse_encrypted_extensions_quic_requires_transport_parameters() {
+	if _, _ := parse_encrypted_extensions_for_transport([u8(0x00), 0x00], true) {
+		assert false
+	}
+}
+
 fn client_hello_extension(full_msg []u8, wanted ExtensionType) ![]u8 {
 	mut r := wire.new_reader(full_msg[4..])
 	_ = r.read_u16()!

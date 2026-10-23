@@ -30,6 +30,7 @@ v test .                                # unit tests across all four modules
 v run src/example/simple_example.v      # minimal client: HTTPS GET
 v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
 v run src/example/trust_store_example.v # client supplying its own root_cas
+v run src/example/quic_dial_example.v   # QUIC handshake attempt with test.privateoctopus.com:4433
 ```
 
 ```v
@@ -98,18 +99,18 @@ matching facade; framing and encryption decisions stay adapter-side:
 new_record_handshake(server_name) !RecordHandshaker
 new_quic_handshake(server_name) !QuicHandshaker
 create_client_hello() ![]u8
-receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
+receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 failure_alert() AlertDescription  /  fail_and_destroy_secrets()  /  zeroize_app_secrets()
 
 // RecordHandshaker only
-record_unconsumed_bytes(level HandshakeLevel) int                     // §5.1 boundary hook
-record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)  // client, server
+record_unconsumed_bytes(level EncryptionLevel) int                     // §5.1 boundary hook
+record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys)  // client, server
 record_update_read_traffic_keys() !  /  record_update_write_traffic_keys() !  // §7.2 ratchet
 zeroize_handshake_traffic_secrets() !                                // record handshake secrets no longer needed
 
 // QuicHandshaker only
-quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
+quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
 zeroize_handshake_traffic_secrets() !                     // when QUIC no longer needs these secrets
 ```
 
@@ -119,15 +120,17 @@ defined in `record_handshaker.v` and `quic_handshaker.v`, respectively.
 Both facades share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
 `new_aead_for_suite`.
 
-`HandshakeLevel` (`plaintext`/`handshake`) tags `receive()` and returned
-`HandshakeMessage`s; it describes TLS handshake phases, not QUIC packet levels.
-`TrafficSecretLevel` (`handshake`/`application`) selects TLS-derived secrets.
-`receive()` appends level-tagged bytes to the core's per-level reassembly buffer
-and consumes complete messages, returning outbound messages ready to send. The
-TCP `Conn` encrypts each returned message under its matching record keys; the
-QUIC engine maps `.plaintext` to Initial CRYPTO and `.handshake` to Handshake
-CRYPTO. All security checks (size caps, HRR rules, transcript binding) live in
-the core, so both transports inherit them.
+`EncryptionLevel` (`initial`, `handshake`, `application`) is shared by
+`receive()` and traffic-secret access. Here `.initial` means the initial TLS
+handshake phase before handshake traffic keys exist; it is not QUIC Initial
+packet protection. `receive()` accepts only initial or handshake bytes and
+appends them to the core's corresponding reassembly buffer; application-level
+bytes are not handshake input. `record_traffic_keys()` and
+`quic_traffic_secrets()` accept handshake or application to select derived
+secrets; the initial phase has no TLS traffic secrets. The QUIC engine maps
+`.initial` to Initial CRYPTO and `.handshake` to Handshake CRYPTO. All security
+checks (size caps, HRR rules, transcript binding) live in the core, so both
+transports inherit them.
 
 `HandshakeOptions` carries ALPN, an optional certificate validator, and ClientHello
 preferences (key-share group, supported-group order, cipher-suite order, and
@@ -150,6 +153,7 @@ src/
     simple_example.v      minimal client (handshake + HTTPS GET, no flags)
     trust_store_example.v minimal client with its own Config.root_cas
     dial_example.v        fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
+    quic_dial_example.v   QUIC handshake attempt with test.privateoctopus.com:4433
   tls/              module `tls`: record layer + public TCP client API
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation

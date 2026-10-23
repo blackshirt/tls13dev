@@ -211,29 +211,29 @@ building a QUIC adapter. The API contract is documented in
 new_record_handshake(server_name string) !RecordHandshaker
 new_quic_handshake(server_name string) !QuicHandshaker
 (mut h) create_client_hello() ![]u8
-(mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
      (h) failure_alert() AlertDescription
 (mut h) fail_and_destroy_secrets()   /   zeroize_app_secrets()
 (mut h) zeroize_handshake_traffic_secrets() !  // zeroizes TLS handshake traffic secrets
 
 // TLS record path only
-     (h) record_unconsumed_bytes(level HandshakeLevel) int                         // §5.1 hook
-     (h) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)   // client, server
+     (h) record_unconsumed_bytes(level EncryptionLevel) int                         // §5.1 hook
+     (h) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys)   // client, server
 (mut h) record_update_read_traffic_keys() !   /   (mut h) record_update_write_traffic_keys() !   // §7.2 ratchet
 
 // QUIC path only
-     (h) quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8)
+     (h) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8)
 ```
 
-- **`HandshakeLevel`** (`plaintext`/`handshake`) tags TLS handshake input and
-  output independently of transport packet levels. `receive()` buffers
-  plaintext ServerHello/HelloRetryRequest input separately from handshake-phase
-  messages. QUIC maps Initial and Handshake CRYPTO streams to these phases;
-  TCP maps plaintext and decrypted records to them.
-- **Traffic-secret levels are separate.** `TrafficSecretLevel` (`handshake` /
-  `application`) selects TLS-derived secrets. QUIC Initial packet keys derive
-  from the destination connection ID and are not part of this TLS secret API.
+- **`EncryptionLevel`** (`initial`/`handshake`/`application`) gives handshake
+  input and derived traffic secrets one shared phase vocabulary, independent of
+  transport packet levels. `.initial` means the initial TLS handshake phase
+  before handshake keys are installed; it is not QUIC Initial packet
+  protection. `receive()` accepts only initial and handshake input, buffering
+  each separately; traffic-key/secret access accepts handshake or application.
+  QUIC Initial packet keys derive from the destination connection ID and are
+  not part of this TLS secret API.
 - **Keys stay adapter-owned.** `RecordHandshaker` caches record `TrafficKeys`
   and implements TLS KeyUpdate ratchets. `QuicHandshaker` exposes TLS traffic
   secrets for RFC 9001 packet-key derivation; the QUIC engine owns packet keys

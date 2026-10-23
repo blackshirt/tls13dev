@@ -30,6 +30,7 @@ const ext_alpn = u16(16)
 const ext_supported_versions = u16(43)
 const ext_cookie = u16(44)
 const ext_key_share = u16(51)
+const ext_quic_transport_parameters = u16(57)
 
 // Named groups (RFC 8446 §4.2.7) the fakeserver can negotiate.
 const group_secp256r1 = u16(0x0017)
@@ -63,6 +64,7 @@ mut:
 	cookie      []u8
 	alpn        []string
 	versions    []u16
+	is_quic     bool
 }
 
 // HrrMode selects the HelloRetryRequest behaviour of the next new_server.
@@ -93,6 +95,9 @@ pub:
 	// client_auth sends a CertificateRequest after EncryptedExtensions and expects
 	// the client's empty Certificate (RFC 8446 §4.3.2/§4.4.2) in the transcript.
 	client_auth bool
+	// quic_source_connection_id is sent as initial_source_connection_id when the
+	// ClientHello carries the QUIC transport-parameters extension.
+	quic_source_connection_id []u8
 }
 
 // Stage tracks where the fakeserver is in its two-hello state machine.
@@ -275,7 +280,8 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	} else {
 		pick_alpn(s.cfg.alpn, ch.alpn)
 	}
-	ee := build_encrypted_extensions(alpn_proto)!
+	ee := build_encrypted_extensions(alpn_proto, ch.is_quic,
+		s.cfg.quic_source_connection_id)!
 	s.transcript.append(ee)
 
 	if s.cfg.client_auth {
@@ -599,6 +605,8 @@ fn parse_client_hello(msg []u8) !ClientHello {
 				ch.share_group = kr.read_u16()!
 				ch.share = kr.read_vector_u16()!
 			}
+		} else if etyp == ext_quic_transport_parameters {
+			ch.is_quic = true
 		} else if etyp == ext_signature_algorithms {
 			// Offered; not needed for a server-auth-only flight.
 		}
@@ -730,7 +738,7 @@ fn build_hrr(session_id []u8, req_group u16, cookie []u8) ![]u8 {
 
 // build_encrypted_extensions emits an EncryptedExtensions body carrying the
 // negotiated ALPN and nothing else (RFC 8446 §4.3.1).
-fn build_encrypted_extensions(alpn_proto string) ![]u8 {
+fn build_encrypted_extensions(alpn_proto string, is_quic bool, quic_source_connection_id []u8) ![]u8 {
 	mut ext := wire.new_writer(32)
 	if alpn_proto.len > 0 {
 		mut proto_list := wire.new_writer(alpn_proto.len + 3)
@@ -739,6 +747,17 @@ fn build_encrypted_extensions(alpn_proto string) ![]u8 {
 		alpn_body.write_vector_u16(proto_list.bytes())!
 		ext.write_u16(ext_alpn)
 		ext.write_vector_u16(alpn_body.bytes())!
+	}
+	if is_quic {
+		if quic_source_connection_id.len > 20 {
+			return error('fakeserver: QUIC source connection ID exceeds 20 bytes')
+		}
+		mut transport_parameters := []u8{cap: quic_source_connection_id.len + 3}
+		transport_parameters << 0x0f // initial_source_connection_id parameter ID
+		transport_parameters << u8(quic_source_connection_id.len)
+		transport_parameters << quic_source_connection_id
+		ext.write_u16(ext_quic_transport_parameters)
+		ext.write_vector_u16(transport_parameters)!
 	}
 	mut body := wire.new_writer(ext.len() + 2)
 	body.write_vector_u16(ext.bytes())!

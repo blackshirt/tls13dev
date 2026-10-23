@@ -53,11 +53,13 @@ preserve the built-in defaults. An initial key-share group must also appear in
 `supported_groups`; a HelloRetryRequest may select another configured supported
 group. Explicit `legacy_session_id` and `random` values are intended only for
 deterministic test vectors.
-`receive()` accepts bytes at a `HandshakeLevel` (`plaintext` or `handshake`),
+`receive()` accepts bytes at an `EncryptionLevel` (`initial` or `handshake`),
 reassembles complete messages, and returns outbound `HandshakeMessage` values
 tagged with that TLS phase. QUIC packet levels are translated by its engine;
-they are not part of the shared handshake API. `TrafficSecretLevel`
-(`handshake` or `application`) independently selects TLS-derived secrets.
+they are not part of the shared handshake API. The same `EncryptionLevel`
+(`handshake` or `application`) selects TLS-derived secrets; `initial` has none.
+Here `initial` denotes the initial TLS handshake phase, not QUIC Initial packet
+protection.
 Each handshake core owns its phase-specific reassembly buffers and
 consumes complete TLS messages. An empty result can mean that input is
 incomplete or that a message advanced the state without producing output;

@@ -62,7 +62,9 @@ fn long_packet_meta(buf []u8) !LongPacketMeta {
 	pn_len_hint := int(buf[0] & 0x03) + 1
 	// The Length field counts the packet number plus the protected payload
 	// (RFC 9000 §17.2), so the packet ends at payload_off + length.
-	length, n := decode_varint(buf[o..])!
+	length, n := decode_varint(buf[o..]) or {
+		return error('quic: invalid long-header packet length: ${err.msg()}')
+	}
 	payload_off := o + n // first byte of the packet number
 	if length > u64(buf.len - payload_off) {
 		return error('quic: long packet length ${length} exceeds remaining buffer ${buf.len - payload_off}')

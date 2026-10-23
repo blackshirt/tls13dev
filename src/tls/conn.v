@@ -96,12 +96,12 @@ mut:
 
 	// Serialize access to the read and write state; read() may acquire wlock
 	// while handling a peer alert, so the global order is rlock then wlock.
-	rlock             &sync.Mutex // serializes read() and every read-cipher/recv_buf mutation; both locks are exclusive mutexes, not RwLock read sides, because each path rewrites AEAD sequence numbers
-	wlock             &sync.Mutex // serializes write() and every write-cipher mutation
+	rlock &sync.Mutex // serializes read() and every read-cipher/recv_buf mutation; both locks are exclusive mutexes, not RwLock read sides, because each path rewrites AEAD sequence numbers
+	wlock &sync.Mutex // serializes write() and every write-cipher mutation
 
 	// Negotiated connection identity and protocol.
-	negotiated_alpn   string      // server's ALPN pick — always one of HandshakeOptions.alpn (the handshake aborts otherwise), '' if none
-	server_name       string      // SNI value sent and the name the certificate was checked against
+	negotiated_alpn string // server's ALPN pick — always one of HandshakeOptions.alpn (the handshake aborts otherwise), '' if none
+	server_name     string // SNI value sent and the name the certificate was checked against
 
 	// Failure-alert plumbing, used only by send_failure_alert on a dead handshake.
 	// Suppresses a fatal-alert response when the peer has already terminated.
@@ -163,22 +163,22 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:         sock
-		hs:           hs
-		session_tickets: []handshake.NewSessionTicket{cap: 4}
-		read_scratch: []u8{len: recv_read_size} // reused by every socket read for this connection
-		recv_buf:     []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
-		recv_pos:     0
-		app_buf:      []u8{cap: max_plaintext_record_len} // one full plaintext record
-		app_pos:      0
-		closed:       false
+		sock:              sock
+		hs:                hs
+		session_tickets:   []handshake.NewSessionTicket{cap: 4}
+		read_scratch:      []u8{len: recv_read_size} // reused by every socket read for this connection
+		recv_buf:          []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
+		recv_pos:          0
+		app_buf:           []u8{cap: max_plaintext_record_len} // one full plaintext record
+		app_pos:           0
+		closed:            false
 		close_notify_sent: false
-		sock_closed: false
-		fatal_error:  ''
-		rlock:        sync.new_mutex()
-		wlock:        sync.new_mutex()
-		negotiated_alpn: ''
-		server_name: server_name
+		sock_closed:       false
+		fatal_error:       ''
+		rlock:             sync.new_mutex()
+		wlock:             sync.new_mutex()
+		negotiated_alpn:   ''
+		server_name:       server_name
 	}
 
 	// On failure send the classified fatal alert (RFC 8446 §6), wipe secrets, close the socket.
@@ -247,11 +247,11 @@ fn (mut c Conn) do_handshake() ! {
 					c.fail_alert = .unexpected_message
 					return error('tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
-				msgs := c.hs.receive(.plaintext, rec.payload)!
+				msgs := c.hs.receive(.initial, rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
-				if c.hs.record_unconsumed_bytes(.plaintext) != 0 {
+				if c.hs.record_unconsumed_bytes(.initial) != 0 {
 					c.fail_alert = .unexpected_message
-					return error('tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.plaintext)} leftover byte(s) (unexpected_message)')
+					return error('tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
 					c.fail_alert = .unexpected_message

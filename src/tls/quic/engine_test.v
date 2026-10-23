@@ -16,8 +16,37 @@ import tls.fakeserver
 import tls.handshake
 import tls.pki
 
+fn test_parse_ack_ecn_frame() ! {
+	body := [u8(0), 0, 0, 0, 1, 2, 3] // ACK fields, then ECT(0), ECT(1), CE counts
+	ack, used := parse_ack_frame(body, true)!
+	assert ack.largest_acked == 0
+	assert used == body.len
+}
+
+fn test_parse_ack_frame_without_ecn() ! {
+	body := [u8(0), 0, 0, 0]
+	ack, used := parse_ack_frame(body, false)!
+	assert ack.largest_acked == 0
+	assert used == body.len
+}
+
+fn test_connection_close_uses_quic_varints() ! {
+	transport := encode_connection_close(0x1234, 0x06, 'stop'.bytes())!
+	parsed_transport := parse_connection_close(transport[1..], false)!
+	assert parsed_transport.error_code == 0x1234
+	assert parsed_transport.frame_type or { u64(0) } == 0x06
+	assert parsed_transport.reason == 'stop'.bytes()
+
+	application := [u8(frame_connection_close_application), 0x52, 0x34, 0x04, 0x64, 0x6f, 0x6e,
+		0x65]
+	parsed_application := parse_connection_close(application[1..], true)!
+	assert parsed_application.error_code == 0x1234
+	assert parsed_application.frame_type == none
+	assert parsed_application.reason == 'done'.bytes()
+}
+
 fn test_quic_packet_levels_map_to_shared_handshake_phases() ! {
-	assert level_of(.initial)! == .plaintext
+	assert level_of(.initial)! == .initial
 	assert level_of(.handshake)! == .handshake
 	level_of(.one_rtt) or {
 		assert err.msg().contains('post-handshake traffic')
@@ -48,13 +77,17 @@ mut:
 // Destination Connection ID.
 fn new_ferry_server(client_dcid []u8) !FerryServer {
 	ck, sk := derive_initial_keys(client_dcid)!
+	server_cid := [u8(0x51), 0x54, 0x9c, 0x0a, 0x1e, 0xb7, 0x3d, 0x66, 0x2f, 0x80]
 	return FerryServer{
 		initial_tx: new_initial_protection(sk)!
 		initial_rx: new_initial_protection(ck)!
-		srv:        fakeserver.new_server(alpn: ['h3'])!
+		srv:        fakeserver.new_server(
+			alpn:                      ['h3']
+			quic_source_connection_id: server_cid
+		)!
 		// A server picks its own connection IDs (§7.2); it does not have to echo the
 		// client's guess, so the ferry sends a value the client never chose.
-		server_cid: [u8(0x51), 0x54, 0x9c, 0x0a, 0x1e, 0xb7, 0x3d, 0x66, 0x2f, 0x80]
+		server_cid: server_cid
 	}
 }
 
@@ -117,7 +150,7 @@ fn (mut f FerryServer) handle_frames(ptype PacketType, payload []u8) ! {
 				off += 1 + used
 			}
 			frame_ack {
-				_, used := parse_ack_frame(body)!
+				_, used := parse_ack_frame(body, false)!
 				off += 1 + used
 			}
 			else {

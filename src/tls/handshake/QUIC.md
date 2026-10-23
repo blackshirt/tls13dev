@@ -54,24 +54,33 @@ Two properties make this work:
 
 2. **The public boundary is a small, level-tagged seam.** The unit the adapter
    exchanges with the core is a `HandshakeMessage` — a complete handshake
-   message (4-byte header included) tagged with the `HandshakeLevel` it belongs
+   message (4-byte header included) tagged with the `EncryptionLevel` it belongs
    to. Framing (records vs. CRYPTO frames) and protection (AEAD records vs.
    QUIC packet protection) are entirely adapter-side.
 
-`HandshakeLevel` is transport-neutral:
+`EncryptionLevel` is transport-neutral:
 
 ```v
-pub enum HandshakeLevel {
-    plaintext    // handshake messages before handshake traffic keys are installed
+pub enum EncryptionLevel {
+    initial      // initial TLS handshake messages before handshake keys are installed
     handshake    // messages protected with handshake traffic keys
+    application  // application traffic keys/secrets
 }
 ```
 
-The QUIC engine maps Initial packet CRYPTO to `.plaintext` and Handshake packet
-CRYPTO to `.handshake`; it rejects 1-RTT CRYPTO because post-handshake messages
-are handled separately. The TCP adapter maps plaintext handshake records to
-`.plaintext` and decrypted handshake records to `.handshake`. QUIC packet
-levels and packet-number spaces remain adapter-side.
+Here `.initial` names the initial TLS handshake phase, not QUIC Initial packet
+protection. The QUIC engine maps Initial packet CRYPTO to `.initial` and
+Handshake packet CRYPTO to `.handshake`; it rejects 1-RTT CRYPTO because
+post-handshake messages are handled separately. The TCP adapter maps plaintext
+handshake records to `.initial` and decrypted handshake records to
+`.handshake`. QUIC packet levels and packet-number spaces remain adapter-side.
+
+QUIC handshakes include the TLS `quic_transport_parameters` extension
+(RFC 9001 §8.2). The current typed `QuicTransportParameters` value carries the
+`initial_source_connection_id` parameter; the QUIC engine fills it from its
+source connection ID and checks that the server's value matches the server
+source connection ID. Other transport parameters are currently ignored by this
+handshake facade.
 
 ---
 
@@ -116,7 +125,7 @@ violation moves the machine to `failed` and wipes all derived material (see
 `ALPN`, `supported_groups`, `signature_algorithms`, and `supported_versions`.
 A HelloRetryRequest is fed as plaintext handshake input; the core switches to
 the requested group, regenerates the share, echoes any cookie, and `receive()`
-**returns the second ClientHello** (tagged `.plaintext`) for the adapter to send.
+**returns the second ClientHello** (tagged `.initial`) for the adapter to send.
 The transcript substitutes the first ClientHello with its
 `message_hash` (§4.4.1) so the Finished binds the whole two-round exchange.
 The retry suite is remembered (`hrr_cipher_suite`) and the final ServerHello
@@ -148,7 +157,7 @@ and key-schedule state.
 
 QUIC derives its **Initial** packet keys from the destination connection ID
 (RFC 9001 §5.2), not from the TLS key schedule. Those packet keys are not
-represented by `TrafficSecretLevel`; the engine derives them itself, below this
+represented by `EncryptionLevel`; the engine derives them itself, below this
 layer. The shared handshake API starts with plaintext ServerHello processing.
 
 ### 3.2 Secrets, not TrafficKeys, cross the boundary
@@ -233,9 +242,9 @@ ch1 := hs.create_client_hello()!
 //    concatenate CRYPTO frame payloads into `initial_stream`.
 
 // 4. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
-msgs := hs.receive(.plaintext, initial_stream)!
+msgs := hs.receive(.initial, initial_stream)!
 for m in msgs {
-    // The only .plaintext output here is the retry ClientHello after a
+    // The only .initial output here is the retry ClientHello after a
     // HelloRetryRequest — send it in an Initial CRYPTO frame and loop.
     _ = m
 }
@@ -287,7 +296,7 @@ hs.zeroize_handshake_traffic_secrets()!
   `QuicHandshaker` has no record-boundary accessor.
 - **`negotiated_alpn()`** returns the server's ALPN pick (`''` if none). The
   core already verified it was one you offered (RFC 7301 §3.1).
-- The shared `receive()` API only accepts `.plaintext` and `.handshake` TLS
+- The shared `receive()` API only accepts `.initial` and `.handshake` TLS
   phases. The QUIC engine rejects CRYPTO data carried in 1-RTT packets; reassemble
   post-handshake CRYPTO and decode it with `next_passthrough_message` +
   `parse_new_session_ticket`.
@@ -327,7 +336,7 @@ new_quic_handshake(server_name string) !QuicHandshaker
 new_record_handshake(server_name string) !RecordHandshaker
 new_client_engine_with_options(server_name string, HandshakeOptions) !ClientEngine
 (mut h) create_client_hello() ![]u8
-(mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
 
 // Observation
 (h) state() HandshakeState
@@ -336,12 +345,12 @@ new_client_engine_with_options(server_name string, HandshakeOptions) !ClientEngi
 (h) failure_alert() AlertDescription
 
 // QUIC facade only
-(h &QuicHandshaker) quic_traffic_secrets(level TrafficSecretLevel) !([]u8, []u8) // (client, server)
+(h &QuicHandshaker) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8) // (client, server)
 (mut h QuicHandshaker) zeroize_handshake_traffic_secrets() !
 
 // Record facade only
-(h &RecordHandshaker) record_traffic_keys(level TrafficSecretLevel) !(TrafficKeys, TrafficKeys)
-(h &RecordHandshaker) record_unconsumed_bytes(level HandshakeLevel) int
+(h &RecordHandshaker) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys)
+(h &RecordHandshaker) record_unconsumed_bytes(level EncryptionLevel) int
 (mut h RecordHandshaker) record_update_read_traffic_keys() !
 (mut h RecordHandshaker) record_update_write_traffic_keys() !
 (mut h RecordHandshaker) zeroize_handshake_traffic_secrets() !
@@ -359,9 +368,8 @@ parse_new_session_ticket(body []u8) !NewSessionTicket
 parse_key_update(body []u8) !bool
 
 // Supporting types
-HandshakeLevel { plaintext, handshake }
-TrafficSecretLevel { handshake, application }
-HandshakeMessage { level HandshakeLevel  msg []u8 }          // msg = full message, header included
+EncryptionLevel { initial, handshake, application }
+HandshakeMessage { level EncryptionLevel  msg []u8 }          // msg = full message, header included
 ```
 
 The validator in `HandshakeOptions` is optional. If omitted, construction uses
