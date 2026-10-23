@@ -40,13 +40,13 @@ pub struct Conn {
 mut:
 	// Transport and transport-neutral handshake adapter.
 	sock &net.TcpConn               // underlying TCP transport
-	hs   handshake.RecordHandshaker // TLS handshake contract for the record adapter
+	hs   handshake.TLSHandshake // TLS handshake contract for the record adapter
 
-	// The four TLS13Protections are the record layer's own state; the core never sees them.
-	server_hs_cipher  TLS13Protection // AEAD state for records the server sends under handshake keys
-	client_hs_cipher  TLS13Protection // AEAD state for records we send under handshake keys
-	server_app_cipher TLS13Protection // AEAD state for records the server sends under app keys
-	client_app_cipher TLS13Protection // AEAD state for records we send under app keys
+	// The four TLSProtections are the record layer's own state; the core never sees them.
+	server_hs_cipher  TLSProtection // AEAD state for records the server sends under handshake keys
+	client_hs_cipher  TLSProtection // AEAD state for records we send under handshake keys
+	server_app_cipher TLSProtection // AEAD state for records the server sends under app keys
+	client_app_cipher TLSProtection // AEAD state for records we send under app keys
 
 	// Post-handshake messages can span records and produce retained tickets.
 	// session_tickets holds the NewSessionTicket backlog the core parses but does not keep (RFC 9001 §4.5).
@@ -157,7 +157,7 @@ pub fn dial(address string, config Config) !&Conn {
 		random:               handshake_options.random.clone()
 	}
 
-	mut hs := handshake.new_record_handshake(server_name, options) or {
+	mut hs := handshake.new_tls_handshake(server_name, options) or {
 		sock.close() or {}
 		return err
 	}
@@ -403,11 +403,11 @@ fn (mut c Conn) compact_recv_buf() {
 	}
 }
 
-// tls13_protection_from_keys instantiates one direction's record protection
+// tls_protection_from_keys instantiates one direction's record protection
 // from the core's cached TrafficKeys; sequence numbers restart at 0 per generation (§5.3).
-fn tls13_protection_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !TLS13Protection {
+fn tls_protection_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !TLSProtection {
 	aead := handshake.new_aead_for_suite(suite, keys.key())!
-	return new_tls13_protection(aead, keys.iv())!
+	return new_tls_protection(aead, keys.iv())!
 }
 
 // install_handshake_ciphers builds both handshake-key record states from the
@@ -415,8 +415,8 @@ fn tls13_protection_from_keys(suite handshake.CipherSuite, keys handshake.Traffi
 fn (mut c Conn) install_handshake_ciphers() ! {
 	ck, sk := c.hs.record_traffic_keys(.handshake)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_hs_cipher = tls13_protection_from_keys(suite, ck)!
-	c.server_hs_cipher = tls13_protection_from_keys(suite, sk)!
+	c.client_hs_cipher = tls_protection_from_keys(suite, ck)!
+	c.server_hs_cipher = tls_protection_from_keys(suite, sk)!
 }
 
 // install_application_ciphers builds both application-key record states from the
@@ -424,22 +424,22 @@ fn (mut c Conn) install_handshake_ciphers() ! {
 fn (mut c Conn) install_application_ciphers() ! {
 	ck, sk := c.hs.record_traffic_keys(.application)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_app_cipher = tls13_protection_from_keys(suite, ck)!
-	c.server_app_cipher = tls13_protection_from_keys(suite, sk)!
+	c.client_app_cipher = tls_protection_from_keys(suite, ck)!
+	c.server_app_cipher = tls_protection_from_keys(suite, sk)!
 }
 
 // rekeyed_write_cipher rebuilds only the write-side application state after the
 // core ratcheted the client secret (KeyUpdate); the read cipher is unchanged.
 fn (mut c Conn) rekeyed_write_cipher() ! {
 	ck, _ := c.hs.record_traffic_keys(.application)!
-	c.client_app_cipher = tls13_protection_from_keys(c.hs.negotiated_cipher_suite(), ck)!
+	c.client_app_cipher = tls_protection_from_keys(c.hs.negotiated_cipher_suite(), ck)!
 }
 
 // rekeyed_read_cipher rebuilds only the read-side application state after the
 // core ratcheted the server secret on receiving the peer's KeyUpdate.
 fn (mut c Conn) rekeyed_read_cipher() ! {
 	_, sk := c.hs.record_traffic_keys(.application)!
-	c.server_app_cipher = tls13_protection_from_keys(c.hs.negotiated_cipher_suite(), sk)!
+	c.server_app_cipher = tls_protection_from_keys(c.hs.negotiated_cipher_suite(), sk)!
 }
 
 // handle_alert processes an alert received after the handshake. It marks the
@@ -449,10 +449,10 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	c.closed = true
 	// Peer termination is final: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
 	c.hs.zeroize_app_secrets()
-	wipe_tls13_protection(mut c.server_hs_cipher)
-	wipe_tls13_protection(mut c.client_hs_cipher)
-	wipe_tls13_protection(mut c.server_app_cipher)
-	wipe_tls13_protection(mut c.client_app_cipher)
+	wipe_tls_protection(mut c.server_hs_cipher)
+	wipe_tls_protection(mut c.client_hs_cipher)
+	wipe_tls_protection(mut c.server_app_cipher)
+	wipe_tls_protection(mut c.client_app_cipher)
 	peer_alert := handshake.parse_alert(payload) or {
 		// A malformed alert body is fatal: pin a sticky error so later reads re-report it.
 		c.fatal_error = 'tls: received malformed alert'
@@ -686,10 +686,10 @@ pub fn (mut c Conn) close() ! {
 	c.closed = true
 	// Teardown is terminal: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
 	c.hs.zeroize_app_secrets()
-	wipe_tls13_protection(mut c.server_hs_cipher)
-	wipe_tls13_protection(mut c.client_hs_cipher)
-	wipe_tls13_protection(mut c.server_app_cipher)
-	wipe_tls13_protection(mut c.client_app_cipher)
+	wipe_tls_protection(mut c.server_hs_cipher)
+	wipe_tls_protection(mut c.client_hs_cipher)
+	wipe_tls_protection(mut c.server_app_cipher)
+	wipe_tls_protection(mut c.client_app_cipher)
 	c.close_socket()
 }
 
@@ -697,10 +697,10 @@ pub fn (mut c Conn) close() ! {
 // core's key-schedule material plus this adapter's record protectors.
 fn (mut c Conn) wipe_on_failure() {
 	c.hs.fail_and_destroy_secrets()
-	wipe_tls13_protection(mut c.server_hs_cipher)
-	wipe_tls13_protection(mut c.client_hs_cipher)
-	wipe_tls13_protection(mut c.server_app_cipher)
-	wipe_tls13_protection(mut c.client_app_cipher)
+	wipe_tls_protection(mut c.server_hs_cipher)
+	wipe_tls_protection(mut c.client_hs_cipher)
+	wipe_tls_protection(mut c.server_app_cipher)
+	wipe_tls_protection(mut c.client_app_cipher)
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),

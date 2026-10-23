@@ -1,19 +1,18 @@
 // Copyright (c) 2026 blackshirt.
 //
-// frame.v implements the small set of QUIC frames (RFC 9000 §19) a client needs
-// to carry a handshake:
+// frame.v implements the small set of QUIC frames (RFC 9000 §19) used during
+// the handshake:
 //
 //   * CRYPTO (§19.6) — carries the handshake message stream, one frame per
 //     encryption level, with an offset so a flight can span several packets.
-//   * ACK (§19.3) — acknowledges received packets so the peer can drop its
-//     recovery state. This engine only emits simple contiguous ACKs.
+//   * ACK (§19.3) — parsed so handshake packets containing acknowledgments can
+//     be consumed; this engine does not track acknowledgments or emit ACKs.
 //   * PADDING (§19.1) — inflates a ClientHello packet to the 1200-byte minimum.
 //   * CONNECTION_CLOSE (§19.19) — carries a handshake failure's alert code.
 //   * HANDSHAKE_DONE (§19.20) — the server's signal that the handshake is
 //     confirmed, which is the engine's cue to zeroize handshake traffic secrets.
 //
-// Frames a client never needs here (STREAM, flow control, Retry, NEW_TOKEN,
-// etc.) are out of scope.
+// Other frames (STREAM, flow control, Retry, NEW_TOKEN, etc.) are out of scope.
 module quic
 
 // frame type codes (RFC 9000 §19).
@@ -44,51 +43,24 @@ fn encode_crypto_frame(offset u64, data []u8) ![]u8 {
 	return out
 }
 
-// AckFrame is a parsed ACK frame: the contiguous packet-number range a peer is
-// acknowledging (RFC 9000 §19.3). Only the largest/last-range fields are
-// retained — enough for this engine to know the peer's progress.
-struct AckFrame {
-	largest_acked u64
-	ack_delay     u64
-	first_range   u64
-	ranges        int
-}
-
-// encode_ack_frame serializes a minimal ACK frame acknowledging the contiguous
-// range [0, largest] with delay 0 and no additional ranges (RFC 9000 §19.3).
-fn encode_ack_frame(largest u64, delay u64) ![]u8 {
-	mut out := []u8{cap: 16}
-	out << frame_ack
-	out << encode_varint(largest)!
-	out << encode_varint(delay)!
-	out << encode_varint(0)! // ACK Range Count
-	out << encode_varint(0)! // First ACK Range: everything below largest
-	return out
-}
-
 // parse_ack_frame parses an ACK or ACK_ECN body (after the type byte)
-// (RFC 9000 §19.3, §19.4). It reads the ranges and optional ECN counters to
-// advance correctly, but only exposes the contiguous high range.
-fn parse_ack_frame(body []u8, with_ecn bool) !(AckFrame, int) {
+// (RFC 9000 §19.3, §19.4), returning the number of body bytes consumed.
+fn parse_ack_frame(body []u8, with_ecn bool) !int {
 	mut off := 0
-	largest, n := decode_varint(body[off..])!
+	_, n := decode_varint(body[off..])!
 	off += n
-	delay, n2 := decode_varint(body[off..])!
+	_, n2 := decode_varint(body[off..])!
 	off += n2
 	count, n3 := decode_varint(body[off..])!
 	off += n3
-	first_range, n4 := decode_varint(body[off..])!
+	_, n4 := decode_varint(body[off..])!
 	off += n4
-	mut ranges := int(0)
 	mut o := off
 	for _ in 0 .. int(count) {
-		gap, ng := decode_varint(body[o..])!
+		_, ng := decode_varint(body[o..])!
 		o += ng
-		range_len, nr := decode_varint(body[o..])!
+		_, nr := decode_varint(body[o..])!
 		o += nr
-		_ = gap
-		_ = range_len
-		ranges++
 	}
 	if with_ecn {
 		_, n_ect0 := decode_varint(body[o..])!
@@ -98,12 +70,7 @@ fn parse_ack_frame(body []u8, with_ecn bool) !(AckFrame, int) {
 		_, n_ce := decode_varint(body[o..])!
 		o += n_ce
 	}
-	return AckFrame{
-		largest_acked: largest
-		ack_delay:     delay
-		first_range:   first_range
-		ranges:        ranges
-	}, o
+	return o
 }
 
 // parse_crypto_frame parses a CRYPTO frame body (after the type byte),

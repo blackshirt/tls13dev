@@ -1,12 +1,12 @@
 // Copyright (c) 2026 blackshirt.
 //
-// RecordHandshaker is the TLS record adapter facade over shared handshake
+// TLSHandshake is the TLS record adapter facade over shared handshake
 // semantics. Record traffic keys and TLS KeyUpdate state live here.
 module handshake
 
-// RecordHandshaker exposes only operations needed by the TLS record layer.
+// TLSHandshake exposes only operations needed by the TLS record layer.
 @[noinit]
-pub struct RecordHandshaker {
+pub struct TLSHandshake {
 	HandshakeCore
 mut:
 	client_hs_keys  TrafficKeys
@@ -15,15 +15,15 @@ mut:
 	server_app_keys TrafficKeys
 }
 
-// new_record_handshake creates a record handshaker. HandshakeOptions fields
-// can be supplied as optional named arguments after server_name.
-pub fn new_record_handshake(server_name string, options HandshakeOptions) !RecordHandshaker {
-	return RecordHandshaker{
+// new_tls_handshake creates a TLS-over-records handshake facade.
+// HandshakeOptions fields can be supplied as optional named arguments.
+pub fn new_tls_handshake(server_name string, options HandshakeOptions) !TLSHandshake {
+	return TLSHandshake{
 		HandshakeCore: new_handshake_core(server_name, options, false)!
 	}
 }
 
-pub fn (mut h RecordHandshaker) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+pub fn (mut h TLSHandshake) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	messages := h.HandshakeCore.receive(level, bytes) or {
 		if h.state() == .failed {
 			h.wipe_record_keys()
@@ -37,19 +37,19 @@ pub fn (mut h RecordHandshaker) receive(level EncryptionLevel, bytes []u8) ![]Ha
 	return messages
 }
 
-pub fn (mut h RecordHandshaker) fail_and_destroy_secrets() {
+pub fn (mut h TLSHandshake) fail_and_destroy_secrets() {
 	h.HandshakeCore.fail_and_destroy_secrets()
 	h.wipe_record_keys()
 }
 
-pub fn (mut h RecordHandshaker) zeroize_app_secrets() {
+pub fn (mut h TLSHandshake) zeroize_app_secrets() {
 	h.HandshakeCore.zeroize_app_secrets()
 	h.wipe_application_keys()
 }
 
 // record_traffic_keys returns independent copies of the cached client/server
 // TrafficKeys at one TLS encryption level.
-pub fn (h &RecordHandshaker) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys) {
+pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys) {
 	match level {
 		.initial {
 			return error('handshake: initial level has no traffic keys')
@@ -69,11 +69,11 @@ pub fn (h &RecordHandshaker) record_traffic_keys(level EncryptionLevel) !(Traffi
 	}
 }
 
-pub fn (h &RecordHandshaker) record_unconsumed_bytes(level EncryptionLevel) int {
+pub fn (h &TLSHandshake) record_unconsumed_bytes(level EncryptionLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 
-pub fn (mut h RecordHandshaker) zeroize_handshake_traffic_secrets() ! {
+pub fn (mut h TLSHandshake) zeroize_handshake_traffic_secrets() ! {
 	h.HandshakeCore.zeroize_handshake_traffic_secrets()!
 	wipe_traffic_keys(mut h.client_hs_keys)
 	wipe_traffic_keys(mut h.server_hs_keys)
@@ -81,7 +81,7 @@ pub fn (mut h RecordHandshaker) zeroize_handshake_traffic_secrets() ! {
 
 // record_update_read_traffic_keys ratchets the server application keys after
 // receiving a TLS KeyUpdate (RFC 8446 §7.2).
-pub fn (mut h RecordHandshaker) record_update_read_traffic_keys() ! {
+pub fn (mut h TLSHandshake) record_update_read_traffic_keys() ! {
 	if h.server_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
@@ -99,7 +99,7 @@ pub fn (mut h RecordHandshaker) record_update_read_traffic_keys() ! {
 
 // record_update_write_traffic_keys ratchets the client application keys before
 // sending a TLS KeyUpdate (RFC 8446 §7.2).
-pub fn (mut h RecordHandshaker) record_update_write_traffic_keys() ! {
+pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
 	if h.client_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
@@ -115,7 +115,7 @@ pub fn (mut h RecordHandshaker) record_update_write_traffic_keys() ! {
 	h.client_app_keys = next
 }
 
-fn (mut h RecordHandshaker) sync_record_keys() ! {
+fn (mut h TLSHandshake) sync_record_keys() ! {
 	if h.client_hs_keys.key.len == 0 && h.client_hs_traffic.len > 0 {
 		client_keys := derive_traffic_keys(h.hash_algo, h.client_hs_traffic, h.key_len,
 			aead_nonce_len)!
@@ -134,13 +134,13 @@ fn (mut h RecordHandshaker) sync_record_keys() ! {
 	}
 }
 
-fn (mut h RecordHandshaker) wipe_record_keys() {
+fn (mut h TLSHandshake) wipe_record_keys() {
 	wipe_traffic_keys(mut h.client_hs_keys)
 	wipe_traffic_keys(mut h.server_hs_keys)
 	h.wipe_application_keys()
 }
 
-fn (mut h RecordHandshaker) wipe_application_keys() {
+fn (mut h TLSHandshake) wipe_application_keys() {
 	wipe_traffic_keys(mut h.client_app_keys)
 	wipe_traffic_keys(mut h.server_app_keys)
 }

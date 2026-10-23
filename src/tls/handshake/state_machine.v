@@ -5,7 +5,7 @@
 // server-signature check (certificate_verify.v). Transport-neutral: it owns no
 // record, cipher, socket, or packet-level concept.
 //
-// Public transport facades live in record_handshaker.v and quic_handshaker.v;
+// Public transport facades live in tls_handshake.v and quic_handshake.v;
 // this file owns the shared handshake state machine.
 module handshake
 
@@ -48,9 +48,8 @@ pub fn (m &HandshakeMessage) msg() []u8 {
 	return m.msg
 }
 
-// new_handshake_message builds a HandshakeMessage for producers outside this
-// module; msg must be exactly one complete handshake message (RFC 8446 §4).
-pub fn new_handshake_message(level EncryptionLevel, msg []u8) !HandshakeMessage {
+// new_handshake_message builds a validated outbound message for the core.
+fn new_handshake_message(level EncryptionLevel, msg []u8) !HandshakeMessage {
 	mut r := wire.new_reader(msg)
 	_, length := parse_handshake_header(mut r)!
 	if r.remaining() != length {
@@ -510,8 +509,9 @@ fn (mut h HandshakeCore) drain_plaintext() ![]HandshakeMessage {
 	return out
 }
 
-// drain_handshake consumes the complete messages of the encrypted flight —
-// EE → Cert → CV → Finished — until the buffer runs dry or the handshake ends.
+// drain_handshake consumes the encrypted flight — EE, optional CertificateRequest,
+// Certificate, CertificateVerify, and Finished — until the buffer runs dry
+// or the handshake ends.
 fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state != .connected && h.state != .failed {
@@ -554,8 +554,8 @@ pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 	return h.cipher_suite
 }
 
-// handle_handshake_message processes one complete message of the encrypted
-// flight — EE → Certificate → CertificateVerify → Finished — from receive().
+// handle_handshake_message processes one complete encrypted-flight message:
+// EE, optional CertificateRequest, Certificate, CertificateVerify, or Finished.
 fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMessage {
 	// The message is complete by construction (reassembly framed it by its own header), so peel type/length and split the body off.
 	mut r := wire.new_reader(full_msg)

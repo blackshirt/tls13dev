@@ -1,6 +1,6 @@
 // Copyright (c) 2026 blackshirt.
 //
-// cipher_state.v carries one direction's AEAD key, IV, and sequence number across
+// record_protection.v carries one direction's AEAD key, IV, and sequence number across
 // the handshake→application key transition, building each record nonce per §5.3
 // and enforcing the record limit that forces a KeyUpdate.
 module tls
@@ -20,22 +20,22 @@ const nonce_seq_offset = aead_nonce_len - 8
 // direction; RFC 8446 §5.5 requires a KeyUpdate before the 2^24.5 AEAD bound.
 const record_seq_limit = u64(1 << 24)
 
-// TLS13Protection manages encryption, decryption, sequence numbers, and nonces
+// TLSProtection manages encryption, decryption, sequence numbers, and nonces
 // for one direction of a TLS 1.3 connection (RFC 8446 §5.2 & §5.3).
-struct TLS13Protection {
+struct TLSProtection {
 mut:
 	aead    cipher.AEAD // AEAD primitive for this direction (AES-GCM or ChaCha20-Poly1305)
 	iv      []u8        // 12-byte nonce base from the key schedule ("iv" label), not a per-record IV
 	seq_num u64         // record counter for this direction; implicitly part of every nonce
 }
 
-// new_tls13_protection initializes a per-direction protection state at seq 0;
+// new_tls_protection initializes a per-direction protection state at seq 0;
 // the IV must be the suite's full nonce base (aead_nonce_len bytes).
-fn new_tls13_protection(aead cipher.AEAD, iv []u8) !TLS13Protection {
+fn new_tls_protection(aead cipher.AEAD, iv []u8) !TLSProtection {
 	if iv.len != aead_nonce_len {
 		return error('record: IV length must be ${aead_nonce_len} bytes, got ${iv.len}')
 	}
-	return TLS13Protection{
+	return TLSProtection{
 		aead:    aead
 		iv:      iv.clone()
 		seq_num: 0
@@ -44,7 +44,7 @@ fn new_tls13_protection(aead cipher.AEAD, iv []u8) !TLS13Protection {
 
 // compute_nonce derives the 12-byte AEAD nonce, nonce = XOR(padded seq_num, iv)
 // (RFC 8446 §5.3): a strictly increasing counter keeps it unique without being sent.
-fn (s &TLS13Protection) compute_nonce(seq u64) []u8 {
+fn (s &TLSProtection) compute_nonce(seq u64) []u8 {
 	mut nonce := s.iv.clone()
 	for i in 0 .. 8 {
 		shift := (7 - i) * 8
@@ -67,7 +67,7 @@ fn record_aad(content_type ContentType, version u16, length int) []u8 {
 
 // encrypt_record encrypts a plaintext payload into an encrypted Record (§5.2);
 // the outer ContentType is always application_data (23), hiding the real type.
-fn (mut s TLS13Protection) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
+fn (mut s TLSProtection) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
 	// Fail closed: an uninitialized cipher would index a zero-length IV or call a nil AEAD.
 	if s.iv.len != aead_nonce_len {
 		return error('record: TLS 1.3 protection not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
@@ -107,7 +107,7 @@ mut:
 
 // decrypt_record decrypts an encrypted Record, verifies the AEAD tag, and
 // extracts the true inner ContentType and plaintext (RFC 8446 §5.2).
-fn (mut s TLS13Protection) decrypt_record(rec Record) !DecryptedRecord {
+fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 	// Fail closed: an uninitialized cipher would index a zero-length IV or call a nil AEAD.
 	if s.iv.len != aead_nonce_len {
 		return error('record: TLS 1.3 protection not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
@@ -156,9 +156,9 @@ fn (mut s TLS13Protection) decrypt_record(rec Record) !DecryptedRecord {
 	}
 }
 
-// wipe_tls13_protection zeroes a protection state's IV in place and resets its
+// wipe_tls_protection zeroes a protection state's IV in place and resets its
 // sequence number, so a dead connection leaves no nonce base behind.
-fn wipe_tls13_protection(mut s TLS13Protection) {
+fn wipe_tls_protection(mut s TLSProtection) {
 	for i in 0 .. s.iv.len {
 		s.iv[i] = 0
 	}

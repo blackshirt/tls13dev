@@ -35,7 +35,7 @@ fn test_build_client_hello_includes_quic_transport_parameters() ! {
 		}
 		is_quic:               true
 		quic_transport_params: QuicTransportParameters{
-			initial_source_connection_id: [u8(0x12), 0x34]
+			initial_scid: [u8(0x12), 0x34]
 		}
 	}
 	_, full_msg := build_client_hello(cfg)!
@@ -50,7 +50,7 @@ fn test_build_record_client_hello_omits_quic_transport_parameters() ! {
 			key_exchange: []u8{len: 32, init: 0xaa}
 		}
 		quic_transport_params: QuicTransportParameters{
-			initial_source_connection_id: [u8(0x12), 0x34]
+			initial_scid: [u8(0x12), 0x34]
 		}
 	}
 	_, full_msg := build_client_hello(cfg)!
@@ -74,7 +74,7 @@ fn test_build_quic_client_hello_requires_transport_parameters() {
 
 fn test_parse_quic_transport_parameters() ! {
 	params := parse_quic_transport_parameters([u8(0x0f), 0x02, 0x12, 0x34])!
-	assert params.initial_source_connection_id == [u8(0x12), 0x34]
+	assert params.initial_scid == [u8(0x12), 0x34]
 }
 
 fn test_parse_quic_transport_parameters_requires_source_id() {
@@ -94,7 +94,7 @@ fn test_parse_encrypted_extensions_quic_transport_parameters() ! {
 	body := [u8(0x00), 0x08, 0x00, 0x39, 0x00, 0x04, 0x0f, 0x02, 0x12, 0x34]
 	alpn, params := parse_encrypted_extensions_for_transport(body, true)!
 	assert alpn == ''
-	assert params or { panic('expected server QUIC transport parameters') }.initial_source_connection_id == [
+	assert params or { panic('expected server QUIC transport parameters') }.initial_scid == [
 		u8(0x12),
 		0x34,
 	]

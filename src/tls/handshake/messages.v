@@ -325,7 +325,7 @@ mut:
 	quic_transport_params ?QuicTransportParameters
 }
 
-const quic_param_initial_source_cid = u64(0x0f)
+const quic_param_initial_scid = u64(0x0f)
 
 fn encode_quic_varint(value u64) ![]u8 {
 	if value < (1 << 6) {
@@ -373,12 +373,12 @@ fn decode_quic_varint(data []u8) !(u64, int) {
 }
 
 fn encode_quic_transport_parameters(params QuicTransportParameters) ![]u8 {
-	if params.initial_source_connection_id.len > 20 {
+	if params.initial_scid.len > 20 {
 		return error('handshake: QUIC initial_source_connection_id exceeds 20 bytes')
 	}
-	mut out := encode_quic_varint(quic_param_initial_source_cid)!
-	out << encode_quic_varint(u64(params.initial_source_connection_id.len))!
-	out << params.initial_source_connection_id
+	mut out := encode_quic_varint(quic_param_initial_scid)!
+	out << encode_quic_varint(u64(params.initial_scid.len))!
+	out << params.initial_scid
 	return out
 }
 
@@ -403,7 +403,7 @@ fn parse_quic_transport_parameters(data []u8) !QuicTransportParameters {
 		seen_ids << id
 		value := data[off..off + int(length)]
 		off += int(length)
-		if id == quic_param_initial_source_cid {
+		if id == quic_param_initial_scid {
 			if value.len > 20 {
 				return error('handshake: QUIC initial_source_connection_id exceeds 20 bytes')
 			}
@@ -415,7 +415,7 @@ fn parse_quic_transport_parameters(data []u8) !QuicTransportParameters {
 		return error('handshake: QUIC transport parameters missing initial_source_connection_id')
 	}
 	return QuicTransportParameters{
-		initial_source_connection_id: source_connection_id
+		initial_scid: source_connection_id
 	}
 }
 

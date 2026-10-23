@@ -18,15 +18,13 @@ import tls.pki
 
 fn test_parse_ack_ecn_frame() ! {
 	body := [u8(0), 0, 0, 0, 1, 2, 3] // ACK fields, then ECT(0), ECT(1), CE counts
-	ack, used := parse_ack_frame(body, true)!
-	assert ack.largest_acked == 0
+	used := parse_ack_frame(body, true)!
 	assert used == body.len
 }
 
 fn test_parse_ack_frame_without_ecn() ! {
 	body := [u8(0), 0, 0, 0]
-	ack, used := parse_ack_frame(body, false)!
-	assert ack.largest_acked == 0
+	used := parse_ack_frame(body, false)!
 	assert used == body.len
 }
 
@@ -150,7 +148,7 @@ fn (mut f FerryServer) handle_frames(ptype PacketType, payload []u8) ! {
 				off += 1 + used
 			}
 			frame_ack {
-				_, used := parse_ack_frame(body, false)!
+				used := parse_ack_frame(body, false)!
 				off += 1 + used
 			}
 			else {
@@ -257,9 +255,11 @@ fn trusted_validator() pki.Validator {
 fn test_engine_completes_quic_handshake() ! {
 	// The engine picks random connection IDs, so we build one and learn its
 	// original DCID to key the ferry server.
-	mut eng := new_client_engine_with_options(fakeserver.server_name, handshake.HandshakeOptions{
-		alpn:      ['h3']
-		validator: trusted_validator()
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		handshake_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
 	})!
 
 	// The client's first datagram is an Initial packet carrying the ClientHello.
@@ -301,8 +301,10 @@ fn test_engine_initial_keys_match_appendix_a() ! {
 	// A fixed-DCID engine must derive the RFC 9001 Appendix A Initial keys; this
 	// ties the engine's wiring to the published vectors.
 	dcid := [u8(0x83), 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]
-	mut eng := new_client_engine_with_ids(fakeserver.server_name, ['h3'],
-		trusted_validator(), dcid, [u8(1), 2, 3, 4, 5, 6, 7, 8])!
+	mut eng := new_client_engine_with_ids(fakeserver.server_name, handshake.HandshakeOptions{
+		alpn:      ['h3']
+		validator: trusted_validator()
+	}, dcid, [u8(1), 2, 3, 4, 5, 6, 7, 8])!
 	start := eng.start()!
 	assert start.len >= 1200
 	assert first_byte_long(start[0])
@@ -317,8 +319,10 @@ fn test_engine_handshake_with_asymmetric_cids() ! {
 	// Equal-length CIDs hide this, so the IDs below are deliberately different sizes.
 	dcid := [u8(0x83), 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08] // 8 bytes, sent by the client
 	scid := [u8(0x01), 0x02, 0x03, 0x04, 0x05, 0x06] // 6 bytes, the client's own address
-	mut eng := new_client_engine_with_ids(fakeserver.server_name, ['h3'],
-		trusted_validator(), dcid, scid)!
+	mut eng := new_client_engine_with_ids(fakeserver.server_name, handshake.HandshakeOptions{
+		alpn:      ['h3']
+		validator: trusted_validator()
+	}, dcid, scid)!
 
 	start := eng.start()!
 	mut ferry := new_ferry_server(eng.original_dcid())!
@@ -337,7 +341,12 @@ fn test_engine_adopts_server_source_cid() ! {
 	// connection ID to address it by, so every later client packet carries the server's
 	// Source CID as its Destination CID. The ferry sends a CID the client never chose,
 	// which is what a real server does; echoing the client's guess hides this.
-	mut eng := new_client_engine(fakeserver.server_name, ['h3'], trusted_validator())!
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		handshake_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
 	start := eng.start()!
 	mut ferry := new_ferry_server(eng.original_dcid())!
 	flight := ferry.exchange(start)!

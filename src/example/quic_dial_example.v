@@ -9,7 +9,7 @@ module main
 
 import net
 import time
-import tls.pki
+import tls.handshake
 import tls.quic
 
 const server_name = 'test.privateoctopus.com'
@@ -29,7 +29,11 @@ fn run() ! {
 	}
 	socket.set_read_timeout(10 * time.second)
 
-	mut engine := quic.new_client_engine(server_name, ['h3'], pki.default_validator()!)!
+	mut engine := quic.new_client_engine(server_name, quic.Config{
+		handshake_options: handshake.HandshakeOptions{
+			alpn: ['h3']
+		}
+	})!
 	initial := engine.start()!
 	send_datagram(mut socket, initial)!
 

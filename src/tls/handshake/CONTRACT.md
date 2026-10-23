@@ -3,8 +3,8 @@
 The `tls.handshake` module has one private `HandshakeCore` for shared TLS 1.3
 semantics and two public facades for its transport adapters:
 
-- `RecordHandshaker` for the TLS record adapter (`tls.Conn`).
-- `QuicHandshaker` for the QUIC adapter (`tls.quic.ClientEngine`).
+- `TLSHandshake` for the TLS record adapter (`tls.Conn`).
+- `QuicHandshake` for the QUIC adapter (`tls.quic.Conn`).
 
 The facades contain the shared core but expose different transport-specific
 operations. A caller chooses its transport at construction, and does not need a
@@ -16,9 +16,9 @@ where they add transport-specific behavior or expose transport-only operations.
 The implementation is split by ownership:
 
 - [`state_machine.v`](./state_machine.v) contains the private shared core.
-- [`record_handshaker.v`](./record_handshaker.v) defines and implements the
+- [`tls_handshake.v`](./tls_handshake.v) defines and implements the
   record facade and its cached TLS keys and KeyUpdate ratchets.
-- [`quic_handshaker.v`](./quic_handshaker.v) defines and implements the QUIC
+- [`quic_handshake.v`](./quic_handshake.v) defines and implements the QUIC
   facade and exposes TLS traffic secrets without deriving record keys.
 
 ## Shared behavior
@@ -26,7 +26,7 @@ The implementation is split by ownership:
 Both facades expose the same handshake operations:
 
 ```v
-mut hs := new_record_handshake(server_name)! // or new_quic_handshake(...)
+mut hs := new_tls_handshake(server_name)! // or new_quic_handshake(...)
 client_hello := hs.create_client_hello()!
 messages := hs.receive(level, bytes)!
 state := hs.state()
@@ -38,12 +38,12 @@ hs.zeroize_app_secrets()
 ```
 
 `fail_and_destroy_secrets()` marks the handshake failed and destroys its derived
-secrets; it does not close a socket or QUIC connection. `RecordHandshaker` also
+secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
 wipes its cached record keys during failure cleanup.
 
 `create_client_hello()` returns the initial, complete handshake message.
 The constructors require only `server_name`. Optional named
-`HandshakeOptions` fields can be passed to `new_record_handshake()` or
+`HandshakeOptions` fields can be passed to `new_tls_handshake()` or
 `new_quic_handshake()` to configure ALPN, certificate validation,
 the initial key-share group, preference-ordered supported groups, TLS 1.3
 cipher suites, and signature algorithms. If no validator is supplied, the
@@ -67,7 +67,7 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 
 ## Record-only operations
 
-`RecordHandshaker` exposes operations needed by TLS over TCP:
+`TLSHandshake` exposes operations needed by TLS over TCP:
 
 - `record_traffic_keys()` returns derived record keys.
 - `record_unconsumed_bytes()` lets the record adapter enforce the
@@ -80,23 +80,23 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 
 ## QUIC-only operations
 
-`QuicHandshaker` exposes `quic_traffic_secrets()` instead of record keys. The
+`QuicHandshake` exposes `quic_traffic_secrets()` instead of record keys. The
 method is implemented directly on the QUIC facade, which owns the transport-
 specific secret-level checks. The shared core contains no QUIC-specific secret
-accessor, and `RecordHandshaker` cannot expose one. The QUIC adapter expands
+accessor, and `TLSHandshake` cannot expose one. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
 calls `zeroize_handshake_traffic_secrets()` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
-are absent from `QuicHandshaker`, rather than present as runtime-rejected calls.
+are absent from `QuicHandshake`, rather than present as runtime-rejected calls.
 
 ## Ownership boundary
 
 The core owns TLS handshake ordering, transcript updates, certificate
 validation, the TLS key schedule, shared traffic secrets, and per-level TLS
 message reassembly buffers.
-`RecordHandshaker` derives and owns the cached TLS `TrafficKeys`; `QuicHandshaker`
+`TLSHandshake` derives and owns the cached TLS `TrafficKeys`; `QuicHandshake`
 only exposes traffic secrets for QUIC key derivation. The record adapter owns
 TLS records and record protection. The QUIC adapter owns CRYPTO offset
 reassembly, packets, packet protection, and QUIC key updates. The core does not

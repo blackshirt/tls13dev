@@ -10,9 +10,9 @@ import tls.pki
 // carried by the TLS handshake.
 pub struct QuicTransportParameters {
 pub:
-	// initial_source_connection_id identifies the source connection ID sent by
-	// this endpoint in its first QUIC packet.
-	initial_source_connection_id []u8
+	// initial_scid identifies the source connection ID sent by this endpoint
+	// in its first QUIC packet.
+	initial_scid []u8
 }
 
 // HandshakeOptions configures the shared TLS handshake, including peer

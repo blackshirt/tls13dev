@@ -35,7 +35,7 @@ fn test_encryption_level_order() ! {
 // test_encryption_level_rejects_unsupported_operation checks that a shared
 // level value is rejected when it does not apply to the selected API operation.
 fn test_encryption_level_rejects_unsupported_operation() ! {
-	mut record := new_record_handshake('example.com', HandshakeOptions{
+	mut record := new_tls_handshake('example.com', HandshakeOptions{
 		validator: fixture_validator()
 	})!
 	_ = record.create_client_hello()!
@@ -98,7 +98,7 @@ fn test_new_handshake_message_rejects_truncated_header() ! {
 // test_feed_plaintext_buffers_incomplete_message checks that an incomplete
 // ServerHello parks in the plaintext buffer without parsing.
 fn test_feed_plaintext_buffers_incomplete_message() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 
 	full := wrap_hs(.server_hello, []u8{len: 10, init: 0xAA})
@@ -119,7 +119,7 @@ fn test_feed_plaintext_buffers_incomplete_message() ! {
 // test_record_unconsumed_bytes_levels_start_empty checks that both handshake
 // reassembly buffers start empty and the accessor tracks a parked fragment.
 fn test_record_unconsumed_bytes_levels_start_empty() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	assert h.record_unconsumed_bytes(.handshake) == 0
 	assert h.record_unconsumed_bytes(.initial) == 0
 	_ = h.create_client_hello()!
@@ -131,7 +131,7 @@ fn test_record_unconsumed_bytes_levels_start_empty() ! {
 // ---- state machine accessor ----
 
 fn test_record_and_quic_facades_share_handshake_state() ! {
-	mut record := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut record := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	mut quic := new_quic_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 
 	assert record.state() == .start
@@ -152,7 +152,7 @@ fn test_handshake_options_select_initial_key_share() ! {
 		key_share_group:  .secp256r1
 		supported_groups: [.secp256r1]
 	}
-	mut h := new_record_handshake('example.com', options)!
+	mut h := new_tls_handshake('example.com', options)!
 	assert h.config.alpn == ['h2']
 	assert h.ecdhe_group == .secp256r1
 	assert h.config.client_share.group == .secp256r1
@@ -161,7 +161,7 @@ fn test_handshake_options_select_initial_key_share() ! {
 }
 
 fn test_handshake_options_reject_unoffered_initial_group() ! {
-	new_record_handshake('example.com', HandshakeOptions{
+	new_tls_handshake('example.com', HandshakeOptions{
 		validator:        fixture_validator()
 		key_share_group:  .x25519
 		supported_groups: [.secp256r1]
@@ -173,7 +173,7 @@ fn test_handshake_options_reject_unoffered_initial_group() ! {
 }
 
 fn test_handshake_options_default_validator() ! {
-	h := new_record_handshake('example.com')!
+	h := new_tls_handshake('example.com')!
 	assert h.state() == .start
 }
 
@@ -184,12 +184,12 @@ fn test_quic_handshake_options_include_alpn_and_validator() ! {
 }
 
 fn test_record_handshake_accepts_named_options() ! {
-	h := new_record_handshake('example.com', alpn: ['h2'], validator: fixture_validator())!
+	h := new_tls_handshake('example.com', alpn: ['h2'], validator: fixture_validator())!
 	assert h.config.alpn == ['h2']
 }
 
 fn test_reassembly_is_owned_by_each_handshake_core() ! {
-	mut record := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut record := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	mut quic := new_quic_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = record.create_client_hello()!
 	_ = quic.create_client_hello()!
@@ -208,7 +208,7 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 // test_state_progression_to_wait_server_hello checks that the machine starts at
 // .start and moves to .wait_server_hello once the ClientHello is built.
 fn test_state_progression_to_wait_server_hello() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	assert h.state() == .start
 	_ = h.create_client_hello()!
 	assert h.state() == .wait_server_hello
@@ -217,7 +217,7 @@ fn test_state_progression_to_wait_server_hello() ! {
 // test_feed_rejects_out_of_order_message checks that a Certificate arriving
 // while the ServerHello is awaited is rejected before parsing.
 fn test_feed_rejects_out_of_order_message() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	cert := wrap_hs(.certificate, []u8{len: 4, init: 0x01})
 	h.receive(.handshake, cert) or {
@@ -232,7 +232,7 @@ fn test_feed_rejects_out_of_order_message() ! {
 // test_create_client_hello_only_runs_once checks that the single-shot entry
 // point refuses a second call that would poison the transcript.
 fn test_create_client_hello_only_runs_once() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.create_client_hello() or {
 		assert err.msg().contains('only runs once')
@@ -245,7 +245,7 @@ fn test_create_client_hello_only_runs_once() ! {
 // test_feed_before_client_hello_refused checks that peer bytes before the
 // ClientHello are refused as a contract error, leaving the state .start.
 fn test_feed_before_client_hello_refused() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('receive() before create_client_hello()')
 		assert h.state == .start
@@ -257,7 +257,7 @@ fn test_feed_before_client_hello_refused() ! {
 // test_feed_initial_after_server_hello_refused checks that initial-level bytes
 // after the ServerHello wait are refused, leaving the machine usable.
 fn test_feed_initial_after_server_hello_refused() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.state = .wait_encrypted_extensions
 	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
@@ -271,7 +271,7 @@ fn test_feed_initial_after_server_hello_refused() ! {
 // test_feed_marks_failed_and_refuses_after_protocol_error checks that a parse
 // failure is terminal: the state becomes .failed and later feeds are refused.
 fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	// A garbage ServerHello body fails to parse; the failure is terminal.
 	bad := wrap_hs(.server_hello, []u8{len: 8, init: 0x01})
@@ -291,7 +291,7 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 // test_feed_reassembly_is_bounded_after_connected checks that late bytes after
 // .connected trip the reassembly cap instead of growing memory.
 fn test_feed_reassembly_is_bounded_after_connected() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.state = .connected
 	h.receive(.handshake, []u8{len: 4 + max_handshake_message_len + 1, init: 0xAA}) or {
@@ -307,7 +307,7 @@ fn test_feed_reassembly_is_bounded_after_connected() ! {
 // test_traffic_keys_unavailable_before_derivation checks that the accessors
 // refuse until the handshake derives keys.
 fn test_traffic_keys_unavailable_before_derivation() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	_, _ := h.record_traffic_keys(.handshake) or {
 		return
@@ -317,7 +317,7 @@ fn test_traffic_keys_unavailable_before_derivation() ! {
 
 // A rejected input at the wrong handshake phase must not discard usable keys.
 fn test_nonfatal_receive_error_preserves_record_keys() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.client_app_keys = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
 	h.server_app_keys = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
 	h.state = .connected
@@ -334,7 +334,7 @@ fn test_nonfatal_receive_error_preserves_record_keys() ! {
 
 // test_zeroize_handshake_traffic_secrets drops cached handshake keys and secrets.
 fn test_zeroize_handshake_traffic_secrets() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.client_hs_traffic = [u8(1), 2, 3]
 	h.server_hs_traffic = [u8(4), 5, 6]
 	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
@@ -357,7 +357,7 @@ fn test_zeroize_handshake_traffic_secrets() ! {
 // test_zeroize_handshake_traffic_secrets_requires_connected_state checks that
 // early cleanup is refused with nothing wiped.
 fn test_zeroize_handshake_traffic_secrets_requires_connected_state() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.client_hs_traffic = [u8(1), 2, 3]
 	h.client_hs_keys = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
 	h.zeroize_handshake_traffic_secrets() or {
@@ -372,7 +372,7 @@ fn test_zeroize_handshake_traffic_secrets_requires_connected_state() ! {
 // test_zeroize_app_secrets_clears_and_refuses checks that zeroization forgets
 // the application secrets and their cached keys (§7.5).
 fn test_zeroize_app_secrets_clears_and_refuses() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.client_ap_traffic = [u8(11), 12]
 	h.server_ap_traffic = [u8(13), 14]
 	h.client_app_keys = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
@@ -395,7 +395,7 @@ fn test_zeroize_app_secrets_clears_and_refuses() ! {
 // test_record_update_traffic_keys_refuse_missing_secrets checks that the
 // ratchet refuses while the application traffic secrets are still empty.
 fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.record_update_read_traffic_keys() or {
 		assert err.msg().contains('server application traffic secret')
 		h.record_update_write_traffic_keys() or {
@@ -411,7 +411,7 @@ fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
 // test_record_update_traffic_keys_ratchet_forward checks that the ratchet
 // advances the secrets and rebuilds the cached keys (§7.2).
 fn test_record_update_traffic_keys_ratchet_forward() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.server_ap_traffic = []u8{len: 32, init: 1}
 	h.client_ap_traffic = []u8{len: 32, init: 2}
 	old_server := h.server_ap_traffic.clone()
@@ -429,7 +429,7 @@ fn test_record_update_traffic_keys_ratchet_forward() ! {
 // test_record_update_traffic_keys_refuses_after_zeroize checks that a ratchet
 // after teardown is refused instead of resurrecting the secret.
 fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.client_ap_traffic = [u8(1), 2, 3]
 	h.client_app_keys = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
 	h.zeroize_app_secrets()
@@ -514,7 +514,7 @@ fn test_next_passthrough_rejects_oversize_length() ! {
 // test_traffic_keys_returns_independent_copies checks that the accessor returns
 // copies, so a ratchet cannot wipe keys an adapter still holds.
 fn test_traffic_keys_returns_independent_copies() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.client_hs_keys = TrafficKeys{ key: [u8(1), 2, 3], iv: [u8(4), 5] }
 	h.server_hs_keys = TrafficKeys{ key: [u8(6), 7], iv: [u8(8)] }
 	ck, sk := h.record_traffic_keys(.handshake)!
@@ -528,7 +528,7 @@ fn test_traffic_keys_returns_independent_copies() ! {
 // test_record_update_traffic_keys_wipes_superseded_generation checks that the
 // superseded generation is zeroed in place after the ratchet.
 fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
-	mut h := new_record_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.server_ap_traffic = []u8{len: 32, init: 7}
 	h.server_app_keys = TrafficKeys{ key: [u8(9), 9, 9], iv: [u8(9)] }
 	// Aliases into the old generation, captured before the ratchet runs.

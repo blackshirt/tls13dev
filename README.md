@@ -76,14 +76,14 @@ tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
 
 | Module          | Responsibility                                                                              |
 |-----------------|---------------------------------------------------------------------------------------------|
-| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `cipher_state` |
+| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `record_protection` |
 | `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC passthrough framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
 | `tls.pki`       | Trust & parsing: `asn1`, `x509`, `validator`, `hostname`, `trust_store`, `rsa`              |
 | `tls.wire`      | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)                       |
 
 Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
 only of certificates, and `tls.handshake` owns **no record, cipher, or socket
-concept** — a grep gate over `src/tls/handshake/` (`Record`, `TLS13Protection`,
+concept** — a grep gate over `src/tls/handshake/` (`Record`, `TLSProtection`,
 `ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
 `conn.v` in the `tls` module is the reference adapter that
 drives the core.
@@ -96,27 +96,27 @@ matching facade; framing and encryption decisions stay adapter-side:
 
 ```v
 // shared (both facades)
-new_record_handshake(server_name) !RecordHandshaker
-new_quic_handshake(server_name) !QuicHandshaker
+new_tls_handshake(server_name) !TLSHandshake
+new_quic_handshake(server_name) !QuicHandshake
 create_client_hello() ![]u8
 receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 failure_alert() AlertDescription  /  fail_and_destroy_secrets()  /  zeroize_app_secrets()
 
-// RecordHandshaker only
+// TLSHandshake only
 record_unconsumed_bytes(level EncryptionLevel) int                     // §5.1 boundary hook
 record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys)  // client, server
 record_update_read_traffic_keys() !  /  record_update_write_traffic_keys() !  // §7.2 ratchet
 zeroize_handshake_traffic_secrets() !                                // record handshake secrets no longer needed
 
-// QuicHandshaker only
+// QuicHandshake only
 quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8)     // RFC 9001 §5.1 expansions
 zeroize_handshake_traffic_secrets() !                     // when QUIC no longer needs these secrets
 ```
 
 The shared implementation, including per-level receive buffers for each
 handshake instance, is in `state_machine.v`; the record and QUIC APIs are
-defined in `record_handshaker.v` and `quic_handshaker.v`, respectively.
+defined in `tls_handshake.v` and `quic_handshake.v`, respectively.
 Both facades share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
 `new_aead_for_suite`.
 
@@ -143,7 +143,7 @@ Empty preference lists retain the existing defaults; deterministic
 `tls.Config.handshake_options` configures the TCP dial path; a validator set
 there takes precedence over `root_cas` and `insecure_skip_verify`. Otherwise
 the validator is built from those Config fields. The QUIC package provides
-`new_client_engine_with_options()`.
+`quic.Config` for handshake options passed to `new_client_engine(server_name, config)`.
 
 ## Repository layout
 
@@ -255,8 +255,8 @@ the all-zero one.
   documented in
   [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md),
   [`state_machine.v`](src/tls/handshake/state_machine.v),
-  [`record_handshaker.v`](src/tls/handshake/record_handshaker.v), and
-  [`quic_handshaker.v`](src/tls/handshake/quic_handshaker.v).
+  [`tls_handshake.v`](src/tls/handshake/tls_handshake.v), and
+  [`quic_handshake.v`](src/tls/handshake/quic_handshake.v).
 - A server mode — this library is client-only
 
 ## Testing
@@ -283,7 +283,7 @@ secrets, and TCP record (re)framing in the connection layer.
 
 The core flight is additionally exercised end to end against an in-repo fake
 TLS 1.3 server (`src/tls/fakeserver/`, a test-only module): tests drive the
-real `RecordHandshaker` through a complete X25519 handshake byte by byte,
+real `TLSHandshake` through a complete X25519 handshake byte by byte,
 asserting the client's ServerHello/Finished/alert bytes and the derived
 traffic keys, then the same handshake over a live loopback TCP socket through
 `tls.dial()` — including HelloRetryRequest, a CertificateRequest answered

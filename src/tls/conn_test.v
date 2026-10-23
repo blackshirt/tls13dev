@@ -13,7 +13,7 @@ import tls.pki
 // new_test_conn builds a fully-initialized Conn for the socket-free tests below:
 // Conn is @[noinit], so a bare &Conn{} would leave every field as garbage.
 fn new_test_conn() !&Conn {
-	mut hs := handshake.new_record_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store(), false) })!
+	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store(), false) })!
 	return &Conn{
 		sock:              unsafe { nil }
 		hs:                hs
@@ -163,7 +163,7 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	}
 	local := listener.addr()!
 	mut sock := net.dial_tcp(local.str())!
-	mut hs := handshake.new_record_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store(), false) })!
+	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store(), false) })!
 	mut c := &Conn{
 		sock:              sock
 		hs:                hs

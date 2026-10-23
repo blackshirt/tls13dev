@@ -17,7 +17,7 @@ fn fixture_trusted_validator() pki.Validator {
 
 // expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —
 // the expected state once zeroize_handshake_traffic_secrets() dropped the handshake material.
-fn expect_no_handshake_keys(h &RecordHandshaker) bool {
+fn expect_no_handshake_keys(h &TLSHandshake) bool {
 	h.record_traffic_keys(.handshake) or {
 		return true
 	}
@@ -26,13 +26,13 @@ fn expect_no_handshake_keys(h &RecordHandshaker) bool {
 
 // expect_no_exported_handshake_secrets reports whether the handshake traffic
 // secrets are gone — the expected state once they were wiped.
-fn expect_no_exported_handshake_secrets(h &RecordHandshaker) bool {
+fn expect_no_exported_handshake_secrets(h &TLSHandshake) bool {
 	return h.client_hs_traffic.len == 0 && h.server_hs_traffic.len == 0
 }
 
 // assert_handshake_material_destroyed checks the failure-path contract: after a
 // failed feed the machine is .failed and every derived secret is gone (RFC 8446 §7.5).
-fn assert_handshake_material_destroyed(h &RecordHandshaker) {
+fn assert_handshake_material_destroyed(h &TLSHandshake) {
 	assert h.state() == .failed
 	assert expect_no_handshake_keys(h), 'handshake TrafficKeys survived a failed feed'
 	assert expect_no_exported_handshake_secrets(h), 'handshake traffic secrets survived a failed feed'
@@ -40,7 +40,7 @@ fn assert_handshake_material_destroyed(h &RecordHandshaker) {
 
 // feed_encrypted_flight feeds the whole server flight one byte at a time and
 // returns every outbound message, exercising reassembly at every split point.
-fn feed_encrypted_flight(mut h RecordHandshaker, flight []u8) ![]HandshakeMessage {
+fn feed_encrypted_flight(mut h TLSHandshake, flight []u8) ![]HandshakeMessage {
 	mut produced := []HandshakeMessage{}
 	for i in 0 .. flight.len {
 		msgs := h.receive(.handshake, [flight[i]])!
@@ -52,7 +52,7 @@ fn feed_encrypted_flight(mut h RecordHandshaker, flight []u8) ![]HandshakeMessag
 // test_client_auth_request_answered_with_empty_certificate checks that a
 // CertificateRequest is answered with an empty Certificate (§4.4.2).
 fn test_client_auth_request_answered_with_empty_certificate() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(client_auth: true)!
 
 	ch := h.create_client_hello()!
@@ -83,7 +83,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 // test_full_handshake_reaches_connected_byte_by_byte checks that a full
 // handshake reaches .connected with byte-correct secrets, fed one byte at a time.
 fn test_full_handshake_reaches_connected_byte_by_byte() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ alpn: ['h2'], validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ alpn: ['h2'], validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(alpn: ['h2', 'http/1.1'])!
 
 	ch := h.create_client_hello()!
@@ -126,7 +126,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 // test_hello_retry_request_change_group_reaches_connected checks that the
 // change_group retry round trip completes (RFC 8446 §4.1.4).
 fn test_hello_retry_request_change_group_reaches_connected() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(hrr: .change_group)!
 
 	ch := h.create_client_hello()!
@@ -155,7 +155,7 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 // test_hello_retry_request_cookie_only_reaches_connected checks that the
 // cookie retry round trip completes with the echoed cookie (RFC 8446 §4.1.4).
 fn test_hello_retry_request_cookie_only_reaches_connected() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(hrr: .cookie_only)!
 
 	ch := h.create_client_hello()!
@@ -179,7 +179,7 @@ fn test_hello_retry_request_cookie_only_reaches_connected() ! {
 // test_rejects_bad_server_finished checks that a corrupted server Finished
 // aborts the handshake with a decrypt_error alert and no surviving secrets.
 fn test_rejects_bad_server_finished() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(bad_finished: true)!
 
 	ch := h.create_client_hello()!
@@ -198,7 +198,7 @@ fn test_rejects_bad_server_finished() ! {
 // test_rejects_bad_certificate_verify checks that a corrupted CertificateVerify
 // aborts the handshake with a decrypt_error alert and no surviving secrets.
 fn test_rejects_bad_certificate_verify() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(bad_certificate_verify: true)!
 
 	ch := h.create_client_hello()!
@@ -217,7 +217,7 @@ fn test_rejects_bad_certificate_verify() ! {
 // test_rejects_out_of_order_certificate checks that a Certificate where
 // EncryptedExtensions is expected is rejected (§4.4.1).
 fn test_rejects_out_of_order_certificate() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server()!
 
 	ch := h.create_client_hello()!
@@ -238,7 +238,7 @@ fn test_rejects_out_of_order_certificate() ! {
 // test_rejects_unoffered_alpn checks that an unoffered ALPN pick aborts rather
 // than negotiating a protocol the client never offered (RFC 7301 §3.1).
 fn test_rejects_unoffered_alpn() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	mut srv := fakeserver.new_server(force_alpn: 'h2')!
 
 	ch := h.create_client_hello()!
@@ -256,7 +256,7 @@ fn test_rejects_unoffered_alpn() ! {
 
 // test_fail_before_secrets_is_safe checks failure cleanup before anything is derived.
 fn test_fail_before_secrets_is_safe() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	h.fail_and_destroy_secrets()
 	assert h.state() == .failed
 	assert expect_no_handshake_keys(h)
@@ -266,7 +266,7 @@ fn test_fail_before_secrets_is_safe() ! {
 // test_malformed_server_hello_aborts_and_destroys checks that a ServerHello
 // which cannot parse still parks the machine in .failed with no keys left.
 fn test_malformed_server_hello_aborts_and_destroys() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	_ := h.create_client_hello()!
 	// A complete ServerHello header with an empty body: parse fails before the key schedule ran.
 	h.receive(.initial, [u8(0x02), 0x00, 0x00, 0x00]) or {
@@ -280,7 +280,7 @@ fn test_malformed_server_hello_aborts_and_destroys() ! {
 // test_default_failure_alert_is_internal_error checks that an unclassified
 // failure reports internal_error, the §6 catch-all.
 fn test_default_failure_alert_is_internal_error() ! {
-	mut h := new_record_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	_ := h.create_client_hello()!
 	assert h.failure_alert() == .internal_error
 }
