@@ -80,10 +80,10 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 
 ## QUIC-only operations
 
-`QuicHandshake` exposes `quic_traffic_secrets()` instead of record keys. The
-method is implemented directly on the QUIC facade, which owns the transport-
-specific secret-level checks. The shared core contains no QUIC-specific secret
-accessor, and `TLSHandshake` cannot expose one. The QUIC adapter expands
+`QuicHandshake` exposes `quic_traffic_secrets()` instead of record keys. It
+delegates to the core's private level-aware traffic-secret accessor, so both
+facades share one availability check while only the QUIC facade exports raw
+secrets; `TLSHandshake` cannot expose that accessor. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
 calls `zeroize_handshake_traffic_secrets()` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.

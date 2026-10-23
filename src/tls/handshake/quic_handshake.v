@@ -29,21 +29,5 @@ pub fn (h &QuicHandshake) peer_transport_parameters() ?QuicTransportParameters {
 
 // quic_traffic_secrets returns copies of TLS traffic secrets for QUIC packet-key derivation.
 pub fn (h &QuicHandshake) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
-	match level {
-		.initial {
-			return error('handshake: initial level has no traffic secrets')
-		}
-		.handshake {
-			if h.client_hs_traffic.len == 0 || h.server_hs_traffic.len == 0 {
-				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_handshake_traffic_secrets)')
-			}
-			return h.client_hs_traffic.clone(), h.server_hs_traffic.clone()
-		}
-		.application {
-			if h.client_ap_traffic.len == 0 || h.server_ap_traffic.len == 0 {
-				return error('handshake: application traffic secrets unavailable before the server Finished')
-			}
-			return h.client_ap_traffic.clone(), h.server_ap_traffic.clone()
-		}
-	}
+	return h.traffic_secret_pair(level)
 }

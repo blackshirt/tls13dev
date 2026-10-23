@@ -39,7 +39,7 @@ const max_compat_ccs_records = 2
 pub struct Conn {
 mut:
 	// Transport and transport-neutral handshake adapter.
-	sock &net.TcpConn               // underlying TCP transport
+	sock &net.TcpConn           // underlying TCP transport
 	hs   handshake.TLSHandshake // TLS handshake contract for the record adapter
 
 	// The four TLSProtections are the record layer's own state; the core never sees them.
@@ -547,23 +547,13 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	c.post_hs_buf << data
 	for {
-		if c.post_hs_buf.len < 4 {
-			return // header still incomplete; wait for the next record
+		msg := handshake.next_passthrough_message(mut c.post_hs_buf)!
+		if msg.len == 0 {
+			return // header or body still incomplete; wait for the next record
 		}
-		mut r := wire.new_reader(c.post_hs_buf)
+		mut r := wire.new_reader(msg)
 		msg_type, length := handshake.parse_handshake_header(mut r)!
-		// A declared length beyond the core's bound is a violation, not a reason to allocate.
-		if length > handshake.max_handshake_message_len {
-			return error('tls: post-handshake message declares ${length} bytes, exceeds maximum ${handshake.max_handshake_message_len}')
-		}
-		if c.post_hs_buf.len < 4 + length {
-			if c.post_hs_buf.len > 4 + handshake.max_handshake_message_len {
-				return error('tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message')
-			}
-			return // body still incomplete; wait for the next record
-		}
-		body := c.post_hs_buf[4..4 + length].clone()
-		c.post_hs_buf = c.post_hs_buf[4 + length..].clone()
+		body := r.read_bytes(length)!
 		match msg_type {
 			.new_session_ticket {
 				ticket := handshake.parse_new_session_ticket(body)!

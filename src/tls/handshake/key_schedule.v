@@ -130,6 +130,25 @@ pub fn (t &TrafficKeys) iv() []u8 {
 	return t.iv
 }
 
+// wipe_secret overwrites a secret buffer before releasing its contents.
+fn wipe_secret(mut secret []u8) {
+	for i in 0 .. secret.len {
+		secret[i] = 0
+	}
+	secret = []u8{}
+}
+
+// wipe_traffic_keys overwrites and clears the key and IV buffers.
+fn wipe_traffic_keys(mut keys TrafficKeys) {
+	for i in 0 .. keys.key.len {
+		keys.key[i] = 0
+	}
+	for i in 0 .. keys.iv.len {
+		keys.iv[i] = 0
+	}
+	keys = TrafficKeys{}
+}
+
 // derive_traffic_keys expands a traffic secret into an AEAD key and IV (RFC 8446
 // §7.1, "key"/"iv" labels); the IV is the static nonce base the adapter consumes.
 fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int) !TrafficKeys {

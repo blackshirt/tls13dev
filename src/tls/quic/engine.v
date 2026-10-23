@@ -373,15 +373,10 @@ fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
 	mut produced := []handshake.HandshakeMessage{}
 	for {
 		mut ns := e.ns_mut(ptype)
-		if ns.reasm.ready.len < 4 {
+		msg := handshake.next_passthrough_message(mut ns.reasm.ready)!
+		if msg.len == 0 {
 			break
 		}
-		msg_len := (int(ns.reasm.ready[1]) << 16) | (int(ns.reasm.ready[2]) << 8) | int(ns.reasm.ready[3])
-		if ns.reasm.ready.len < 4 + msg_len {
-			break
-		}
-		msg := ns.reasm.ready[..4 + msg_len].clone()
-		ns.reasm.ready = ns.reasm.ready[4 + msg_len..].clone()
 		out := e.hs.receive(level, msg) or {
 			// A core failure must become a QUIC connection error: classify the
 			// alert, record the CRYPTO_ERROR code, and stop.

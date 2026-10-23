@@ -95,9 +95,7 @@ pub fn (mut h TLSHandshake) record_update_read_traffic_keys() ! {
 	if h.server_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
-	new_secret := hkdf_expand_label(h.hash_algo, h.server_ap_traffic, 'traffic upd', []u8{},
-		h.hash_algo.hash_len())!
-	next := derive_traffic_keys(h.hash_algo, new_secret, h.key_len, aead_nonce_len) or {
+	new_secret, next := ratchet_application_traffic(h.hash_algo, h.key_len, h.server_ap_traffic) or {
 		h.fail_and_destroy_secrets()
 		return err
 	}
@@ -113,9 +111,7 @@ pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
 	if h.client_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
-	new_secret := hkdf_expand_label(h.hash_algo, h.client_ap_traffic, 'traffic upd', []u8{},
-		h.hash_algo.hash_len())!
-	next := derive_traffic_keys(h.hash_algo, new_secret, h.key_len, aead_nonce_len) or {
+	new_secret, next := ratchet_application_traffic(h.hash_algo, h.key_len, h.client_ap_traffic) or {
 		h.fail_and_destroy_secrets()
 		return err
 	}
@@ -123,6 +119,15 @@ pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
 	h.client_ap_traffic = new_secret
 	wipe_traffic_keys(mut h.client_app_keys)
 	h.client_app_keys = next
+}
+
+// ratchet_application_traffic advances one application traffic secret with the
+// TLS KeyUpdate "traffic upd" label and derives the next cached keys.
+fn ratchet_application_traffic(hash_algo HashAlgorithm, key_len int, secret []u8) !([]u8, TrafficKeys) {
+	new_secret := hkdf_expand_label(hash_algo, secret, 'traffic upd', []u8{},
+		hash_algo.hash_len())!
+	next := derive_traffic_keys(hash_algo, new_secret, key_len, aead_nonce_len)!
+	return new_secret, next
 }
 
 // sync_record_keys derives and caches record keys when the core exposes
@@ -165,23 +170,4 @@ fn clone_traffic_keys(keys TrafficKeys) TrafficKeys {
 		key: keys.key.clone()
 		iv:  keys.iv.clone()
 	}
-}
-
-// wipe_secret overwrites a secret buffer before releasing its contents.
-fn wipe_secret(mut secret []u8) {
-	for i in 0 .. secret.len {
-		secret[i] = 0
-	}
-	secret = []u8{}
-}
-
-// wipe_traffic_keys overwrites and clears the key and IV buffers.
-fn wipe_traffic_keys(mut keys TrafficKeys) {
-	for i in 0 .. keys.key.len {
-		keys.key[i] = 0
-	}
-	for i in 0 .. keys.iv.len {
-		keys.iv[i] = 0
-	}
-	keys = TrafficKeys{}
 }
