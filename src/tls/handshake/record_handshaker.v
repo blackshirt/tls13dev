@@ -4,8 +4,6 @@
 // semantics. Record traffic keys and TLS KeyUpdate state live here.
 module handshake
 
-import tls.pki
-
 // RecordHandshaker exposes only operations needed by the TLS record layer.
 @[noinit]
 pub struct RecordHandshaker {
@@ -17,17 +15,9 @@ mut:
 	server_app_keys TrafficKeys
 }
 
-// new_record_handshake creates a TLS 1.3 record-layer handshaker.
-pub fn new_record_handshake(server_name string, alpn []string, validator pki.Validator) !RecordHandshaker {
-	return new_record_handshake_with_options(server_name, HandshakeOptions{
-		alpn:      alpn
-		validator: validator
-	})!
-}
-
-// new_record_handshake_with_options creates a record handshaker from the
-// complete transport-neutral handshake options.
-pub fn new_record_handshake_with_options(server_name string, options HandshakeOptions) !RecordHandshaker {
+// new_record_handshake creates a record handshaker. HandshakeOptions fields
+// can be supplied as optional named arguments after server_name.
+pub fn new_record_handshake(server_name string, options HandshakeOptions) !RecordHandshaker {
 	return RecordHandshaker{
 		HandshakeCore: new_handshake_core(server_name, options)!
 	}

@@ -26,7 +26,7 @@ The implementation is split by ownership:
 Both facades expose the same handshake operations:
 
 ```v
-mut hs := new_record_handshake(server_name, alpn, validator)! // or new_quic_handshake(...)
+mut hs := new_record_handshake(server_name)! // or new_quic_handshake(...)
 client_hello := hs.create_client_hello()!
 messages := hs.receive(level, bytes)!
 state := hs.state()
@@ -42,8 +42,9 @@ secrets; it does not close a socket or QUIC connection. `RecordHandshaker` also
 wipes its cached record keys during failure cleanup.
 
 `create_client_hello()` returns the initial, complete handshake message.
-Pass `HandshakeOptions` to `new_record_handshake_with_options()` or
-`new_quic_handshake_with_options()` to configure ALPN, certificate validation,
+The constructors require only `server_name`. Optional named
+`HandshakeOptions` fields can be passed to `new_record_handshake()` or
+`new_quic_handshake()` to configure ALPN, certificate validation,
 the initial key-share group, preference-ordered supported groups, TLS 1.3
 cipher suites, and signature algorithms. If no validator is supplied, the
 constructors use the system root CA bundle; callers can supply a custom

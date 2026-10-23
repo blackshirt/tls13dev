@@ -208,10 +208,8 @@ building a QUIC adapter. The API contract is documented in
 
 ```v
 // shared handshake driving
-new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
-new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
-new_record_handshake_with_options(server_name string, HandshakeOptions) !RecordHandshaker
-new_quic_handshake_with_options(server_name string, HandshakeOptions) !QuicHandshaker
+new_record_handshake(server_name string) !RecordHandshaker
+new_quic_handshake(server_name string) !QuicHandshaker
 (mut h) create_client_hello() ![]u8
 (mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite

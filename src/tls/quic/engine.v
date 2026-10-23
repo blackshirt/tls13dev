@@ -86,7 +86,7 @@ pub fn new_client_engine(server_name string, alpn []string, validator pki.Valida
 // new_client_engine_with_options constructs the QUIC engine with explicit
 // handshake options.
 pub fn new_client_engine_with_options(server_name string, options handshake.HandshakeOptions) !ClientEngine {
-	hs := handshake.new_quic_handshake_with_options(server_name, options)!
+	hs := handshake.new_quic_handshake(server_name, options)!
 	scid := random_cid(8)!
 	dcid := random_cid(8)!
 	mut eng := ClientEngine{
@@ -111,7 +111,7 @@ pub fn new_client_engine_with_ids(server_name string, alpn []string, validator p
 // new_client_engine_with_ids_and_options combines deterministic connection
 // IDs with explicit TLS handshake options.
 pub fn new_client_engine_with_ids_and_options(server_name string, dcid []u8, scid []u8, options handshake.HandshakeOptions) !ClientEngine {
-	hs := handshake.new_quic_handshake_with_options(server_name, options)!
+	hs := handshake.new_quic_handshake(server_name, options)!
 	mut eng := ClientEngine{
 		hs:        hs
 		dcid:      dcid.clone()

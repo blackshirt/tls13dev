@@ -220,7 +220,7 @@ whole integration is this loop:
 import tls.handshake
 
 // The omitted validator uses the system root CA bundle.
-mut hs := handshake.new_quic_handshake_with_options('example.com', handshake.HandshakeOptions{
+mut hs := handshake.new_quic_handshake('example.com', handshake.HandshakeOptions{
 	alpn: ['h3']
 })!
 
@@ -323,10 +323,8 @@ error, close the connection, and drop its own per-level protection state.
 
 ```v
 // Construction and shared handshake operations
-new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
-new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
-new_quic_handshake_with_options(server_name string, HandshakeOptions) !QuicHandshaker
-new_record_handshake_with_options(server_name string, HandshakeOptions) !RecordHandshaker
+new_quic_handshake(server_name string) !QuicHandshaker
+new_record_handshake(server_name string) !RecordHandshaker
 new_client_engine_with_options(server_name string, HandshakeOptions) !ClientEngine
 (mut h) create_client_hello() ![]u8
 (mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
@@ -369,7 +367,8 @@ HandshakeMessage { level HandshakeLevel  msg []u8 }          // msg = full messa
 The validator in `HandshakeOptions` is optional. If omitted, construction uses
 `pki.default_validator()` and propagates an error if the system root bundle
 cannot be loaded. Supply a custom `pki.Validator` to use private trust roots or
-custom validation policy. The legacy constructors accept a validator directly.
+custom validation policy. Other `HandshakeOptions` fields can be supplied by
+name, for example `new_quic_handshake('example.com', alpn: ['h3'])`.
 
 ---
 

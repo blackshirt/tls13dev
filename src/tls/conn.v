@@ -119,7 +119,7 @@ pub fn dial(address string, config Config) !&Conn {
 		random:               handshake_options.random.clone()
 	}
 
-	mut hs := handshake.new_record_handshake_with_options(server_name, options) or {
+	mut hs := handshake.new_record_handshake(server_name, options) or {
 		sock.close() or {}
 		return err
 	}

@@ -94,10 +94,8 @@ matching facade; framing and encryption decisions stay adapter-side:
 
 ```v
 // shared (both facades)
-new_record_handshake(server_name, alpn, pki.Validator) !RecordHandshaker
-new_quic_handshake(server_name, alpn, pki.Validator) !QuicHandshaker
-new_record_handshake_with_options(server_name, HandshakeOptions) !RecordHandshaker
-new_quic_handshake_with_options(server_name, HandshakeOptions) !QuicHandshaker
+new_record_handshake(server_name) !RecordHandshaker
+new_quic_handshake(server_name) !QuicHandshaker
 create_client_hello() ![]u8
 receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
@@ -132,9 +130,10 @@ the core, so both transports inherit them.
 
 `HandshakeOptions` carries ALPN, an optional certificate validator, and ClientHello
 preferences (key-share group, supported-group order, cipher-suite order, and
-signature schemes). If omitted, the validator uses the system root CA bundle;
-callers can provide a custom validator for private roots or tests. The legacy
-constructors still accept ALPN and a validator as separate arguments.
+signature schemes). The constructors require only `server_name`; omit all
+options to use system roots and built-in preferences, or provide options as
+named arguments (for example, `new_quic_handshake('example.com', alpn: ['h3'])`).
+Supply a custom validator for private roots or tests.
 Empty preference lists retain the existing defaults; deterministic
 `legacy_session_id` and `random` overrides are for test vectors only.
 `tls.Config.handshake_options` configures the TCP dial path; a validator set

@@ -4,25 +4,15 @@
 // semantics. QUIC derives packet protection from the exported traffic secrets.
 module handshake
 
-import tls.pki
-
 // QuicHandshaker exposes only operations needed by a QUIC adapter.
 @[noinit]
 pub struct QuicHandshaker {
 	HandshakeCore
 }
 
-// new_quic_handshake creates a QUIC handshaker.
-pub fn new_quic_handshake(server_name string, alpn []string, validator pki.Validator) !QuicHandshaker {
-	return new_quic_handshake_with_options(server_name, HandshakeOptions{
-		alpn:      alpn
-		validator: validator
-	})!
-}
-
-// new_quic_handshake_with_options creates a QUIC handshaker from the complete
-// transport-neutral handshake options.
-pub fn new_quic_handshake_with_options(server_name string, options HandshakeOptions) !QuicHandshaker {
+// new_quic_handshake creates a QUIC handshaker. HandshakeOptions fields can
+// be supplied as optional named arguments after server_name.
+pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshaker {
 	return QuicHandshaker{
 		HandshakeCore: new_handshake_core(server_name, options)!
 	}
