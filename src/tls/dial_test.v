@@ -190,12 +190,12 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 	}
 	ts := fakeserver.test_trust_store()!
 	mut conn := dial(addr,
-		server_name:       fakeserver.server_name
+		server_name: fakeserver.server_name
 		hsk_options: handshake.HandshakeOptions{
 			alpn: ['h2']
 		}
-		root_cas:          ts
-		timeout:           10 * time.second
+		root_cas:    ts
+		timeout:     10 * time.second
 	)!
 
 	assert conn.negotiated_alpn() == 'h2'
@@ -223,12 +223,12 @@ fn test_dial_reassembles_post_handshake_message_across_records() ! {
 	}
 	ts := fakeserver.test_trust_store()!
 	mut conn := dial(addr,
-		server_name:       fakeserver.server_name
+		server_name: fakeserver.server_name
 		hsk_options: handshake.HandshakeOptions{
 			alpn: ['h2']
 		}
-		root_cas:          ts
-		timeout:           10 * time.second
+		root_cas:    ts
+		timeout:     10 * time.second
 	)!
 
 	mut buf := []u8{len: 64}

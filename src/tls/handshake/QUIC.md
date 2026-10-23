@@ -28,7 +28,8 @@ The core was therefore split so that the carrier is always someone else's job:
 ```
    ┌──────────────────────────── tls.handshake (this module) ───────────────────────────┐
    │  Shared core: state_machine.v / server_hello_flow.v / encrypted_flight.v       │
-   │  ECDHE: key_exchange.v  Key schedule: key_schedule.v / handshake_keys.v        │
+   │  ECDHE: key_exchange.v  Secrets: secret_lifecycle.v                            │
+   │  Key schedule: key_schedule.v / handshake_keys.v                               │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / quic_transport_parameters.v / transcript.v         │
    │  Record facade: tls_handshake.v owns TLS TrafficKeys and KeyUpdate ratchets    │
