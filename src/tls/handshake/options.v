@@ -37,6 +37,6 @@ pub:
 	legacy_session_id []u8
 	random            []u8
 pub mut:
-	// quic_transport_parameters is sent only by the QUIC handshake facade.
-	quic_transport_parameters QuicTransportParameters
+	// quic_transport_params is sent only by the QUIC handshake facade.
+	quic_transport_params QuicTransportParameters
 }

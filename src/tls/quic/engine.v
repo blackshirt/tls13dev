@@ -89,7 +89,7 @@ pub fn new_client_engine_with_options(server_name string, options handshake.Hand
 	scid := random_cid(8)!
 	dcid := random_cid(8)!
 	mut hs_options := options
-	hs_options.quic_transport_parameters = handshake.QuicTransportParameters{
+	hs_options.quic_transport_params = handshake.QuicTransportParameters{
 		initial_source_connection_id: scid.clone()
 	}
 	hs := handshake.new_quic_handshake(server_name, hs_options)!
@@ -116,7 +116,7 @@ pub fn new_client_engine_with_ids(server_name string, alpn []string, validator p
 // IDs with explicit TLS handshake options.
 pub fn new_client_engine_with_ids_and_options(server_name string, dcid []u8, scid []u8, options handshake.HandshakeOptions) !ClientEngine {
 	mut hs_options := options
-	hs_options.quic_transport_parameters = handshake.QuicTransportParameters{
+	hs_options.quic_transport_params = handshake.QuicTransportParameters{
 		initial_source_connection_id: scid.clone()
 	}
 	hs := handshake.new_quic_handshake(server_name, hs_options)!

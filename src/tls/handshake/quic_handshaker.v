@@ -21,7 +21,7 @@ pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHan
 // peer_transport_parameters returns the server's QUIC transport parameters,
 // parsed from EncryptedExtensions once the server sends them.
 pub fn (h &QuicHandshaker) peer_transport_parameters() ?QuicTransportParameters {
-	params := h.peer_quic_transport_parameters or { return none }
+	params := h.quic_params or { return none }
 	return QuicTransportParameters{
 		initial_source_connection_id: params.initial_source_connection_id.clone()
 	}

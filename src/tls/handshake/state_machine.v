@@ -82,12 +82,12 @@ mut:
 	client_hello1 []u8              // first ClientHello, kept in case the server requests a retry
 
 	// Transcript and negotiated cipher suite.
-	transcript                     Transcript    // hash of handshake messages exchanged so far
-	hash_algo                      HashAlgorithm // hash algorithm used for this handshake
-	cipher_suite                   CipherSuite   // cipher suite selected by the server
-	key_len                        int           // encryption key length for the selected cipher suite
-	is_quic                        bool          // whether this handshake carries QUIC transport parameters
-	peer_quic_transport_parameters ?QuicTransportParameters
+	transcript   Transcript    // hash of handshake messages exchanged so far
+	hash_algo    HashAlgorithm // hash algorithm used for this handshake
+	cipher_suite CipherSuite   // cipher suite selected by the server
+	key_len      int           // encryption key length for the selected cipher suite
+	is_quic      bool          // whether this handshake carries QUIC transport parameters
+	quic_params  ?QuicTransportParameters
 
 	// Traffic secrets used to protect handshake and application data.
 	handshake_secret  []u8 // secret used to derive handshake traffic keys
@@ -135,15 +135,16 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	mut core := HandshakeCore{
 		state:                .start
 		config:               ClientHelloConfig{
-			server_name:               server_name
-			alpn:                      options.alpn.clone()
-			session_id:                session_id
-			random:                    random
-			cipher_suites:             options.cipher_suites.clone()
-			supported_groups:          options.supported_groups.clone()
-			signature_algorithms:      options.signature_algorithms.clone()
-			quic_transport_parameters: if is_quic {
-				options.quic_transport_parameters
+			server_name:           server_name
+			alpn:                  options.alpn.clone()
+			session_id:            session_id
+			random:                random
+			cipher_suites:         options.cipher_suites.clone()
+			supported_groups:      options.supported_groups.clone()
+			signature_algorithms:  options.signature_algorithms.clone()
+			is_quic:               is_quic
+			quic_transport_params: if is_quic {
+				options.quic_transport_params
 			} else {
 				none
 			}
@@ -575,7 +576,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 				return error('handshake: server selected ALPN "${alpn}" not offered by client')
 			}
 			h.negotiated_alpn = alpn
-			h.peer_quic_transport_parameters = transport_parameters
+			h.quic_params = transport_parameters
 			h.transcript.update(full_msg)
 			h.state = .wait_certificate_request
 		}

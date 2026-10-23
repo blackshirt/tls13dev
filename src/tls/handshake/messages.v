@@ -294,27 +294,38 @@ pub fn parse_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
 // ClientHelloConfig holds the parameters used to build a ClientHello.
 struct ClientHelloConfig {
 mut:
-	// server_name is sent in the SNI extension; empty omits it.
+	// Server identity and application protocol.
+	// Host name sent to the server for SNI; empty omits the extension.
 	server_name string
-	// alpn is the ordered list of application protocols offered (§4.2.1).
+	// Application protocols offered to the server, in preference order.
 	alpn []string
-	// client_share is the single key_share offered (§4.2.8).
+
+	// Key exchange and cryptographic capabilities.
+	// Client's key-exchange group and public key share.
 	client_share KeyShareEntry
-	// session_id is echoed across HelloRetryRequest; generated if empty and pinned back for §4.1.4 reuse.
-	session_id []u8
-	// random is the ClientHello.random, generated if empty; an explicit value replays RFC test vectors.
-	random []u8
-	// cookie is echoed from HelloRetryRequest when present.
-	cookie []u8
-	// cipher_suites defaults to the three TLS 1.3 AEAD suites when empty.
+	// TLS cipher suites offered to the server.
 	cipher_suites []CipherSuite
-	// supported_groups and signature_algorithms use defaults when empty.
-	supported_groups          []NamedGroup
-	signature_algorithms      []SignatureScheme
-	quic_transport_parameters ?QuicTransportParameters
+	// Key-exchange groups supported by the client.
+	supported_groups []NamedGroup
+	// Signature algorithms the client supports.
+	signature_algorithms []SignatureScheme
+
+	// ClientHello values reused or echoed during HelloRetryRequest.
+	// Legacy session ID sent in the ClientHello and reused after a retry.
+	session_id []u8
+	// ClientHello random value; generated if empty.
+	random []u8
+	// Cookie received in HelloRetryRequest and echoed in the retry ClientHello.
+	cookie []u8
+
+	// QUIC-specific settings.
+	// Whether this ClientHello is for a QUIC connection.
+	is_quic bool
+	// QUIC transport parameters to include when is_quic is true.
+	quic_transport_params ?QuicTransportParameters
 }
 
-const quic_transport_parameter_initial_source_connection_id = u64(0x0f)
+const quic_param_initial_source_cid = u64(0x0f)
 
 fn encode_quic_varint(value u64) ![]u8 {
 	if value < (1 << 6) {
@@ -365,7 +376,7 @@ fn encode_quic_transport_parameters(params QuicTransportParameters) ![]u8 {
 	if params.initial_source_connection_id.len > 20 {
 		return error('handshake: QUIC initial_source_connection_id exceeds 20 bytes')
 	}
-	mut out := encode_quic_varint(quic_transport_parameter_initial_source_connection_id)!
+	mut out := encode_quic_varint(quic_param_initial_source_cid)!
 	out << encode_quic_varint(u64(params.initial_source_connection_id.len))!
 	out << params.initial_source_connection_id
 	return out
@@ -392,7 +403,7 @@ fn parse_quic_transport_parameters(data []u8) !QuicTransportParameters {
 		seen_ids << id
 		value := data[off..off + int(length)]
 		off += int(length)
-		if id == quic_transport_parameter_initial_source_connection_id {
+		if id == quic_param_initial_source_cid {
 			if value.len > 20 {
 				return error('handshake: QUIC initial_source_connection_id exceeds 20 bytes')
 			}
@@ -566,7 +577,10 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	}
 
 	// QUIC transport parameters are carried in ClientHello (RFC 9001 §8.2).
-	if params := cfg.quic_transport_parameters {
+	if cfg.is_quic {
+		params := cfg.quic_transport_params or {
+			return error('handshake: QUIC ClientHello is missing transport parameters')
+		}
 		write_extension(mut ext_writer, .quic_transport_parameters,
 			encode_quic_transport_parameters(params)!)!
 	}

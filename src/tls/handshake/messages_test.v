@@ -29,17 +29,47 @@ fn test_build_client_hello() ! {
 
 fn test_build_client_hello_includes_quic_transport_parameters() ! {
 	cfg := ClientHelloConfig{
-		client_share:              KeyShareEntry{
+		client_share:          KeyShareEntry{
 			group:        .x25519
 			key_exchange: []u8{len: 32, init: 0xaa}
 		}
-		quic_transport_parameters: QuicTransportParameters{
+		is_quic:               true
+		quic_transport_params: QuicTransportParameters{
 			initial_source_connection_id: [u8(0x12), 0x34]
 		}
 	}
 	_, full_msg := build_client_hello(cfg)!
 	assert client_hello_extension(full_msg, .quic_transport_parameters)! == [u8(0x0f), 0x02, 0x12,
 		0x34]
+}
+
+fn test_build_record_client_hello_omits_quic_transport_parameters() ! {
+	cfg := ClientHelloConfig{
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+		quic_transport_params: QuicTransportParameters{
+			initial_source_connection_id: [u8(0x12), 0x34]
+		}
+	}
+	_, full_msg := build_client_hello(cfg)!
+	if _ := client_hello_extension(full_msg, .quic_transport_parameters) {
+		assert false
+	}
+}
+
+fn test_build_quic_client_hello_requires_transport_parameters() {
+	cfg := ClientHelloConfig{
+		is_quic:      true
+		client_share: KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+	}
+	if _, _ := build_client_hello(cfg) {
+		assert false
+	}
 }
 
 fn test_parse_quic_transport_parameters() ! {
