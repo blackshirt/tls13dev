@@ -61,13 +61,8 @@ fn (sh ServerHello) validate(cfg &ClientHelloConfig) ! {
 
 // is_offered_cipher_suite reports whether the client advertised the suite.
 fn (sh ServerHello) is_offered_cipher_suite(cfg &ClientHelloConfig) bool {
-	// Linear scan: the offered list is at most the three TLS 1.3 AEAD suites.
-	for offered in offered_cipher_suites(cfg) {
-		if offered == sh.cipher_suite {
-			return true
-		}
-	}
-	return false
+	// `in` is a linear scan; the offered list is at most the three TLS 1.3 AEAD suites.
+	return sh.cipher_suite in offered_cipher_suites(cfg)
 }
 
 // parse_server_hello decodes a ServerHello message body (RFC 8446 §4.1.3).

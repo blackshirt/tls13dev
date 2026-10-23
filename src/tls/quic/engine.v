@@ -35,6 +35,7 @@ const max_crypto_buffer = 1 << 20
 struct LevelKeys {
 mut:
 	next_pn    u64         // Next packet number to send in this space.
+	tx_offset  u64         // Next outbound CRYPTO stream offset for this level.
 	largest_rx u64         // Largest received packet number, used for reconstruction.
 	any_rx     bool        // Whether any packet has been received in this space.
 	reasm      CryptoReasm // Contiguous inbound CRYPTO stream and pending fragments.
@@ -471,8 +472,13 @@ fn (mut e Conn) flush_level(ptype PacketType) ![]u8 {
 		return []u8{}
 	}
 	// One CRYPTO frame per level for the handshake (flights are small); a real
-	// stack fragments against the datagram MTU.
-	frame := encode_crypto_frame(0, pending)!
+	// stack fragments against the datagram MTU. The offset advances by the bytes
+	// already emitted on this level's CRYPTO stream, so a retry ClientHello after
+	// a HelloRetryRequest continues past the original ClientHello instead of
+	// rewriting offset 0 (RFC 9000 §7.5, §19.6; the receiver rejects conflicting
+	// overlap). The first flush of a level still starts at offset 0.
+	crypto_offset := e.ns_mut(ptype).tx_offset
+	frame := encode_crypto_frame(crypto_offset, pending)!
 	pn := e.next_pn(ptype)
 	pn_len := packet_number_len(pn, 0)
 	mut payload := frame.clone()
@@ -483,6 +489,7 @@ fn (mut e Conn) flush_level(ptype PacketType) ![]u8 {
 	packet := e.seal(ptype, mut tx, pn, pn_len, payload)!
 	e.store_tx(ptype, tx)
 	e.bump_pn(ptype)
+	e.ns_mut(ptype).tx_offset += u64(pending.len)
 	return packet
 }
 
@@ -509,10 +516,15 @@ fn (mut e Conn) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len in
 	}
 }
 
-// fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR and
-// records it (RFC 9001 §4.8). The caller emits a CONNECTION_CLOSE with this code.
+// fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
+// records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
+// §7.5). The record adapter wipes its core secrets on failure (its
+// wipe_on_failure); the QUIC adapter must do the same, or a dead handshake
+// leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
+// The caller emits a CONNECTION_CLOSE with the recorded code.
 fn (mut e Conn) fail_close() ! {
 	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
+	e.hs.fail_and_destroy_secrets()
 	e.closed = true
 }
 

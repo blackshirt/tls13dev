@@ -128,10 +128,8 @@ fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	for r.remaining() > 0 {
 		typ := r.read_u16()!
 		data := r.read_vector_u16()!
-		for seen_type in seen_types {
-			if seen_type == typ {
-				return error('handshake: duplicate extension type 0x${typ:04x} in extensions block')
-			}
+		if typ in seen_types {
+			return error('handshake: duplicate extension type 0x${typ:04x} in extensions block')
 		}
 		seen_types << typ
 		out << WireExtension{

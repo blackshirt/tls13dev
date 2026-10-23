@@ -69,11 +69,24 @@ mut:
 	out          []u8 // accumulated outbound datagrams
 	srv          fakeserver.Server
 	got_finished bool
+	// Initial- and Handshake-level CRYPTO reassemblers, so a client frame is
+	// accepted only at a non-conflicting stream offset (RFC 9000 §19.6). The
+	// ferry used to feed cf.data straight to the fakeserver and ignore
+	// cf.offset, which hid an engine bug that re-emitted the retry ClientHello
+	// at offset 0 after a HelloRetryRequest.
+	init_reasm CryptoReasm
+	hs_reasm   CryptoReasm
+	// Offsets of every Initial-level CRYPTO frame received, so a regression test
+	// can pin the retry ClientHello to len(original ClientHello).
+	initial_crypto_offsets []u64
+	// Total CRYPTO bytes delivered at the Initial level; equals the original
+	// ClientHello length after round 1 even once `ready` is drained by delivery.
+	initial_crypto_bytes u64
 }
 
 // new_ferry_server builds a server endpoint keyed from the client's original
 // Destination Connection ID.
-fn new_ferry_server(client_dcid []u8) !FerryServer {
+fn new_ferry_server(client_dcid []u8, hrr fakeserver.HrrMode) !FerryServer {
 	ck, sk := derive_initial_keys(client_dcid)!
 	server_cid := [u8(0x51), 0x54, 0x9c, 0x0a, 0x1e, 0xb7, 0x3d, 0x66, 0x2f, 0x80]
 	return FerryServer{
@@ -81,6 +94,7 @@ fn new_ferry_server(client_dcid []u8) !FerryServer {
 		initial_rx: new_initial_protection(ck)!
 		srv:        fakeserver.new_server(
 			alpn:                      ['h3']
+			hrr:                       hrr
 			quic_source_connection_id: server_cid
 		)!
 		// A server picks its own connection IDs (§7.2); it does not have to echo the
@@ -131,8 +145,8 @@ fn (mut f FerryServer) handle_packet(buf []u8) !int {
 	return total
 }
 
-// handle_frames pulls CRYPTO bytes from a client packet and hands complete
-// handshake messages to the fakeserver.
+// handle_frames walks the frames in a decrypted client packet and feeds each
+// CRYPTO frame to the offset-aware reassembler in deliver_client_crypto.
 fn (mut f FerryServer) handle_frames(ptype PacketType, payload []u8) ! {
 	mut off := 0
 	for off < payload.len {
@@ -158,19 +172,62 @@ fn (mut f FerryServer) handle_frames(ptype PacketType, payload []u8) ! {
 	}
 }
 
-// deliver_client_crypto runs the fakeserver over a client CRYPTO frame. The
-// fakeserver takes exactly one complete handshake message per call.
+// deliver_client_crypto reassembles the client's CRYPTO stream by offset and
+// runs the fakeserver over each complete handshake message. Honoring cf.offset
+// is what catches a retry ClientHello wrongly re-emitted at offset 0 after a
+// HelloRetryRequest: it overlaps the original ClientHello and CryptoReasm
+// rejects the conflicting bytes (RFC 9000 §19.6).
 fn (mut f FerryServer) deliver_client_crypto(ptype PacketType, cf CryptoFrame) ! {
-	if ptype == .initial {
-		// ClientHello (or retry ClientHello): ServerHello or HelloRetryRequest.
-		fl := f.srv.handle_client_hello(cf.data)!
-		f.send_server_flight(fl)!
-	} else if ptype == .handshake {
-		// The client's Finished.
-		f.srv.handle_client_finished(cf.data)!
-		f.got_finished = true
-		f.emit_handshake_done()!
+	match ptype {
+		.initial {
+			f.initial_crypto_offsets << cf.offset
+			f.initial_crypto_bytes += u64(cf.data.len)
+			f.init_reasm.insert(cf.offset, cf.data)!
+			for msg in collect_crypto_messages(mut f.init_reasm) {
+				f.handle_initial_message(msg)?
+			}
+		}
+		.handshake {
+			f.hs_reasm.insert(cf.offset, cf.data)!
+			for msg in collect_crypto_messages(mut f.hs_reasm) {
+				f.handle_handshake_message(msg)?
+			}
+		}
+		else {
+			return error('ferry: unexpected CRYPTO at level ${ptype}')
+		}
 	}
+}
+
+// collect_crypto_messages drains every complete handshake message from the front
+// of a level's reassembled CRYPTO stream. Insertion (not this loop) is what
+// rejects a frame whose offset conflicts with bytes already buffered, exactly as
+// a spec-compliant peer would (RFC 9000 §19.6).
+fn collect_crypto_messages(mut r CryptoReasm) [][]u8 {
+	mut out := [][]u8{}
+	for {
+		msg := handshake.next_passthrough_message(mut r.ready)!
+		if msg.len == 0 {
+			break
+		}
+		out << msg
+	}
+	return out
+}
+
+// handle_initial_message answers a complete ClientHello from the reassembled
+// Initial stream with the ServerHello (or HelloRetryRequest) flight.
+fn (mut f FerryServer) handle_initial_message(msg []u8) ! {
+	fl := f.srv.handle_client_hello(msg)!
+	f.send_server_flight(fl)!
+}
+
+// handle_handshake_message consumes the client's Finished from the reassembled
+// Handshake stream and confirms the connection with HANDSHAKE_DONE.
+fn (mut f FerryServer) handle_handshake_message(msg []u8) ! {
+	f.srv.handle_client_finished(msg)!
+	f.got_finished = true
+	f.emit_handshake_done()!
 }
 
 // send_server_flight protects the fakeserver's ServerHello (Initial) and the
@@ -270,7 +327,7 @@ fn test_engine_completes_quic_handshake() ! {
 
 	// The ferry server needs the client's original DCID to derive Initial keys;
 	// the engine exposes it for the test.
-	mut ferry := new_ferry_server(eng.original_dcid())!
+	mut ferry := new_ferry_server(eng.original_dcid(), .none)!
 
 	// Round 1: the server flight — ServerHello (Initial) then
 	// EE/Cert/CV/Finished (Handshake).
@@ -325,7 +382,7 @@ fn test_engine_handshake_with_asymmetric_cids() ! {
 	}, dcid, scid)!
 
 	start := eng.start()!
-	mut ferry := new_ferry_server(eng.original_dcid())!
+	mut ferry := new_ferry_server(eng.original_dcid(), .none)!
 	flight := ferry.exchange(start)!
 	client_finished := eng.receive(flight)!
 	assert eng.state() == .connected, 'client should reach connected, got ${eng.state()}'
@@ -348,10 +405,61 @@ fn test_engine_adopts_server_source_cid() ! {
 		}
 	})!
 	start := eng.start()!
-	mut ferry := new_ferry_server(eng.original_dcid())!
+	mut ferry := new_ferry_server(eng.original_dcid(), .none)!
 	flight := ferry.exchange(start)!
 	client_next := eng.receive(flight)!
 
 	meta := long_packet_meta(client_next)!
 	assert meta.dcid == ferry.server_cid, 'client is still addressing its own original DCID'
+}
+
+fn test_engine_hello_retry_request_reassembles_retry_at_correct_offset() ! {
+	// HelloRetryRequest over QUIC (RFC 9001 §4.1.2). The engine appends the retry
+	// ClientHello to the same Initial CRYPTO stream, so it must be emitted at
+	// offset len(original ClientHello). A peer that reassembles the stream (as a
+	// spec-compliant server does) rejects a retry re-emitted at offset 0 as
+	// conflicting overlapping CRYPTO data (RFC 9000 §19.6).
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		hsk_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
+
+	start := eng.start()!
+	mut ferry := new_ferry_server(eng.original_dcid(), .change_group)!
+
+	// Round 1: the ferry reassembles the Original ClientHello at offset 0 and
+	// answers with a HelloRetryRequest (Initial only, no Handshake flight).
+	assert ferry.initial_crypto_offsets == [u64(0)], 'the first ClientHello must sit at offset 0'
+	hrr := ferry.exchange(start)!
+	assert hrr.len > 0
+	// The whole original ClientHello was delivered as one Initial CRYPTO frame;
+	// its byte length is the offset the retry ClientHello must continue at.
+	ch1_len := ferry.initial_crypto_bytes
+	assert ch1_len > 0, 'the ferry must have reassembled the original ClientHello'
+	assert ferry.initial_crypto_offsets[0] == 0
+
+	// The client processes the HelloRetryRequest and flushes a retry ClientHello
+	// onto the same Initial stream.
+	retry := eng.receive(hrr)!
+	assert retry.len > 0
+	assert eng.state() == .wait_server_hello, 'after an HRR the client rearms to await the real ServerHello'
+
+	// The retry ClientHello is the second Initial CRYPTO frame; its offset must
+	// continue past the original ClientHello, never rewrite offset 0.
+	assert ferry.initial_crypto_offsets.len == 1
+	ferry.exchange(retry)!
+	assert ferry.initial_crypto_offsets.len == 2, 'the retry ClientHello must reach the Initial CRYPTO stream'
+	assert ferry.initial_crypto_offsets[1] == ch1_len, 'retry ClientHello offset ${ferry.initial_crypto_offsets[1]} != len(original ClientHello) ${ch1_len}'
+
+	// The ferry then sends the real flight; the client finishes and confirms.
+	flight := ferry.exchange(eng.flush())!
+	client_finished := eng.receive(flight)!
+	assert eng.state() == .connected, 'client should reach connected after HRR, got ${eng.state()}'
+	done := ferry.exchange(client_finished)!
+	_ = eng.receive(done)!
+	assert eng.confirmed(), 'HANDSHAKE_DONE must confirm the handshake after a HelloRetryRequest'
+	assert eng.negotiated_alpn() == 'h3'
+	assert eng.negotiated_cipher_suite() == .tls_aes_128_gcm_sha256
 }

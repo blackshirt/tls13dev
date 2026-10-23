@@ -74,10 +74,8 @@ fn parse_quic_transport_parameters(data []u8) !QuicTransportParameters {
 		if length > u64(data.len - off) {
 			return error('handshake: truncated QUIC transport parameter value')
 		}
-		for seen_id in seen_ids {
-			if seen_id == id {
-				return error('handshake: duplicate QUIC transport parameter ${id}')
-			}
+		if id in seen_ids {
+			return error('handshake: duplicate QUIC transport parameter ${id}')
 		}
 		seen_ids << id
 		value := data[off..off + int(length)]

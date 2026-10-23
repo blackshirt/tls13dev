@@ -113,10 +113,14 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	// RSA leaf-key strength floor (default 2048 bits); escape hatch: Validator.set_min_rsa_bits.
 	check_leaf_rsa_floor(leaf, v.effective_min_rsa_bits())!
 
-	// Name constraints (RFC 5280 §4.2.1.10): each CA in the chain may restrict the namespace of its subordinates.
+	// Name constraints (RFC 5280 §4.2.1.10, §6.1.4(o)): a constraining CA binds every
+	// subordinate beneath it, not just the leaf. Apply each CA's constraints to every
+	// certificate it issues directly or indirectly — all chain indices below the CA.
 	for i in 1 .. chain.len {
-		enforce_name_constraints(chain[i], leaf) or {
-			return error('pki: certificate at chain index ${i} restricts the leaf: ${err.msg()}')
+		for j in 0 .. i {
+			enforce_name_constraints(chain[i], chain[j]) or {
+				return error('pki: certificate at chain index ${i} restricts subordinate at index ${j}: ${err.msg()}')
+			}
 		}
 	}
 
@@ -201,7 +205,14 @@ fn enforce_name_constraints(ca Certificate, child Certificate) ! {
 	if !ca.name_constraints_present {
 		return
 	}
-	for name in child.sans {
+	// dNSName subtrees constrain the subject's dNSNames; when no SAN is present the
+	// subject Common Name is the constrained name instead (RFC 5280 §4.2.1.10, mirroring
+	// the hostname check above, where a present SAN disables the CN).
+	mut dns_names := child.sans.clone()
+	if !child.has_san && child.subject_cn != '' {
+		dns_names = [child.subject_cn]
+	}
+	for name in dns_names {
 		if ca.excluded_dns.len > 0 && dns_in_any_subtree(name, ca.excluded_dns) {
 			return error('dNSName "${name}" is within an excluded subtree')
 		}

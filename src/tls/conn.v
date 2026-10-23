@@ -561,6 +561,13 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 // decrypted post-handshake plaintext, reassembling fragments (RFC 8446 §5.2).
 fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	c.post_hs_buf << data
+	// Bound the post-handshake reassembly the same way the core bounds its
+	// initial/handshake reassembly (check_reassembly_bound): a peer that streams
+	// incomplete handshake fragments must not grow this buffer without limit.
+	if c.post_hs_buf.len > record_header_len + handshake.max_handshake_message_len {
+		c.fail_alert = .record_overflow
+		return error('tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
+	}
 	for {
 		msg := handshake.next_passthrough_message(mut c.post_hs_buf)!
 		if msg.len == 0 {
