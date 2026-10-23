@@ -93,10 +93,6 @@ fn offered_supported_groups(groups []NamedGroup) []NamedGroup {
 	return if groups.len > 0 { groups } else { default_supported_groups }
 }
 
-fn offered_signature_algorithms(schemes []SignatureScheme) []SignatureScheme {
-	return if schemes.len > 0 { schemes } else { default_signature_algorithms }
-}
-
 fn validate_handshake_options(options HandshakeOptions) ! {
 	groups := offered_supported_groups(options.supported_groups)
 	if groups.len == 0 {
@@ -812,13 +808,6 @@ fn build_empty_certificate(request_context []u8) []u8 {
 	body << request_context
 	body << [u8(0), 0, 0] // u24 certificate_list length: empty
 	return wrap_handshake_message(.certificate, body)
-}
-
-// parse_encrypted_extensions decodes EncryptedExtensions (RFC 8446 §4.3.1) and
-// returns the negotiated ALPN protocol (empty when none); only client-offered extensions belong here.
-fn parse_encrypted_extensions(body []u8) !string {
-	alpn, _ := parse_encrypted_extensions_for_transport(body, false)!
-	return alpn
 }
 
 fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?QuicTransportParameters) {

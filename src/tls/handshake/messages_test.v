@@ -198,7 +198,8 @@ fn test_parse_certificate_chain() ! {
 // yields no ALPN selection.
 fn test_parse_encrypted_extensions_no_alpn() ! {
 	body := [u8(0x00), 0x00] // empty extension list
-	assert parse_encrypted_extensions(body)! == ''
+	alpn, _ := parse_encrypted_extensions_for_transport(body, false)!
+	assert alpn == ''
 }
 
 // test_parse_encrypted_extensions_extension_policy checks the §4.3.1 placement
@@ -206,12 +207,13 @@ fn test_parse_encrypted_extensions_no_alpn() ! {
 fn test_parse_encrypted_extensions_extension_policy() ! {
 	// extensions vector (len 6) = key_share entry with 2 bytes of data
 	bad := [u8(0x00), 0x06, 0x00, 0x33, 0x00, 0x02, 0xaa, 0xbb]
-	if _ := parse_encrypted_extensions(bad) {
+	if _, _ := parse_encrypted_extensions_for_transport(bad, false) {
 		assert false // 'bad' must be rejected per §4.3.1
 	}
 	// extensions vector (len 5) = renegotiation_info (0xff01), 1 byte of data
 	ok := [u8(0x00), 0x05, 0xff, 0x01, 0x00, 0x01, 0x00]
-	assert parse_encrypted_extensions(ok)! == ''
+	alpn, _ := parse_encrypted_extensions_for_transport(ok, false)!
+	assert alpn == ''
 }
 
 // test_parse_encrypted_extensions_server_name_ack checks that an empty
@@ -219,10 +221,11 @@ fn test_parse_encrypted_extensions_extension_policy() ! {
 fn test_parse_encrypted_extensions_server_name_ack() ! {
 	// extensions vector (len 4) = server_name (0x0000) with zero-length data
 	empty := [u8(0x00), 0x04, 0x00, 0x00, 0x00, 0x00]
-	assert parse_encrypted_extensions(empty)! == ''
+	alpn, _ := parse_encrypted_extensions_for_transport(empty, false)!
+	assert alpn == ''
 	// extensions vector (len 5) = server_name (0x0000) with 1 byte of data
 	bad := [u8(0x00), 0x05, 0x00, 0x00, 0x00, 0x01, 0x00]
-	if _ := parse_encrypted_extensions(bad) {
+	if _, _ := parse_encrypted_extensions_for_transport(bad, false) {
 		assert false // a non-empty server_name in EncryptedExtensions must be rejected
 	}
 }
@@ -233,14 +236,15 @@ fn test_parse_encrypted_extensions_single_alpn() ! {
 	// ext_block(0x0f) = alpn(0x0010), list len 0x09 || [len 0x08]"http/1.1"
 	body := [u8(0x00), 0x0f, 0x00, 0x10, 0x00, 0x0b, 0x00, 0x09, 0x08, 0x68, 0x74, 0x74, 0x70,
 		0x2f, 0x31, 0x2e, 0x31]
-	assert parse_encrypted_extensions(body)! == 'http/1.1'
+	alpn, _ := parse_encrypted_extensions_for_transport(body, false)!
+	assert alpn == 'http/1.1'
 }
 
 // test_parse_encrypted_extensions_rejects_empty_alpn checks that a zero-length
 // protocol list selects nothing, which RFC 7301 §3.1 forbids.
 fn test_parse_encrypted_extensions_rejects_empty_alpn() ! {
 	body := [u8(0x00), 0x06, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00]
-	if _ := parse_encrypted_extensions(body) {
+	if _, _ := parse_encrypted_extensions_for_transport(body, false) {
 		assert false // empty ALPN list must be rejected
 	}
 }
@@ -251,7 +255,7 @@ fn test_parse_encrypted_extensions_rejects_multi_alpn() ! {
 	// list(0x0c) = [2]"h2" [8]"http/1.1"
 	body := [u8(0x00), 0x12, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68,
 		0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31]
-	if _ := parse_encrypted_extensions(body) {
+	if _, _ := parse_encrypted_extensions_for_transport(body, false) {
 		assert false // multi-protocol ALPN list must be rejected
 	}
 }
@@ -261,7 +265,7 @@ fn test_parse_encrypted_extensions_rejects_multi_alpn() ! {
 fn test_parse_encrypted_extensions_rejects_renegotiation_info_content() ! {
 	// renegotiation_info(0xff01), data len 4 = [len 3]"abc"
 	body := [u8(0x00), 0x08, 0xff, 0x01, 0x00, 0x04, 0x03, 0x61, 0x62, 0x63]
-	if _ := parse_encrypted_extensions(body) {
+	if _, _ := parse_encrypted_extensions_for_transport(body, false) {
 		assert false // non-empty renegotiated_connection must be rejected
 	}
 }
