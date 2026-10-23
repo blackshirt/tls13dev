@@ -211,19 +211,18 @@ owns the TLS plaintext and Handshake message buffers for each handshake instance
 
 ## 4. Writing a QUIC adapter: the engine loop
 
-An engine imports **`tls.handshake`** and **`tls.pki`** (for `TrustStore`) and
-never imports `tls`. The whole integration is this loop:
+An engine imports **`tls.handshake`** and never imports `tls`. Certificate
+validation defaults to the system root bundle; provide a `pki.Validator` in
+`HandshakeOptions` when using private roots or custom validation policy. The
+whole integration is this loop:
 
 ```v
 import tls.handshake
-import tls.pki
 
-// 0. Trust anchors (system bundle, or your own pinned roots).
-mut store := pki.new_trust_store()
-store.load_system_ca_bundle()!
-
-// 1. Construct — the QUIC facade exposes QUIC-specific operations; X25519 share generated here.
-mut hs := handshake.new_quic_handshake('example.com', ['h3'], pki.new_validator(store, false))!
+// The omitted validator uses the system root CA bundle.
+mut hs := handshake.new_quic_handshake_with_options('example.com', handshake.HandshakeOptions{
+	alpn: ['h3']
+})!
 
 // 2. First ClientHello. `ch1` is a complete handshake message; place it into a
 //    CRYPTO frame in an Initial packet (which YOU protect with Initial keys
@@ -326,6 +325,9 @@ error, close the connection, and drop its own per-level protection state.
 // Construction and shared handshake operations
 new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
 new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
+new_quic_handshake_with_options(server_name string, HandshakeOptions) !QuicHandshaker
+new_record_handshake_with_options(server_name string, HandshakeOptions) !RecordHandshaker
+new_client_engine_with_options(server_name string, HandshakeOptions) !ClientEngine
 (mut h) create_client_hello() ![]u8
 (mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
 
@@ -363,6 +365,11 @@ HandshakeLevel { plaintext, handshake }
 TrafficSecretLevel { handshake, application }
 HandshakeMessage { level HandshakeLevel  msg []u8 }          // msg = full message, header included
 ```
+
+The validator in `HandshakeOptions` is optional. If omitted, construction uses
+`pki.default_validator()` and propagates an error if the system root bundle
+cannot be loaded. Supply a custom `pki.Validator` to use private trust roots or
+custom validation policy. The legacy constructors accept a validator directly.
 
 ---
 

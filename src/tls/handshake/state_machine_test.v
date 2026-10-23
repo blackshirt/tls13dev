@@ -116,12 +116,14 @@ fn test_record_and_quic_facades_share_handshake_state() ! {
 }
 
 fn test_handshake_options_select_initial_key_share() ! {
-	options := ClientHelloOptions{
+	options := HandshakeOptions{
+		alpn:             ['h2']
+		validator:        fixture_validator()
 		key_share_group:  .secp256r1
 		supported_groups: [.secp256r1]
 	}
-	mut h := new_record_handshake_with_options('example.com', []string{}, fixture_validator(),
-		options)!
+	mut h := new_record_handshake_with_options('example.com', options)!
+	assert h.config.alpn == ['h2']
 	assert h.ecdhe_group == .secp256r1
 	assert h.config.client_share.group == .secp256r1
 	assert h.config.client_share.key_exchange.len == 65
@@ -129,15 +131,29 @@ fn test_handshake_options_select_initial_key_share() ! {
 }
 
 fn test_handshake_options_reject_unoffered_initial_group() ! {
-	new_record_handshake_with_options('example.com', []string{}, fixture_validator(),
-		ClientHelloOptions{
-			key_share_group:  .x25519
-			supported_groups: [.secp256r1]
-		}) or {
+	new_record_handshake_with_options('example.com', HandshakeOptions{
+		validator:        fixture_validator()
+		key_share_group:  .x25519
+		supported_groups: [.secp256r1]
+	}) or {
 		assert err.msg().contains('must be included in supported_groups')
 		return
 	}
 	assert false
+}
+
+fn test_handshake_options_default_validator() ! {
+	h := new_record_handshake_with_options('example.com', HandshakeOptions{})!
+	assert h.state() == .start
+}
+
+fn test_quic_handshake_options_include_alpn_and_validator() ! {
+	mut h := new_quic_handshake_with_options('example.com', HandshakeOptions{
+		alpn:      ['h3']
+		validator: fixture_validator()
+	})!
+	assert h.config.alpn == ['h3']
+	assert h.state() == .start
 }
 
 fn test_reassembly_is_owned_by_each_handshake_core() ! {

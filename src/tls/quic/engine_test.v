@@ -13,6 +13,7 @@
 module quic
 
 import tls.fakeserver
+import tls.handshake
 import tls.pki
 
 fn test_quic_packet_levels_map_to_shared_handshake_phases() ! {
@@ -223,7 +224,10 @@ fn trusted_validator() pki.Validator {
 fn test_engine_completes_quic_handshake() ! {
 	// The engine picks random connection IDs, so we build one and learn its
 	// original DCID to key the ferry server.
-	mut eng := new_client_engine(fakeserver.server_name, ['h3'], trusted_validator())!
+	mut eng := new_client_engine_with_options(fakeserver.server_name, handshake.HandshakeOptions{
+		alpn:      ['h3']
+		validator: trusted_validator()
+	})!
 
 	// The client's first datagram is an Initial packet carrying the ClientHello.
 	start := eng.start()!

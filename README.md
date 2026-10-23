@@ -96,8 +96,8 @@ matching facade; framing and encryption decisions stay adapter-side:
 // shared (both facades)
 new_record_handshake(server_name, alpn, pki.Validator) !RecordHandshaker
 new_quic_handshake(server_name, alpn, pki.Validator) !QuicHandshaker
-new_record_handshake_with_options(server_name, alpn, pki.Validator, ClientHelloOptions) !RecordHandshaker
-new_quic_handshake_with_options(server_name, alpn, pki.Validator, ClientHelloOptions) !QuicHandshaker
+new_record_handshake_with_options(server_name, HandshakeOptions) !RecordHandshaker
+new_quic_handshake_with_options(server_name, HandshakeOptions) !QuicHandshaker
 create_client_hello() ![]u8
 receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
@@ -130,11 +130,17 @@ QUIC engine maps `.plaintext` to Initial CRYPTO and `.handshake` to Handshake
 CRYPTO. All security checks (size caps, HRR rules, transcript binding) live in
 the core, so both transports inherit them.
 
-`ClientHelloOptions` selects the key-share group, supported-group order,
-cipher-suite order, and signature schemes. Empty lists retain the existing
-defaults; deterministic `legacy_session_id` and `random` overrides are for test
-vectors only. `tls.Config.client_hello_options` configures the TCP dial path;
-the QUIC package provides `new_client_engine_with_options()`.
+`HandshakeOptions` carries ALPN, an optional certificate validator, and ClientHello
+preferences (key-share group, supported-group order, cipher-suite order, and
+signature schemes). If omitted, the validator uses the system root CA bundle;
+callers can provide a custom validator for private roots or tests. The legacy
+constructors still accept ALPN and a validator as separate arguments.
+Empty preference lists retain the existing defaults; deterministic
+`legacy_session_id` and `random` overrides are for test vectors only.
+`tls.Config.handshake_options` configures the TCP dial path; a validator set
+there takes precedence over `root_cas` and `insecure_skip_verify`. Otherwise
+the validator is built from those Config fields. The QUIC package provides
+`new_client_engine_with_options()`.
 
 ## Repository layout
 

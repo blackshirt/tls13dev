@@ -210,8 +210,8 @@ building a QUIC adapter. The API contract is documented in
 // shared handshake driving
 new_record_handshake(server_name string, alpn []string, pki.Validator) !RecordHandshaker
 new_quic_handshake(server_name string, alpn []string, pki.Validator) !QuicHandshaker
-new_record_handshake_with_options(server_name string, alpn []string, pki.Validator, ClientHelloOptions) !RecordHandshaker
-new_quic_handshake_with_options(server_name string, alpn []string, pki.Validator, ClientHelloOptions) !QuicHandshaker
+new_record_handshake_with_options(server_name string, HandshakeOptions) !RecordHandshaker
+new_quic_handshake_with_options(server_name string, HandshakeOptions) !QuicHandshaker
 (mut h) create_client_hello() ![]u8
 (mut h) receive(level HandshakeLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
@@ -400,7 +400,7 @@ pub:
 	insecure_skip_verify bool
 	root_cas             ?pki.TrustStore
 	min_rsa_bits         int
-	client_hello_options handshake.ClientHelloOptions
+	handshake_options handshake.HandshakeOptions
 	timeout              time.Duration = 30 * time.second
 }
 ```
@@ -412,11 +412,11 @@ build one up front from `default_config()`).
 | Field | Default | Description |
 |---|---|---|
 | `server_name` | `''` | SNI and certificate hostname verification target. Empty ⇒ derived from the dial address. Must match the server's certificate (SAN dNSName / IP, CN fallback per RFC 6125). |
-| `alpn` | `[]` (none offered) | Application protocols to offer, in preference order (e.g. `['h2', 'http/1.1']`). The server's pick is verified against this list. |
+| `alpn` | `[]` (none offered) | Application protocols to offer, in preference order (e.g. `['h2', 'http/1.1']`). A non-empty Config value overrides `handshake_options.alpn`; otherwise the options value is used. The server's pick is verified against the effective list. |
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
-| `client_hello_options` | defaults | ClientHello key-share group and preference-ordered supported groups, cipher suites, and signature algorithms. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. |
+| `handshake_options` | defaults | Handshake ALPN, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]
@@ -453,6 +453,11 @@ pub struct TrustStore {}
 A set of trusted root CA certificates, assigned to `Config.root_cas`.
 `@[noinit]` stops a bare `TrustStore{}` from existing with an uninitialized
 internal slice — instances come from `new_trust_store()`.
+
+`pki.default_validator()` builds a certificate validator from the cached system
+root bundle and returns an error if no system bundle is available. Options-based
+handshake constructors use this validator when `HandshakeOptions.validator` is
+omitted; provide a validator explicitly to use private roots or custom policy.
 
 #### `new_trust_store`
 

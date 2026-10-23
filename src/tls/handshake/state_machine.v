@@ -110,10 +110,13 @@ mut:
 	fail_alert AlertDescription = .internal_error
 }
 
-// new_handshake_core creates shared state using the caller's ClientHello
-// preferences, with certificate validation policy injected by the caller.
-fn new_handshake_core(server_name string, alpn []string, validator pki.Validator, options ClientHelloOptions) !HandshakeCore {
-	validate_client_hello_options(options)!
+// new_handshake_core creates shared state from the server name and complete
+// handshake options, including ALPN and certificate validation.
+fn new_handshake_core(server_name string, options HandshakeOptions) !HandshakeCore {
+	validate_handshake_options(options)!
+	validator := options.validator or {
+		pki.default_validator()!
+	}
 	// Pin random/session id at construction so HRR reuses them byte-identically (§4.1.4).
 	session_id := if options.legacy_session_id.len > 0 {
 		options.legacy_session_id.clone()
@@ -130,7 +133,7 @@ fn new_handshake_core(server_name string, alpn []string, validator pki.Validator
 		state:                .start
 		config:               ClientHelloConfig{
 			server_name:          server_name
-			alpn:                 alpn
+			alpn:                 options.alpn.clone()
 			session_id:           session_id
 			random:               random
 			cipher_suites:        options.cipher_suites.clone()

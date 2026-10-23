@@ -36,6 +36,11 @@ pub fn new_validator(store TrustStore, insecure bool) Validator {
 	}
 }
 
+// default_validator creates a validator using the system root CA bundle.
+pub fn default_validator() !Validator {
+	return new_validator(system_root_cas()!, false)
+}
+
 // set_min_rsa_bits overrides the RSA leaf-key floor (0 restores the default);
 // lowering it is a deliberate security downgrade.
 pub fn (mut v Validator) set_min_rsa_bits(bits int) {

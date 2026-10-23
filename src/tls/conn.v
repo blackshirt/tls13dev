@@ -83,26 +83,43 @@ pub fn dial(address string, config Config) !&Conn {
 	sock.set_read_timeout(timeout)
 	sock.set_write_timeout(timeout)
 
-	// Trust anchors: an explicit root_cas wins, else the system bundle (skipped if verification is off).
-	mut store := pki.new_trust_store()
-	if roots := config.root_cas {
-		store = roots
-	} else if !config.insecure_skip_verify {
-		// Fatal, but close the socket so a dial error leaks no fd.
-		store = pki.system_root_cas() or {
-			sock.close() or {}
-			return err
+	handshake_options := config.handshake_options
+	mut validator := if configured := handshake_options.validator {
+		configured
+	} else {
+		// Trust anchors: an explicit root_cas wins, else the system bundle.
+		mut store := pki.new_trust_store()
+		if roots := config.root_cas {
+			store = roots
+		} else if !config.insecure_skip_verify {
+			// Fatal, but close the socket so a dial error leaks no fd.
+			store = pki.system_root_cas() or {
+				sock.close() or {}
+				return err
+			}
 		}
+		pki.new_validator(store, config.insecure_skip_verify)
 	}
-	validator := pki.new_validator(store, config.insecure_skip_verify)
-	// Apply the caller's RSA leaf-key floor only when it overrides the default.
-	mut validator_mut := validator
 	if config.min_rsa_bits > 0 {
-		validator_mut.set_min_rsa_bits(config.min_rsa_bits)
+		validator.set_min_rsa_bits(config.min_rsa_bits)
+	}
+	alpn := if config.alpn.len > 0 || handshake_options.alpn.len == 0 {
+		config.alpn.clone()
+	} else {
+		handshake_options.alpn.clone()
+	}
+	options := handshake.HandshakeOptions{
+		alpn:                 alpn
+		validator:            validator
+		key_share_group:      handshake_options.key_share_group
+		supported_groups:     handshake_options.supported_groups.clone()
+		cipher_suites:        handshake_options.cipher_suites.clone()
+		signature_algorithms: handshake_options.signature_algorithms.clone()
+		legacy_session_id:    handshake_options.legacy_session_id.clone()
+		random:               handshake_options.random.clone()
 	}
 
-	mut hs := handshake.new_record_handshake_with_options(server_name, config.alpn,
-		validator_mut, config.client_hello_options) or {
+	mut hs := handshake.new_record_handshake_with_options(server_name, options) or {
 		sock.close() or {}
 		return err
 	}

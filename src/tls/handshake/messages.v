@@ -76,24 +76,6 @@ pub enum SignatureScheme as u16 {
 	ed25519                = 0x0807
 }
 
-// ClientHelloOptions selects the supported key-exchange groups, initial key
-// share, cipher suites, and signature schemes offered by a TLS client.
-@[params]
-pub struct ClientHelloOptions {
-pub:
-	// key_share_group is the group used for the initial ECDHE share.
-	key_share_group NamedGroup = .x25519
-	// supported_groups is preference-ordered; empty uses X25519 then P-256.
-	supported_groups []NamedGroup
-	// cipher_suites is preference-ordered; empty uses the built-in TLS 1.3 suites.
-	cipher_suites []CipherSuite
-	// signature_algorithms is preference-ordered; empty uses the built-in list.
-	signature_algorithms []SignatureScheme
-	// legacy_session_id and random are for deterministic test vectors only.
-	legacy_session_id []u8
-	random            []u8
-}
-
 const default_supported_groups = [NamedGroup.x25519, .secp256r1]
 
 const default_signature_algorithms = [
@@ -114,7 +96,7 @@ fn offered_signature_algorithms(schemes []SignatureScheme) []SignatureScheme {
 	return if schemes.len > 0 { schemes } else { default_signature_algorithms }
 }
 
-fn validate_client_hello_options(options ClientHelloOptions) ! {
+fn validate_handshake_options(options HandshakeOptions) ! {
 	groups := offered_supported_groups(options.supported_groups)
 	if groups.len == 0 {
 		return error('handshake: supported_groups must not be empty')
@@ -370,7 +352,7 @@ fn (sh ServerHello) is_offered_cipher_suite(cfg &ClientHelloConfig) bool {
 // build_client_hello generates the ClientHello of RFC 8446 §4.1.2, returning the
 // message body followed by the full handshake message (header + body).
 fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
-	validate_client_hello_options(ClientHelloOptions{
+	validate_handshake_options(HandshakeOptions{
 		key_share_group:      cfg.client_share.group
 		supported_groups:     cfg.supported_groups
 		cipher_suites:        cfg.cipher_suites
