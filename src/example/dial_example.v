@@ -21,6 +21,7 @@ module main
 import os
 import time
 import tls
+import tls.handshake
 
 const default_host = 'tls-v1-3.testserver.host'
 const default_path = '/tls/client-hello'
@@ -43,7 +44,9 @@ fn main() {
 
 	mut conn := tls.dial(opts.address,
 		server_name:          host_without_port(opts.address)
-		alpn:                 [opts.alpn]
+		handshake_options:    handshake.HandshakeOptions{
+			alpn: [opts.alpn]
+		}
 		insecure_skip_verify: opts.insecure
 		timeout:              opts.timeout * time.second
 	) or {

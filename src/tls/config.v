@@ -16,8 +16,6 @@ pub struct Config {
 pub:
 	// server_name is used for SNI and certificate hostname verification.
 	server_name string
-	// alpn overrides handshake_options.alpn when non-empty; the server's pick must be one of them (RFC 7301 §3.1).
-	alpn []string = []string{}
 	// handshake_options configures ALPN, certificate validation, and ClientHello preferences.
 	handshake_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
 	// insecure_skip_verify disables certificate chain and hostname validation (tests only).

@@ -41,16 +41,17 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 ```
 
 `Config` exposes the caller-facing knobs: `server_name` (SNI + the name the
-certificate is checked against), `alpn` (offered protocols — the server's pick
-is verified against this list), `root_cas` (override the system trust store),
-and `insecure_skip_verify` (test/lab only; it removes all authentication). See
+certificate is checked against), `handshake_options` (including offered ALPN
+protocols — the server's pick is verified against this list), `root_cas`
+(override the system trust store), and `insecure_skip_verify` (test/lab only;
+it removes all authentication). See
 [`docs.md`](docs.md) for the complete API reference — signatures, defaults,
 behavioral guarantees, and usage recipes. Those fields are read-only; because
-`Config` is a `@[params]` struct you customise it by
-passing named arguments straight to `dial()` — e.g.
-`tls.dial('example.com:443', server_name: 'example.com', alpn: ['h2'])!` — and any
-field you omit keeps the default declared on it (`default_config()` remains an
-explicit way to build the same value).
+`Config` is a `@[params]` struct you customise it by passing named arguments
+straight to `dial()`. ALPN is configured in `handshake_options.alpn` (for
+example, `['h2']` to offer HTTP/2). Any field you omit keeps the default
+declared on it (`default_config()` remains an explicit way to build the same
+value).
 
 For a TLS-over-TCP client the entry point is the `tls` module, which
 deliberately exports only `Conn`, `dial()`, `Config` (plus the
@@ -81,7 +82,7 @@ tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
 
 Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
 only of certificates, and `tls.handshake` owns **no record, cipher, or socket
-concept** — a grep gate over `src/tls/handshake/` (`Record`, `RecordProtector`,
+concept** — a grep gate over `src/tls/handshake/` (`Record`, `TLS13Protection`,
 `ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
 `conn.v` in the `tls` module is the reference adapter that
 drives the core.

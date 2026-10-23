@@ -48,7 +48,7 @@ The core was therefore split so that the carrier is always someone else's job:
 Two properties make this work:
 
 1. **The core owns no record, cipher, or socket concept.** A grep gate over
-   `src/tls/handshake/` (`Record`, `RecordProtector`, `ContentType`,
+   `src/tls/handshake/` (`Record`, `TLS13Protection`, `ContentType`,
    `change_cipher_spec`, `record_header_len`) keeps it that way. The core never
    encrypts, never frames a record, and never calls `read(2)`/`write(2)`.
 

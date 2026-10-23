@@ -147,7 +147,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
 	// The rest of the flight, one encrypted record per message, under the server handshake keys.
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
-	mut senc := new_record_protector(aead, siv)!
+	mut senc := new_tls13_protection(aead, siv)!
 	for m in fl.rest {
 		enc := senc.encrypt_record(.handshake, m)!
 		c.write(enc.serialize()) or { return err }
@@ -157,7 +157,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
 	cfin_rec := scripted_read_record(mut c)!
 	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
-	mut cdec := new_record_protector(caead, civ)!
+	mut cdec := new_tls13_protection(caead, civ)!
 	dec := cdec.decrypt_record(cfin_rec)!
 	if dec.content_type != .handshake {
 		return error('client Finished has inner type ${dec.content_type}, expected handshake')
@@ -167,7 +167,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
 	// Post-handshake: a NewSessionTicket and one application record under the server application keys.
 	akey, aiv := srv.server_app_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
-	mut aenc := new_record_protector(aaead, aiv)!
+	mut aenc := new_tls13_protection(aaead, aiv)!
 	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
 	if split_ticket {
 		// Split the ticket across two records: RFC 8446 §5.2 permits a message to span records.
@@ -190,10 +190,12 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 	}
 	ts := fakeserver.test_trust_store()!
 	mut conn := dial(addr,
-		server_name: fakeserver.server_name
-		alpn:        ['h2']
-		root_cas:    ts
-		timeout:     10 * time.second
+		server_name:       fakeserver.server_name
+		handshake_options: handshake.HandshakeOptions{
+			alpn: ['h2']
+		}
+		root_cas:          ts
+		timeout:           10 * time.second
 	)!
 
 	assert conn.negotiated_alpn() == 'h2'
@@ -221,10 +223,12 @@ fn test_dial_reassembles_post_handshake_message_across_records() ! {
 	}
 	ts := fakeserver.test_trust_store()!
 	mut conn := dial(addr,
-		server_name: fakeserver.server_name
-		alpn:        ['h2']
-		root_cas:    ts
-		timeout:     10 * time.second
+		server_name:       fakeserver.server_name
+		handshake_options: handshake.HandshakeOptions{
+			alpn: ['h2']
+		}
+		root_cas:          ts
+		timeout:           10 * time.second
 	)!
 
 	mut buf := []u8{len: 64}
@@ -366,7 +370,7 @@ fn hrr_script(mut c net.TcpConn) ! {
 
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
-	mut senc := new_record_protector(aead, siv)!
+	mut senc := new_tls13_protection(aead, siv)!
 	for m in fl2.rest {
 		enc := senc.encrypt_record(.handshake, m)!
 		c.write(enc.serialize()) or { return err }
@@ -375,7 +379,7 @@ fn hrr_script(mut c net.TcpConn) ! {
 	cfin_rec := scripted_read_record(mut c)!
 	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
-	mut cdec := new_record_protector(caead, civ)!
+	mut cdec := new_tls13_protection(caead, civ)!
 	dec := cdec.decrypt_record(cfin_rec)!
 	srv.handle_client_finished(dec.plaintext) or { return error('fakeserver Finished: ${err.msg()}') }
 }
@@ -418,7 +422,7 @@ fn alert_back_script(mut c net.TcpConn) ! {
 
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
-	mut senc := new_record_protector(aead, siv)!
+	mut senc := new_tls13_protection(aead, siv)!
 	for m in fl.rest {
 		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
 	}
@@ -430,7 +434,7 @@ fn alert_back_script(mut c net.TcpConn) ! {
 	}
 	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
-	mut cdec := new_record_protector(caead, civ)!
+	mut cdec := new_tls13_protection(caead, civ)!
 	dec := cdec.decrypt_record(alert_rec)!
 	if dec.content_type != .alert {
 		return error('client sent inner type ${dec.content_type}, expected alert')
@@ -506,7 +510,7 @@ fn client_auth_script(mut c net.TcpConn) ! {
 
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
-	mut senc := new_record_protector(aead, siv)!
+	mut senc := new_tls13_protection(aead, siv)!
 	// fl.rest is [EncryptedExtensions, CertificateRequest].
 	for m in fl.rest {
 		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
@@ -515,7 +519,7 @@ fn client_auth_script(mut c net.TcpConn) ! {
 	// The client answers with its empty Certificate under the client handshake keys.
 	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
-	mut cdec := new_record_protector(caead, civ)!
+	mut cdec := new_tls13_protection(caead, civ)!
 	ccert_rec := scripted_read_record(mut c)!
 	ccert := cdec.decrypt_record(ccert_rec)!
 	if ccert.content_type != .handshake {

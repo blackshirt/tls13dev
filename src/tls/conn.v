@@ -38,31 +38,74 @@ const max_compat_ccs_records = 2
 @[noinit]
 pub struct Conn {
 mut:
+	// Transport and transport-neutral handshake adapter.
 	sock &net.TcpConn               // underlying TCP transport
 	hs   handshake.RecordHandshaker // TLS handshake contract for the record adapter
-	// The four RecordProtectors are the record layer's own state; the core never sees them.
-	server_hs_cipher  RecordProtector // AEAD state for records the server sends under handshake keys
-	client_hs_cipher  RecordProtector // AEAD state for records we send under handshake keys
-	server_app_cipher RecordProtector // AEAD state for records the server sends under app keys
-	client_app_cipher RecordProtector // AEAD state for records we send under app keys
+
+	// The four TLS13Protections are the record layer's own state; the core never sees them.
+	server_hs_cipher  TLS13Protection // AEAD state for records the server sends under handshake keys
+	client_hs_cipher  TLS13Protection // AEAD state for records we send under handshake keys
+	server_app_cipher TLS13Protection // AEAD state for records the server sends under app keys
+	client_app_cipher TLS13Protection // AEAD state for records we send under app keys
+
+	// Post-handshake messages can span records and produce retained tickets.
 	// session_tickets holds the NewSessionTicket backlog the core parses but does not keep (RFC 9001 §4.5).
-	session_tickets   []handshake.NewSessionTicket
-	post_hs_buf       []u8        // reassembly buffer for post-handshake messages (NewSessionTicket/KeyUpdate) split across records (RFC 8446 §5.2)
-	recv_buf          []u8        // raw bytes read from the socket, framing not yet applied
-	recv_pos          int         // start of unconsumed data in recv_buf (prefix is already parsed)
-	read_scratch      []u8        // connection-lifetime scratch filled by sock.read in read_raw_record, so a record arriving in TCP pieces costs no allocation
-	app_buf           []u8        // decrypted application bytes that didn't fit the caller's buffer
-	app_pos           int         // start of undrained bytes in app_buf (mirrors recv_pos: draining advances the index instead of re-cloning the tail)
-	closed            bool        // set once the connection is finished (close or fatal alert)
-	close_notify_sent bool        // guards against sending close_notify twice
-	sock_closed       bool        // set once sock.close() ran: `closed` alone cannot guard the fd, because handle_alert marks closed while leaving the socket open for close() to collect
-	fatal_error       string      // non-empty once a fatal alert/error closed the connection; re-surfaced by read()
+	session_tickets []handshake.NewSessionTicket
+	// Holds decrypted handshake bytes between records when a post-handshake
+	// message (for example, NewSessionTicket) is split across records. It may
+	// also contain more than one message; handle_post_handshake consumes complete
+	// messages and retains any incomplete tail for the next record (RFC 8446 §5.2).
+	post_hs_buf []u8
+
+	// Read-side buffers: socket bytes are framed into records, then decrypted
+	// application bytes are delivered to callers.
+	// Fixed-size, connection-lifetime workspace for each sock.read in
+	// read_raw_record. Received bytes are appended to recv_buf before this buffer
+	// is reused, avoiding a fresh temporary allocation for every socket read.
+	read_scratch []u8
+	// TCP is a byte stream: a socket read may return part of a record or several
+	// records. read_raw_record appends bytes here and parses one complete framed
+	// record at a time, leaving any following record bytes for the next call.
+	recv_buf []u8
+	// Index of the first unread byte in recv_buf. Bytes before it belong to
+	// records already parsed; advancing this index avoids shifting the remaining
+	// bytes on every record. compact_recv_buf reclaims the prefix when appropriate.
+	recv_pos int
+	// Keeps the unread remainder of a decrypted application-data record when the
+	// caller's read buffer is smaller than that record. Conn.read drains this
+	// before reading/decrypting another record, preserving byte order.
+	app_buf []u8
+	// Index of the first undelivered plaintext byte in app_buf. Like recv_pos,
+	// this lets partial reads advance without copying the remaining tail each time.
+	app_pos int
+
+	// Connection lifecycle and sticky read failure.
+	// closed marks the terminal protocol state after a local close or peer alert.
+	// Fatal alerts still surface through fatal_error rather than as clean EOF.
+	closed bool
+	// Set before attempting the local close_notify write, preventing retries if
+	// that write fails or close() is called again.
+	close_notify_sent bool
+	// Tracks whether close_socket() has called sock.close(). This is separate
+	// from `closed`, because handle_alert marks the protocol closed but leaves
+	// the socket for close() to release.
+	sock_closed bool
+	// Sticky fatal read error; returned again on subsequent read() calls instead
+	// of appearing as a clean EOF.
+	fatal_error string
+
+	// Serialize access to the read and write state; read() may acquire wlock
+	// while handling a peer alert, so the global order is rlock then wlock.
 	rlock             &sync.Mutex // serializes read() and every read-cipher/recv_buf mutation; both locks are exclusive mutexes, not RwLock read sides, because each path rewrites AEAD sequence numbers
 	wlock             &sync.Mutex // serializes write() and every write-cipher mutation
-	negotiated_alpn   string      // server's ALPN pick — always one of Config.alpn (the handshake aborts otherwise), '' if none
+
+	// Negotiated connection identity and protocol.
+	negotiated_alpn   string      // server's ALPN pick — always one of HandshakeOptions.alpn (the handshake aborts otherwise), '' if none
 	server_name       string      // SNI value sent and the name the certificate was checked against
+
 	// Failure-alert plumbing, used only by send_failure_alert on a dead handshake.
-	peer_terminated bool                        // set when the peer itself sent the alert: never alert back into a socket the peer already closed
+	// Suppresses a fatal-alert response when the peer has already terminated.
+	peer_terminated bool
 	fail_alert      ?handshake.AlertDescription // adapter-classified alert; when unset, send_failure_alert falls back to the core's hs.failure_alert()
 }
 
@@ -103,13 +146,8 @@ pub fn dial(address string, config Config) !&Conn {
 	if config.min_rsa_bits > 0 {
 		validator.set_min_rsa_bits(config.min_rsa_bits)
 	}
-	alpn := if config.alpn.len > 0 || handshake_options.alpn.len == 0 {
-		config.alpn.clone()
-	} else {
-		handshake_options.alpn.clone()
-	}
 	options := handshake.HandshakeOptions{
-		alpn:                 alpn
+		alpn:                 handshake_options.alpn.clone()
 		validator:            validator
 		key_share_group:      handshake_options.key_share_group
 		supported_groups:     handshake_options.supported_groups.clone()
@@ -125,22 +163,22 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:              sock
-		hs:                hs
-		session_tickets:   []handshake.NewSessionTicket{cap: 4}
-		recv_buf:          []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
-		recv_pos:          0
-		read_scratch:      []u8{len: recv_read_size}           // reused by every socket read for this connection
-		app_buf:           []u8{cap: max_plaintext_record_len}                      // one full plaintext record
-		app_pos:           0
-		closed:            false
+		sock:         sock
+		hs:           hs
+		session_tickets: []handshake.NewSessionTicket{cap: 4}
+		read_scratch: []u8{len: recv_read_size} // reused by every socket read for this connection
+		recv_buf:     []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
+		recv_pos:     0
+		app_buf:      []u8{cap: max_plaintext_record_len} // one full plaintext record
+		app_pos:      0
+		closed:       false
 		close_notify_sent: false
-		sock_closed:       false
-		fatal_error:       ''
-		rlock:             sync.new_mutex()
-		wlock:             sync.new_mutex()
-		negotiated_alpn:   ''
-		server_name:       server_name
+		sock_closed: false
+		fatal_error:  ''
+		rlock:        sync.new_mutex()
+		wlock:        sync.new_mutex()
+		negotiated_alpn: ''
+		server_name: server_name
 	}
 
 	// On failure send the classified fatal alert (RFC 8446 §6), wipe secrets, close the socket.
@@ -365,11 +403,11 @@ fn (mut c Conn) compact_recv_buf() {
 	}
 }
 
-// record_protector_from_keys instantiates one direction's record protection from
-// the core's cached TrafficKeys; sequence numbers restart at 0 per generation (§5.3).
-fn record_protector_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !RecordProtector {
+// tls13_protection_from_keys instantiates one direction's record protection
+// from the core's cached TrafficKeys; sequence numbers restart at 0 per generation (§5.3).
+fn tls13_protection_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !TLS13Protection {
 	aead := handshake.new_aead_for_suite(suite, keys.key())!
-	return new_record_protector(aead, keys.iv())!
+	return new_tls13_protection(aead, keys.iv())!
 }
 
 // install_handshake_ciphers builds both handshake-key record states from the
@@ -377,8 +415,8 @@ fn record_protector_from_keys(suite handshake.CipherSuite, keys handshake.Traffi
 fn (mut c Conn) install_handshake_ciphers() ! {
 	ck, sk := c.hs.record_traffic_keys(.handshake)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_hs_cipher = record_protector_from_keys(suite, ck)!
-	c.server_hs_cipher = record_protector_from_keys(suite, sk)!
+	c.client_hs_cipher = tls13_protection_from_keys(suite, ck)!
+	c.server_hs_cipher = tls13_protection_from_keys(suite, sk)!
 }
 
 // install_application_ciphers builds both application-key record states from the
@@ -386,22 +424,22 @@ fn (mut c Conn) install_handshake_ciphers() ! {
 fn (mut c Conn) install_application_ciphers() ! {
 	ck, sk := c.hs.record_traffic_keys(.application)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_app_cipher = record_protector_from_keys(suite, ck)!
-	c.server_app_cipher = record_protector_from_keys(suite, sk)!
+	c.client_app_cipher = tls13_protection_from_keys(suite, ck)!
+	c.server_app_cipher = tls13_protection_from_keys(suite, sk)!
 }
 
 // rekeyed_write_cipher rebuilds only the write-side application state after the
 // core ratcheted the client secret (KeyUpdate); the read cipher is unchanged.
 fn (mut c Conn) rekeyed_write_cipher() ! {
 	ck, _ := c.hs.record_traffic_keys(.application)!
-	c.client_app_cipher = record_protector_from_keys(c.hs.negotiated_cipher_suite(), ck)!
+	c.client_app_cipher = tls13_protection_from_keys(c.hs.negotiated_cipher_suite(), ck)!
 }
 
 // rekeyed_read_cipher rebuilds only the read-side application state after the
 // core ratcheted the server secret on receiving the peer's KeyUpdate.
 fn (mut c Conn) rekeyed_read_cipher() ! {
 	_, sk := c.hs.record_traffic_keys(.application)!
-	c.server_app_cipher = record_protector_from_keys(c.hs.negotiated_cipher_suite(), sk)!
+	c.server_app_cipher = tls13_protection_from_keys(c.hs.negotiated_cipher_suite(), sk)!
 }
 
 // handle_alert processes an alert received after the handshake. It marks the
@@ -411,10 +449,10 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	c.closed = true
 	// Peer termination is final: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
 	c.hs.zeroize_app_secrets()
-	wipe_record_protector(mut c.server_hs_cipher)
-	wipe_record_protector(mut c.client_hs_cipher)
-	wipe_record_protector(mut c.server_app_cipher)
-	wipe_record_protector(mut c.client_app_cipher)
+	wipe_tls13_protection(mut c.server_hs_cipher)
+	wipe_tls13_protection(mut c.client_hs_cipher)
+	wipe_tls13_protection(mut c.server_app_cipher)
+	wipe_tls13_protection(mut c.client_app_cipher)
 	peer_alert := handshake.parse_alert(payload) or {
 		// A malformed alert body is fatal: pin a sticky error so later reads re-report it.
 		c.fatal_error = 'tls: received malformed alert'
@@ -648,10 +686,10 @@ pub fn (mut c Conn) close() ! {
 	c.closed = true
 	// Teardown is terminal: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
 	c.hs.zeroize_app_secrets()
-	wipe_record_protector(mut c.server_hs_cipher)
-	wipe_record_protector(mut c.client_hs_cipher)
-	wipe_record_protector(mut c.server_app_cipher)
-	wipe_record_protector(mut c.client_app_cipher)
+	wipe_tls13_protection(mut c.server_hs_cipher)
+	wipe_tls13_protection(mut c.client_hs_cipher)
+	wipe_tls13_protection(mut c.server_app_cipher)
+	wipe_tls13_protection(mut c.client_app_cipher)
 	c.close_socket()
 }
 
@@ -659,10 +697,10 @@ pub fn (mut c Conn) close() ! {
 // core's key-schedule material plus this adapter's record protectors.
 fn (mut c Conn) wipe_on_failure() {
 	c.hs.fail_and_destroy_secrets()
-	wipe_record_protector(mut c.server_hs_cipher)
-	wipe_record_protector(mut c.client_hs_cipher)
-	wipe_record_protector(mut c.server_app_cipher)
-	wipe_record_protector(mut c.client_app_cipher)
+	wipe_tls13_protection(mut c.server_hs_cipher)
+	wipe_tls13_protection(mut c.client_hs_cipher)
+	wipe_tls13_protection(mut c.server_app_cipher)
+	wipe_tls13_protection(mut c.client_app_cipher)
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),

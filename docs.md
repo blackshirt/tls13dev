@@ -69,7 +69,7 @@ The dependency graph is strictly downward —
 <span style="color:#2ea44f">lower layers never reference higher ones</span>, and
 the separation is enforced by the compiler rather than by convention alone.
 In particular a grep gate over `src/tls/handshake/` proves the core owns no
-record-layer token (`Record`, `RecordProtector`, `ContentType`,
+record-layer token (`Record`, `TLS13Protection`, `ContentType`,
 `change_cipher_spec`, `record_header_len`), which is what makes `tls.handshake`
 safe to import from a QUIC stack that has no record layer at all. Building such
 a stack is covered end to end in
@@ -131,7 +131,7 @@ role; this table summarizes it by owning module.
 | `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN, name constraints) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 5280 §4.2.1.10 name-constraint enforcement (permitted/excluded dNSName and iPAddress subtrees on the leaf) with a default-on leaf RSA strength floor, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. `TrustStore` is public so `Config.root_cas` can be populated. |
 | `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `handshake_keys.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v` | The transport-neutral core: RFC 8446 §4 message structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history; the §7.1 HKDF-Extract/Expand ladder (`key_schedule.v`) which `handshake_keys.v` adapts — with the offered-group policy — to the handshake flow without touching the transcript; the AEAD constructors a suite maps to (`aead.v`); the CertificateVerify signature check over the §4.4.3 content (`certificate_verify.v`); the shared alert vocabulary — `AlertDescription`, its `encode`/`parse_alert`, and the RFC 9001 §4.8 `quic_connection_error` mapping (`alert.v`); and the recordless CRYPTO-stream passthrough reassembly `next_passthrough_message` with the 1 MiB `max_handshake_message_len` cap (RFC 9001 §4, `passthrough.v`). The `state_machine.v` sequences it all, owns the key ratchet, and speaks raw handshake messages at its `pub` boundary — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. Its `TransportMode` is pinned at construction (`new_record_handshake`/`new_quic_handshake`) and rejects cross-transport calls. It scrubs handshake secrets and both ephemeral private keys at `.connected` and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene), deferring handshake-stage material to `zeroize_handshake_traffic_secrets()` so a QUIC adapter can still use it per RFC 9001 §4.1.2/§4.9.2. |
 | `tls` | `record.v`, `cipher_state.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `alert_record` wrapper, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side helpers (`alert_record`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
-| `tls` | `conn.v`, `config.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `RecordProtector` installation from `record_traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits); `config.v` holds `Config`/`default_config()`. |
+| `tls` | `conn.v`, `config.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `TLS13Protection` installation from `record_traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits); `config.v` holds `Config`/`default_config()`. |
 
 ### 1.3 Data flow of `dial()`
 
@@ -253,7 +253,7 @@ Five exported symbols; the whole surface:
 |---|---|---|
 | [`dial`](#21-dial) | Open a socket, run the full handshake, return a ready `Conn` | [§2.1](#21-dial) |
 | [`Conn`](#22-conn) | The protected stream: `read` / `write` / `close` | [§2.2](#22-conn) |
-| [`Config`](#23-config) | `@[params]` dial options — SNI, ALPN, trust, timeout | [§2.3](#23-config) |
+| [`Config`](#23-config) | `@[params]` dial options — SNI, trust, timeout | [§2.3](#23-config) |
 | [`default_config`](#24-default_config) | Explicit conservative `Config` constructor | [§2.4](#24-default_config) |
 | [`TrustStore`](#25-truststore) | Custom root-CA set for `Config.root_cas` | [§2.5](#25-truststore) |
 
@@ -270,9 +270,13 @@ named arguments directly on `dial()` — omitted fields keep the defaults declar
 on `Config`:
 
 ```v
+import tls.handshake
+
 mut conn := tls.dial('example.com:443',
 	server_name: 'example.com'
-	alpn:        ['h2', 'http/1.1']
+	handshake_options: handshake.HandshakeOptions{
+		alpn: ['h2', 'http/1.1']
+	}
 )!
 ```
 
@@ -320,7 +324,7 @@ without `dial()` supplying every field.
 | Field | Type | Meaning |
 |---|---|---|
 | `server_name` | `string` | SNI value sent and the name the certificate was checked against |
-| `negotiated_alpn` | `string` | The server's ALPN pick — always one of `Config.alpn`, or `''` if none |
+| `negotiated_alpn` | `string` | The server's ALPN pick — always one of `handshake_options.alpn`, or `''` if none |
 
 #### `read`
 
@@ -394,11 +398,10 @@ import tls.handshake
 pub struct Config {
 pub:
 	server_name          string
-	alpn                 []string = []string{}
 	insecure_skip_verify bool
 	root_cas             ?pki.TrustStore
 	min_rsa_bits         int
-	handshake_options handshake.HandshakeOptions
+	handshake_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
 	timeout              time.Duration = 30 * time.second
 }
 ```
@@ -410,11 +413,10 @@ build one up front from `default_config()`).
 | Field | Default | Description |
 |---|---|---|
 | `server_name` | `''` | SNI and certificate hostname verification target. Empty ⇒ derived from the dial address. Must match the server's certificate (SAN dNSName / IP, CN fallback per RFC 6125). |
-| `alpn` | `[]` (none offered) | Application protocols to offer, in preference order (e.g. `['h2', 'http/1.1']`). A non-empty Config value overrides `handshake_options.alpn`; otherwise the options value is used. The server's pick is verified against the effective list. |
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
-| `handshake_options` | defaults | Handshake ALPN, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
+| `handshake_options` | defaults | ALPN protocols to offer, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. An empty ALPN list offers no ALPN; the server's pick is verified against the offered list. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]
@@ -523,10 +525,13 @@ adds CLI arguments/flags, HTTP status/header parsing, and chunked-body decoding.
 
 ```v
 import tls
+import tls.handshake
 
 mut conn := tls.dial('example.com:443',
 	server_name: 'example.com'
-	alpn:        ['http/1.1']
+	handshake_options: handshake.HandshakeOptions{
+		alpn: ['http/1.1']
+	}
 ) or {
 	eprintln('dial failed: ${err}')
 	exit(1)

@@ -41,8 +41,8 @@ fn test_record_cipher_state_aes_gcm_roundtrip() ! {
 	gcm_enc := aes.new_aes_gcm(key)!
 	gcm_dec := aes.new_aes_gcm(key)!
 
-	mut enc_state := new_record_protector(gcm_enc, iv)!
-	mut dec_state := new_record_protector(gcm_dec, iv)!
+	mut enc_state := new_tls13_protection(gcm_enc, iv)!
+	mut dec_state := new_tls13_protection(gcm_dec, iv)!
 
 	msg1 := 'GET / HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
 	encrypted_rec := enc_state.encrypt_record(.application_data, msg1)!
@@ -74,8 +74,8 @@ fn test_record_cipher_state_tamper_detection() ! {
 	gcm_enc := aes.new_aes_gcm(key)!
 	gcm_dec := aes.new_aes_gcm(key)!
 
-	mut enc_state := new_record_protector(gcm_enc, iv)!
-	mut dec_state := new_record_protector(gcm_dec, iv)!
+	mut enc_state := new_tls13_protection(gcm_enc, iv)!
+	mut dec_state := new_tls13_protection(gcm_dec, iv)!
 
 	msg := 'Secret data'.bytes()
 	mut encrypted_rec := enc_state.encrypt_record(.application_data, msg)!
@@ -166,7 +166,7 @@ fn test_decrypt_record_rejects_empty_inner_plaintext() ! {
 	iv := [u8(0xc0), 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb]
 
 	gcm_dec := aes.new_aes_gcm(key)!
-	mut dec_state := new_record_protector(gcm_dec, iv)!
+	mut dec_state := new_tls13_protection(gcm_dec, iv)!
 
 	// Forge a tag-only record: empty plaintext under nonce 0 with AAD length 16.
 	gcm_rogue := aes.new_aes_gcm(key)!
@@ -196,7 +196,7 @@ fn test_record_seq_limit_backstops_sender() ! {
 	iv := [u8(0xd0), 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb]
 
 	gcm := aes.new_aes_gcm(key)!
-	mut state := new_record_protector(gcm, iv)!
+	mut state := new_tls13_protection(gcm, iv)!
 	state.seq_num = record_seq_limit - 1
 
 	// The final legal record under this key still encrypts.
@@ -218,8 +218,8 @@ fn test_record_seq_limit_backstops_receiver() ! {
 
 	gcm_enc := aes.new_aes_gcm(key)!
 	gcm_dec := aes.new_aes_gcm(key)!
-	mut enc_state := new_record_protector(gcm_enc, iv)!
-	mut dec_state := new_record_protector(gcm_dec, iv)!
+	mut enc_state := new_tls13_protection(gcm_enc, iv)!
+	mut dec_state := new_tls13_protection(gcm_dec, iv)!
 	enc_state.seq_num = record_seq_limit - 1
 	dec_state.seq_num = record_seq_limit - 1
 
@@ -236,18 +236,18 @@ fn test_record_seq_limit_backstops_receiver() ! {
 }
 
 // test_record_uninitialized_cipher_state_fails_closed checks that a zero-value
-// RecordProtector (no keys installed) errors instead of panicking.
+// TLS13Protection (no keys installed) errors instead of panicking.
 fn test_record_uninitialized_cipher_state_fails_closed() ! {
-	mut uninit := RecordProtector{ aead: unsafe { nil } }
+	mut uninit := TLS13Protection{ aead: unsafe { nil } }
 	mut decrypt_rejected := false
 	uninit.decrypt_record(new_record(.application_data, [u8(0x01), 0x02])) or {
-		assert err.msg().contains('record protector not initialized')
+		assert err.msg().contains('TLS 1.3 protection not initialized')
 		decrypt_rejected = true
 	}
 	assert decrypt_rejected
 
 	uninit.encrypt_record(.application_data, 'data'.bytes()) or {
-		assert err.msg().contains('record protector not initialized')
+		assert err.msg().contains('TLS 1.3 protection not initialized')
 		return
 	}
 	assert false
