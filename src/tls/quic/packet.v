@@ -8,14 +8,6 @@ const long_header_form = u8(0x80)
 const fixed_bit = u8(0x40)
 const short_header_form = u8(0x00)
 
-// LongPacketType is the 2-bit type in a long header (RFC 9000 §17.2).
-enum LongPacketType {
-	initial   = 0
-	zero_rtt  = 1
-	handshake = 2
-	retry     = 3
-}
-
 // long_header_type_mask selects the two type bits of a long header byte.
 const long_header_type_mask = u8(0x30)
 

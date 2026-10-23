@@ -16,12 +16,13 @@ fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) !
 	alpn, transport_parameters := parse_encrypted_extensions_for_transport(body,
 		h.config.is_quic)!
 	// RFC 7301 §3.1: the server must pick from the offered list; an unoffered value could steer the application protocol below us.
-	if alpn != '' && !h.config.alpn.contains(alpn) {
+	// `in` is exact element membership — a substring test would let a hostile pick like "1.1" pass against the offer "http/1.1".
+	if alpn != '' && !(alpn in h.config.alpn) {
 		return h.fail(.illegal_parameter, 'handshake: server selected ALPN "${alpn}" not offered by client')
 	}
 	h.negotiated_alpn = alpn
 	h.quic_params = transport_parameters
-	h.transcript.update(full_msg)
+	h.update_transcript(full_msg)!
 	h.state = .wait_certificate_request
 	return []HandshakeMessage{}
 }
@@ -33,13 +34,13 @@ fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![
 		return h.fail(.unexpected_message, 'handshake: unexpected CertificateRequest')
 	}
 	req := parse_certificate_request(body)!
-	h.transcript.update(full_msg)
+	h.update_transcript(full_msg)!
 	h.request_context = req.request_context
 	h.state = .wait_certificate
 
 	// The empty Certificate-response (§4.4.2) enters the transcript BEFORE the server's flight is verified, so the server Finished covers our response.
 	response := build_empty_certificate(h.request_context)
-	h.transcript.update(response)
+	h.update_transcript(response)!
 	return [new_handshake_message(.handshake, response)!]
 }
 
@@ -50,7 +51,7 @@ fn (mut h HandshakeCore) handle_certificate(full_msg []u8, body []u8) ![]Handsha
 		return h.fail(.unexpected_message, 'handshake: unexpected Certificate')
 	}
 	cert_ders := parse_certificate_message(body)!
-	h.transcript.update(full_msg)
+	h.update_transcript(full_msg)!
 
 	h.server_certs = []pki.Certificate{}
 	for der in cert_ders {
@@ -70,7 +71,7 @@ fn (mut h HandshakeCore) handle_certificate_verify(full_msg []u8, body []u8) ![]
 	}
 	cv := parse_certificate_verify(body)!
 	signed_content := certificate_verify_signed_content(h.transcript.current_hash())
-	h.transcript.update(full_msg)
+	h.update_transcript(full_msg)!
 
 	if h.server_certs.len == 0 {
 		return h.fail(.decode_error, 'handshake: missing server certificate for verification')
@@ -96,7 +97,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	if subtle.constant_time_compare(server_verify_data, expected_verify_data) != 1 {
 		return h.fail(.decrypt_error, 'handshake: server Finished verify_data mismatch')
 	}
-	h.transcript.update(full_msg)
+	h.update_transcript(full_msg)!
 
 	// Advance the key schedule to the application phase: Master Secret, then the application traffic secrets bound to the transcript including server Finished.
 	th_sfin := h.transcript.current_hash()
@@ -107,7 +108,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// The client Finished uses the handshake traffic secret over the transcript now including server Finished, sent under the (still active) handshake keys.
 	client_verify_data := compute_finished_verify_data(h.hash_algo, h.client_hs_traffic, th_sfin)!
 	client_fin_msg := build_finished(client_verify_data)
-	h.transcript.update(client_fin_msg)
+	h.update_transcript(client_fin_msg)!
 
 	if h.hs_reassembly.len > 0 {
 		return h.fail(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')

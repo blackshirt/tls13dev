@@ -11,6 +11,10 @@ import x.crypto.chacha20
 // hp_sample_len is the header-protection sample length (RFC 9001 §5.4.2).
 const hp_sample_len = 16
 
+// hp_mask_len is the number of mask bytes consumed: one for the first-byte/PN
+// bits plus up to 4 for the packet number (RFC 9001 §5.4.2, max PN length 4).
+const hp_mask_len = 5
+
 // ProtectionKeys holds one direction's packet-protection material (RFC 9001 §5.1).
 struct ProtectionKeys {
 	key []u8
@@ -82,7 +86,7 @@ fn (s &ProtectionState) compute_mask(sample []u8) ![]u8 {
 			block := aes.new_cipher(s.hp)!
 			mut out := []u8{len: hp_sample_len}
 			block.encrypt(mut out, sample[..hp_sample_len])
-			return out[..5]
+			return out[..hp_mask_len]
 		}
 		.tls_chacha20_poly1305_sha256 {
 			// ChaCha20 mask (§5.4.4): the full hp key is the key, the first 4 bytes of
@@ -91,8 +95,8 @@ fn (s &ProtectionState) compute_mask(sample []u8) ![]u8 {
 			counter := u32(samp[0]) | (u32(samp[1]) << 8) | (u32(samp[2]) << 16) | (u32(samp[3]) << 24)
 			mut c := chacha20.new_cipher(s.hp, samp[4..], chacha20.Options{})!
 			c.set_counter(u64(counter))
-			mut zeros := []u8{len: 5}
-			mut out := []u8{len: 5}
+			mut zeros := []u8{len: hp_mask_len}
+			mut out := []u8{len: hp_mask_len}
 			c.xor_key_stream(mut out, zeros)
 			return out
 		}
@@ -122,6 +126,12 @@ fn (s &ProtectionState) remove_header_protection(mut packet []u8, pn_offset int,
 		packet[0] ^= mask[0] & 0x1f
 	}
 	pn_len := int(packet[0] & 0x03) + 1
+	// Defense-in-depth: the caller guarantees a full 16-byte sample (pn_offset+4+16
+	// <= packet.len), so pn_offset+pn_len is always in-bounds for pn_len <= 4; guard
+	// anyway so a future caller cannot make this XOR loop read past the buffer.
+	if pn_offset + pn_len > packet.len {
+		return error('quic: packet number field runs past packet end')
+	}
 	for i in 0 .. pn_len {
 		packet[pn_offset + i] ^= mask[1 + i]
 	}

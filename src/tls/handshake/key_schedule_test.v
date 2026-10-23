@@ -28,9 +28,23 @@ fn test_rfc8448_transcript_hashing() ! {
 	client_hello := hex.decode(rfc8448_client_hello)!
 	server_hello := hex.decode(rfc8448_server_hello)!
 	mut transcript := new_transcript(.sha256)
-	transcript.update(client_hello)
-	transcript.update(server_hello)
+	transcript.update(client_hello)!
+	transcript.update(server_hello)!
 	assert hex.encode(transcript.current_hash()) == rfc8448_transcript_hash_ch_sh
+}
+
+// test_transcript_update_enforces_total_bound checks that appends past
+// max_transcript_len are refused without growing the buffer, so a peer sending
+// endless legal-size handshake messages cannot exhaust memory (§4.4.1).
+fn test_transcript_update_enforces_total_bound() ! {
+	mut transcript := new_transcript(.sha256)
+	msg := []u8{len: max_transcript_len, init: 0xaa}
+	transcript.update(msg)! // exactly at the bound: still legal
+	transcript.update([u8(0x00)]) or {
+		assert err.msg().contains('transcript exceeds')
+		return
+	}
+	assert false, 'a transcript append past max_transcript_len must fail'
 }
 
 // test_rfc8448_section3_key_schedule walks the entire Early → Handshake → Master

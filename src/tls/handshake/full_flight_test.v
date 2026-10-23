@@ -254,6 +254,27 @@ fn test_rejects_unoffered_alpn() ! {
 	assert false, 'an unoffered ALPN selection must abort the handshake'
 }
 
+// test_rejects_substring_alpn checks that an ALPN pick which is only a substring
+// of an offered protocol is refused — element membership, not substring matching
+// (RFC 7301 §3.1).
+fn test_rejects_substring_alpn() ! {
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ alpn: ['http/1.1'], validator: fixture_trusted_validator() })!
+	// '1.1' is contained in the offered 'http/1.1' but was never offered itself.
+	mut srv := fakeserver.new_server(force_alpn: '1.1')!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	h.receive(.initial, fl.server_hello)!
+
+	h.receive(.handshake, fakeserver.flatten(fl.rest)) or {
+		assert err.msg().contains('not offered by client')
+		assert h.failure_alert() == .illegal_parameter
+		assert_handshake_material_destroyed(h)
+		return
+	}
+	assert false, 'a substring ALPN pick must abort the handshake'
+}
+
 // test_fail_before_secrets_is_safe checks failure cleanup before anything is derived.
 fn test_fail_before_secrets_is_safe() ! {
 	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!

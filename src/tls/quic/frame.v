@@ -140,15 +140,18 @@ fn parse_connection_close(body []u8, application bool) !ConnectionClose {
 	}
 }
 
-// pad_to returns `payload` followed by enough PADDING frames to make the whole
-// QUIC packet at least 1200 bytes (RFC 9000 §14.1). QUIC requires every client
-// Initial datagram carrying a ClientHello to be padded to this floor;
-// `packet_overhead` is the cleartext-header-plus-AEAD-tag size the caller
+// min_client_initial_datagram_len is the RFC 9000 §14.1 floor: every client
+// Initial datagram carrying a ClientHello must be padded to at least this many
+// bytes so a server with no other state can confirm the attempt is genuine.
+const min_client_initial_datagram_len = 1200
+
+// pad_datagram returns `payload` followed by enough PADDING frames to make the
+// whole QUIC packet at least `min_client_initial_datagram_len` bytes (RFC 9000
+// §14.1). `packet_overhead` is the cleartext-header-plus-AEAD-tag size the caller
 // already commits to.
 fn pad_datagram(payload []u8, packet_overhead int) []u8 {
-	target := 1200
 	mut out := payload.clone()
-	for packet_overhead + out.len < target {
+	for packet_overhead + out.len < min_client_initial_datagram_len {
 		out << frame_padding
 	}
 	return out

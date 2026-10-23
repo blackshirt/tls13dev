@@ -264,7 +264,7 @@ fn test_engine_completes_quic_handshake() ! {
 
 	// The client's first datagram is an Initial packet carrying the ClientHello.
 	start := eng.start()!
-	assert start.len >= 1200, 'client Initial datagram must be padded to 1200 bytes'
+	assert start.len >= min_client_initial_datagram_len, 'client Initial datagram must be padded to 1200 bytes'
 	assert first_byte_long(start[0])
 	assert eng.state() == .wait_server_hello
 
@@ -306,7 +306,7 @@ fn test_engine_initial_keys_match_appendix_a() ! {
 		validator: trusted_validator()
 	}, dcid, [u8(1), 2, 3, 4, 5, 6, 7, 8])!
 	start := eng.start()!
-	assert start.len >= 1200
+	assert start.len >= min_client_initial_datagram_len
 	assert first_byte_long(start[0])
 	assert eng.state() == .wait_server_hello
 }

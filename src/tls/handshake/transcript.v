@@ -4,6 +4,18 @@
 // CertificateVerify hash over; it records raw messages so history can be rewritten at HRR.
 module handshake
 
+// max_transcript_len caps the total handshake transcript: every message is capped
+// individually, so without a running bound a peer could keep sending legal-size
+// handshake records and grow the buffer without ever completing the flight.
+const max_transcript_len = 1 << 22
+
+// transcript_buf_cap is the initial allocation for the accumulated transcript bytes.
+const transcript_buf_cap = 4096
+
+// hs_type_message_hash is the synthetic HandshakeType the HRR rewrite records under
+// (RFC 8446 §4.4.1); it never appears on the wire.
+const hs_type_message_hash = u8(0xfe)
+
 // Transcript maintains the running handshake transcript and computes Transcript-Hash
 // per RFC 8446 §4.4.1, storing raw messages so the HRR checkpoint can rewrite history.
 struct Transcript {
@@ -16,13 +28,17 @@ mut:
 fn new_transcript(hash_algo HashAlgorithm) Transcript {
 	return Transcript{
 		hash_algo: hash_algo
-		messages:  []u8{cap: 4096}
+		messages:  []u8{cap: transcript_buf_cap}
 	}
 }
 
 // update appends a raw handshake message (HandshakeType || 3-byte Length || Body)
-// to the transcript, excluding the transport's framing (RFC 8446 §4.4.1).
-fn (mut t Transcript) update(handshake_msg []u8) {
+// to the transcript, excluding the transport's framing (RFC 8446 §4.4.1), and
+// enforces the running total bound so no caller can bypass it by appending directly.
+fn (mut t Transcript) update(handshake_msg []u8) ! {
+	if t.messages.len + handshake_msg.len > max_transcript_len {
+		return error('handshake: transcript exceeds ${max_transcript_len} bytes')
+	}
 	t.messages << handshake_msg
 }
 
@@ -38,13 +54,13 @@ fn (mut t Transcript) apply_hello_retry_request(client_hello1 []u8, hello_retry_
 	hash_len := t.hash_algo.hash_len()
 
 	mut synthetic_msg := []u8{cap: 4 + hash_len}
-	synthetic_msg << 0xfe // HandshakeType.message_hash
+	synthetic_msg << hs_type_message_hash // HandshakeType.message_hash
 	synthetic_msg << 0x00
 	synthetic_msg << 0x00
 	synthetic_msg << u8(hash_len)
 	synthetic_msg << ch1_hash
 
-	t.messages = []u8{cap: 4096}
+	t.messages = []u8{cap: transcript_buf_cap}
 	t.messages << synthetic_msg
 	t.messages << hello_retry_request
 }

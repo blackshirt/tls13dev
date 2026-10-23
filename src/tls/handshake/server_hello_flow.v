@@ -46,7 +46,7 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	h.cipher_suite = sh.cipher_suite
 	h.key_len = suite_key_len(sh.cipher_suite)
 	h.set_hash_algo(suite_hash_algo(sh.cipher_suite))
-	h.transcript.update(full_sh_msg)
+	h.update_transcript(full_sh_msg)!
 
 	// §7.1 handshake phase: derive the Handshake Secret and the client/server handshake traffic secrets.
 	shared_secret := h.compute_shared_secret(sh.server_share)!
@@ -122,7 +122,7 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	h.config.cookie = cookie
 	_, full_ch2 := build_client_hello(h.config)!
 	// Hash the retry into the already message_hash-rewritten transcript so the Finished MAC covers the retried flight (§4.4.1).
-	h.transcript.update(full_ch2)
+	h.update_transcript(full_ch2)!
 
 	h.state = .wait_server_hello // rearm: the server now answers with the real ServerHello
 	return [new_handshake_message(.initial, full_ch2)!]

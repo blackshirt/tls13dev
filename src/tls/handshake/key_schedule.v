@@ -130,7 +130,9 @@ pub fn (t &TrafficKeys) iv() []u8 {
 	return t.iv
 }
 
-// wipe_secret overwrites a secret buffer before releasing its contents.
+// wipe_secret overwrites a secret buffer before releasing its contents. The
+// zeroing loop is the security-relevant step; the rebinding below only clears the
+// local handle — callers assign the replacement secret right after.
 fn wipe_secret(mut secret []u8) {
 	for i in 0 .. secret.len {
 		secret[i] = 0
@@ -138,7 +140,9 @@ fn wipe_secret(mut secret []u8) {
 	secret = []u8{}
 }
 
-// wipe_traffic_keys overwrites and clears the key and IV buffers.
+// wipe_traffic_keys overwrites and clears the key and IV buffers. As with
+// wipe_secret, the zeroing loops are what matters; the final reset just leaves the
+// local handle empty — every caller overwrites the stored pair immediately.
 fn wipe_traffic_keys(mut keys TrafficKeys) {
 	for i in 0 .. keys.key.len {
 		keys.key[i] = 0

@@ -21,6 +21,13 @@ fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 		return error('asn1: truncated element header')
 	}
 	tag := r.read_u8()!
+	// DER permits only the low-tag-number form (X.690 §10.5): bits 1–5 all set
+	// (0x1f) signal a multi-octet identifier, which valid DER never emits. X.509
+	// tags in use here are all < 0x1f, so rejecting it fails closed on malformed
+	// or adversarial input rather than misreading the following byte as a tag.
+	if (tag & 0x1f) == 0x1f {
+		return error('asn1: high-tag-number form is not permitted in DER')
+	}
 	is_construct := (tag & 0x20) != 0
 
 	len_byte := r.read_u8()!

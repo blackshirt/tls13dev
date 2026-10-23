@@ -105,6 +105,10 @@ mut:
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
 }
 
+// reassembly_buf_cap is the initial per-level reassembly allocation; the hard bound
+// a hostile peer must never exceed is check_reassembly_bound's message cap.
+const reassembly_buf_cap = 4096
+
 // new_handshake_core creates shared state from the server name and complete
 // handshake options, including ALPN and certificate validation.
 fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool) !HandshakeCore {
@@ -145,8 +149,8 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 		hash_algo:            .sha256
 		key_len:              16
 		validator:            validator
-		plaintext_reassembly: []u8{cap: 4096}
-		hs_reassembly:        []u8{cap: 4096}
+		plaintext_reassembly: []u8{cap: reassembly_buf_cap}
+		hs_reassembly:        []u8{cap: reassembly_buf_cap}
 	}
 	core.generate_key_share(options.key_share_group)!
 	core.config.client_share = KeyShareEntry{
@@ -178,6 +182,14 @@ fn (mut h HandshakeCore) fail(alert AlertDescription, message string) IError {
 	return error(message)
 }
 
+// update_transcript appends one message to the running transcript, converting the
+// total-size bound into the alert-classified failure the state machine reports.
+fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
+	h.transcript.update(msg) or {
+		return h.fail(.decode_error, err.msg())
+	}
+}
+
 // create_client_hello generates the initial ClientHello, advances to
 // .wait_server_hello and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
 pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
@@ -187,7 +199,7 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	}
 	_, full_client_hello := build_client_hello(h.config)!
 	h.client_hello1 = full_client_hello.clone()
-	h.transcript.update(full_client_hello)
+	h.update_transcript(full_client_hello)!
 
 	h.state = .wait_server_hello
 	return full_client_hello
@@ -198,13 +210,13 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 fn (mut h HandshakeCore) check_reassembly_bound(level EncryptionLevel) ! {
 	match level {
 		.initial {
-			if h.plaintext_reassembly.len > 4 + max_handshake_message_len {
+			if h.plaintext_reassembly.len > handshake_header_len + max_handshake_message_len {
 				return h.fail(.decode_error, 'handshake: initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 		}
 		.handshake {
 			// Late retransmits at .connected skip the drain loop, so the cap is the backstop.
-			if h.hs_reassembly.len > 4 + max_handshake_message_len {
+			if h.hs_reassembly.len > handshake_header_len + max_handshake_message_len {
 				return h.fail(.decode_error, 'handshake: Handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 			}
 		}

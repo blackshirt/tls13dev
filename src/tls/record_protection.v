@@ -129,7 +129,8 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 	// Increment only on success: a bad tag is fatal anyway (RFC 8446 §6).
 	s.seq_num++
 
-	// The type byte sits just before any 0x00 padding; an all-zero result is a fatal decode error (§5.2).
+	// The type byte sits just before any 0x00 padding (§5.2): scan back over zeros,
+	// then take the surviving first non-zero byte as the inner content type.
 	if inner_plaintext.len == 0 {
 		return error('record: malformed inner plaintext (no content type byte)')
 	}
@@ -137,11 +138,16 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 	for end >= 0 && inner_plaintext[end] == 0 {
 		end--
 	}
+	// end < 0 would mean an all-zero inner plaintext, which carries no type byte;
+	// unreachable here (0x00 is not a ContentType and the loop stops at the type byte),
+	// but kept so the index below can never go negative.
 	if end < 0 {
 		return error('record: malformed inner plaintext (only zero padding found)')
 	}
 
 	inner_type := content_type_from_u8(inner_plaintext[end])!
+	// Defense in depth: content_type_from_u8 already rejects 0x00 (its 0 maps to
+	// .invalid), so this only pins the sentinel contract for future type changes.
 	if inner_type == .invalid {
 		return error('record: invalid inner content type (unexpected_message)')
 	}

@@ -12,10 +12,15 @@ mut:
 	buf []u8 // bytes accumulated for the frame currently being built
 }
 
+// default_writer_cap is the buffer capacity used when new_writer is given a
+// non-positive size; it comfortably fits a typical handshake message so the
+// common case avoids grow-and-copy without forcing every caller to pick a size.
+const default_writer_cap = 128
+
 // new_writer creates a Writer with an optional preallocated capacity.
 // Preallocating the frame size avoids grow-and-copy; capacity <= 0 uses a default.
 pub fn new_writer(capacity int) Writer {
-	cap_size := if capacity > 0 { capacity } else { 128 }
+	cap_size := if capacity > 0 { capacity } else { default_writer_cap }
 	return Writer{
 		buf: []u8{cap: cap_size}
 	}

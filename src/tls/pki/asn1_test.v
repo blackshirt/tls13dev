@@ -3,7 +3,8 @@
 // ASN.1 DER reader tests: read_asn1_element must classify constructed vs
 // primitive tags, decode short- and long-form lengths, and reject malformed
 // framing (truncated header, DER-illegal indefinite length, non-minimal long
-// form, a declared length beyond what is buffered) instead of over-reading;
+// form, the DER-illegal high-tag-number form, a declared length beyond what is
+// buffered) instead of over-reading;
 // parse_sequence walks child TLVs in order and yields an empty list for empty
 // input. pki_test.v covers parse_oid's basic decoding (this file adds its edge
 // inputs too); these fill the TLV/length paths.
@@ -86,6 +87,17 @@ fn test_asn1_read_element_length_exceeds_remaining() ! {
 	mut r := wire.new_reader([u8(0x02), 0x10, 0x01])
 	read_asn1_element(mut r) or {
 		assert err.msg().contains('exceeds remaining bytes')
+		return
+	}
+	assert false
+}
+
+fn test_asn1_read_element_rejects_high_tag_form() ! {
+	// (tag & 0x1f) == 0x1f marks the multi-octet high-tag-number form, which DER
+	// forbids (X.690 §10.5); it must be rejected before the length is parsed.
+	mut r := wire.new_reader([u8(0x1f), 0x81, 0x02, 0x01, 0x02])
+	read_asn1_element(mut r) or {
+		assert err.msg().contains('high-tag-number form')
 		return
 	}
 	assert false

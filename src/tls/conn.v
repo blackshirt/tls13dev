@@ -33,6 +33,11 @@ const write_batch_threshold = 131072
 // awaiting a flight, so a peer cannot pin the handshake (RFC 8446 §5 / App. D.4).
 const max_compat_ccs_records = 2
 
+// max_empty_records_per_read bounds the zero-length padding records one Conn.read()
+// call may skip before failing: the records are AEAD-verified, but an unbounded run
+// would spin the loop and starve the caller (RFC 8446 §5.2 permits empty payloads).
+const max_empty_records_per_read = 1000
+
 // Conn is a TLS 1.3 client connection over TCP, built only by dial(). read() and
 // write() take separate mutexes; the lock order is always rlock → wlock.
 @[noinit]
@@ -386,6 +391,8 @@ fn (mut c Conn) read_raw_record() !Record {
 		}
 		c.recv_buf << c.read_scratch[..n]
 	}
+	// Every branch inside the loop returns or keeps looping; this fail-closed tail
+	// exists only so no future edit can fall out of the loop unreturned.
 	return error('tls: unreachable')
 }
 
@@ -495,6 +502,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		return 0
 	}
 
+	mut empty_records := 0
 	for {
 		rec := c.read_raw_record()!
 		match rec.content_type {
@@ -511,7 +519,12 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				match dec.content_type {
 					.application_data {
 						if dec.plaintext.len == 0 {
-							// Zero-length records are legal (padding only): keep looping.
+							// Zero-length records are legal (padding only), but a verified flood
+							// must not spin this loop forever (max_empty_records_per_read).
+							empty_records++
+							if empty_records > max_empty_records_per_read {
+								return error('tls: too many empty application-data records in one read (unexpected_message)')
+							}
 							continue
 						}
 						n := copy(mut buf, dec.plaintext)
@@ -539,6 +552,8 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 			}
 		}
 	}
+	// The loop only exits through the explicit returns inside the match arms or an
+	// error propagation; this fail-closed tail exists so no future path can fall out.
 	return error('tls: unreachable')
 }
 

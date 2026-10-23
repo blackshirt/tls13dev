@@ -202,36 +202,28 @@ fn enforce_name_constraints(ca Certificate, child Certificate) ! {
 		return
 	}
 	for name in child.sans {
-		if ca.excluded_dns.len > 0 && dns_excluded(name, ca.excluded_dns) {
+		if ca.excluded_dns.len > 0 && dns_in_any_subtree(name, ca.excluded_dns) {
 			return error('dNSName "${name}" is within an excluded subtree')
 		}
-		if ca.permitted_dns.len > 0 && !dns_permitted(name, ca.permitted_dns) {
+		if ca.permitted_dns.len > 0 && !dns_in_any_subtree(name, ca.permitted_dns) {
 			return error('dNSName "${name}" is outside the permitted subtrees')
 		}
 	}
 	for ip in child.ip_sans {
-		if ca.excluded_ip.len > 0 && ip_excluded(ip, ca.excluded_ip) {
+		if ca.excluded_ip.len > 0 && ip_in_any_subtree(ip, ca.excluded_ip) {
 			return error('iPAddress ${ip} is within an excluded subtree')
 		}
-		if ca.permitted_ip.len > 0 && !ip_permitted(ip, ca.permitted_ip) {
+		if ca.permitted_ip.len > 0 && !ip_in_any_subtree(ip, ca.permitted_ip) {
 			return error('iPAddress ${ip} is outside the permitted subtrees')
 		}
 	}
 }
 
-// dns_permitted reports whether name falls within at least one permitted
-// dNSName subtree (RFC 5280 §4.2.1.10).
-fn dns_permitted(name string, subtrees []string) bool {
-	for sub in subtrees {
-		if dns_within_subtree(name, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// dns_excluded reports whether name falls within any excluded dNSName subtree.
-fn dns_excluded(name string, subtrees []string) bool {
+// dns_in_any_subtree reports whether name falls within at least one dNSName
+// subtree. RFC 5280 §4.2.1.10 defines a single "within a subtree" relation that
+// both permitted and excluded constraints share; the caller supplies the meaning
+// through how it uses the result (excluded: reject a match; permitted: require one).
+fn dns_in_any_subtree(name string, subtrees []string) bool {
 	for sub in subtrees {
 		if dns_within_subtree(name, sub) {
 			return true
@@ -258,19 +250,11 @@ fn dns_within_subtree(name string, subtree string) bool {
 	return n.ends_with('.' + s)
 }
 
-// ip_permitted reports whether ip falls within at least one permitted iPAddress
-// subtree (RFC 5280 §4.2.1.10 encodes it as an address plus a mask).
-fn ip_permitted(ip []u8, subtrees [][]u8) bool {
-	for sub in subtrees {
-		if ip_within_subtree(ip, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// ip_excluded reports whether ip falls within any excluded iPAddress subtree.
-fn ip_excluded(ip []u8, subtrees [][]u8) bool {
+// ip_in_any_subtree reports whether ip falls within at least one iPAddress
+// subtree (RFC 5280 §4.2.1.10 encodes each as an address plus a mask). As with
+// the DNS form, permitted and excluded share one relation and the caller's use
+// of the result decides which applies.
+fn ip_in_any_subtree(ip []u8, subtrees [][]u8) bool {
 	for sub in subtrees {
 		if ip_within_subtree(ip, sub) {
 			return true

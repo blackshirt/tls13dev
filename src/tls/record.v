@@ -44,7 +44,7 @@ const max_ciphertext_record_len = max_plaintext_record_len + max_record_overhead
 struct Record {
 mut:
 	content_type   ContentType // kind of message carried in the payload
-	legacy_version u16         // always legacy_record_version on the wire
+	legacy_version u16         // always legacy_record_version on the wire; stored on parse but never validated — RFC 8446 §5.1 declares it meaningless, so adding a check here would break compliant peers
 	payload        []u8        // record body: handshake bytes, alert bytes, or ciphertext
 }
 

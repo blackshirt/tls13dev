@@ -294,7 +294,7 @@ fn test_feed_reassembly_is_bounded_after_connected() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.state = .connected
-	h.receive(.handshake, []u8{len: 4 + max_handshake_message_len + 1, init: 0xAA}) or {
+	h.receive(.handshake, []u8{len: handshake_header_len + max_handshake_message_len + 1, init: 0xAA}) or {
 		assert err.msg().contains('reassembly exceeds')
 		assert h.state == .failed
 		return
