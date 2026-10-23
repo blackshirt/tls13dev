@@ -136,9 +136,13 @@ mut:
 // plaintext, plus the remaining messages the caller must protect.
 pub struct Flight {
 pub:
-	is_hrr       bool
+	// Whether server_hello is a HelloRetryRequest.
+	is_hrr bool
+	// Complete plaintext ServerHello or HelloRetryRequest message.
 	server_hello []u8
-	rest         [][]u8
+	// Remaining server handshake messages, which the caller must protect at
+	// the Handshake level.
+	rest [][]u8
 }
 
 // Transcript is a SHA-256 transcript of full handshake messages (RFC 8446 §4.4.1).

@@ -9,10 +9,10 @@ module handshake
 pub struct TLSHandshake {
 	HandshakeCore
 mut:
-	client_hs_keys  TrafficKeys
-	server_hs_keys  TrafficKeys
-	client_app_keys TrafficKeys
-	server_app_keys TrafficKeys
+	client_hs_keys  TrafficKeys // Cached keys for records sent by the client at the Handshake level.
+	server_hs_keys  TrafficKeys // Cached keys for records received from the server at the Handshake level.
+	client_app_keys TrafficKeys // Cached keys for client application-data records.
+	server_app_keys TrafficKeys // Cached keys for server application-data records.
 }
 
 // new_tls_handshake creates a TLS-over-records handshake facade.
@@ -23,6 +23,8 @@ pub fn new_tls_handshake(server_name string, options HandshakeOptions) !TLSHands
 	}
 }
 
+// receive feeds TLS handshake bytes at one encryption level and returns any
+// complete outbound handshake messages triggered by the input.
 pub fn (mut h TLSHandshake) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	messages := h.HandshakeCore.receive(level, bytes) or {
 		if h.state() == .failed {
@@ -37,11 +39,15 @@ pub fn (mut h TLSHandshake) receive(level EncryptionLevel, bytes []u8) ![]Handsh
 	return messages
 }
 
+// fail_and_destroy_secrets marks the handshake failed and wipes TLS secrets and
+// all cached record keys. It does not close the TCP connection.
 pub fn (mut h TLSHandshake) fail_and_destroy_secrets() {
 	h.HandshakeCore.fail_and_destroy_secrets()
 	h.wipe_record_keys()
 }
 
+// zeroize_app_secrets destroys application traffic secrets and cached record
+// keys, for example when the connection is closed.
 pub fn (mut h TLSHandshake) zeroize_app_secrets() {
 	h.HandshakeCore.zeroize_app_secrets()
 	h.wipe_application_keys()
@@ -69,10 +75,14 @@ pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !(TrafficKey
 	}
 }
 
+// record_unconsumed_bytes reports buffered TLS handshake bytes at a level that
+// have not yet formed a complete handshake message.
 pub fn (h &TLSHandshake) record_unconsumed_bytes(level EncryptionLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 
+// zeroize_handshake_traffic_secrets destroys handshake secrets and cached keys
+// after the record adapter no longer needs them; only valid when connected.
 pub fn (mut h TLSHandshake) zeroize_handshake_traffic_secrets() ! {
 	h.HandshakeCore.zeroize_handshake_traffic_secrets()!
 	wipe_traffic_keys(mut h.client_hs_keys)

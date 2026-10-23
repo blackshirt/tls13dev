@@ -22,46 +22,72 @@ pub enum PublicKeyAlgorithm {
 @[noinit]
 pub struct Certificate {
 pub:
-	// Read-only outside tls.pki; consumed by the CertificateVerify check and this module's chain/hostname validation.
-	public_key_algo    PublicKeyAlgorithm
-	public_key_raw     []u8          // SubjectPublicKeyInfo BIT STRING contents
-	rsa_public_key     ?RsaPublicKey // set when public_key_algo is .rsa
-	ecdsa_curve        ecdsa.Nid     // curve of the EC key, NID form
-	raw                []u8          // full DER-encoded certificate as received
-	tbs_raw            []u8          // DER of the TBSCertificate — exactly the bytes the issuer signed
-	version            int           // X.509 version (3 = v3); encoded value is version-1
-	serial_number      []u8          // issuer-assigned serial, big-endian
-	signature_algo_oid string        // OID of the signature AlgorithmIdentifier
+	// Public-key algorithm identified by SubjectPublicKeyInfo.
+	public_key_algo PublicKeyAlgorithm
+	// SubjectPublicKeyInfo BIT STRING contents.
+	public_key_raw []u8
+	// Parsed RSA key; present when public_key_algo is .rsa.
+	rsa_public_key ?RsaPublicKey
+	// Named curve identifier for an ECDSA public key.
+	ecdsa_curve ecdsa.Nid
+	// Complete DER-encoded certificate as received.
+	raw []u8
+	// DER-encoded TBSCertificate, exactly the bytes signed by the issuer.
+	tbs_raw []u8
+	// X.509 version number (3 for v3; DER stores version minus one).
+	version int
+	// Issuer-assigned serial number in big-endian form.
+	serial_number []u8
+	// OID identifying the certificate signature algorithm.
+	signature_algo_oid string
 	// signature_hash_oid holds the hash algorithm OID for PSS signatures.
 	signature_hash_oid string
-	issuer_cn          string // commonName of the issuer
-	subject_cn         string // commonName of the subject
+	// Common Name (CN) of the issuer.
+	issuer_cn string
+	// Common Name (CN) of the subject.
+	subject_cn string
 	// issuer_dn and subject_dn hold the DER-encoded RDNSequence contents of the Name fields.
-	issuer_dn       []u8
-	subject_dn      []u8
-	not_before      string // validity start, RFC 5280 UTCTime/GeneralizedTime as written
-	not_after       string // validity end, same encoding as not_before
-	not_before_unix i64    // not_before in Unix seconds, for easy comparison
-	not_after_unix  i64    // not_after in Unix seconds
+	issuer_dn  []u8
+	subject_dn []u8
+	// Validity start as encoded using RFC 5280 UTCTime or GeneralizedTime.
+	not_before string
+	// Validity end in the same encoding as not_before.
+	not_after string
+	// Validity start as Unix seconds.
+	not_before_unix i64
+	// Validity end as Unix seconds.
+	not_after_unix i64
 	// sans holds dNSName SAN entries only; rfc822Name is excluded (RFC 6125 §2.1).
 	sans []string
 	// ip_sans holds the raw bytes of each iPAddress SAN (4 bytes IPv4, 16 IPv6).
-	ip_sans         [][]u8
-	has_san         bool // the SAN extension was present at all (RFC 6125 §6.4.4 CN precedence)
-	is_ca           bool // basicConstraints CA flag; intermediates must have it
-	max_path_len    int  // basicConstraints pathLenConstraint; -1 when absent (unlimited)
-	has_key_usage   bool // keyUsage extension present (RFC 5280 §4.2.1.3)
-	key_usage       []u8 // BIT STRING contents of keyUsage, big-endian named bits
-	has_eku         bool // an extendedKeyUsage extension was present at all
-	eku_server_auth bool // EKU includes id-kp-serverAuth, required for TLS servers
+	ip_sans [][]u8
+	// Whether a subjectAltName extension was present, including if it has no DNS names.
+	has_san bool
+	// basicConstraints CA flag; required on intermediate certificates.
+	is_ca bool
+	// basicConstraints pathLenConstraint; -1 means no constraint is present.
+	max_path_len int
+	// Whether the keyUsage extension is present.
+	has_key_usage bool
+	// keyUsage BIT STRING contents with named bits in big-endian order.
+	key_usage []u8
+	// Whether the extendedKeyUsage extension is present.
+	has_eku bool
+	// Whether EKU includes id-kp-serverAuth.
+	eku_server_auth bool
 	// name_constraints restricts the namespace of subordinate names (RFC 5280
 	// §4.2.1.10); permitted_* / excluded_* hold the subtrees per name form.
 	name_constraints_present bool
-	permitted_dns            []string
-	excluded_dns             []string
-	permitted_ip             [][]u8
-	excluded_ip              [][]u8
-	signature                []u8 // BIT STRING contents of signatureValue
+	// Permitted DNS subtrees from nameConstraints.
+	permitted_dns []string
+	// Excluded DNS subtrees from nameConstraints.
+	excluded_dns []string
+	// Permitted IP subtrees as address/mask byte pairs.
+	permitted_ip [][]u8
+	// Excluded IP subtrees as address/mask byte pairs.
+	excluded_ip [][]u8
+	// BIT STRING contents of signatureValue.
+	signature []u8
 }
 
 // parse_certificate decodes an X.509 DER certificate.
