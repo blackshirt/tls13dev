@@ -44,7 +44,7 @@ fn main() {
 
 	mut conn := tls.dial(opts.address,
 		server_name:          host_without_port(opts.address)
-		handshake_options:    handshake.HandshakeOptions{
+		hsk_options:          handshake.HandshakeOptions{
 			alpn: [opts.alpn]
 		}
 		insecure_skip_verify: opts.insecure

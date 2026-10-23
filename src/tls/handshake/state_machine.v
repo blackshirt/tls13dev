@@ -34,8 +34,8 @@ pub enum HandshakeState {
 // TLS protection phase, and msg holds the wire bytes, header included.
 @[noinit]
 pub struct HandshakeMessage {
-	level EncryptionLevel
-	msg   []u8
+	level EncryptionLevel // protection phase for the message
+	msg   []u8             // complete handshake message bytes, including the header
 }
 
 // level returns the TLS protection phase this message belongs to.
@@ -86,7 +86,7 @@ mut:
 	cipher_suite CipherSuite   // cipher suite selected by the server
 	key_len      int           // encryption key length for the selected cipher suite
 	is_quic      bool          // whether this handshake carries QUIC transport parameters
-	quic_params  ?QuicTransportParameters
+	quic_params  ?QuicTransportParameters // server transport parameters received in EncryptedExtensions
 
 	// Traffic secrets used to protect handshake and application data.
 	handshake_secret  []u8 // secret used to derive handshake traffic keys

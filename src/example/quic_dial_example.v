@@ -30,7 +30,7 @@ fn run() ! {
 	socket.set_read_timeout(10 * time.second)
 
 	mut engine := quic.new_client_engine(server_name, quic.Config{
-		handshake_options: handshake.HandshakeOptions{
+		hsk_options: handshake.HandshakeOptions{
 			alpn: ['h3']
 		}
 	})!

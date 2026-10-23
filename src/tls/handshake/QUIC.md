@@ -379,12 +379,12 @@ The validator in `HandshakeOptions` is optional. If omitted, construction uses
 `pki.default_validator()` and propagates an error if the system root bundle
 cannot be loaded. Supply a custom `pki.Validator` to use private trust roots or
 custom validation policy. The QUIC client constructor requires `server_name`;
-its optional TLS settings are supplied through `quic.Config.handshake_options`.
+its optional TLS settings are supplied through `quic.Config.hsk_options`.
 For example:
 
 ```v
 mut conn := quic.new_client_engine('example.com', quic.Config{
-	handshake_options: handshake.HandshakeOptions{ alpn: ['h3'] }
+	hsk_options: handshake.HandshakeOptions{ alpn: ['h3'] }
 })!
 ```
 

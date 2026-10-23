@@ -191,7 +191,7 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 	ts := fakeserver.test_trust_store()!
 	mut conn := dial(addr,
 		server_name:       fakeserver.server_name
-		handshake_options: handshake.HandshakeOptions{
+		hsk_options: handshake.HandshakeOptions{
 			alpn: ['h2']
 		}
 		root_cas:          ts
@@ -224,7 +224,7 @@ fn test_dial_reassembles_post_handshake_message_across_records() ! {
 	ts := fakeserver.test_trust_store()!
 	mut conn := dial(addr,
 		server_name:       fakeserver.server_name
-		handshake_options: handshake.HandshakeOptions{
+		hsk_options: handshake.HandshakeOptions{
 			alpn: ['h2']
 		}
 		root_cas:          ts

@@ -125,6 +125,8 @@ pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
 	h.client_app_keys = next
 }
 
+// sync_record_keys derives and caches record keys when the core exposes
+// corresponding handshake or application traffic secrets.
 fn (mut h TLSHandshake) sync_record_keys() ! {
 	if h.client_hs_keys.key.len == 0 && h.client_hs_traffic.len > 0 {
 		client_keys := derive_traffic_keys(h.hash_algo, h.client_hs_traffic, h.key_len,
@@ -144,17 +146,20 @@ fn (mut h TLSHandshake) sync_record_keys() ! {
 	}
 }
 
+// wipe_record_keys clears all cached handshake and application record keys.
 fn (mut h TLSHandshake) wipe_record_keys() {
 	wipe_traffic_keys(mut h.client_hs_keys)
 	wipe_traffic_keys(mut h.server_hs_keys)
 	h.wipe_application_keys()
 }
 
+// wipe_application_keys clears the cached client and server application keys.
 fn (mut h TLSHandshake) wipe_application_keys() {
 	wipe_traffic_keys(mut h.client_app_keys)
 	wipe_traffic_keys(mut h.server_app_keys)
 }
 
+// clone_traffic_keys returns an independent copy of a traffic key and IV.
 fn clone_traffic_keys(keys TrafficKeys) TrafficKeys {
 	return TrafficKeys{
 		key: keys.key.clone()
@@ -162,6 +167,7 @@ fn clone_traffic_keys(keys TrafficKeys) TrafficKeys {
 	}
 }
 
+// wipe_secret overwrites a secret buffer before releasing its contents.
 fn wipe_secret(mut secret []u8) {
 	for i in 0 .. secret.len {
 		secret[i] = 0
@@ -169,6 +175,7 @@ fn wipe_secret(mut secret []u8) {
 	secret = []u8{}
 }
 
+// wipe_traffic_keys overwrites and clears the key and IV buffers.
 fn wipe_traffic_keys(mut keys TrafficKeys) {
 	for i in 0 .. keys.key.len {
 		keys.key[i] = 0

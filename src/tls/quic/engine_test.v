@@ -256,7 +256,7 @@ fn test_engine_completes_quic_handshake() ! {
 	// The engine picks random connection IDs, so we build one and learn its
 	// original DCID to key the ferry server.
 	mut eng := new_client_engine(fakeserver.server_name, Config{
-		handshake_options: handshake.HandshakeOptions{
+		hsk_options: handshake.HandshakeOptions{
 			alpn:      ['h3']
 			validator: trusted_validator()
 		}
@@ -342,7 +342,7 @@ fn test_engine_adopts_server_source_cid() ! {
 	// Source CID as its Destination CID. The ferry sends a CID the client never chose,
 	// which is what a real server does; echoing the client's guess hides this.
 	mut eng := new_client_engine(fakeserver.server_name, Config{
-		handshake_options: handshake.HandshakeOptions{
+		hsk_options: handshake.HandshakeOptions{
 			alpn:      ['h3']
 			validator: trusted_validator()
 		}

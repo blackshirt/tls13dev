@@ -86,7 +86,7 @@ mut:
 	// Set before attempting the local close_notify write, preventing retries if
 	// that write fails or close() is called again.
 	close_notify_sent bool
-	// Tracks whether close_socket() has called sock.close(). This is separate
+	// Tracks whether close_tcp_socket() has called sock.close(). This is separate
 	// from `closed`, because handle_alert marks the protocol closed but leaves
 	// the socket for close() to release.
 	sock_closed bool
@@ -126,7 +126,7 @@ pub fn dial(address string, config Config) !&Conn {
 	sock.set_read_timeout(timeout)
 	sock.set_write_timeout(timeout)
 
-	handshake_options := config.handshake_options
+	handshake_options := config.hsk_options
 	mut validator := if configured := handshake_options.validator {
 		configured
 	} else {
@@ -675,7 +675,7 @@ pub fn (mut c Conn) close() ! {
 	}
 	// Idempotent teardown: no second close_notify, no double socket close.
 	if c.closed {
-		c.close_socket()
+		c.close_tcp_socket()
 		return
 	}
 	// Emit close_notify at most once, guarded separately from `closed`.
@@ -690,7 +690,7 @@ pub fn (mut c Conn) close() ! {
 	wipe_tls_protection(mut c.client_hs_cipher)
 	wipe_tls_protection(mut c.server_app_cipher)
 	wipe_tls_protection(mut c.client_app_cipher)
-	c.close_socket()
+	c.close_tcp_socket()
 }
 
 // wipe_on_failure destroys every secret a failed handshake may have derived: the
@@ -725,9 +725,9 @@ fn (mut c Conn) send_failure_alert() {
 	c.write_records([new_record(.alert, payload)]) or {}
 }
 
-// close_socket closes the TCP transport exactly once; `closed` alone cannot be
-// the once-guard, since handle_alert marks closed while leaving the socket open.
-fn (mut c Conn) close_socket() {
+// close_tcp_socket releases the TCP socket without sending TLS shutdown alerts.
+// It is guarded separately because handle_alert marks closed but leaves it open.
+fn (mut c Conn) close_tcp_socket() {
 	if c.sock == unsafe { nil } || c.sock_closed {
 		return
 	}

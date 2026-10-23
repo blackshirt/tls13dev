@@ -41,15 +41,20 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 // conn.read(mut buf), conn.negotiated_alpn(), conn.close() ...
 ```
 
+`Conn.close()` performs TLS shutdown when possible by sending `close_notify`,
+then releases the TCP socket. If the peer has already sent `close_notify`,
+`read()` returns clean EOF but the caller should still call `close()` to release
+the socket.
+
 `Config` exposes the caller-facing knobs: `server_name` (SNI + the name the
-certificate is checked against), `handshake_options` (including offered ALPN
+certificate is checked against), `hsk_options` (including offered ALPN
 protocols — the server's pick is verified against this list), `root_cas`
 (override the system trust store), and `insecure_skip_verify` (test/lab only;
 it removes all authentication). See
 [`docs.md`](docs.md) for the complete API reference — signatures, defaults,
 behavioral guarantees, and usage recipes. Those fields are read-only; because
 `Config` is a `@[params]` struct you customise it by passing named arguments
-straight to `dial()`. ALPN is configured in `handshake_options.alpn` (for
+straight to `dial()`. ALPN is configured in `hsk_options.alpn` (for
 example, `['h2']` to offer HTTP/2). Any field you omit keeps the default
 declared on it (`default_config()` remains an explicit way to build the same
 value).
@@ -140,7 +145,7 @@ named arguments (for example, `new_quic_handshake('example.com', alpn: ['h3'])`)
 Supply a custom validator for private roots or tests.
 Empty preference lists retain the existing defaults; deterministic
 `legacy_session_id` and `random` overrides are for test vectors only.
-`tls.Config.handshake_options` configures the TCP dial path; a validator set
+`tls.Config.hsk_options` configures the TCP dial path; a validator set
 there takes precedence over `root_cas` and `insecure_skip_verify`. Otherwise
 the validator is built from those Config fields. The QUIC package provides
 `quic.Config` for handshake options passed to `new_client_engine(server_name, config)`.

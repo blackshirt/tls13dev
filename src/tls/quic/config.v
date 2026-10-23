@@ -9,6 +9,6 @@ import tls.handshake
 @[params]
 pub struct Config {
 pub:
-	// handshake_options configures certificate validation, ALPN, and ClientHello preferences.
-	handshake_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
+	// hsk_options configures certificate validation, ALPN, and ClientHello preferences.
+	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
 }

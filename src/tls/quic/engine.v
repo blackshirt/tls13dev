@@ -85,7 +85,7 @@ mut:
 // Configure TLS behavior through Config; connection IDs are generated
 // automatically, and Initial keys are derived from the original DCID (§5.2).
 pub fn new_client_engine(server_name string, config Config) !Conn {
-	return new_client_engine_with_ids(server_name, config.handshake_options,
+	return new_client_engine_with_ids(server_name, config.hsk_options,
 		random_cid(8)!, random_cid(8)!)!
 }
 

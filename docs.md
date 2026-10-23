@@ -274,7 +274,7 @@ import tls.handshake
 
 mut conn := tls.dial('example.com:443',
 	server_name: 'example.com'
-	handshake_options: handshake.HandshakeOptions{
+	hsk_options: handshake.HandshakeOptions{
 		alpn: ['h2', 'http/1.1']
 	}
 )!
@@ -324,7 +324,7 @@ without `dial()` supplying every field.
 | Field | Type | Meaning |
 |---|---|---|
 | `server_name` | `string` | SNI value sent and the name the certificate was checked against |
-| `negotiated_alpn` | `string` | The server's ALPN pick — always one of `handshake_options.alpn`, or `''` if none |
+| `negotiated_alpn` | `string` | The server's ALPN pick — always one of `hsk_options.alpn`, or `''` if none |
 
 #### `read`
 
@@ -378,6 +378,8 @@ Sends `close_notify` (encrypted with application keys when they exist, per
 §6.1/§A.4), zeroizes the retained application traffic secrets, and closes the
 TCP socket. <span style="color:#2ea44f">**Idempotent**</span>: a second `close()` neither re-sends `close_notify`
 nor double-closes the socket, and never errors. Use it in a `defer` block.
+If the peer sends `close_notify`, `read()` returns `0` but leaves the TCP socket
+open; call `close()` to release it.
 
 #### `negotiated_alpn`
 
@@ -401,7 +403,7 @@ pub:
 	insecure_skip_verify bool
 	root_cas             ?pki.TrustStore
 	min_rsa_bits         int
-	handshake_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
+	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
 	timeout              time.Duration = 30 * time.second
 }
 ```
@@ -416,7 +418,7 @@ build one up front from `default_config()`).
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
-| `handshake_options` | defaults | ALPN protocols to offer, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. An empty ALPN list offers no ALPN; the server's pick is verified against the offered list. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
+| `hsk_options` | defaults | ALPN protocols to offer, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. An empty ALPN list offers no ALPN; the server's pick is verified against the offered list. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 
 > [!IMPORTANT]
@@ -529,7 +531,7 @@ import tls.handshake
 
 mut conn := tls.dial('example.com:443',
 	server_name: 'example.com'
-	handshake_options: handshake.HandshakeOptions{
+	hsk_options: handshake.HandshakeOptions{
 		alpn: ['http/1.1']
 	}
 ) or {
@@ -650,7 +652,7 @@ recorded session (§7.5).
 | DNS / TCP connect failure | <span style="color:#cf222e">`dial()` error</span> |
 | Socket timeout (read or write) | `dial()` / `read()` / `write()` error after `Config.timeout` |
 | Peer sends a fatal alert during handshake | <span style="color:#cf222e">`dial()` error</span> carrying the alert description |
-| Peer `close_notify` while reading | <span style="color:#2ea44f">`read()` returns `0` (clean EOF)</span> |
+| Peer `close_notify` while reading | <span style="color:#2ea44f">`read()` returns `0` (clean EOF); call `close()` to release the TCP socket</span> |
 | Peer fatal alert (encrypted, post-handshake) | <span style="color:#cf222e">`read()` error</span> carrying the alert description |
 | `write()` after `close()` or before handshake | error, nothing sent |
 | `close()` twice | <span style="color:#2ea44f">no-op, no error, `close_notify` sent at most once</span> |

@@ -16,8 +16,8 @@ pub struct Config {
 pub:
 	// server_name is used for SNI and certificate hostname verification.
 	server_name string
-	// handshake_options configures ALPN, certificate validation, and ClientHello preferences.
-	handshake_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
+	// hsk_options configures ALPN, certificate validation, and ClientHello preferences.
+	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
 	// insecure_skip_verify disables certificate chain and hostname validation (tests only).
 	insecure_skip_verify bool
 	// root_cas, when set, is used instead of the system trust store.
@@ -35,6 +35,6 @@ pub fn default_config(server_name string) Config {
 		server_name:          server_name
 		insecure_skip_verify: false
 		root_cas:             none
-		handshake_options:    handshake.HandshakeOptions{}
+		hsk_options:          handshake.HandshakeOptions{}
 	}
 }
