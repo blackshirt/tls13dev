@@ -369,10 +369,15 @@ fn (mut c Conn) read_raw_record() !Record {
 			// Peek the length field (offset 3) without consuming it; TCP can split records.
 			payload_len := int(u16(c.recv_buf[c.recv_pos + 3]) << 8 | u16(c.recv_buf[c.recv_pos + 4]))
 			if payload_len > max_ciphertext_record_len {
+				c.fail_alert = .record_overflow
 				return error('record: record length ${payload_len} exceeds maximum allowed ${max_ciphertext_record_len}')
 			}
 			total := record_header_len + payload_len
 			if avail >= total {
+				content_type_from_u8(c.recv_buf[c.recv_pos]) or {
+					c.fail_alert = .unexpected_message
+					return err
+				}
 				// Parse directly over the live recv_buf; read_bytes copies the payload out.
 				mut r := wire.new_reader(c.recv_buf[c.recv_pos..c.recv_pos + total])
 				c.recv_pos += total
@@ -511,7 +516,10 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 
 	mut empty_records := 0
 	for {
-		rec := c.read_raw_record()!
+		rec := c.read_raw_record() or {
+			alert := c.fail_alert or { handshake.AlertDescription.decode_error }
+			return c.abort_connection(alert, err.msg())
+		}
 		match rec.content_type {
 			.change_cipher_spec {
 				// RFC 8446 §5: a CCS record is illegal once application keys are in use.
@@ -538,7 +546,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 							// must not spin this loop forever (max_empty_records_per_read).
 							empty_records++
 							if empty_records > max_empty_records_per_read {
-								return error('tls: too many empty application-data records in one read (unexpected_message)')
+								return c.abort_connection(.unexpected_message, 'tls: too many empty application-data records in one read (unexpected_message)')
 							}
 							continue
 						}

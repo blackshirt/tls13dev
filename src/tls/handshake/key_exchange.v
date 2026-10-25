@@ -113,7 +113,9 @@ fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8
 			) or {
 				return h.fail(.illegal_parameter, 'handshake: P-256 key_share is not a valid uncompressed point on the curve (illegal_parameter)')
 			}
-			secret := priv.derive_shared_secret(peer)!
+			secret := priv.derive_shared_secret(peer) or {
+				return h.fail(.internal_error, 'handshake: P-256 ECDH operation failed')
+			}
 			if subtle.constant_time_compare(secret, []u8{len: secret.len, init: 0}) == 1 {
 				return h.fail(.illegal_parameter, 'handshake: computed P-256 shared secret is all-zero value (illegal_parameter)')
 			}

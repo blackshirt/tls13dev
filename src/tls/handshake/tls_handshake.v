@@ -94,8 +94,11 @@ pub fn (mut h TLSHandshake) zeroize_handshake_traffic_secrets() ! {
 }
 
 // record_update_read_traffic_keys ratchets the server application keys after
-// receiving a TLS KeyUpdate (RFC 8446 §7.2).
+// receiving a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
 pub fn (mut h TLSHandshake) record_update_read_traffic_keys() ! {
+	if h.state() != .connected {
+		return error('handshake: cannot update server application traffic keys before the handshake is connected (state: ${h.state()})')
+	}
 	if h.server_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}
@@ -110,8 +113,11 @@ pub fn (mut h TLSHandshake) record_update_read_traffic_keys() ! {
 }
 
 // record_update_write_traffic_keys ratchets the client application keys before
-// sending a TLS KeyUpdate (RFC 8446 §7.2).
+// sending a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
 pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
+	if h.state() != .connected {
+		return error('handshake: cannot update client application traffic keys before the handshake is connected (state: ${h.state()})')
+	}
 	if h.client_ap_traffic.len == 0 {
 		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
 	}

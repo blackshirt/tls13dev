@@ -207,6 +207,9 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 
 // receive_msgs_at_level processes bytes using the encryption-level reassembly buffers
 // owned by the selected transport facade, returning any outbound messages triggered.
+// Initial-level input is accepted only while awaiting ServerHello; handshake-level
+// input is accepted only between ServerHello and Finished. Phase misuse is rejected
+// without consuming bytes or changing state.
 pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: receive_msgs_at_level() before create_client_hello() — no ClientHello has been sent yet')
@@ -222,6 +225,11 @@ pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes 
 			return h.append_and_drain(level, bytes)
 		}
 		.handshake {
+			if h.state != .wait_encrypted_extensions && h.state != .wait_certificate_request
+				&& h.state != .wait_certificate && h.state != .wait_certificate_verify
+				&& h.state != .wait_server_finished {
+				return error('handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state})')
+			}
 			return h.append_and_drain(level, bytes)
 		}
 		.application {

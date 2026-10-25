@@ -123,6 +123,7 @@ fn test_record_unconsumed_bytes_levels_start_empty() ! {
 	assert h.record_unconsumed_bytes(.handshake) == 0
 	assert h.record_unconsumed_bytes(.initial) == 0
 	_ = h.create_client_hello()!
+	h.state = .wait_encrypted_extensions
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
 	_ = h.receive_msgs_at_level(.handshake, [u8(2), 0x00])!
 	assert h.record_unconsumed_bytes(.handshake) == 2
@@ -243,7 +244,9 @@ fn test_feed_rejects_out_of_order_message() ! {
 	_ = h.create_client_hello()!
 	cert := wrap_hs(.certificate, []u8{len: 4, init: 0x01})
 	h.receive_msgs_at_level(.handshake, cert) or {
+		assert err.msg().contains('only expected after ServerHello')
 		assert h.record_unconsumed_bytes(.handshake) == 0
+		assert h.state() == .wait_server_hello
 		return
 	}
 	assert false
@@ -310,15 +313,16 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	assert false
 }
 
-// test_feed_reassembly_is_bounded_after_connected checks that late bytes after
-// .connected trip the reassembly cap instead of growing memory.
-fn test_feed_reassembly_is_bounded_after_connected() ! {
+// test_feed_handshake_level_after_connected_refused checks that the handshake
+// API refuses handshake-flight input after Finished without buffering it.
+fn test_feed_handshake_level_after_connected_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.state = .connected
-	h.receive_msgs_at_level(.handshake, []u8{len: handshake_header_len + max_handshake_message_len + 1, init: 0xAA}) or {
-		assert err.msg().contains('reassembly exceeds')
-		assert h.state == .failed
+	h.receive_msgs_at_level(.handshake, wrap_hs(.new_session_ticket, [u8(0)])) or {
+		assert err.msg().contains('only expected after ServerHello')
+		assert h.state == .connected
+		assert h.record_unconsumed_bytes(.handshake) == 0
 		return
 	}
 	assert false
@@ -418,6 +422,7 @@ fn test_zeroize_app_secrets_clears_and_refuses() ! {
 // ratchet refuses while the application traffic secrets are still empty.
 fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.state = .connected
 	h.record_update_read_traffic_keys() or {
 		assert err.msg().contains('server application traffic secret')
 		h.record_update_write_traffic_keys() or {
@@ -430,10 +435,38 @@ fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
 	assert false
 }
 
+// test_record_update_traffic_keys_refuse_before_connected ensures a caller
+// cannot ratchet secrets merely because they are present in the core.
+fn test_record_update_traffic_keys_refuse_before_connected() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.server_ap_traffic = []u8{len: 32, init: 1}
+	h.client_ap_traffic = []u8{len: 32, init: 2}
+	old_server := h.server_ap_traffic.clone()
+	old_client := h.client_ap_traffic.clone()
+
+	h.record_update_read_traffic_keys() or {
+		assert err.msg().contains('before the handshake is connected')
+		assert h.state() == .start
+		assert h.server_ap_traffic == old_server
+		assert h.app_keys.server.key.len == 0
+		h.record_update_write_traffic_keys() or {
+			assert err.msg().contains('before the handshake is connected')
+			assert h.state() == .start
+			assert h.client_ap_traffic == old_client
+			assert h.app_keys.client.key.len == 0
+			return
+		}
+		assert false
+		return
+	}
+	assert false
+}
+
 // test_record_update_traffic_keys_ratchet_forward checks that the ratchet
 // advances the secrets and rebuilds the cached keys (§7.2).
 fn test_record_update_traffic_keys_ratchet_forward() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.state = .connected
 	h.server_ap_traffic = []u8{len: 32, init: 1}
 	h.client_ap_traffic = []u8{len: 32, init: 2}
 	old_server := h.server_ap_traffic.clone()
@@ -452,6 +485,7 @@ fn test_record_update_traffic_keys_ratchet_forward() ! {
 // after teardown is refused instead of resurrecting the secret.
 fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.state = .connected
 	h.client_ap_traffic = [u8(1), 2, 3]
 	h.app_keys.client = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
 	h.zeroize_app_secrets()
@@ -551,6 +585,7 @@ fn test_traffic_keys_returns_independent_copies() ! {
 // superseded generation is zeroed in place after the ratchet.
 fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.state = .connected
 	h.server_ap_traffic = []u8{len: 32, init: 7}
 	h.app_keys.server = TrafficKeys{ key: [u8(9), 9, 9], iv: [u8(9)] }
 	// Aliases into the old generation, captured before the ratchet runs.

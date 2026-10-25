@@ -49,7 +49,10 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	h.update_transcript(full_sh_msg)!
 
 	// §7.1 handshake phase: derive the Handshake Secret and the client/server handshake traffic secrets.
-	shared_secret := h.compute_shared_secret(sh.server_share)!
+	mut shared_secret := h.compute_shared_secret(sh.server_share)!
+	defer {
+		wipe_secret(mut shared_secret)
+	}
 
 	// The handshake secret is retained because the Master Secret derives from it.
 	th_ch_sh := h.transcript.current_hash()

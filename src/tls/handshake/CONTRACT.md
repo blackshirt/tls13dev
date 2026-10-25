@@ -60,6 +60,9 @@ they are not part of the shared handshake API. The same `EncryptionLevel`
 (`handshake` or `application`) selects TLS-derived secrets; `initial` has none.
 Here `initial` denotes the initial TLS handshake phase, not QUIC Initial packet
 protection.
+Initial-level input is accepted only while awaiting ServerHello; handshake-level
+input is accepted only after ServerHello and before Finished. Out-of-phase API
+calls are rejected without consuming input or changing handshake state.
 Each handshake core owns its phase-specific reassembly buffers and
 consumes complete TLS messages. An empty result can mean that input is
 incomplete or that a message advanced the state without producing output;
@@ -73,7 +76,8 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 - `record_unconsumed_bytes()` lets the record adapter enforce the
   ServerHello record-boundary rule.
 - `record_update_read_traffic_keys()` and
-  `record_update_write_traffic_keys()` implement TLS KeyUpdate.
+  `record_update_write_traffic_keys()` implement TLS KeyUpdate and are valid
+  only after the handshake reaches `.connected`.
 - `zeroize_handshake_traffic_secrets()` destroys handshake traffic secrets once
   the adapter no longer needs them; the record facade also wipes its cached
   handshake keys. This is cleanup, not a handshake-confirmation signal.

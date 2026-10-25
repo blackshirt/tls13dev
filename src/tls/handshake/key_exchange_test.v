@@ -130,6 +130,23 @@ fn test_rejects_compressed_p256_share() ! {
 	}
 }
 
+// test_rejects_invalid_uncompressed_p256_share checks that a correctly sized,
+// uncompressed encoding of an off-curve point is treated as a peer error.
+fn test_rejects_invalid_uncompressed_p256_share() ! {
+	mut h := core_with_group(.secp256r1)!
+	mut share := []u8{len: 65, init: 0}
+	share[0] = 0x04
+	mut rejected := false
+	h.compute_shared_secret(KeyShareEntry{
+		group:        .secp256r1
+		key_exchange: share
+	}) or {
+		assert h.fail_alert == .illegal_parameter
+		rejected = true
+	}
+	assert rejected, 'an off-curve P-256 share must be rejected'
+}
+
 // test_valid_x25519_share_is_accepted guards against an over-tight rejection:
 // a genuine random peer share must produce its matching shared secret.
 fn test_valid_x25519_share_is_accepted() ! {

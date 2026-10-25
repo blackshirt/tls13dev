@@ -160,9 +160,30 @@ fn test_read_bounds_empty_record_flood() ! {
 	}
 	c.read(mut buf) or {
 		assert err.msg().contains('too many empty application-data records')
+		assert c.closed
+		assert c.fatal_error == err.msg()
+		assert c.hs.state() == .failed
 		return
 	}
 	assert false, 'an empty-record flood must not spin read() forever'
+}
+
+// test_malformed_record_fails_closed checks that record-framing errors become
+// sticky connection failures instead of leaving the read cipher usable.
+fn test_malformed_record_fails_closed() ! {
+	mut c := new_test_conn()!
+	c.recv_buf << [u8(0x7f), 0x03, 0x03, 0x00, 0x00]
+	mut buf := []u8{len: 1}
+	c.read(mut buf) or {
+		assert err.msg().contains('invalid content type')
+		assert c.closed
+		assert c.fatal_error == err.msg()
+		pinned := c.fail_alert or { panic('malformed record must set a fatal alert') }
+		assert pinned == handshake.AlertDescription.unexpected_message
+		assert c.hs.state() == .failed
+		return
+	}
+	assert false, 'an invalid record content type must fail closed'
 }
 
 // test_post_handshake_reassembly_is_bounded checks that a peer streaming

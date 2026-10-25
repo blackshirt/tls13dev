@@ -299,9 +299,10 @@ hs.zeroize_handshake_traffic_secrets()!
   handshake core's level-specific reassembly buffer and consumes every complete
   message immediately. Separate handshaker instances have separate core state.
   Returned messages are the outbound follow-ups triggered by the peer's bytes.
-  Contract misuse (feeding before `create_client_hello()`, plaintext bytes
-  outside the ServerHello wait, anything after `failed`) is refused with the state left
-  untouched so you can fix your sequencing.
+  Contract misuse (feeding before `create_client_hello()`, initial-level bytes
+  outside the ServerHello wait, handshake-level bytes before ServerHello or
+  after Finished, anything after `failed`) is refused without consuming input
+  or changing state so you can fix your sequencing.
 - **`record_unconsumed_bytes(level)`** is available only on `TLSHandshake`.
   The TCP adapter uses it for the §5.1 ServerHello record-boundary rule. The
   `QuicHandshake` has no record-boundary accessor.
