@@ -16,39 +16,59 @@ pub const max_cert_chain_depth = 32
 // (server) certificate (NIST SP 800-57 / CA-Browser Forum require ≥2048).
 pub const default_min_rsa_bits = 2048
 
+// min_rsa_bits_floor is the hard lower bound for an explicitly configured RSA
+// leaf-key floor. Values below it are a broken-crypto typo, not a legitimate
+// legacy-interop downgrade, so set_min_rsa_bits clamps them up to this bound.
+pub const min_rsa_bits_floor = 1024
+
 // Validator verifies certificate chains against trusted roots and hostnames.
 @[noinit]
 pub struct Validator {
 mut:
 	store                TrustStore // roots the chain must anchor to
-	insecure_skip_verify bool       // skips chain and hostname checks; testing only
+	insecure_skip_verify bool       // set only via new_insecure_validator; skips every check
 	// min_rsa_bits floors the accepted size of an RSA leaf (server) public key;
 	// 0 means default_min_rsa_bits (lower = deliberate downgrade).
 	min_rsa_bits int
 }
 
-// new_validator creates a Validator with the default RSA floor (2048 bits).
-pub fn new_validator(store TrustStore, insecure bool) Validator {
+// new_validator creates a Validator that always performs chain, hostname and
+// key-strength verification against the given trust store. It is the only
+// general-purpose constructor: there is no flag that can silently turn
+// verification off. Use it for every real peer.
+pub fn new_validator(store TrustStore) Validator {
 	return Validator{
-		store:                store
-		insecure_skip_verify: insecure
+		store:        store
+		min_rsa_bits: default_min_rsa_bits
+	}
+}
+
+// new_insecure_validator creates a Validator that skips ALL certificate chain and
+// hostname verification. It exists so the dangerous intent is spelled out at the
+// call site instead of hidden in a positional `true`. Never use it to validate a
+// real peer; it is for tests and deliberate local experiments only.
+pub fn new_insecure_validator() Validator {
+	return Validator{
+		store:                new_trust_store()
+		insecure_skip_verify: true
 		min_rsa_bits:         default_min_rsa_bits
 	}
 }
 
 // default_validator creates a validator using the system root CA bundle.
 pub fn default_validator() !Validator {
-	return new_validator(system_root_cas()!, false)
+	return new_validator(system_root_cas()!)
 }
 
-// set_min_rsa_bits overrides the RSA leaf-key floor (0 restores the default);
-// lowering it is a deliberate security downgrade.
+// set_min_rsa_bits overrides the RSA leaf-key floor (0 restores the default).
+// A deliberate downgrade is honored only down to min_rsa_bits_floor; anything
+// lower is clamped up, so the escape hatch cannot silently accept breakable keys.
 pub fn (mut v Validator) set_min_rsa_bits(bits int) {
 	if bits <= 0 {
 		v.min_rsa_bits = default_min_rsa_bits
 		return
 	}
-	v.min_rsa_bits = bits
+	v.min_rsa_bits = if bits < min_rsa_bits_floor { min_rsa_bits_floor } else { bits }
 }
 
 // effective_min_rsa_bits returns the floor in force, applying the default when zero.
@@ -169,17 +189,27 @@ fn chain_has_trusted_anchor(chain []Certificate, roots []Certificate, now i64) b
 			if now < root.not_before_unix || now > root.not_after_unix {
 				continue
 			}
+			// A trust anchor must be a CA. Without this check a leaf that was
+			// misguidedly added to the store via add_der would anchor any chain
+			// it happens to have signed (RFC 5280 §6.1.1 anchors are CA certs).
+			if !root.is_ca {
+				continue
+			}
+			// If the anchor asserts keyUsage it must include keyCertSign (bit 5);
+			// mirrors the same rule applied to intermediates at chain index i+1.
+			// Absent keyUsage is unconstrained, per RFC 5280 §4.2.1.3.
+			if root.has_key_usage && !key_usage_bit(root.key_usage, 5) {
+				continue
+			}
 			if cert.raw == root.raw {
 				return true
 			}
 			if cert.issuer_dn != root.subject_dn {
 				continue
 			}
-			// A failed signature under this root is not fatal: another stored
-			// root may share the subject.
-			if verify_cert_signature(cert, root) or { false } {
-				return true
-			}
+			// Failed under this root — another may share the subject.
+			verify_cert_signature(cert, root) or { continue }
+			return true
 		}
 	}
 	return false
@@ -212,11 +242,15 @@ fn enforce_name_constraints(ca Certificate, child Certificate) ! {
 	if !child.has_san && child.subject_cn != '' {
 		dns_names = [child.subject_cn]
 	}
+	// RFC 5280 §4.2.1.10 treats permittedSubtrees as one namespace across forms,
+	// so gate on the union — a per-form check would let an IP-only set exempt dNS
+	// names and vice versa. Excluded subtrees stay per-form.
+	permitted_any := ca.permitted_dns.len > 0 || ca.permitted_ip.len > 0
 	for name in dns_names {
 		if ca.excluded_dns.len > 0 && dns_in_any_subtree(name, ca.excluded_dns) {
 			return error('dNSName "${name}" is within an excluded subtree')
 		}
-		if ca.permitted_dns.len > 0 && !dns_in_any_subtree(name, ca.permitted_dns) {
+		if permitted_any && !dns_in_any_subtree(name, ca.permitted_dns) {
 			return error('dNSName "${name}" is outside the permitted subtrees')
 		}
 	}
@@ -224,7 +258,7 @@ fn enforce_name_constraints(ca Certificate, child Certificate) ! {
 		if ca.excluded_ip.len > 0 && ip_in_any_subtree(ip, ca.excluded_ip) {
 			return error('iPAddress ${ip} is within an excluded subtree')
 		}
-		if ca.permitted_ip.len > 0 && !ip_in_any_subtree(ip, ca.permitted_ip) {
+		if permitted_any && !ip_in_any_subtree(ip, ca.permitted_ip) {
 			return error('iPAddress ${ip} is outside the permitted subtrees')
 		}
 	}
@@ -290,8 +324,9 @@ fn ip_within_subtree(ip []u8, subtree []u8) bool {
 	return true
 }
 
-// verify_cert_signature verifies that `child` was signed by `parent`.
-fn verify_cert_signature(child Certificate, parent Certificate) !bool {
+// verify_cert_signature verifies that `child` was signed by `parent`. Failure
+// is signaled only by an error — no bool for the caller to silently discard.
+fn verify_cert_signature(child Certificate, parent Certificate) ! {
 	match parent.public_key_algo {
 		.rsa {
 			rsa_key := parent.rsa_public_key or {
@@ -327,10 +362,11 @@ fn verify_cert_signature(child Certificate, parent Certificate) !bool {
 
 			hash := digest_bytes(digest_type, child.tbs_raw)!
 
+			// `!` drops rsa.v's bool; an Ok(false) must not pass here.
 			if is_pss {
-				return rsa_key.verify_pss(digest_type, hash, child.signature)
+				rsa_key.verify_pss(digest_type, hash, child.signature)!
 			} else {
-				return rsa_key.verify_pkcs1_v1_5(digest_type, hash, child.signature)
+				rsa_key.verify_pkcs1_v1_5(digest_type, hash, child.signature)!
 			}
 		}
 		.ecdsa {
@@ -338,11 +374,9 @@ fn verify_cert_signature(child Certificate, parent Certificate) !bool {
 			// ECDSA carries no hash parameter; the digest is hashed inside verify.
 			match child.signature_algo_oid {
 				'1.2.840.10045.4.3.2', '1.2.840.10045.4.3.3', '1.2.840.10045.4.3.4' {
-					ok := pubkey.verify(child.tbs_raw, child.signature)!
-					if !ok {
+					if !pubkey.verify(child.tbs_raw, child.signature)! {
 						return error('pki: ECDSA signature verification failed')
 					}
-					return true
 				}
 				else {
 					return error('pki: unsupported ECDSA signature OID ${child.signature_algo_oid}')
@@ -354,11 +388,9 @@ fn verify_cert_signature(child Certificate, parent Certificate) !bool {
 			if parent.public_key_raw.len != ed25519.public_key_size {
 				return error('pki: invalid Ed25519 public key length')
 			}
-			ok := ed25519.verify(ed25519.PublicKey(parent.public_key_raw), child.tbs_raw, child.signature)!
-			if !ok {
+			if !ed25519.verify(ed25519.PublicKey(parent.public_key_raw), child.tbs_raw, child.signature)! {
 				return error('pki: Ed25519 signature verification failed')
 			}
-			return true
 		}
 		else {
 			return error('pki: signature verification for ${parent.public_key_algo} not yet implemented')

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// rsa.v implements raw RSA / RSASSA-PKCS1-v1_5 verification over math.big integers;
-// ECDSA and PSS paths route through the crypto packages.
+// rsa.v decodes PKCS #1 RSAPublicKey DER and verifies RSASSA-PKCS1-v1_5 and
+// RSASSA-PSS chain signatures. ECDSA and Ed25519 dispatch to crypto.* packages.
 module pki
 
 import math.big
@@ -26,6 +26,7 @@ const max_rsa_modulus_bytes = 1024
 
 // parse_rsa_public_key parses an RSA public key from ASN.1 DER (PKCS #1 RSAPublicKey).
 // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+@[direct_array_access]
 fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	// der is the full DER-encoded SEQUENCE (tag 0x30 + length + contents).
 	// Unwrap the outer SEQUENCE to get its contents, then parse the two INTEGERs.

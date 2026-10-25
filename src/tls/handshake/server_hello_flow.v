@@ -9,17 +9,22 @@ module handshake
 fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMessage {
 	if h.state != .wait_server_hello {
 		// Strict ordering: a ServerHello is only legal while we await it (§4.4.1).
-		return h.fail(.unexpected_message, 'handshake: unexpected ServerHello in state ${h.state}')
+		return h.classify_failure(.unexpected_message, 'handshake: unexpected ServerHello in state ${h.state}')
 	}
 
 	// Peel the 4-byte handshake header (type || 3-byte length) to bound the body (§4).
-	msg_type, body := split_handshake_message(sh_msg)!
+	msg_type, body := split_handshake_message(sh_msg) or {
+		return h.classify_failure(.decode_error, err.msg())
+	}
 	if msg_type != .server_hello {
 		// HelloRetryRequest reuses the ServerHello type value (2) and is told apart only by the sentinel random (§4.1.3).
-		return h.fail(.unexpected_message, 'handshake: expected ServerHello (2), got ${msg_type}')
+		return h.classify_failure(.unexpected_message, 'handshake: expected ServerHello (2), got ${msg_type}')
 	}
 	// Transport framing boundaries are enforced by adapters; reassembly hands this method one complete handshake message.
-	sh := parse_server_hello(body)! // §4.1.3 field decode plus the §4.2 extension allowlist
+	// §4.1.3 field decode plus the §4.2 extension allowlist.
+	sh := parse_server_hello(body) or {
+		return h.classify_failure(.decode_error, err.msg())
+	}
 	// Re-frame header + body so the transcript covers the exact wire layout.
 	full_sh_msg := wrap_handshake_message(.server_hello, body)
 
@@ -28,18 +33,18 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	}
 
 	// Normal ServerHello: validate echoed fields and that a key share was selected for our group; (EC)DHE cannot proceed without one.
-	sh.validate(&h.config) or { return h.fail(.illegal_parameter, err.msg()) }
+	sh.validate(&h.config) or { return h.classify_failure(.illegal_parameter, err.msg()) }
 	// §4.1.4: after a HelloRetryRequest the ServerHello suite must match the HRR's.
 	if hrr_suite := h.hrr_cipher_suite {
 		if hrr_suite != sh.cipher_suite {
-			return h.fail(.illegal_parameter, 'handshake: ServerHello cipher suite ${sh.cipher_suite} differs from HelloRetryRequest suite ${hrr_suite} (illegal_parameter)')
+			return h.classify_failure(.illegal_parameter, 'handshake: ServerHello cipher suite ${sh.cipher_suite} differs from HelloRetryRequest suite ${hrr_suite} (illegal_parameter)')
 		}
 	}
 	if !sh.has_key_share {
-		return h.fail(.illegal_parameter, 'handshake: ServerHello missing key_share extension')
+		return h.classify_failure(.illegal_parameter, 'handshake: ServerHello missing key_share extension')
 	}
 	if sh.server_share.group != h.ecdhe_group {
-		return h.fail(.illegal_parameter, 'handshake: ServerHello key_share group ${sh.server_share.group} does not match offered group ${h.ecdhe_group}')
+		return h.classify_failure(.illegal_parameter, 'handshake: ServerHello key_share group ${sh.server_share.group} does not match offered group ${h.ecdhe_group}')
 	}
 
 	// The suite fixes both hash and key length; set them before deriving secrets.
@@ -69,21 +74,21 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 // transcript, and returns the retried ClientHello (RFC 8446 §4.1.4).
 fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg []u8) ![]HandshakeMessage {
 	// §4.1.4: validate shared fields, reject a second HelloRetryRequest, and require that the request actually changes something.
-	sh.validate(&h.config) or { return h.fail(.illegal_parameter, err.msg()) }
+	sh.validate(&h.config) or { return h.classify_failure(.illegal_parameter, err.msg()) }
 	if h.hrr_received {
-		return h.fail(.unexpected_message, 'handshake: received second HelloRetryRequest (unexpected_message)')
+		return h.classify_failure(.unexpected_message, 'handshake: received second HelloRetryRequest (unexpected_message)')
 	}
 
 	if !sh.has_key_share && sh.cookie.len == 0 {
-		return h.fail(.illegal_parameter, 'handshake: HelloRetryRequest would not change the ClientHello (illegal_parameter)')
+		return h.classify_failure(.illegal_parameter, 'handshake: HelloRetryRequest would not change the ClientHello (illegal_parameter)')
 	}
 	if sh.has_key_share {
 		// The requested group must be offered and differ from the one already sent a key share for (§4.2.8).
 		if sh.server_share.group !in offered_groups(&h.config) {
-			return h.fail(.illegal_parameter, 'handshake: HelloRetryRequest requested unoffered group ${sh.server_share.group} (illegal_parameter)')
+			return h.classify_failure(.illegal_parameter, 'handshake: HelloRetryRequest requested unoffered group ${sh.server_share.group} (illegal_parameter)')
 		}
 		if sh.server_share.group == h.config.client_share.group {
-			return h.fail(.illegal_parameter, 'handshake: HelloRetryRequest reselected the already-offered group ${sh.server_share.group} (illegal_parameter)')
+			return h.classify_failure(.illegal_parameter, 'handshake: HelloRetryRequest reselected the already-offered group ${sh.server_share.group} (illegal_parameter)')
 		}
 	}
 

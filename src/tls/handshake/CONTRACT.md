@@ -55,6 +55,21 @@ failure handling. Clearing verbs are tiered: `wipe_*` zeroes bytes or handles (t
 mechanism), `zeroize_*` clears secret material under lifecycle guard rules (RFC 8446
 §7.5), and `destroy_*` tears down a whole adapter connection.
 
+Within the core, a classified handshake failure is one atomic concept: the private
+`classify_failure(alert, message)` primitive pins the alert `failure_alert()` will
+surface, calls `fail_and_zeroize_secrets()` to zeroize the derived secrets and park
+the machine in `.failed`, and returns the `IError` to propagate. No call site can
+produce one of those steps without the others, so a peer-triggered decode error both
+tears down and reports the RFC-correct alert (e.g. `decode_error` for a malformed
+message) rather than a stale default. Every handshake-level and ServerHello-path
+parse/framing failure routes through it; `append_and_drain()` keeps an
+`or { fail_and_zeroize_secrets() }` safety net for any non-classified internal error
+(teardown is idempotent, so the belt-and-suspenders call is harmless). On the record
+facade this still triggers the cached-record-key wipe: `TLSHandshake.receive_msgs_at_level()`
+detects the `.failed` state and drops its `TrafficKeys`. Out-of-phase API guards in
+`receive_msgs_at_level()` deliberately return a plain error *without* `classify_failure`,
+so a rejected mis-ordered call cannot discard usable keys.
+
 `create_client_hello()` returns the initial, complete handshake message.
 The constructors require only `server_name`. Optional named
 `HandshakeOptions` fields can be passed to `new_tls_handshake()` or
@@ -81,6 +96,13 @@ Each handshake core owns its phase-specific reassembly buffers and
 consumes complete TLS messages. An empty result can mean that input is
 incomplete or that a message advanced the state without producing output;
 adapters use `state()` to observe progress and errors to detect invalid input.
+Key-material readiness, however, is queried through `available_secret_phases()`
+rather than inferred from `state()`: it reports which traffic-secret phases the
+core currently holds (`handshake`, `application`), returning false for a phase
+whose secrets are absent or already zeroized. Both the record and QUIC adapters
+call it to decide when to install transport keys, so that decision lives in one
+place and a `.failed` handshake (whose schedule is wiped) never presents stale
+readiness.
 
 ## Record-only operations
 
@@ -137,8 +159,9 @@ frame or encrypt transport records or packets.
 
 ## Future API work
 
-`receive_msgs_at_level()` still returns only outbound messages. Adapters continue to observe
-`state()` to determine milestones such as handshake-key readiness. A structured
-progress result could make those milestones explicit later, once both adapters
-can migrate without changing message ordering, alert classification, or secret
-lifetimes.
+`receive_msgs_at_level()` still returns only outbound messages. Handshake-key
+readiness is no longer inferred from `state()` — both adapters now use the
+centralized `available_secret_phases()` query — but a full structured progress
+*return value* (naming milestones such as ServerHello-done or connected as part of
+each receive) remains future work, to be added only if both adapters can migrate
+without changing message ordering, alert classification, or secret lifetimes.

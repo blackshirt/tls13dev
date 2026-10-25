@@ -455,9 +455,12 @@ fn (mut e Conn) queue_outbound(m handshake.HandshakeMessage) ! {
 // exported traffic secrets as soon as each level becomes available
 // (RFC 9001 §5.1). It is idempotent: keys are only installed once.
 fn (mut e Conn) install_exported_keys() ! {
-	state := e.hs.state()
-	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none
-		&& state != .start && state != .wait_server_hello {
+	// Readiness comes from the core's secret-phase query, not from decoding
+	// HandshakeState: a phase is true exactly while both directions' traffic secrets
+	// exist, so a .failed handshake (schedule wiped) never reaches these expands with
+	// zeroized secrets. The adapter keeps its own install-once flags.
+	phases := e.hs.available_secret_phases()
+	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none && phases.handshake {
 		ck, sk := e.hs.quic_traffic_secrets(.handshake)!
 		suite := e.hs.negotiated_cipher_suite()
 		chash := handshake.suite_hash_algo(suite)
@@ -467,7 +470,7 @@ fn (mut e Conn) install_exported_keys() ! {
 		e.handshake_tx = new_protection(client_keys, suite)!
 		e.handshake_rx = new_protection(server_keys, suite)!
 	}
-	if e.hs.state() == .connected && e.app_tx == none && e.app_rx == none {
+	if phases.application && e.app_tx == none && e.app_rx == none {
 		ck, sk := e.hs.quic_traffic_secrets(.application)!
 		suite := e.hs.negotiated_cipher_suite()
 		chash := handshake.suite_hash_algo(suite)

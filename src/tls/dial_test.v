@@ -458,6 +458,58 @@ fn test_dial_sends_fatal_alert_on_certificate_verify_failure() ! {
 	expect_dial_failure(addr, 'CertificateVerify failed', res_ch)!
 }
 
+// bad_record_mac_script drives the client to fail AEAD decryption of a bogus record
+// sent under the handshake keys, and checks it answers with a fatal bad_record_mac
+// alert — the handshake phase must classify a non-opening record exactly like the
+// read() path does, not fall back to the stale .internal_error default.
+fn bad_record_mac_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+
+	mut srv := fakeserver.new_server() or {
+		return error('fakeserver: ${err.msg()}')
+	}
+	fl := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH: ${err.msg()}') }
+	// A valid ServerHello so the client derives and installs its handshake keys.
+	c.write(new_record(.handshake, fl.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+	// Then an outer application_data record that cannot AEAD-open under those keys.
+	c.write(new_record(.application_data, []u8{len: 28, init: 0xa5}).serialize()) or { return err }
+
+	// The client answers with a fatal alert encrypted under its client handshake keys.
+	alert_rec := scripted_read_record(mut c)!
+	if alert_rec.content_type != .application_data {
+		return error('client alert has outer type ${alert_rec.content_type}, expected application_data (encrypted)')
+	}
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_tls_protection(caead, civ)!
+	dec := cdec.decrypt_record(alert_rec)!
+	if dec.content_type != .alert {
+		return error('client sent inner type ${dec.content_type}, expected alert')
+	}
+	peer_alert := handshake.parse_alert(dec.plaintext)!
+	if peer_alert.level != .fatal {
+		return error('client alert level is ${peer_alert.level}, expected fatal')
+	}
+	if peer_alert.description != .bad_record_mac {
+		return error('client alert is ${peer_alert.description}, expected bad_record_mac')
+	}
+}
+
+// test_dial_sends_bad_record_mac_on_undecryptable_flight checks that a record that
+// will not open under the handshake keys yields a fatal bad_record_mac alert.
+fn test_dial_sends_bad_record_mac_on_undecryptable_flight() ! {
+	addr, res_ch := start_scripted_server(bad_record_mac_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	expect_dial_failure(addr, 'AEAD decryption failed', res_ch)!
+}
+
 // alert_back_pre_sh_script answers the ClientHello with a malformed ServerHello
 // body that fails before any keys are derived, then reads the plaintext alert.
 fn alert_back_pre_sh_script(mut c net.TcpConn) ! {

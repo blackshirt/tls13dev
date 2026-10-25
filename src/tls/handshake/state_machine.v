@@ -209,8 +209,37 @@ pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
 
-fn (mut h HandshakeCore) fail(alert AlertDescription, message string) IError {
+// SecretPhases reports which TLS traffic-secret phases the core currently holds
+// (derived and not yet zeroized). It is transport-neutral: the record adapter
+// expands these into TLS record keys and the QUIC adapter into packet keys. A
+// phase is true only while both directions' secrets are present, so it goes false
+// again after zeroize_traffic_secrets() for that level or after a failure wipes the
+// schedule. This lets adapters install their transport keys when the material
+// actually exists instead of re-deriving readiness from HandshakeState.
+pub struct SecretPhases {
+pub:
+	handshake   bool // client+server handshake traffic secrets available
+	application bool // client+server application traffic secrets available
+}
+
+// available_secret_phases reports the current key-material readiness.
+pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
+	return SecretPhases{
+		handshake:   h.client_hsk_traffic.len > 0 && h.server_hsk_traffic.len > 0
+		application: h.client_app_traffic.len > 0 && h.server_app_traffic.len > 0
+	}
+}
+
+// classify_failure is the single terminal-failure primitive for the core: it
+// pins the alert the adapter must surface, zeroes every derived secret (via
+// fail_and_zeroize_secrets), parks the machine in .failed, and returns the IError
+// for the caller to propagate (RFC 8446 §7.5). It never recovers a connection.
+// Named for what it does now — classify AND tear down — so a call site cannot
+// record an alert and forget to zeroize. Idempotent, so an outer receive-loop
+// safety net (fail_and_zeroize_secrets) remains harmless when it re-runs teardown.
+fn (mut h HandshakeCore) classify_failure(alert AlertDescription, message string) IError {
 	h.fail_alert = alert
+	h.fail_and_zeroize_secrets()
 	return error(message)
 }
 
@@ -218,7 +247,7 @@ fn (mut h HandshakeCore) fail(alert AlertDescription, message string) IError {
 // total-size bound into the alert-classified failure the state machine reports.
 fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 	h.transcript.update(msg) or {
-		return h.fail(.decode_error, err.msg())
+		return h.classify_failure(.decode_error, err.msg())
 	}
 }
 
@@ -271,7 +300,11 @@ pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes 
 }
 
 // append_and_drain bounds each append before allocating, while still allowing a
-// transport to deliver multiple complete messages in one call.
+// transport to deliver multiple complete messages in one call. Every classified
+// failure inside already tears the core down (classify_failure); the fail_and_zeroize_secrets()
+// safety nets below catch any error that did not come from a classify_failure
+// (a non-panicking accessor that returned `err`, for example) — teardown is
+// idempotent, so the belt-and-suspenders call is harmless.
 fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	mut offset := 0
@@ -285,9 +318,7 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 		available := limit - buffer_len
 		if offset < bytes.len && available == 0 {
 			alert := if level == .initial { 'initial-level' } else { 'handshake-level' }
-			err := h.fail(.decode_error, 'handshake: ${alert} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
-			h.fail_and_zeroize_secrets()
-			return err
+			return h.classify_failure(.decode_error, 'handshake: ${alert} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 		}
 		take := if bytes.len - offset > available { available } else { bytes.len - offset }
 		if take > 0 {
@@ -322,11 +353,16 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 fn (mut h HandshakeCore) drain_initial() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state == .wait_server_hello {
-		msg := next_recordless_message(mut h.init_buf)!
+		msg := next_recordless_message(mut h.init_buf) or {
+			return h.classify_failure(.decode_error, err.msg())
+		}
 		if msg.len == 0 {
 			break // header or body still incomplete
 		}
-		out << h.handle_server_hello_message(msg)!
+		out_msgs := h.handle_server_hello_message(msg) or {
+			return err // classified inside the ServerHello handler
+		}
+		out << out_msgs
 		if h.state != .wait_server_hello {
 			break // ServerHello consumed (or failed); an HRR rearms the wait
 		}
@@ -340,11 +376,16 @@ fn (mut h HandshakeCore) drain_initial() ![]HandshakeMessage {
 fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state != .connected && h.state != .failed {
-		msg := next_recordless_message(mut h.hsk_buf)!
+		msg := next_recordless_message(mut h.hsk_buf) or {
+			return h.classify_failure(.decode_error, err.msg())
+		}
 		if msg.len == 0 {
 			break
 		}
-		out << h.handle_handshake_message(msg)!
+		out_msgs := h.handle_handshake_message(msg) or {
+			return err // classified inside the encrypted-flight handlers
+		}
+		out << out_msgs
 	}
 	return out
 }
@@ -367,7 +408,9 @@ pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 // EE, optional CertificateRequest, Certificate, CertificateVerify, or Finished.
 fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMessage {
 	// The message is complete by construction (reassembly framed it by its own header), so peel type/length and split the body off.
-	msg_type, body := split_handshake_message(full_msg)!
+	msg_type, body := split_handshake_message(full_msg) or {
+		return h.classify_failure(.decode_error, err.msg())
+	}
 
 	match msg_type {
 		.encrypted_extensions { return h.handle_encrypted_extensions(full_msg, body) }
@@ -376,7 +419,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 		.certificate_verify { return h.handle_certificate_verify(full_msg, body) }
 		.finished { return h.handle_finished(full_msg, body) }
 		else {
-			return h.fail(.unexpected_message, 'handshake: unexpected handshake message ${msg_type}')
+			return h.classify_failure(.unexpected_message, 'handshake: unexpected handshake message ${msg_type}')
 		}
 	}
 }

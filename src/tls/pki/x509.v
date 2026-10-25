@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// x509.v decodes DER-encoded X.509 v3 certificates into a Certificate: subject
-// and issuer names, validity window, public key, signature algorithm and the
-// SAN/basic-constraints extensions validator.v and hostname.v consume.
+// x509.v decodes DER-encoded X.509 v3 certificates, including the SAN,
+// basicConstraints, keyUsage, EKU, and nameConstraints extensions validator.v
+// consumes. Malformed or unsupported inputs fail the whole decode (fail closed).
 module pki
 
 import crypto.ecdsa
@@ -16,6 +16,11 @@ pub enum PublicKeyAlgorithm {
 	ed25519
 	unknown
 }
+
+// max_certificate_der_bytes bounds a single DER blob handed to
+// parse_certificate. Owned here because it is the parser's invariant; the
+// trust-store loader references it so the two entry points stay in sync.
+const max_certificate_der_bytes = 32 * 1024
 
 // Certificate represents a decoded X.509 certificate (RFC 5280); only
 // parse_certificate may produce one (@[noinit], read-only fields).
@@ -75,16 +80,16 @@ pub:
 	has_eku bool
 	// Whether EKU includes id-kp-serverAuth.
 	eku_server_auth bool
-	// name_constraints restricts the namespace of subordinate names (RFC 5280
-	// §4.2.1.10); permitted_* / excluded_* hold the subtrees per name form.
+	// name_constraints restricts subordinate names (RFC 5280 §4.2.1.10); the
+	// permitted set is enforced as one namespace across dNSName and iPAddress.
 	name_constraints_present bool
-	// Permitted DNS subtrees from nameConstraints.
+	// Permitted dNSName subtrees.
 	permitted_dns []string
-	// Excluded DNS subtrees from nameConstraints.
+	// Excluded dNSName subtrees.
 	excluded_dns []string
-	// Permitted IP subtrees as address/mask byte pairs.
+	// Permitted iPAddress subtrees as address+mask byte pairs.
 	permitted_ip [][]u8
-	// Excluded IP subtrees as address/mask byte pairs.
+	// Excluded iPAddress subtrees as address+mask byte pairs.
 	excluded_ip [][]u8
 	// BIT STRING contents of signatureValue.
 	signature []u8
@@ -92,7 +97,17 @@ pub:
 
 // parse_certificate decodes an X.509 DER certificate.
 // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+@[direct_array_access]
 pub fn parse_certificate(der []u8) !Certificate {
+	// Bound the accepted DER before touching the ASN.1 walker. Real X.509
+	// certificates are 1–4 KB; anything past 32 KB is either a malformed
+	// input, a hostile blob designed to drive the parser deep, or a bug in
+	// the caller. This cap protects every entry point uniformly — TLS
+	// handshake via encrypted_flight.v, TrustStore.add_der, and
+	// TrustStore.add_pem — with one invariant rather than per-site bounds.
+	if der.len > max_certificate_der_bytes {
+		return error('x509: certificate DER of ${der.len} bytes exceeds ${max_certificate_der_bytes} cap')
+	}
 	mut r := wire.new_reader(der)
 	cert_seq := read_asn1_element(mut r)!
 	if cert_seq.tag != 0x30 {
@@ -322,7 +337,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 						}
 						'2.5.29.30' { // Name Constraints (RFC 5280 §4.2.1.10)
 							nc_present = true
-							permitted_dns, excluded_dns, permitted_ip, excluded_ip = parse_name_constraints(ext_val_bytes)
+							// §6.1.4: propagate the parse error rather than accept an empty constraint set.
+							permitted_dns, excluded_dns, permitted_ip, excluded_ip = parse_name_constraints(ext_val_bytes)!
 						}
 						else {
 							// RFC 5280 §4.2: an unknown critical extension MUST be rejected (a constrained CA must not issue outside its sandbox).
@@ -435,6 +451,7 @@ fn unwrap_octet_string(data []u8) []u8 {
 
 // parse_eku_server_auth reports whether an EKU extension value (RFC 5280
 // §4.2.1.12) permits server authentication (id-kp-serverAuth or anyExtendedKeyUsage).
+@[direct_array_access]
 fn parse_eku_server_auth(ext_bytes []u8) bool {
 	data := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(data)
@@ -460,6 +477,7 @@ fn parse_eku_server_auth(ext_bytes []u8) bool {
 }
 
 // extract_cn_from_name finds the Common Name (OID 2.5.4.3) in an ASN.1 Name sequence.
+@[direct_array_access]
 fn extract_cn_from_name(name_bytes []u8) string {
 	rdn_seq := parse_sequence(name_bytes) or { return '' }
 	for rdn_set in rdn_seq {
@@ -484,6 +502,7 @@ fn extract_cn_from_name(name_bytes []u8) string {
 
 // parse_san_extension extracts dNSName strings and raw iPAddress bytes (4 for
 // IPv4, 16 for IPv6) from a SAN extension (RFC 5280 §4.2.1.6).
+@[direct_array_access]
 fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	mut dns := []string{}
 	mut ip := [][]u8{}
@@ -519,9 +538,12 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 	return dns, ip
 }
 
-// parse_name_constraints decodes the NameConstraints value (RFC 5280 §4.2.1.10)
-// into the permitted/excluded dNSName and iPAddress subtrees (the only forms kept).
-fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
+// parse_name_constraints decodes a nameConstraints extension. Per RFC 5280
+// §6.1.4, any structural failure, malformed subtree, or unsupported GeneralName
+// form is fatal — never a silent drop, since an empty permitted set would
+// wrongly exempt every subordinate name.
+@[direct_array_access]
+fn parse_name_constraints(ext_bytes []u8) !([]string, []string, [][]u8, [][]u8) {
 	mut permitted_dns := []string{}
 	mut excluded_dns := []string{}
 	mut permitted_ip := [][]u8{}
@@ -529,39 +551,61 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(inner)
-	seq := read_asn1_element(mut r) or { return permitted_dns, excluded_dns, permitted_ip, excluded_ip }
+	seq := read_asn1_element(mut r) or {
+		return error('x509: nameConstraints is not a decodable SEQUENCE')
+	}
+	if seq.tag != 0x30 {
+		return error('x509: nameConstraints has unexpected tag 0x${seq.tag:02x}')
+	}
 	mut body := wire.new_reader(seq.data)
-
+	mut saw_field := false
 	for body.remaining() > 0 {
-		field := read_asn1_element(mut body) or { break }
+		field := read_asn1_element(mut body) or {
+			return error('x509: malformed nameConstraints subtree field')
+		}
 		// [0] permittedSubtrees and [1] excludedSubtrees are context-specific CONSTRUCTED tags (0xa0, 0xa1).
 		is_permitted := field.tag == 0xa0
 		is_excluded := field.tag == 0xa1
 		if !is_permitted && !is_excluded {
-			continue
+			return error('x509: unexpected nameConstraints field tag 0x${field.tag:02x}')
 		}
+		saw_field = true
 		mut subtrees := wire.new_reader(field.data)
 		// GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree, wrapped by the [0]/[1] field.
 		if subtrees.remaining() == 0 {
-			continue
+			return error('x509: empty nameConstraints subtree list (SIZE 1..MAX)')
 		}
-		list := read_asn1_element(mut subtrees) or { continue }
+		list := read_asn1_element(mut subtrees) or {
+			return error('x509: malformed nameConstraints GeneralSubtrees SEQUENCE')
+		}
+		if list.tag != 0x30 {
+			return error('x509: nameConstraints GeneralSubtrees has unexpected tag 0x${list.tag:02x}')
+		}
 		mut entries := wire.new_reader(list.data)
+		mut entry_count := 0
 		for entries.remaining() > 0 {
-			gs := read_asn1_element(mut entries) or { break }
+			gs := read_asn1_element(mut entries) or {
+				return error('x509: malformed GeneralSubtree')
+			}
 			// Each GeneralSubtree is a SEQUENCE whose first element is the base GeneralName.
+			if gs.tag != 0x30 {
+				return error('x509: GeneralSubtree is not a SEQUENCE (0x${gs.tag:02x})')
+			}
 			mut gs_body := wire.new_reader(gs.data)
 			if gs_body.remaining() == 0 {
-				continue
+				return error('x509: GeneralSubtree missing base GeneralName')
 			}
-			base := read_asn1_element(mut gs_body) or { continue }
+			base := read_asn1_element(mut gs_body) or {
+				return error('x509: malformed base GeneralName in nameConstraints')
+			}
 			if (base.tag & 0xc0) != 0x80 || (base.tag & 0x20) != 0 {
-				continue
+				return error('x509: nameConstraints base is not a context-specific primitive GeneralName')
 			}
+			entry_count++
 			match base.tag & 0x1f {
 				2 { // [2] dNSName
 					if base.data.contains(0) {
-						continue // null-byte smuggling guard, as in SAN parsing
+						return error('x509: nameConstraints dNSName contains a NUL byte')
 					}
 					name := base.data.bytestr()
 					if is_permitted {
@@ -572,17 +616,30 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 				}
 				7 { // [7] iPAddress
 					// In nameConstraints an iPAddress subtree is address+mask (8 bytes IPv4, 32 IPv6), not the bare 4/16 of a SAN.
-					if base.data.len == 8 || base.data.len == 32 {
-						if is_permitted {
-							permitted_ip << base.data.clone()
-						} else {
-							excluded_ip << base.data.clone()
-						}
+					if base.data.len != 8 && base.data.len != 32 {
+						return error('x509: nameConstraints iPAddress subtree has length ${base.data.len}, expected address+mask (8 or 32)')
+					}
+					if is_permitted {
+						permitted_ip << base.data.clone()
+					} else {
+						excluded_ip << base.data.clone()
 					}
 				}
-				else {}
+				else {
+					// A subtree over a GeneralName form we do not enforce (email, URI,
+					// directoryName, registeredID, ...) cannot be honored; ignoring it
+					// would silently exempt or un-exclude names, so fail closed.
+					return error('x509: unsupported nameConstraints general name form ${base.tag & 0x1f}')
+				}
 			}
 		}
+		if entry_count == 0 {
+			return error('x509: empty nameConstraints subtree list (SIZE 1..MAX)')
+		}
+	}
+	if !saw_field {
+		// A nameConstraints with neither permitted nor excluded subtrees is meaningless.
+		return error('x509: nameConstraints extension asserts no subtrees')
 	}
 	return permitted_dns, excluded_dns, permitted_ip, excluded_ip
 }
@@ -590,6 +647,7 @@ fn parse_name_constraints(ext_bytes []u8) ([]string, []string, [][]u8, [][]u8) {
 // parse_path_len_constraint decodes a BasicConstraints pathLenConstraint INTEGER,
 // enforcing the RFC 5280 §4.2.1.9 (0..MAX) range and DER minimal encoding;
 // any invalid/negative/non-minimal/oversized form collapses to 0 (never -1).
+@[direct_array_access]
 fn parse_path_len_constraint(data []u8) int {
 	if data.len == 0 || data.len > 4 {
 		return 0
@@ -614,6 +672,7 @@ fn parse_path_len_constraint(data []u8) int {
 
 // parse_basic_constraints parses the cA boolean and pathLenConstraint (RFC 5280 §4.2.1.9).
 // The path limit is -1 only when the INTEGER is absent (unlimited); a present-but-malformed one yields 0.
+@[direct_array_access]
 fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(inner)
@@ -641,6 +700,7 @@ fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 
 // parse_key_usage returns the BIT STRING contents of a keyUsage extension
 // (RFC 5280 §4.2.1.3), big-endian named bits; an empty result means "no usage asserted".
+@[direct_array_access]
 fn parse_key_usage(ext_bytes []u8) []u8 {
 	inner := unwrap_octet_string(ext_bytes)
 	mut r := wire.new_reader(inner)

@@ -124,6 +124,7 @@ mut:
 // wipe_secret overwrites a secret buffer before releasing its contents. The
 // zeroing loop is the security-relevant step; the rebinding below only clears the
 // local handle — callers assign the replacement secret right after.
+@[direct_array_access]
 fn wipe_secret(mut secret []u8) {
 	for i in 0 .. secret.len {
 		secret[i] = 0
@@ -146,6 +147,7 @@ fn wipe_traffic_keys(mut keys TrafficKeys) {
 
 // derive_traffic_keys expands a traffic secret into an AEAD key and IV (RFC 8446
 // §7.1, "key"/"iv" labels); the IV is the static nonce base the adapter consumes.
+@[direct_array_access]
 fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int) !TrafficKeys {
 	key := hkdf_expand_label(hash, secret, 'key', []u8{}, key_len)!
 	iv := hkdf_expand_label(hash, secret, 'iv', []u8{}, iv_len)!
@@ -157,12 +159,14 @@ fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int)
 
 // derive_finished_key computes the finished_key = HKDF-Expand-Label(BaseKey, "finished",
 // "", Hash.length) MAC key RFC 8446 §4.4.4 binds to a Finished message.
+@[direct_array_access]
 fn derive_finished_key(hash HashAlgorithm, base_key []u8) ![]u8 {
 	return hkdf_expand_label(hash, base_key, 'finished', []u8{}, hash.hash_len())!
 }
 
 // compute_finished_verify_data derives finished_key and computes HMAC over
 // transcript_hash (RFC 8446 §4.4.4).
+@[direct_array_access]
 fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_hash []u8) ![]u8 {
 	finished_key := derive_finished_key(hash, base_key)!
 	return hash.compute_hmac(finished_key, transcript_hash)

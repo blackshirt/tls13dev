@@ -76,6 +76,7 @@ fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 }
 
 // parse_sequence decodes an ASN.1 SEQUENCE into its child elements.
+@[direct_array_access]
 fn parse_sequence(data []u8) ![]Asn1Element {
 	mut r := wire.new_reader(data)
 	mut elements := []Asn1Element{}
@@ -88,6 +89,7 @@ fn parse_sequence(data []u8) ![]Asn1Element {
 
 // parse_oid decodes an ASN.1 object identifier into canonical dotted-decimal
 // form (RFC 5280 §A.1). The first subidentifier packs arcs 1 and 2 as (arc1*40+arc2).
+@[direct_array_access]
 fn parse_oid(data []u8) string {
 	if data.len == 0 {
 		return ''

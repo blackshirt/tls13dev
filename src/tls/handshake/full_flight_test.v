@@ -12,7 +12,7 @@ import tls.pki
 // test CA so the Certificate message authenticates exactly the fake chain.
 fn fixture_trusted_validator() pki.Validator {
 	ts := fakeserver.test_trust_store() or { panic('fakeserver trust store: ${err.msg()}') }
-	return pki.new_validator(ts, false)
+	return pki.new_validator(ts)
 }
 
 // expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —

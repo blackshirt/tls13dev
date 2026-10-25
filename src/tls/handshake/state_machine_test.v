@@ -11,7 +11,7 @@ import tls.wire
 // fixture_validator builds a Validator over an empty trust store; none of these
 // tests reach chain verification.
 fn fixture_validator() pki.Validator {
-	return pki.new_validator(pki.new_trust_store(), false)
+	return pki.new_validator(pki.new_trust_store())
 }
 
 // wrap_hsk frames a handshake body with its 4-byte header, mirroring the core's
@@ -311,6 +311,64 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 		return
 	}
 	assert false
+}
+
+// test_class_a_failure_zeroizes_and_parks_failed locks the failure-path choke-point:
+// a Class A dispatch failure (an explicit classify) at the handshake level must both
+// park the machine in .failed and zeroize every derived secret — not just record the
+// alert. Planting key-schedule material first makes the zeroization observable.
+fn test_class_a_failure_zeroizes_and_parks_failed() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	_ = h.create_client_hello()!
+	h.handshake_secret = [u8(9), 8, 7]
+	h.client_hsk_traffic = [u8(1), 2, 3]
+	h.server_hsk_traffic = [u8(4), 5, 6]
+	h.state = .wait_encrypted_extensions
+	// Class A: a Certificate is illegal while EncryptedExtensions is awaited (unexpected_message).
+	h.receive_msgs_at_level(.handshake, wrap_hsk(.certificate, []u8{len: 4, init: 0x01})) or {
+		assert h.state == .failed
+		assert h.handshake_secret.len == 0
+		assert h.client_hsk_traffic.len == 0
+		assert h.server_hsk_traffic.len == 0
+		return
+	}
+	assert false, 'an out-of-order Certificate must abort the handshake'
+}
+
+// test_class_b_parse_failure_zeroizes_and_reports_decode_error locks the Phase-2
+// classification fix: a Class B internal error (a peer-triggered parse that uses `!`)
+// now routes through classify_failure, so it BOTH tears down and surfaces the
+// RFC-correct decode_error instead of the stale .internal_error default.
+fn test_class_b_parse_failure_zeroizes_and_reports_decode_error() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	_ = h.create_client_hello()!
+	h.handshake_secret = [u8(9), 8, 7]
+	h.client_hsk_traffic = [u8(1), 2, 3]
+	h.state = .wait_certificate
+	// Class B: a malformed Certificate body fails to decode while in the right state.
+	h.receive_msgs_at_level(.handshake, wrap_hsk(.certificate, []u8{len: 8, init: 0x01})) or {
+		assert h.state == .failed
+		assert h.failure_alert() == .decode_error
+		assert h.handshake_secret.len == 0
+		assert h.client_hsk_traffic.len == 0
+		return
+	}
+	assert false, 'a malformed Certificate must abort the handshake'
+}
+
+// test_malformed_finished_reports_decode_error checks that a Finished shorter than
+// Hash.length is classified decode_error (not the stale internal_error) and is terminal.
+fn test_malformed_finished_reports_decode_error() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	_ = h.create_client_hello()!
+	h.server_hsk_traffic = [u8(1), 2, 3]
+	h.state = .wait_server_finished
+	h.receive_msgs_at_level(.handshake, wrap_hsk(.finished, []u8{len: 4, init: 0xab})) or {
+		assert h.state == .failed
+		assert h.failure_alert() == .decode_error
+		return
+	}
+	assert false, 'a malformed Finished must abort the handshake'
 }
 
 // test_feed_handshake_level_after_connected_refused checks that the handshake
@@ -636,4 +694,29 @@ fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
 	assert h.server_app_traffic != old_secret
 	assert h.server_app_traffic.len == 32
 	assert h.server_app_keys.key.len > 0
+}
+
+// test_available_secret_phases_tracks_derivation locks the transport-neutral
+// readiness query the adapters now rely on instead of decoding HandshakeState:
+// each phase flips true only once both directions' secrets exist, and a terminal
+// failure that wipes the schedule drops readiness back to none.
+fn test_available_secret_phases_tracks_derivation() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	_ = h.create_client_hello()!
+	// Before ServerHello: no phase material yet.
+	assert h.available_secret_phases().handshake == false
+	assert h.available_secret_phases().application == false
+	// Plant handshake secrets (as the ServerHello derivation would).
+	h.client_hsk_traffic = [u8(1), 2, 3]
+	h.server_hsk_traffic = [u8(4), 5, 6]
+	assert h.available_secret_phases().handshake
+	assert h.available_secret_phases().application == false
+	// Plant application secrets (as the server Finished derivation would).
+	h.client_app_traffic = [u8(7)]
+	h.server_app_traffic = [u8(8)]
+	assert h.available_secret_phases().application
+	// A terminal failure wipes the whole schedule: readiness drops to none.
+	h.fail_and_zeroize_secrets()
+	assert h.available_secret_phases().handshake == false
+	assert h.available_secret_phases().application == false
 }

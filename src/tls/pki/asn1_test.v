@@ -1,13 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// ASN.1 DER reader tests: read_asn1_element must classify constructed vs
-// primitive tags, decode short- and long-form lengths, and reject malformed
-// framing (truncated header, DER-illegal indefinite length, non-minimal long
-// form, the DER-illegal high-tag-number form, a declared length beyond what is
-// buffered) instead of over-reading;
-// parse_sequence walks child TLVs in order and yields an empty list for empty
-// input. pki_test.v covers parse_oid's basic decoding (this file adds its edge
-// inputs too); these fill the TLV/length paths.
+// ASN.1 DER reader tests: read_asn1_element's tag/length framing (short/long
+// forms, constructed vs primitive) and its rejection of malformed encodings.
+// parse_oid's basic decoding lives in pki_test.v; this file adds its edge inputs.
 module pki
 
 import tls.wire

@@ -1,12 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// RSA public-key decode tests against hand-built PKCS#1 RSAPublicKey DER: the
-// modulus' DER sign byte is stripped so size_bytes is exact, the public
-// exponent accumulates from its big-endian INTEGER, and every malformed shape is
-// rejected (non-SEQUENCE outer tag, too few sequence elements, an all-zero
-// modulus that strips to empty, a zero exponent, the degenerate e=1, any even
-// exponent (they fail RSA's odd-exponent requirement and enable small-order
-// forgeries), and an exponent wider than the u64 accumulator).
+// RSA tests: PKCS #1 RSAPublicKey decode against hand-built DER, plus verify
+// paths for PKCS1-v1_5 and PSS. Every malformed key shape must reject.
 module pki
 
 import crypto.sha256

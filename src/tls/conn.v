@@ -134,19 +134,22 @@ pub fn dial(address string, config Config) !&Conn {
 	handshake_options := config.hsk_options
 	mut validator := if configured := handshake_options.validator {
 		configured
+	} else if config.insecure_skip_verify {
+		// The named escape hatch: no roots are consulted, verification is skipped.
+		pki.new_insecure_validator()
 	} else {
 		// Trust anchors: an explicit root_cas wins, else the system bundle.
 		mut store := pki.new_trust_store()
 		if roots := config.root_cas {
 			store = roots
-		} else if !config.insecure_skip_verify {
+		} else {
 			// Fatal, but close the socket so a dial error leaks no fd.
 			store = pki.system_root_cas() or {
 				sock.close() or {}
 				return err
 			}
 		}
-		pki.new_validator(store, config.insecure_skip_verify)
+		pki.new_validator(store)
 	}
 	if config.min_rsa_bits > 0 {
 		validator.set_min_rsa_bits(config.min_rsa_bits)
@@ -186,7 +189,11 @@ pub fn dial(address string, config Config) !&Conn {
 		server_name:       server_name
 	}
 
-	// On failure send the classified fatal alert (RFC 8446 §6), wipe secrets, close the socket.
+	// The single handshake-phase teardown choke-point: every do_handshake() failure —
+	// whether it pinned an alert via classify_failure or is an internal `!` surfacing the
+	// core's default — funnels here to send the classified fatal alert (RFC 8446 §6),
+	// destroy secrets, and close the socket. It stays a safety net even though the
+	// classified sites already pinned fail_alert, so no future `return` path can leak material.
 	conn.do_handshake() or {
 		conn.send_failure_alert()
 		conn.destroy_on_failure()
@@ -214,18 +221,19 @@ fn (mut c Conn) do_handshake() ! {
 			.change_cipher_spec {
 				// The peer's dummy CCS carries no meaning in TLS 1.3 — drop it (RFC 8446 §5).
 				ccs_seen = validate_compat_ccs(rec.payload, ccs_seen) or {
-					c.fail_alert = .unexpected_message
-					return err
+					return c.classify_failure(.unexpected_message, err.msg())
 				}
 				continue
 			}
 			.alert {
 				// After ServerHello, RFC 8446 §6 requires alerts to be encrypted — reject a plaintext one.
 				if c.hs.state() != .wait_server_hello {
-					c.fail_alert = .unexpected_message
-					return error('tls: unencrypted alert after ServerHello (unexpected_message)')
+					return c.classify_failure(.unexpected_message, 'tls: unencrypted alert after ServerHello (unexpected_message)')
 				}
-				peer_alert := handshake.parse_alert(rec.payload)!
+				peer_alert := handshake.parse_alert(rec.payload) or {
+					// A malformed alert record is a decode error, not our internal_error default.
+					return c.classify_failure(.decode_error, 'tls: malformed alert record (decode_error): ${err.msg()}')
+				}
 				// The peer terminated of its own accord: never alert back (RFC 8446 §6).
 				c.peer_terminated = true
 				return error('tls: received alert ${peer_alert.description} (level=${peer_alert.level})')
@@ -233,21 +241,21 @@ fn (mut c Conn) do_handshake() ! {
 			.handshake {
 				// Plaintext handshake records are legal only while the ServerHello is outstanding (§5.1/§6).
 				if c.hs.state() != .wait_server_hello {
-					c.fail_alert = .unexpected_message
-					return error('tls: unencrypted handshake record after ServerHello (unexpected_message)')
+					return c.classify_failure(.unexpected_message, 'tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
 				msgs := c.hs.receive_msgs_at_level(.initial, rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
 				if c.hs.record_unconsumed_bytes(.initial) != 0 {
-					c.fail_alert = .unexpected_message
-					return error('tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
+					return c.classify_failure(.unexpected_message, 'tls: misframed ServerHello record: ${c.hs.record_unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
-					c.fail_alert = .unexpected_message
-					return error('tls: incomplete ServerHello at record boundary (unexpected_message)')
+					return c.classify_failure(.unexpected_message, 'tls: incomplete ServerHello at record boundary (unexpected_message)')
 				}
-				if c.hs.state() == .wait_encrypted_extensions {
-					// The core has cached the handshake record keys; install this side's ciphers now.
+				if c.hs.available_secret_phases().handshake {
+					// The core now holds both directions' handshake traffic secrets (and has
+					// cached the record keys); install this side's ciphers. Keyed on real secret
+					// availability rather than the .wait_encrypted_extensions state, so the
+					// decision shares the core's single readiness query with the QUIC adapter.
 					c.install_handshake_ciphers()!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
@@ -258,10 +266,20 @@ fn (mut c Conn) do_handshake() ! {
 			.application_data {
 				// Everything under the server's handshake keys has outer type application_data (RFC 8446 §5.1/§5.2).
 				if c.hs.state() == .start || c.hs.state() == .wait_server_hello {
-					c.fail_alert = .unexpected_message
-					return error('tls: unexpected encrypted record before ServerHello (unexpected_message)')
+					return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
 				}
-				dec := c.server_hsk_cipher.decrypt_record(rec)!
+				dec := c.server_hsk_cipher.decrypt_record(rec) or {
+					// Mirror the read() path's classification: a record that will not open under
+					// the handshake keys is a TLS-integrity failure the peer caused, so it must
+					// surface bad_record_mac/record_overflow, not the stale internal_error default.
+					if err.msg().contains('sequence limit') {
+						return c.classify_failure(.record_overflow, err.msg())
+					}
+					if err.msg().contains('AEAD decryption failed') {
+						return c.classify_failure(.bad_record_mac, err.msg())
+					}
+					return c.classify_failure(.unexpected_message, err.msg())
+				}
 				// Inner-type routing is record-layer policy; the core has no ContentType concept.
 				match dec.content_type {
 					.handshake {
@@ -274,7 +292,10 @@ fn (mut c Conn) do_handshake() ! {
 					}
 					.alert {
 						// RFC 8446 §6: the server may surface a fatal alert under the handshake keys.
-						peer_alert := handshake.parse_alert(dec.plaintext)!
+						peer_alert := handshake.parse_alert(dec.plaintext) or {
+							// A malformed encrypted alert body is a decode error, not the stale internal_error.
+							return c.classify_failure(.decode_error, 'tls: malformed encrypted alert (decode_error): ${err.msg()}')
+						}
 						if peer_alert.description == .close_notify {
 							c.peer_terminated = true
 							return error('tls: peer sent close_notify during handshake')
@@ -284,14 +305,12 @@ fn (mut c Conn) do_handshake() ! {
 					}
 					else {
 						// Only handshake and alert are legal here; anything else violates §5.6.
-						c.fail_alert = .unexpected_message
-						return error('tls: unexpected content type in handshake phase: ${dec.content_type}')
+						return c.classify_failure(.unexpected_message, 'tls: unexpected content type in handshake phase: ${dec.content_type}')
 					}
 				}
 			}
 			else {
-				c.fail_alert = .unexpected_message
-				return error('tls: unexpected record type ${rec.content_type} during handshake')
+				return c.classify_failure(.unexpected_message, 'tls: unexpected record type ${rec.content_type} during handshake')
 			}
 		}
 	}
@@ -657,6 +676,20 @@ fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, messag
 	}
 	c.post_hsk_buf = []u8{}
 	c.close_tcp_socket()
+	return error(message)
+}
+
+// classify_failure records the alert the adapter must surface for a handshake-phase
+// failure and returns the terminating error, so a call site cannot pin half of it
+// (the two-step `c.fail_alert = ..; return error(..)` that a new `return` can skip).
+// Unlike abort_connection — used once the socket is live and doing its own teardown —
+// this deliberately does NOT tear down: every error it produces propagates out of
+// do_handshake() to dial()'s single teardown wrapper, which sends the alert, destroys
+// secrets and closes the socket. Pinning here is what makes a peer-triggered adapter
+// error surface the RFC-correct code (decode_error, bad_record_mac) instead of the
+// stale .internal_error that send_failure_alert falls back to when fail_alert is unset.
+fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message string) IError {
+	c.fail_alert = alert
 	return error(message)
 }
 

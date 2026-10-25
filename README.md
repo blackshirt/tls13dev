@@ -13,16 +13,6 @@ Full module and API reference documentation lives in [`docs.md`](docs.md).
 > this library has had limited exposure to real-world servers and is **not
 > audited**. Don't ship it in production yet.
 
-## Requirements
-
-A current V toolchain — the library uses standard-library crypto only
-(`crypto.aes`, `x.crypto.chacha20poly1305`, `x.crypto.curve25519`, ECDSA /
-Ed25519 from `crypto.*`), so no external dependencies, but also no stable-release
-backward compatibility promise while V itself is pre-1.0. Compile anything
-performance-sensitive with `v -prod`: V's default `tcc` backend is 20–50×
-slower on this library's crypto hot paths (a chacha20-poly1305 bulk transfer
-measures ~4 MB/s by default versus ~100 MB/s under `-prod`).
-
 ## Quick start
 
 ```bash
@@ -65,47 +55,9 @@ deliberately exports only `Conn`, `dial()`, `Config` (plus the
 populate `Config.root_cas`. The record layer, cipher state, and TCP transport
 stay `tls`-private. The handshake core itself is not hidden: it is a separate,
 deliberately importable module (`tls.handshake`) whose `pub` surface is the
-adapter contract below, so a non-TCP transport (QUIC) can drive it directly
+adapter contract in [CONTRACT.md](src/tls/handshake/CONTRACT.md), so a non-TCP
+transport (QUIC) can drive it directly
 without ever importing `tls`.
-
-## Architecture
-
-The library is split into four V modules under `src/tls/`, each owning one
-layer of the stack, with a strictly downward dependency graph (no cycles — a
-child never imports its parent):
-
-```
-tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
-  └───────────────────────────────────────────┘
-```
-
-| Module          | Responsibility                                                                              |
-|-----------------|---------------------------------------------------------------------------------------------|
-| `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `record_protection` |
-| `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC recordless framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
-| `tls.pki`       | Trust & parsing: `asn1`, `x509`, `validator`, `hostname`, `trust_store`, `rsa`              |
-| `tls.wire`      | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)                       |
-
-Layering is enforced by construction: `tls.wire` knows nothing of TLS, `tls.pki`
-only of certificates, and `tls.handshake` owns **no record, cipher, or socket
-concept** — a grep gate over `src/tls/handshake/` (`Record`, `TLSProtection`,
-`ContentType`, `change_cipher_spec`, `record_header_len`) keeps it that way.
-`conn.v` in the `tls` module is the reference adapter that
-drives the core.
-
-### Handshake adapters
-
-TCP and QUIC use separate `tls.handshake` facades over a shared, transport-neutral
-core. The canonical API, phase/lifecycle rules, and transport-specific operations
-are documented in [the handshake adapter contract](src/tls/handshake/CONTRACT.md).
-For QUIC integration details and a driver example, see
-[the QUIC handshake guide](src/tls/handshake/QUIC.md).
-
-`HandshakeOptions` configures ALPN, certificate validation, and ClientHello
-preferences. `tls.Config.hsk_options` configures TCP dialing; a validator set
-there takes precedence over `root_cas` and `insecure_skip_verify`. Otherwise,
-the validator is built from those Config fields. QUIC callers pass options
-through `quic.Config.hsk_options` to `new_client_engine()`.
 
 ## Repository layout
 
@@ -161,38 +113,6 @@ that imports it must sit beside it.
   `decrypt_error`/`bad_certificate` set where the cause is known) and sends it —
   plaintext before the ServerHello, under the handshake keys after — before
   destroying every derived secret (§7.5) and closing the socket
-
-### Hardened parsing
-
-Message decoding is deliberately strict — extensions must appear at most once
-(RFC 8446 §4.2), must belong in the message they appear in (ServerHello /
-EncryptedExtensions allowlists), fixed-format extension data must be exactly
-its defined length, and ECDHE shares are size- and encoding-gated (§4.2.8.2)
-before any crypto backend sees them. Resource use is equally bounded: a single
-reassembled handshake message is capped at 1 MiB, a `Certificate` list longer
-than 32 entries is refused at parse time (before each entry is decoded), at
-most two middlebox dummy ChangeCipherSpec records are tolerated before the
-handshake aborts, per-key record counts enforce the §5.5 rekeying obligation in
-both directions, and RSA keys below 2048 bits are refused — CAs always, and the
-leaf under the default `min_rsa_bits` floor (see `Validator` in `docs.md`).
-Malformed input is a handshake error, never a panic.
-
-Certificate validation is strict X.509 too: DER must use minimal length
-encodings (X.690 §10.1), each certificate extension OID appears at most once
-(RFC 5280 §4.2), and a `keyUsage`/`basicConstraints` extension is honored when
-present — a leaf must assert `digitalSignature`, a signing CA `keyCertSign`,
-and `pathLenConstraint` caps how many intermediates may sit below a CA (a
-malformed constraint collapses to the most restrictive 0, never the unlimited
-default). TBSCertificate fields are element-counted after the optional `version
-[0]` is consumed, so a truncated v3 certificate fails the decode instead of
-indexing past the array, and RSA public keys must carry a non-zero, odd
-exponent (e=1 and even e are refused). The CertificateVerify scheme must match
-the leaf key type — and ECDSA schemes their exact curve (RFC 8446 §4.2.3) —
-before any key material is read. An unparseable validity date fails the whole
-decode rather than silently disabling expiry enforcement — UTCTime and
-GeneralizedTime must be exact-width all-digit strings ending in `Z` — and the
-X25519 exchange rejects every small-order shared secret (0, 1, p−1) not just
-the all-zero one.
 
 ## Not (yet) implemented
 

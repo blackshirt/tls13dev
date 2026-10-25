@@ -1,15 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// X.509 decoding tests aimed at the extension/name helpers that parse_certificate
-// delegates to, built from hand-assembled DER: SAN dNSName/iPAddress extraction
-// with the CVE-2009-2408 null-byte and bad-length guards, BasicConstraints CA
-// flag and pathLenConstraint (including the DEFAULT-FALSE absent case), keyUsage
-// BIT STRING decoding with the unused-bits check, ExtendedKeyUsage serverAuth /
-// anyExtendedKeyUsage recognition, commonName extraction from a Name, UTCTime /
-// GeneralizedTime parsing with the RFC 5280 year pivot, OCTET STRING unwrapping,
-// and parse_certificate's structural rejection of non-SEQUENCE/truncated input,
-// including the post-version element-count guards that turn a v3 truncation into
-// a clean decode error instead of an out-of-bounds panic.
+// X.509 decoding tests built from hand-assembled DER: SAN, basicConstraints,
+// keyUsage, EKU, nameConstraints, commonName, and validity-time parsing, plus
+// parse_certificate's structural rejection of malformed input.
 module pki
 
 import crypto.ecdsa
@@ -639,4 +632,73 @@ fn test_enforce_name_constraints_honors_exclusions() ! {
 		return
 	}
 	assert false
+}
+
+// test_parse_certificate_rejects_unsupported_name_constraint_form: a
+// nameConstraints subtree over a GeneralName form this validator cannot enforce
+// (rfc822Name) must reject the certificate (RFC 5280 §6.1.4), not be dropped into
+// an empty constraint set that would silently exempt every subordinate name.
+fn test_parse_certificate_rejects_unsupported_name_constraint_form() ! {
+	email_base := der_tlv(0x81, ['user@example.com'.bytes()]) // [1] rfc822Name
+	subtree := der_tlv(0x30, [email_base])
+	permitted := der_tlv(0xa0, [der_tlv(0x30, [subtree])])
+	nc_value := der_tlv(0x30, [permitted])
+	nc_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x1e] // 2.5.29.30
+	// Non-critical: the rejection must come from the constraint parse, not the
+	// unknown-critical-extension path.
+	cert := minimal_extension_cert(nc_oid, false, nc_value)
+	parse_certificate(cert) or {
+		assert err.msg().contains('unsupported nameConstraints general name form')
+		return
+	}
+	assert false
+}
+
+// test_parse_certificate_rejects_malformed_ip_length pins that an iPAddress
+// subtree that is not address+mask (8 or 32 bytes) is a fatal decode error.
+fn test_parse_certificate_rejects_malformed_ip_length() ! {
+	bad_ip_base := der_tlv(0x87, [[u8(1), 2, 3, 4, 5]]) // 5 bytes: neither 8 nor 32
+	subtree := der_tlv(0x30, [bad_ip_base])
+	excluded := der_tlv(0xa1, [der_tlv(0x30, [subtree])])
+	nc_value := der_tlv(0x30, [excluded])
+	nc_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x1e] // 2.5.29.30
+	cert := minimal_extension_cert(nc_oid, false, nc_value)
+	parse_certificate(cert) or {
+		assert err.msg().contains('iPAddress subtree has length')
+		return
+	}
+	assert false
+}
+
+// test_enforce_name_constraints_ip_only_permitted_rejects_dns locks the
+// cross-form fail-open: RFC 5280 §4.2.1.10 treats permittedSubtrees as a single
+// namespace, so a permitted set that lists only an iPAddress subtree must still
+// reject a subordinate dNS name rather than exempt it, while a subordinate whose
+// names fall inside the permitted subtree still passes.
+fn test_enforce_name_constraints_ip_only_permitted_rejects_dns() ! {
+	ca := Certificate{
+		name_constraints_present: true
+		permitted_ip:             [[u8(10), 0, 0, 0, 255, 0, 0, 0]]
+	}
+	// A dNS-only subordinate is outside the (IP-only) permitted namespace.
+	dns_child := Certificate{
+		sans: ['api.example.com']
+	}
+	enforce_name_constraints(ca, dns_child) or {
+		assert err.msg().contains('outside the permitted subtrees')
+		return
+	}
+	assert false
+}
+
+fn test_enforce_name_constraints_permitted_ip_accepts_matching_ip() ! {
+	ca := Certificate{
+		name_constraints_present: true
+		permitted_ip:             [[u8(10), 0, 0, 0, 255, 0, 0, 0]]
+	}
+	// Positive control: the union gate must not over-reject an in-subtree address.
+	ok_child := Certificate{
+		ip_sans: [[u8(10), 1, 2, 3]]
+	}
+	enforce_name_constraints(ca, ok_child)!
 }

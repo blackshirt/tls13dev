@@ -14,7 +14,7 @@ import x.crypto.curve25519
 // these tests reach chain verification. V compiles each _test.v file on its own,
 // so this file carries its own fixture instead of reaching into a sibling suite.
 fn empty_store_validator() pki.Validator {
-	return pki.new_validator(pki.new_trust_store(), false)
+	return pki.new_validator(pki.new_trust_store())
 }
 
 // core_with_group builds a HandshakeCore whose ephemeral share lives on the
@@ -48,7 +48,6 @@ fn test_rejects_all_zero_x25519_share() ! {
 // be rejected even though the backend computes them without error. The shares
 // are built in the little-endian wire order X25519 itself uses.
 fn test_rejects_small_order_x25519_shares() ! {
-	mut h := core_with_group(.x25519)!
 	mut u_one := []u8{len: 32} // u = 1 -> the shared secret is 1
 	u_one[0] = 1
 	mut u_p := []u8{len: 32, init: 0xff} // u = 2^255-19, which reduces to 0 mod p
@@ -57,6 +56,10 @@ fn test_rejects_small_order_x25519_shares() ! {
 	peers := [u_one, u_p]
 	mut rejections := 0
 	for share in peers {
+		// A classified key_share rejection is terminal: classify_failure releases the
+		// ephemeral private key (RFC 8446 §7.5), so each peer share must be exercised
+		// against a fresh core rather than a torn-down one.
+		mut h := core_with_group(.x25519)!
 		mut rejected := false
 		h.compute_shared_secret(KeyShareEntry{
 			group:        .x25519

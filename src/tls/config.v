@@ -18,7 +18,8 @@ pub:
 	server_name string
 	// hsk_options configures ALPN, certificate validation, and ClientHello preferences.
 	hsk_options handshake.HandshakeOptions
-	// insecure_skip_verify disables certificate chain and hostname validation (tests only).
+	// insecure_skip_verify, when true, makes dial() use pki.new_insecure_validator and
+	// skip all certificate chain and hostname validation (tests only).
 	insecure_skip_verify bool
 	// root_cas, when set, is used instead of the system trust store.
 	root_cas ?pki.TrustStore

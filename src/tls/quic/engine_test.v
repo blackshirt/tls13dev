@@ -338,7 +338,7 @@ fn (mut f FerryServer) emit_handshake_done() ! {
 // trusted_validator builds a Validator over the fakeserver's embedded test CA.
 fn trusted_validator() pki.Validator {
 	ts := fakeserver.test_trust_store() or { panic('trust store: ${err.msg()}') }
-	return pki.new_validator(ts, false)
+	return pki.new_validator(ts)
 }
 
 fn test_engine_completes_quic_handshake() ! {

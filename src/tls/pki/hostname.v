@@ -54,6 +54,14 @@ fn match_hostname(pattern string, hostname string) bool {
 	p := pattern.to_lower().trim_space()
 	h := hostname.to_lower().trim_space()
 
+	// Defense in depth: an empty SAN entry should never match. Upstream
+	// verify_certificate_chain already rejects an empty hostname, but this
+	// function is also called from paths that may not, and the plain
+	// `p == h` below would otherwise return true on ('', '').
+	if p.len == 0 || h.len == 0 {
+		return false
+	}
+
 	if p == h {
 		return true
 	}

@@ -1,16 +1,12 @@
 // Copyright (c) 2026 blackshirt.
 //
 // trust_store.v loads and indexes trusted root CA certificates, seeding the
-// verifier's chain-of-trust check from the host's system trust bundle so leaf
-// certificates can be anchored back to a known-good root.
-//
-// This file is annotated @[has_globals] for one purpose: the process-wide
-// parsed-bundle cache (cached_system_roots) below. V rejects __global in
-// normal files, so the attribute opts this file in explicitly.
+// verifier's chain-of-trust check from the host's system trust bundle.
+// @[has_globals] opts in the process-wide cached_system_roots bundle below.
 @[has_globals]
 module pki
 
-import encoding.base64
+import crypto.pem
 import os
 import sync
 
@@ -30,45 +26,81 @@ pub fn new_trust_store() TrustStore {
 	}
 }
 
+// pem_begin_marker matches crypto.pem's internal delimiter; used to split an
+// incoming bundle into per-block chunks so one malformed envelope isolates to
+// its own block instead of aborting the scan.
+const pem_begin_marker = '-----BEGIN '
+
+// max_pem_blocks_per_bundle bounds work per add_pem call. Real system trust
+// bundles carry ~150 roots; anything larger is either hostile or pathological.
+const max_pem_blocks_per_bundle = 1024
+
+// max_pem_bundle_bytes caps the input a single add_pem call may inspect.
+// Debian's ca-certificates.crt is ~220 KB; 2 MB leaves room for enterprise
+// bundles while bounding the split-time allocation to a known ceiling. The
+// check runs BEFORE split so a huge file never reaches the heap.
+const max_pem_bundle_bytes = 2 * 1024 * 1024
+
+// The per-block DER ceiling is owned by x509.v as `max_certificate_der_bytes`;
+// add_pem below references it directly so the loader cap and the parser cap
+// stay in lock-step (a block that would pass add_pem's size filter and then
+// trip parse_certificate's own cap would produce a confusing double guard).
+
 // add_der parses and appends a single DER-encoded certificate into the store.
 pub fn (mut ts TrustStore) add_der(der []u8) ! {
 	cert := parse_certificate(der)!
 	ts.certs << cert
 }
 
-// add_pem parses and appends all certificates from a PEM string into the store.
-// PEM is just a base64-of-DER wrapper, so the real parsing target is the decoded
-// DER between the markers. Unparseable blocks are skipped rather than failing the
-// whole bundle, since system bundles occasionally contain unsupported formats.
+// add_pem parses and appends every X.509 certificate from a PEM string. Each
+// block's PEM grammar (RFC 1421 headers, base64 assembly, BEGIN/END label
+// matching) is delegated to crypto.pem; blocks whose type is not CERTIFICATE
+// (CRLs, private keys, PKCS #7 wrappers) are filtered out before DER parsing.
+// Splitting on the BEGIN marker isolates each block so one malformed envelope
+// costs only itself — every later anchor in a 150-root system bundle still
+// loads. Three hard bounds fail CLOSED (return an error, not a silent partial
+// load) so an operator never ends up with a partially-populated trust store:
+//   - total input bytes  > max_pem_bundle_bytes        → error
+//   - block count        > max_pem_blocks_per_bundle   → error
+//   - single DER size    > max_certificate_der_bytes   → block skipped
+// The last is per-block rather than fatal because an over-long DER that still
+// decodes as PEM has to be a hostile or corrupted envelope, not a missing
+// anchor the caller can recover elsewhere.
 pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
+	// Bound the input BEFORE split so a hostile file cannot drive an oversized
+	// allocation via the chunk vector.
+	if pem_content.len > max_pem_bundle_bytes {
+		return error('trust_store: PEM bundle of ${pem_content.len} bytes exceeds ${max_pem_bundle_bytes} cap')
+	}
 	mut count := 0
-	lines := pem_content.split_into_lines()
-	mut in_cert := false
-	// Lines append into bytes and are joined once per certificate: string `+=`
-	// reallocated and copied on every line, making the bundle parse quadratic
-	// in the number of base64 lines.
-	mut b64_buf := []u8{}
-
-	for line in lines {
-		trimmed := line.trim_space()
-		if trimmed.starts_with('-----BEGIN ') && trimmed.ends_with('CERTIFICATE-----') {
-			in_cert = true
-			b64_buf = []u8{}
+	// Split on the BEGIN marker: chunks[0] is prose before the first marker
+	// (usually empty); every subsequent element gets the marker restored
+	// before decode so crypto.pem sees a well-formed block each iteration.
+	// Safe because `-` is not in the base64 alphabet, so the marker cannot
+	// legitimately appear inside a well-formed PEM body.
+	mut chunks := pem_content.split(pem_begin_marker)
+	if chunks.len <= 1 {
+		return 0
+	}
+	chunks = chunks[1..]
+	if chunks.len > max_pem_blocks_per_bundle {
+		// Fail closed: silently truncating the tail here would leave the trust
+		// store looking healthy while every anchor past the cap is missing.
+		return error('trust_store: PEM bundle declares ${chunks.len} blocks (> cap ${max_pem_blocks_per_bundle})')
+	}
+	for chunk in chunks {
+		block_text := pem_begin_marker + chunk
+		blk := pem.decode_only(block_text) or { continue }
+		if blk.block_type != 'CERTIFICATE' {
 			continue
 		}
-		if trimmed.starts_with('-----END ') && trimmed.ends_with('CERTIFICATE-----') {
-			in_cert = false
-			der := base64.decode(b64_buf.bytestr())
-			cert := parse_certificate(der) or {
-				continue
-			}
-			ts.certs << cert
-			count++
+		if blk.data.len == 0 || blk.data.len > max_certificate_der_bytes {
+			// Empty or absurdly large DER: never hand this to parse_certificate.
 			continue
 		}
-		if in_cert {
-			b64_buf << trimmed.bytes()
-		}
+		cert := parse_certificate(blk.data) or { continue }
+		ts.certs << cert
+		count++
 	}
 	return count
 }
@@ -89,6 +121,15 @@ pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 
 	for path in paths {
 		if os.exists(path) {
+			// Stat-check BEFORE read_file so an oversized / mislabelled bundle
+			// does not allocate a huge in-memory buffer for a file we intend to
+			// reject anyway. os.file_size returns a negative value on stat failure;
+			// skipping the path (rather than erroring) lets the loop fall through
+			// to the next known bundle location.
+			size := os.file_size(path)
+			if size < 0 || size > max_pem_bundle_bytes {
+				continue
+			}
 			content := os.read_file(path) or { continue }
 			count := ts.add_pem(content) or { continue }
 			if count > 0 {
@@ -99,17 +140,10 @@ pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 	return error('trust_store: no system root CA bundle found')
 }
 
-// cached_system_roots memoizes the parsed system trust bundle for the lifetime
-// of the process. Parsing a typical ~150-root host bundle is the single most
-// expensive step of a dial (tens of milliseconds), yet its contents are a
-// read-only property of the machine, so re-parsing it for every connection is
-// pure waste. The memo sits behind a global mutex: the cache is a slice header
-// assigned by the loader and read by every clone, so concurrent first dials
-// racing on it would be a data race (a torn header can yield garbage roots, not
-// merely duplicate work). The zero-initialized Mutex is valid as-given on every
-// platform V supports — static-init on Linux, lazy_init in Darwin's lock(), and
-// a zeroed SRWLOCK on Windows. Every caller receives a private clone via
-// system_root_cas(), so mutating the returned store can never touch the cache.
+// cached_system_roots memoizes the parsed system trust bundle so dial() does
+// not re-read a ~150-root file on every connection. The mutex guards the slice
+// header against concurrent first dials; system_root_cas() hands each caller a
+// private clone, so mutating the returned store cannot corrupt the cache.
 __global cached_system_roots []Certificate
 __global cached_system_roots_mu sync.Mutex
 
