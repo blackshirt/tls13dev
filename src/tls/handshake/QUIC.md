@@ -295,94 +295,24 @@ hs.zeroize_handshake_traffic_secrets()!
 
 ### Notes on each step
 
-- **`receive_msgs_at_level()` is the single inbound entry point.** It appends bytes to that
-  handshake core's level-specific reassembly buffer and consumes every complete
-  message immediately. Separate handshaker instances have separate core state.
-  Returned messages are the outbound follow-ups triggered by the peer's bytes.
-  Contract misuse (feeding before `create_client_hello()`, initial-level bytes
-  outside the ServerHello wait, handshake-level bytes before ServerHello or
-  after Finished, anything after `failed`) is refused without consuming input
-  or changing state so you can fix your sequencing.
-- **`record_unconsumed_bytes(level)`** is available only on `TLSHandshake`.
-  The TCP adapter uses it for the §5.1 ServerHello record-boundary rule. The
-  `QuicHandshake` has no record-boundary accessor.
-- **`negotiated_alpn()`** returns the server's ALPN pick (`''` if none). The
-  core already verified it was one you offered (RFC 7301 §3.1).
-- The shared `receive_msgs_at_level()` API only accepts `.initial` and `.handshake` TLS
-  phases. The QUIC engine rejects CRYPTO data carried in 1-RTT packets; reassemble
-  post-handshake CRYPTO and decode it with `next_recordless_message` +
-  `parse_new_session_ticket`.
+- The shared API sequence, phase guards, and TLS-only operations are specified
+  in the [handshake adapter contract](./CONTRACT.md). For QUIC, queue every
+  returned message at its tagged level; map `.initial` to Initial CRYPTO and
+  `.handshake` to Handshake CRYPTO.
+- The QUIC engine rejects CRYPTO data carried in 1-RTT packets. Handle
+  post-handshake CRYPTO separately with `next_recordless_message()` and
+  `parse_new_session_ticket()`.
+- `negotiated_alpn()` returns the server's selection (`''` if none); the shared
+  core verifies that any selection was offered (RFC 7301 §3.1).
 
 ---
 
-## 5. Failure handling
+## 6. API reference
 
-When the core kills a handshake it takes two actions an adapter must respect:
-
-1. **It classifies an alert.** `failure_alert()` returns the `AlertDescription`
-   to send. RFC 8446 §6 makes `internal_error` a legal catch-all (the default);
-   where the cause is knowable the core sets `unexpected_message`,
-   `illegal_parameter`, `decrypt_error`, or `bad_certificate`. Over QUIC, map it
-   with `quic_connection_error()` and raise a `CONNECTION_CLOSE` of type `0x1c`
-   (RFC 9001 §4.8). There is no CRYPTO alert path.
-
-2. **It wipes every secret.** Any error that drives the machine to `failed`
-   calls `fail_and_destroy_secrets()`: the Handshake Secret, both traffic-secret generations, and
-   both ephemeral ECDHE private halves are destroyed (RFC 8446 §1.3.1/§7.5).
-   `TLSHandshake` also wipes its cached record keys; a QUIC adapter wipes
-   its packet-protection state. `fail_and_destroy_secrets()` parks the core in
-   `.failed`. The success path wipes at `.connected`
-   (`zeroize_handshake_secrets`) and at teardown (`zeroize_app_secrets`), with
-   the handshake stage deferred to `zeroize_handshake_traffic_secrets()` per §3.3 above.
-
-Your adapter should: read `failure_alert()`, convert it to a QUIC connection
-error, close the connection, and drop its own per-level protection state.
-
----
-
-## 6. The public API at a glance
-
-```v
-// Construction and shared handshake operations
-new_quic_handshake(server_name string) !QuicHandshake
-new_tls_handshake(server_name string) !TLSHandshake
-new_client_engine(server_name string, Config) !tls.quic.Conn
-(mut h) create_client_hello() ![]u8
-(mut h) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
-
-// Observation
-(h) state() HandshakeState
-(h) negotiated_alpn() string
-(h) negotiated_cipher_suite() CipherSuite
-(h) failure_alert() AlertDescription
-
-// QUIC facade only
-(h &QuicHandshake) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8) // (client, server)
-(mut h QuicHandshake) zeroize_handshake_traffic_secrets() !
-
-// Record facade only
-(h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys)
-(h &TLSHandshake) record_unconsumed_bytes(level EncryptionLevel) int
-(mut h TLSHandshake) record_update_read_traffic_keys() !
-(mut h TLSHandshake) record_update_write_traffic_keys() !
-(mut h TLSHandshake) zeroize_handshake_traffic_secrets() !
-
-// Shared lifecycle
-(mut h) fail_and_destroy_secrets()      // → .failed, wipes TLS handshake secrets
-(mut h) zeroize_app_secrets()
-
-// Recordless framing + alert mapping
-next_recordless_message(mut buf []u8) ![]u8
-max_handshake_message_len                                 // = 1 << 20
-(d AlertDescription) quic_connection_error() u32          // 0x100 + description
-hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context []u8, length int) ![]u8
-parse_new_session_ticket(body []u8) !NewSessionTicket
-parse_key_update(body []u8) !bool
-
-// Supporting types
-EncryptionLevel { initial, handshake, application }
-HandshakeMessage { level EncryptionLevel  msg []u8 }          // msg = full message, header included
-```
+The canonical list of shared and transport-specific methods, lifecycle rules,
+and public helper APIs is in the [handshake adapter contract](./CONTRACT.md).
+This guide focuses on QUIC behavior and adapter sequencing rather than
+repeating that API inventory.
 
 The validator in `HandshakeOptions` is optional. If omitted, construction uses
 `pki.default_validator()` and propagates an error if the system root bundle

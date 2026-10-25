@@ -399,12 +399,13 @@ fn test_zeroize_handshake_traffic_secrets_requires_connected_state() ! {
 // the application secrets and their cached keys (§7.5).
 fn test_zeroize_app_secrets_clears_and_refuses() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.state = .connected
 	h.client_ap_traffic = [u8(11), 12]
 	h.server_ap_traffic = [u8(13), 14]
 	h.app_keys.client = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
 	h.app_keys.server = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
 
-	h.zeroize_app_secrets()
+	h.zeroize_app_secrets()!
 
 	assert h.client_ap_traffic.len == 0
 	assert h.server_ap_traffic.len == 0
@@ -413,6 +414,24 @@ fn test_zeroize_app_secrets_clears_and_refuses() ! {
 	assert h.app_keys.client.iv.len == 0
 	assert h.app_keys.server.key.len == 0
 	_, _ := h.record_traffic_keys(.application) or {
+		return
+	}
+	assert false
+}
+
+// test_zeroize_app_secrets_refuses_before_connected keeps an out-of-phase
+// cleanup call from silently destroying keys needed by the handshake.
+fn test_zeroize_app_secrets_refuses_before_connected() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	h.client_ap_traffic = [u8(11), 12]
+	h.server_ap_traffic = [u8(13), 14]
+	h.app_keys.client = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
+
+	h.zeroize_app_secrets() or {
+		assert err.msg().contains('only valid after the handshake reaches .connected')
+		assert h.state() == .start
+		assert h.client_ap_traffic == [u8(11), 12]
+		assert h.app_keys.client.key == [u8(1)]
 		return
 	}
 	assert false
@@ -488,7 +507,7 @@ fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
 	h.state = .connected
 	h.client_ap_traffic = [u8(1), 2, 3]
 	h.app_keys.client = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
-	h.zeroize_app_secrets()
+	h.zeroize_app_secrets()!
 	h.record_update_write_traffic_keys() or {
 		assert err.msg().contains('destroyed by zeroize_app_secrets')
 		return

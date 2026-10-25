@@ -467,7 +467,11 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// Any alert is terminal: mark closed before decoding, even a malformed body.
 	c.closed = true
 	// Peer termination is final: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
-	c.hs.zeroize_app_secrets()
+	if c.hs.state() == .connected {
+		c.hs.zeroize_app_secrets()!
+	} else {
+		c.hs.fail_and_destroy_secrets()
+	}
 	wipe_tls_protection(mut c.server_hs_cipher)
 	wipe_tls_protection(mut c.client_hs_cipher)
 	wipe_tls_protection(mut c.server_app_cipher)
@@ -657,11 +661,17 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 // abort_connection sends a best-effort fatal alert, destroys connection secrets,
 // closes the socket, and makes the failure sticky for subsequent reads.
 fn (mut c Conn) abort_connection(alert handshake.AlertDescription, message string) IError {
-	c.fail_alert = alert
 	c.wlock.lock()
 	defer {
 		c.wlock.unlock()
 	}
+	return c.abort_connection_locked(alert, message)
+}
+
+// abort_connection_locked terminates the connection while its write lock is
+// already held, avoiding recursive locking from write() failure handling.
+fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, message string) IError {
+	c.fail_alert = alert
 	c.closed = true
 	c.fatal_error = message
 	c.send_failure_alert()
@@ -689,6 +699,26 @@ pub fn (mut c Conn) write(data []u8) !int {
 	if c.hs.state() != .connected {
 		return error('tls: handshake not complete')
 	}
+	return c.write_application_data(data)
+}
+
+// write_application_data encrypts and sends application data while the caller
+// holds wlock. Any failure is terminal because sequence numbers or stream bytes
+// may already have advanced.
+fn (mut c Conn) write_application_data(data []u8) !int {
+	return c.write_application_data_inner(data) or {
+		alert := if err.msg().contains('sequence limit') {
+			handshake.AlertDescription.record_overflow
+		} else {
+			handshake.AlertDescription.internal_error
+		}
+		return c.abort_connection_locked(alert, 'tls: application write failed: ${err.msg()}')
+	}
+}
+
+// write_application_data_inner performs record generation and socket writes.
+// The caller holds wlock and owns terminal error handling.
+fn (mut c Conn) write_application_data_inner(data []u8) !int {
 	// Chunk to max_plaintext_record_len (2^14): TLS forbids larger records (RFC 8446 §5.1).
 	mut offset := 0
 	mut batch := []Record{}
@@ -766,7 +796,11 @@ pub fn (mut c Conn) close() ! {
 	}
 	c.closed = true
 	// Teardown is terminal: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
-	c.hs.zeroize_app_secrets()
+	if c.hs.state() == .connected {
+		c.hs.zeroize_app_secrets()!
+	} else {
+		c.hs.fail_and_destroy_secrets()
+	}
 	wipe_tls_protection(mut c.server_hs_cipher)
 	wipe_tls_protection(mut c.client_hs_cipher)
 	wipe_tls_protection(mut c.server_app_cipher)

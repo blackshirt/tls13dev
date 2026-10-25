@@ -186,6 +186,28 @@ fn test_malformed_record_fails_closed() ! {
 	assert false, 'an invalid record content type must fail closed'
 }
 
+// test_application_write_failure_fails_closed checks that a failed write
+// cannot leave advanced record state available for accidental reuse.
+fn test_application_write_failure_fails_closed() ! {
+	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+		0xff, 0x00]
+	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
+	mut c := new_test_conn()!
+	c.client_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.wlock.lock()
+	c.write_application_data([u8(42)]) or {
+		c.wlock.unlock()
+		assert err.msg().contains('application write failed')
+		assert c.closed
+		assert c.fatal_error == err.msg()
+		assert c.hs.state() == .failed
+		assert c.client_app_cipher.iv.len == 0
+		return
+	}
+	c.wlock.unlock()
+	assert false, 'a failed socket write must make the connection terminal'
+}
+
 // test_post_handshake_reassembly_is_bounded checks that a peer streaming
 // incomplete handshake fragments can never grow post_hs_buf past one capped
 // message plus header — the bound must fire as record_overflow before the

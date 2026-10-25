@@ -34,12 +34,17 @@ alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
 alert := hs.failure_alert()
 hs.fail_and_destroy_secrets()
-hs.zeroize_app_secrets()
+hs.zeroize_app_secrets()!
 ```
 
 `fail_and_destroy_secrets()` marks the handshake failed and destroys its derived
 secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
-wipes its cached record keys during failure cleanup.
+wipes its cached record keys during failure cleanup. `zeroize_app_secrets()`
+is a fallible teardown operation and is accepted only after `.connected`, so
+an out-of-phase call cannot discard traffic material needed to finish a handshake.
+Adapters call these lifecycle operations when aborting or tearing down; callers
+driving a handshake normally need only construct, send the ClientHello, feed
+peer messages, and observe the resulting state.
 
 `create_client_hello()` returns the initial, complete handshake message.
 The constructors require only `server_name`. Optional named
@@ -81,6 +86,8 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 - `zeroize_handshake_traffic_secrets()` destroys handshake traffic secrets once
   the adapter no longer needs them; the record facade also wipes its cached
   handshake keys. This is cleanup, not a handshake-confirmation signal.
+- `zeroize_app_secrets()` is available after `.connected` and also wipes the
+  cached application record keys.
 
 ## QUIC-only operations
 
@@ -91,9 +98,21 @@ secrets; `TLSHandshake` cannot expose that accessor. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
 calls `zeroize_handshake_traffic_secrets()` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.
+`peer_transport_parameters()` returns the server's opaque extension bytes once
+received, and `hello_retry_request_received()` reports whether a retry occurred.
+`zeroize_app_secrets()` is available after `.connected` for adapter teardown.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 are absent from `QuicHandshake`, rather than present as runtime-rejected calls.
+
+## Supporting protocol helpers
+
+The module also exposes lower-level helpers used by adapters that implement
+post-handshake handling or transport key setup: `next_recordless_message()`,
+`parse_new_session_ticket()`, `parse_key_update()`, `quic_connection_error()`,
+`hkdf_expand_label()`, `suite_hash_algo()`, `suite_key_len()`, and
+`new_aead_for_suite()`. These are protocol building blocks, not alternatives
+to the facade's phase-checked handshake entry points.
 
 ## Ownership boundary
 

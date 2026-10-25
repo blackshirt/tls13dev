@@ -75,7 +75,11 @@ fn (mut h HandshakeCore) zeroize_handshake_secrets() {
 }
 
 // zeroize_app_secrets destroys the application traffic secrets once the
-// connection is finished (RFC 8446 §1.3.1/§7.5).
-pub fn (mut h HandshakeCore) zeroize_app_secrets() {
+// handshake is connected and the adapter is tearing down the connection
+// (RFC 8446 §1.3.1/§7.5).
+pub fn (mut h HandshakeCore) zeroize_app_secrets() ! {
+	if h.state != .connected {
+		return error('handshake: zeroize_app_secrets() is only valid after the handshake reaches .connected (state: ${h.state})')
+	}
 	h.wipe_application_traffic_secrets()
 }

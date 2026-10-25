@@ -53,8 +53,8 @@ pub fn (mut h TLSHandshake) fail_and_destroy_secrets() {
 
 // zeroize_app_secrets destroys application traffic secrets and cached record
 // keys, for example when the connection is closed.
-pub fn (mut h TLSHandshake) zeroize_app_secrets() {
-	h.HandshakeCore.zeroize_app_secrets()
+pub fn (mut h TLSHandshake) zeroize_app_secrets() ! {
+	h.HandshakeCore.zeroize_app_secrets()!
 	h.app_keys.wipe()
 }
 
