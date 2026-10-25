@@ -17,7 +17,7 @@ pub:
 	// server_name is used for SNI and certificate hostname verification.
 	server_name string
 	// hsk_options configures ALPN, certificate validation, and ClientHello preferences.
-	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
+	hsk_options handshake.HandshakeOptions
 	// insecure_skip_verify disables certificate chain and hostname validation (tests only).
 	insecure_skip_verify bool
 	// root_cas, when set, is used instead of the system trust store.
