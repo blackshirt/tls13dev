@@ -31,14 +31,14 @@ The core was therefore split so that the carrier is always someone else's job:
    │  ECDHE: key_exchange.v  Secrets: secret_lifecycle.v                            │
    │  Key schedule: key_schedule.v / handshake_keys.v                               │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
-   │          post_handshake.v / quic_transport_parameters.v / transcript.v         │
+   │          post_handshake.v / transcript.v                                       │
    │  Record facade: tls_handshake.v owns TLS TrafficKeys and KeyUpdate ratchets    │
    │  QUIC facade: quic_handshake.v exports TLS traffic secrets                     │
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
-        │ receive(level, bytes)                │ record_traffic_keys /                │ create_client_hello /
-        │                                      │ quic_traffic_secrets                 │ receive
+        │ receive_msgs_at_level                │ record_traffic_keys /                │ create_client_hello /
+        │                                      │ quic_traffic_secrets                 │ receive_msgs_at_level
         │                                      │                                      │
    ┌────┴──────────────┐              ┌───────┴───────────┐               ┌─────────┴──────────┐
    │ tls TCP adapter   │              │ a QUIC engine     │               │ tests / other      │
@@ -79,11 +79,16 @@ handshake records to `.initial` and decrypted handshake records to
 `.handshake`. QUIC packet levels and packet-number spaces remain adapter-side.
 
 QUIC handshakes include the TLS `quic_transport_parameters` extension
-(RFC 9001 §8.2). The current typed `QuicTransportParameters` value carries the
-`initial_source_connection_id` parameter; the QUIC engine fills it from its
-source connection ID and checks that the server's value matches the server
-source connection ID. Other transport parameters are currently ignored by this
-handshake facade.
+(RFC 9001 §8.2). The core treats its content as opaque bytes: it rules only on
+placement — required when the connection is QUIC, rejected on a record transport
+— and carries the value out and back in untouched. Encoding this endpoint's own
+parameters and decoding a peer's id/length/value triplets lives above the
+handshake, in `tls.quic` (`transport_params.v`): the engine advertises
+`initial_source_connection_id` from its source connection ID, and requires a
+server to declare both `initial_source_connection_id` and
+`original_destination_connection_id`, checking each against the connection IDs
+it actually saw on the wire (RFC 9000 §7.3). Parameters outside that set reach
+the adapter intact and are ignored there.
 
 ---
 
@@ -116,7 +121,7 @@ start
   connected                     (client Finished emitted; application secrets live)
 ```
 
-`failed` is terminal: once reached, `receive()` refuses further input. A protocol
+`failed` is terminal: once reached, `receive_msgs_at_level()` refuses further input. A protocol
 violation moves the machine to `failed` and wipes all derived material (see
 §5). The public accessors `state()`, `negotiated_alpn()`, and
 `negotiated_cipher_suite()` let an adapter poll progress and outcome.
@@ -129,7 +134,7 @@ the built-in TLS 1.3 defaults), `supported_groups`, `signature_algorithms`, and
 `supported_versions`. `SNI` is included for a DNS server name, and `ALPN` when
 protocols are configured.
 A HelloRetryRequest is fed as plaintext handshake input; the core switches to
-the requested group, regenerates the share, echoes any cookie, and `receive()`
+the requested group, regenerates the share, echoes any cookie, and `receive_msgs_at_level()`
 **returns the second ClientHello** (tagged `.initial`) for the adapter to send.
 The transcript substitutes the first ClientHello with its
 `message_hash` (§4.4.1) so the Finished binds the whole two-round exchange.
@@ -215,7 +220,7 @@ CRYPTO alert path at all.
 ### 3.6 CRYPTO reassembly
 
 Within a level the CRYPTO stream is self-framed handshake messages
-(type ∥ u24 length). `next_passthrough_message()` — the recordless twin of the
+(type ∥ u24 length). `next_recordless_message()` — the recordless twin of the
 record layer's parser — extracts one complete message from the front of a byte
 buffer, capping the declared length at `max_handshake_message_len` (1 MiB) from
 the header alone so a hostile peer cannot make the adapter buffer indefinitely.
@@ -248,7 +253,7 @@ ch1 := hs.create_client_hello()!
 //    concatenate CRYPTO frame payloads into `initial_stream`.
 
 // 4. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
-msgs := hs.receive(.initial, initial_stream)!
+msgs := hs.receive_msgs_at_level(.initial, initial_stream)!
 for m in msgs {
     // The only .initial output here is the retry ClientHello after a
     // HelloRetryRequest — send it in an Initial CRYPTO frame and loop.
@@ -267,7 +272,7 @@ qkey := handshake.hkdf_expand_label(hash, ck, 'quic key', []u8{}, key_len)!
 
 // 6. Feed the reassembled Handshake CRYPTO stream. The return carries the
 //    client Finished (tagged .handshake) once the server flight verifies.
-flight := hs.receive(.handshake, handshake_stream)!
+flight := hs.receive_msgs_at_level(.handshake, handshake_stream)!
 for m in flight {
     if m.level == .handshake {
         // Send m.msg in a Handshake CRYPTO frame, protected with the client
@@ -284,13 +289,13 @@ for m in flight {
 hs.zeroize_handshake_traffic_secrets()!
 
 // 9. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
-//    with next_passthrough_message and decode with parse_new_session_ticket.
+//    with next_recordless_message and decode with parse_new_session_ticket.
 //    A KeyUpdate here is a connection error (RFC 9001 §6) — do NOT feed keys.
 ```
 
 ### Notes on each step
 
-- **`receive()` is the single inbound entry point.** It appends bytes to that
+- **`receive_msgs_at_level()` is the single inbound entry point.** It appends bytes to that
   handshake core's level-specific reassembly buffer and consumes every complete
   message immediately. Separate handshaker instances have separate core state.
   Returned messages are the outbound follow-ups triggered by the peer's bytes.
@@ -302,9 +307,9 @@ hs.zeroize_handshake_traffic_secrets()!
   `QuicHandshake` has no record-boundary accessor.
 - **`negotiated_alpn()`** returns the server's ALPN pick (`''` if none). The
   core already verified it was one you offered (RFC 7301 §3.1).
-- The shared `receive()` API only accepts `.initial` and `.handshake` TLS
+- The shared `receive_msgs_at_level()` API only accepts `.initial` and `.handshake` TLS
   phases. The QUIC engine rejects CRYPTO data carried in 1-RTT packets; reassemble
-  post-handshake CRYPTO and decode it with `next_passthrough_message` +
+  post-handshake CRYPTO and decode it with `next_recordless_message` +
   `parse_new_session_ticket`.
 
 ---
@@ -342,7 +347,7 @@ new_quic_handshake(server_name string) !QuicHandshake
 new_tls_handshake(server_name string) !TLSHandshake
 new_client_engine(server_name string, Config) !tls.quic.Conn
 (mut h) create_client_hello() ![]u8
-(mut h) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
 
 // Observation
 (h) state() HandshakeState
@@ -366,7 +371,7 @@ new_client_engine(server_name string, Config) !tls.quic.Conn
 (mut h) zeroize_app_secrets()
 
 // Recordless framing + alert mapping
-next_passthrough_message(mut buf []u8) ![]u8
+next_recordless_message(mut buf []u8) ![]u8
 max_handshake_message_len                                 // = 1 << 20
 (d AlertDescription) quic_connection_error() u32          // 0x100 + description
 hkdf_expand_label(hash HashAlgorithm, secret []u8, label string, context []u8, length int) ![]u8

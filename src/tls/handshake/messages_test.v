@@ -27,16 +27,17 @@ fn test_build_client_hello() ! {
 	assert full_msg[3] == u8(body.len & 0xff)
 }
 
-fn test_build_client_hello_includes_quic_transport_parameters() ! {
+// The handshake is a courier for QUIC transport parameters: it frames the bytes
+// its adapter encoded and must not rewrite or interpret them, so these fixtures
+// are already-encoded extension content (RFC 9001 §8.2).
+fn test_build_client_hello_carries_quic_transport_parameters_verbatim() ! {
 	cfg := ClientHelloConfig{
 		client_share:          KeyShareEntry{
 			group:        .x25519
 			key_exchange: []u8{len: 32, init: 0xaa}
 		}
 		is_quic:               true
-		quic_transport_params: QuicTransportParameters{
-			initial_scid: [u8(0x12), 0x34]
-		}
+		quic_transport_params: [u8(0x0f), 0x02, 0x12, 0x34]
 	}
 	_, full_msg := build_client_hello(cfg)!
 	assert client_hello_extension(full_msg, .quic_transport_parameters)! == [u8(0x0f), 0x02, 0x12,
@@ -49,9 +50,7 @@ fn test_build_record_client_hello_omits_quic_transport_parameters() ! {
 			group:        .x25519
 			key_exchange: []u8{len: 32, init: 0xaa}
 		}
-		quic_transport_params: QuicTransportParameters{
-			initial_scid: [u8(0x12), 0x34]
-		}
+		quic_transport_params: [u8(0x0f), 0x02, 0x12, 0x34]
 	}
 	_, full_msg := build_client_hello(cfg)!
 	if _ := client_hello_extension(full_msg, .quic_transport_parameters) {
@@ -72,21 +71,20 @@ fn test_build_quic_client_hello_requires_transport_parameters() {
 	}
 }
 
-fn test_parse_quic_transport_parameters() ! {
-	params := parse_quic_transport_parameters([u8(0x0f), 0x02, 0x12, 0x34])!
-	assert params.initial_scid == [u8(0x12), 0x34]
-}
-
-fn test_parse_quic_transport_parameters_requires_source_id() {
-	if _ := parse_quic_transport_parameters([]u8{}) {
-		assert false
+// TLS does not judge the parameter list: a value the QUIC codec would refuse is
+// still framed and sent, leaving rejection to the peer's adapter. This pins the
+// courier role so QUIC semantics cannot creep back into the handshake.
+fn test_build_quic_client_hello_does_not_judge_transport_parameters() ! {
+	cfg := ClientHelloConfig{
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+		is_quic:               true
+		quic_transport_params: [u8(0x00)]
 	}
-}
-
-fn test_parse_quic_transport_parameters_rejects_duplicate_ids() {
-	if _ := parse_quic_transport_parameters([u8(0x0f), 0x00, 0x0f, 0x00]) {
-		assert false
-	}
+	_, full_msg := build_client_hello(cfg)!
+	assert client_hello_extension(full_msg, .quic_transport_parameters)! == [u8(0x00)]
 }
 
 fn test_parse_encrypted_extensions_quic_transport_parameters() ! {
@@ -94,10 +92,18 @@ fn test_parse_encrypted_extensions_quic_transport_parameters() ! {
 	body := [u8(0x00), 0x08, 0x00, 0x39, 0x00, 0x04, 0x0f, 0x02, 0x12, 0x34]
 	alpn, params := parse_encrypted_extensions_for_transport(body, true)!
 	assert alpn == ''
-	assert params or { panic('expected server QUIC transport parameters') }.initial_scid == [
-		u8(0x12),
-		0x34,
-	]
+	raw := params or { panic('expected server QUIC transport parameters') }
+	assert raw == [u8(0x0f), 0x02, 0x12, 0x34]
+}
+
+// Decoding the triplets is the adapter's job. A parameter list this stack would
+// reject as malformed still has to survive the handshake intact, so the rejection
+// happens once, in quic, with the quic error vocabulary.
+fn test_parse_encrypted_extensions_does_not_decode_quic_transport_parameters() ! {
+	body := [u8(0x00), 0x08, 0x00, 0x39, 0x00, 0x04, 0x0f, 0x00, 0x0f, 0x00]
+	_, params := parse_encrypted_extensions_for_transport(body, true)!
+	raw := params or { panic('expected raw QUIC transport parameters') }
+	assert raw == [u8(0x0f), 0x00, 0x0f, 0x00]
 }
 
 fn test_parse_encrypted_extensions_quic_requires_transport_parameters() {

@@ -1,6 +1,6 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Core-contract suite for the transport-neutral handshake: level-tagged receive()
+// Core-contract suite for the transport-neutral handshake: level-tagged receive_msgs_at_level()
 // reassembly across adversarial splits, the unconsumed-bytes accessor, the
 // confirm/zeroize secret lifecycle, and the traffic-keys guards.
 module handshake
@@ -40,7 +40,7 @@ fn test_encryption_level_rejects_unsupported_operation() ! {
 	})!
 	_ = record.create_client_hello()!
 	mut rejected := false
-	record.receive(.application, []u8{}) or {
+	record.receive_msgs_at_level(.application, []u8{}) or {
 		assert err.msg().contains('does not accept application-level bytes')
 		rejected = true
 	}
@@ -93,7 +93,7 @@ fn test_new_handshake_message_rejects_truncated_header() ! {
 	assert false
 }
 
-// ---- receive() reassembly: split and coalesced delivery ----
+// ---- receive_msgs_at_level() reassembly: split and coalesced delivery ----
 
 // test_feed_plaintext_buffers_incomplete_message checks that an incomplete
 // ServerHello parks in the plaintext buffer without parsing.
@@ -104,12 +104,12 @@ fn test_feed_plaintext_buffers_incomplete_message() ! {
 	full := wrap_hs(.server_hello, []u8{len: 10, init: 0xAA})
 	split := full.len / 2
 
-	first := h.receive(.initial, full[..split])!
+	first := h.receive_msgs_at_level(.initial, full[..split])!
 	assert first.len == 0
 	assert h.record_unconsumed_bytes(.initial) == split
 
 	// Completing the frame consumes it; the garbage body then fails to parse.
-	h.receive(.initial, full[split..]) or {
+	h.receive_msgs_at_level(.initial, full[split..]) or {
 		assert h.record_unconsumed_bytes(.initial) == 0
 		return
 	}
@@ -124,7 +124,7 @@ fn test_record_unconsumed_bytes_levels_start_empty() ! {
 	assert h.record_unconsumed_bytes(.initial) == 0
 	_ = h.create_client_hello()!
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
-	_ = h.receive(.handshake, [u8(2), 0x00])!
+	_ = h.receive_msgs_at_level(.handshake, [u8(2), 0x00])!
 	assert h.record_unconsumed_bytes(.handshake) == 2
 }
 
@@ -194,8 +194,8 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	_ = record.create_client_hello()!
 	_ = quic.create_client_hello()!
 
-	_ = record.receive(.initial, [u8(2), 0])!
-	_ = quic.receive(.initial, [u8(2)])!
+	_ = record.receive_msgs_at_level(.initial, [u8(2), 0])!
+	_ = quic.receive_msgs_at_level(.initial, [u8(2)])!
 
 	assert record.HandshakeCore.plaintext_reassembly.len == 2
 	assert quic.HandshakeCore.plaintext_reassembly.len == 1
@@ -220,14 +220,14 @@ fn test_feed_rejects_out_of_order_message() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	cert := wrap_hs(.certificate, []u8{len: 4, init: 0x01})
-	h.receive(.handshake, cert) or {
+	h.receive_msgs_at_level(.handshake, cert) or {
 		assert h.record_unconsumed_bytes(.handshake) == 0
 		return
 	}
 	assert false
 }
 
-// ---- receive() phase guards & failure semantics ----
+// ---- receive_msgs_at_level() phase guards & failure semantics ----
 
 // test_create_client_hello_only_runs_once checks that the single-shot entry
 // point refuses a second call that would poison the transcript.
@@ -246,8 +246,8 @@ fn test_create_client_hello_only_runs_once() ! {
 // ClientHello are refused as a contract error, leaving the state .start.
 fn test_feed_before_client_hello_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
-		assert err.msg().contains('receive() before create_client_hello()')
+	h.receive_msgs_at_level(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
+		assert err.msg().contains('receive_msgs_at_level() before create_client_hello()')
 		assert h.state == .start
 		return
 	}
@@ -260,7 +260,7 @@ fn test_feed_initial_after_server_hello_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.state = .wait_encrypted_extensions
-	h.receive(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
+	h.receive_msgs_at_level(.initial, wrap_hs(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('while awaiting ServerHello')
 		assert h.state == .wait_encrypted_extensions
 		return
@@ -275,10 +275,10 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	_ = h.create_client_hello()!
 	// A garbage ServerHello body fails to parse; the failure is terminal.
 	bad := wrap_hs(.server_hello, []u8{len: 8, init: 0x01})
-	h.receive(.initial, bad) or {
+	h.receive_msgs_at_level(.initial, bad) or {
 		assert h.state == .failed
-		// No later receive() may make progress against a dead machine.
-		h.receive(.initial, bad) or {
+		// No later receive_msgs_at_level() may make progress against a dead machine.
+		h.receive_msgs_at_level(.initial, bad) or {
 			assert err.msg().contains('state machine has failed')
 			return
 		}
@@ -294,7 +294,7 @@ fn test_feed_reassembly_is_bounded_after_connected() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.state = .connected
-	h.receive(.handshake, []u8{len: handshake_header_len + max_handshake_message_len + 1, init: 0xAA}) or {
+	h.receive_msgs_at_level(.handshake, []u8{len: handshake_header_len + max_handshake_message_len + 1, init: 0xAA}) or {
 		assert err.msg().contains('reassembly exceeds')
 		assert h.state == .failed
 		return
@@ -322,7 +322,7 @@ fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	h.app_keys.server = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
 	h.state = .connected
 
-	h.receive(.initial, [u8(0)]) or {
+	h.receive_msgs_at_level(.initial, [u8(0)]) or {
 		assert err.msg().contains('only expected while awaiting ServerHello')
 		assert h.state == .connected
 		assert h.app_keys.client.key.len == 1
@@ -465,17 +465,17 @@ fn test_second_hello_reproduces_pinned_random() ! {
 	assert random2 == cfg.random
 }
 
-// ---- recordless passthrough framing ----
+// ---- recordless framing ----
 
-// test_next_passthrough_splits_one_byte_cadence checks that a message
+// test_next_recordless_splits_one_byte_cadence checks that a message
 // materializes exactly once, at the final byte (RFC 9001 §4).
-fn test_next_passthrough_splits_one_byte_cadence() ! {
+fn test_next_recordless_splits_one_byte_cadence() ! {
 	mut buf := []u8{}
 	full := wrap_hs(.finished, [u8(0xDE), 0xAD, 0xBE, 0xEF])
 	mut got := 0
 	for b in full {
 		buf << b
-		msg := next_passthrough_message(mut buf)!
+		msg := next_recordless_message(mut buf)!
 		if msg.len > 0 {
 			got += 1
 			assert msg == full
@@ -485,27 +485,27 @@ fn test_next_passthrough_splits_one_byte_cadence() ! {
 	assert got == 1
 }
 
-// test_next_passthrough_two_messages_sequential checks that two coalesced
+// test_next_recordless_two_messages_sequential checks that two coalesced
 // messages are extracted one at a time.
-fn test_next_passthrough_two_messages_sequential() ! {
+fn test_next_recordless_two_messages_sequential() ! {
 	// `+` cannot join []u8 in V, so the second frame is appended with `<<`.
 	mut buf := wrap_hs(.encrypted_extensions, [u8(0x00)])
 	buf << wrap_hs(.certificate, [u8(0x01), 0x02])
-	m1 := next_passthrough_message(mut buf)!
+	m1 := next_recordless_message(mut buf)!
 	assert m1.len == 5 // 4-byte header + 1-byte body
-	m2 := next_passthrough_message(mut buf)!
+	m2 := next_recordless_message(mut buf)!
 	assert m2.len == 6
 	assert buf.len == 0
 }
 
-// test_next_passthrough_rejects_oversize_length checks that a length above
+// test_next_recordless_rejects_oversize_length checks that a length above
 // max_handshake_message_len aborts at the header.
-fn test_next_passthrough_rejects_oversize_length() ! {
+fn test_next_recordless_rejects_oversize_length() ! {
 	mut w := wire.new_writer(4)
 	w.write_u8(u8(HandshakeType.certificate))
 	w.write_u24(u32(max_handshake_message_len + 1))
 	mut buf := w.bytes()
-	next_passthrough_message(mut buf) or {
+	next_recordless_message(mut buf) or {
 		return
 	}
 	assert false

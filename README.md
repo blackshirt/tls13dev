@@ -82,7 +82,7 @@ tls  ──▶  tls.handshake  ──▶  tls.pki  ──▶  tls.wire
 | Module          | Responsibility                                                                              |
 |-----------------|---------------------------------------------------------------------------------------------|
 | `tls`           | TLS 1.3 **record layer** (RFC 8446 §5) + the public TCP client API: `conn`, `config`, `record`, `record_protection` |
-| `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC passthrough framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
+| `tls.handshake` | **Transport-neutral handshake core**: message codecs, the state machine, §7.1 key schedule, transcript, AEAD constructors, alerts vocabulary, QUIC recordless framing (`messages`, `state_machine`, `key_schedule`, `transcript`, `handshake_keys`, `aead`, `alert`, `certificate_verify`, `passthrough`) |
 | `tls.pki`       | Trust & parsing: `asn1`, `x509`, `validator`, `hostname`, `trust_store`, `rsa`              |
 | `tls.wire`      | Bounds-checked byte reader / length-prefixed writer (no TLS semantics)                       |
 
@@ -104,7 +104,7 @@ matching facade; framing and encryption decisions stay adapter-side:
 new_tls_handshake(server_name) !TLSHandshake
 new_quic_handshake(server_name) !QuicHandshake
 create_client_hello() ![]u8
-receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
+receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage   // single inbound entry
 state() HandshakeState  /  negotiated_alpn() string  /  negotiated_cipher_suite() CipherSuite
 failure_alert() AlertDescription  /  fail_and_destroy_secrets()  /  zeroize_app_secrets()
 
@@ -126,9 +126,9 @@ Both facades share `hkdf_expand_label`, `suite_hash_algo`, `suite_key_len`, and
 `new_aead_for_suite`.
 
 `EncryptionLevel` (`initial`, `handshake`, `application`) is shared by
-`receive()` and traffic-secret access. Here `.initial` means the initial TLS
+`receive_msgs_at_level()` and traffic-secret access. Here `.initial` means the initial TLS
 handshake phase before handshake traffic keys exist; it is not QUIC Initial
-packet protection. `receive()` accepts only initial or handshake bytes and
+packet protection. `receive_msgs_at_level()` accepts only initial or handshake bytes and
 appends them to the core's corresponding reassembly buffer; application-level
 bytes are not handshake input. `record_traffic_keys()` and
 `quic_traffic_secrets()` accept handshake or application to select derived
@@ -250,8 +250,8 @@ the all-zero one.
 - A QUIC transport stack (RFC 9001) — packet building, header protection,
   packet-number spaces, and `CONNECTION_CLOSE` signaling are out of scope. The
   handshake core is nonetheless built to be driven over QUIC: it lives in the
-  importable `tls.handshake` module (with the passthrough framing helpers, the
-  level-tagged `receive`/`record_traffic_keys`/`quic_traffic_secrets` seam, and the
+  importable `tls.handshake` module (with the recordless framing helpers, the
+  level-tagged `receive_msgs_at_level`/`record_traffic_keys`/`quic_traffic_secrets` seam, and the
   `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
   only `tls.handshake` + `tls.pki` and never imports `tls`; the full
   eight-step engine loop over that seam is walked through in

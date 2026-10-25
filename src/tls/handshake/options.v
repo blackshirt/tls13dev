@@ -6,15 +6,6 @@ module handshake
 
 import tls.pki
 
-// QuicTransportParameters is the subset of QUIC transport parameters currently
-// carried by the TLS handshake.
-pub struct QuicTransportParameters {
-pub:
-	// initial_scid identifies the source connection ID sent by this endpoint
-	// in its first QUIC packet.
-	initial_scid []u8
-}
-
 // HandshakeOptions configures the shared TLS handshake, including peer
 // validation, ALPN, and the ClientHello preferences offered by the client.
 @[params]
@@ -37,6 +28,10 @@ pub:
 	legacy_session_id []u8
 	random            []u8
 pub mut:
-	// quic_transport_params is sent only by the QUIC handshake facade.
-	quic_transport_params QuicTransportParameters
+	// quic_transport_params is the already-encoded content of the TLS
+	// quic_transport_parameters extension (RFC 9001 §8.2), sent only by the QUIC
+	// handshake facade. TLS copies these bytes in and stores them back out
+	// without interpreting them: transport parameters are QUIC's own vocabulary,
+	// so the adapter above encodes and decodes them.
+	quic_transport_params []u8
 }

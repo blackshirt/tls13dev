@@ -28,10 +28,10 @@ pub fn new_tls_handshake(server_name string, options HandshakeOptions) !TLSHands
 	}
 }
 
-// receive feeds TLS handshake bytes at one encryption level and returns any
-// complete outbound handshake messages triggered by the input.
-pub fn (mut h TLSHandshake) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
-	messages := h.HandshakeCore.receive(level, bytes) or {
+// receive_msgs_at_level feeds TLS handshake bytes at one encryption level and returns
+// any complete outbound handshake messages triggered by the input.
+pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+	messages := h.HandshakeCore.receive_msgs_at_level(level, bytes) or {
 		if h.state() == .failed {
 			h.wipe_record_keys()
 		}

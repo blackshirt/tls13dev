@@ -75,11 +75,11 @@ mut:
 	client_hello1 []u8              // first ClientHello, kept in case the server requests a retry
 
 	// Transcript and negotiated cipher suite.
-	transcript   Transcript               // hash of handshake messages exchanged so far
-	hash_algo    HashAlgorithm            // hash algorithm used for this handshake
-	cipher_suite CipherSuite              // cipher suite selected by the server
-	key_len      int                      // encryption key length for the selected cipher suite
-	quic_params  ?QuicTransportParameters // server transport parameters received in EncryptedExtensions
+	transcript   Transcript    // hash of handshake messages exchanged so far
+	hash_algo    HashAlgorithm // hash algorithm used for this handshake
+	cipher_suite CipherSuite   // cipher suite selected by the server
+	key_len      int           // encryption key length for the selected cipher suite
+	quic_params  ?[]u8         // server transport parameters received in EncryptedExtensions, kept as opaque bytes for the QUIC adapter
 
 	// Traffic secrets used to protect handshake and application data.
 	handshake_secret  []u8 // secret used to derive handshake traffic keys
@@ -193,9 +193,9 @@ fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 // create_client_hello generates the initial ClientHello, advances to
 // .wait_server_hello and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
 pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
-	// A second call would replay the first ClientHello into the transcript and corrupt every later hash; the retry ClientHello has its own path via receive().
+	// A second call would replay the first ClientHello into the transcript and corrupt every later hash; the retry ClientHello has its own path via receive_msgs_at_level().
 	if h.state != .start {
-		return error('handshake: create_client_hello() only runs once (state: ${h.state}); the retry ClientHello is produced by receive() during HelloRetryRequest handling')
+		return error('handshake: create_client_hello() only runs once (state: ${h.state}); the retry ClientHello is produced by receive_msgs_at_level() during HelloRetryRequest handling')
 	}
 	_, full_client_hello := build_client_hello(h.config)!
 	h.client_hello1 = full_client_hello.clone()
@@ -224,14 +224,14 @@ fn (mut h HandshakeCore) check_reassembly_bound(level EncryptionLevel) ! {
 	}
 }
 
-// receive processes bytes using the encryption-level reassembly buffers owned
-// by the selected transport facade, returning any outbound messages triggered.
-pub fn (mut h HandshakeCore) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+// receive_msgs_at_level processes bytes using the encryption-level reassembly buffers
+// owned by the selected transport facade, returning any outbound messages triggered.
+pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
-		return error('handshake: receive() before create_client_hello() — no ClientHello has been sent yet')
+		return error('handshake: receive_msgs_at_level() before create_client_hello() — no ClientHello has been sent yet')
 	}
 	if h.state == .failed {
-		return error('handshake: state machine has failed; receive() refuses further messages')
+		return error('handshake: state machine has failed; receive_msgs_at_level() refuses further messages')
 	}
 	match level {
 		.initial {
@@ -262,7 +262,7 @@ pub fn (mut h HandshakeCore) receive(level EncryptionLevel, bytes []u8) ![]Hands
 			return out
 		}
 		.application {
-			return error('handshake: receive() does not accept application-level bytes')
+			return error('handshake: receive_msgs_at_level() does not accept application-level bytes')
 		}
 	}
 }
@@ -272,7 +272,7 @@ pub fn (mut h HandshakeCore) receive(level EncryptionLevel, bytes []u8) ![]Hands
 fn (mut h HandshakeCore) drain_plaintext() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state == .wait_server_hello {
-		msg := next_passthrough_message(mut h.plaintext_reassembly)!
+		msg := next_recordless_message(mut h.plaintext_reassembly)!
 		if msg.len == 0 {
 			break // header or body still incomplete
 		}
@@ -290,7 +290,7 @@ fn (mut h HandshakeCore) drain_plaintext() ![]HandshakeMessage {
 fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state != .connected && h.state != .failed {
-		msg := next_passthrough_message(mut h.hs_reassembly)!
+		msg := next_recordless_message(mut h.hs_reassembly)!
 		if msg.len == 0 {
 			break
 		}

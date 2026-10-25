@@ -95,9 +95,14 @@ pub:
 	// client_auth sends a CertificateRequest after EncryptedExtensions and expects
 	// the client's empty Certificate (RFC 8446 §4.3.2/§4.4.2) in the transcript.
 	client_auth bool
-	// quic_source_connection_id is sent as initial_source_connection_id when the
-	// ClientHello carries the QUIC transport-parameters extension.
-	quic_source_connection_id []u8
+	// quic_scid is sent as initial_source_connection_id when the ClientHello carries
+	// the QUIC transport-parameters extension.
+	quic_scid []u8
+	// quic_original_dcid is sent as original_destination_connection_id: the
+	// destination connection ID the client used in its first Initial packet.
+	// RFC 9000 §7.3 makes a server that omits it non-compliant, so a QUIC fakeserver
+	// must be given it.
+	quic_original_dcid []u8
 }
 
 // Stage tracks where the fakeserver is in its two-hello state machine.
@@ -284,8 +289,8 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	} else {
 		pick_alpn(s.cfg.alpn, ch.alpn)
 	}
-	ee := build_encrypted_extensions(alpn_proto, ch.is_quic,
-		s.cfg.quic_source_connection_id)!
+	ee := build_encrypted_extensions(alpn_proto, ch.is_quic, s.cfg.quic_original_dcid,
+		s.cfg.quic_scid)!
 	s.transcript.append(ee)
 
 	if s.cfg.client_auth {
@@ -741,8 +746,9 @@ fn build_hrr(session_id []u8, req_group u16, cookie []u8) ![]u8 {
 }
 
 // build_encrypted_extensions emits an EncryptedExtensions body carrying the
-// negotiated ALPN and nothing else (RFC 8446 §4.3.1).
-fn build_encrypted_extensions(alpn_proto string, is_quic bool, quic_source_connection_id []u8) ![]u8 {
+// negotiated ALPN and, on a QUIC connection, this server's transport parameters
+// (RFC 8446 §4.3.1, RFC 9001 §8.2).
+fn build_encrypted_extensions(alpn_proto string, is_quic bool, quic_original_dcid []u8, quic_scid []u8) ![]u8 {
 	mut ext := wire.new_writer(32)
 	if alpn_proto.len > 0 {
 		mut proto_list := wire.new_writer(alpn_proto.len + 3)
@@ -753,13 +759,25 @@ fn build_encrypted_extensions(alpn_proto string, is_quic bool, quic_source_conne
 		ext.write_vector_u16(alpn_body.bytes())!
 	}
 	if is_quic {
-		if quic_source_connection_id.len > 20 {
-			return error('fakeserver: QUIC source connection ID exceeds 20 bytes')
+		if quic_original_dcid.len > 20 || quic_scid.len > 20 {
+			return error('fakeserver: QUIC connection ID exceeds 20 bytes')
 		}
-		mut transport_parameters := []u8{cap: quic_source_connection_id.len + 3}
+		// The TLS handshake treats the extension content as opaque, and this test
+		// server must not depend on tls.quic, so the two connection-ID triplets are
+		// written by hand: parameter id, byte length, then the connection ID. All the
+		// integers stay below 64, so each is a valid one-byte QUIC varint
+		// (RFC 9000 §16); tls.quic's transport_params.v holds the canonical encoder
+		// this mirrors.
+		mut tp_cap := quic_original_dcid.len + quic_scid.len
+		tp_cap += 6
+		mut transport_parameters := []u8{cap: tp_cap}
+		// RFC 9000 §18.2 parameter ids, written in ascending order.
+		transport_parameters << 0x00 // original_destination_connection_id parameter ID
+		transport_parameters << u8(quic_original_dcid.len)
+		transport_parameters << quic_original_dcid
 		transport_parameters << 0x0f // initial_source_connection_id parameter ID
-		transport_parameters << u8(quic_source_connection_id.len)
-		transport_parameters << quic_source_connection_id
+		transport_parameters << u8(quic_scid.len)
+		transport_parameters << quic_scid
 		ext.write_u16(ext_quic_transport_parameters)
 		ext.write_vector_u16(transport_parameters)!
 	}

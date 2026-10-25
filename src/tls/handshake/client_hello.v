@@ -105,8 +105,9 @@ mut:
 	// QUIC-specific settings.
 	// Whether this ClientHello is for a QUIC connection.
 	is_quic bool
-	// QUIC transport parameters to include when is_quic is true.
-	quic_transport_params ?QuicTransportParameters
+	// quic_transport_params is the already-encoded extension content, built by
+	// the QUIC adapter; it is required when is_quic is true.
+	quic_transport_params ?[]u8
 }
 
 // offered_cipher_suites returns the suites a client sends in its ClientHello:
@@ -233,13 +234,15 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		write_extension(mut ext_writer, .alpn, alpn_w.bytes())!
 	}
 
-	// QUIC transport parameters are carried in ClientHello (RFC 9001 §8.2).
+	// QUIC transport parameters are carried in ClientHello (RFC 9001 §8.2). TLS is
+	// a courier for these bytes: it frames and sends whatever the adapter encoded,
+	// without inspecting the value - even a malformed list is the peer's adapter to
+	// reject, not this handshake's.
 	if cfg.is_quic {
 		params := cfg.quic_transport_params or {
 			return error('handshake: QUIC ClientHello is missing transport parameters')
 		}
-		write_extension(mut ext_writer, .quic_transport_parameters,
-			encode_quic_transport_parameters(params)!)!
+		write_extension(mut ext_writer, .quic_transport_parameters, params)!
 	}
 
 	// cookie (RFC 8446 §4.2.2) — echoed after HelloRetryRequest

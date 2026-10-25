@@ -252,7 +252,7 @@ fn (mut c Conn) do_handshake() ! {
 					c.fail_alert = .unexpected_message
 					return error('tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
-				msgs := c.hs.receive(.initial, rec.payload)!
+				msgs := c.hs.receive_msgs_at_level(.initial, rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
 				if c.hs.record_unconsumed_bytes(.initial) != 0 {
 					c.fail_alert = .unexpected_message
@@ -281,7 +281,7 @@ fn (mut c Conn) do_handshake() ! {
 				// Inner-type routing is record-layer policy; the core has no ContentType concept.
 				match dec.content_type {
 					.handshake {
-						msgs := c.hs.receive(.handshake, dec.plaintext)!
+						msgs := c.hs.receive_msgs_at_level(.handshake, dec.plaintext)!
 						for m in msgs {
 							// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
 							enc := c.client_hs_cipher.encrypt_record(.handshake, m.msg())!
@@ -569,7 +569,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 		return error('tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
 	}
 	for {
-		msg := handshake.next_passthrough_message(mut c.post_hs_buf)!
+		msg := handshake.next_recordless_message(mut c.post_hs_buf)!
 		if msg.len == 0 {
 			return // header or body still incomplete; wait for the next record
 		}

@@ -6,17 +6,37 @@
 // prefix and stashes any higher-offset chunk until the gap fills.
 module quic
 
+import tls.handshake
+
 // Bound both buffered bytes and per-chunk map overhead for out-of-order input.
 const max_crypto_chunks = 256
 
-// CryptoReasm reassembles one encryption level's CRYPTO stream. `ready` is the
-// contiguous prefix from offset 0; `pending` holds out-of-order chunks keyed by
-// their stream offset.
+// CryptoReasm reassembles one encryption level's CRYPTO stream. `ready` holds
+// the contiguous bytes not yet delivered, starting at the absolute stream offset
+// `base`; `pending` holds out-of-order chunks keyed by their stream offset.
+// Offsets within a level are absolute and monotonic (RFC 9000 §19.6), so the end
+// of the contiguous range is `base + ready.len` — never `ready.len` alone, which
+// collapses back to 0 as soon as a message is delivered and would strand every
+// later chunk (a retry ClientHello, or the tail of a certificate split across
+// packets) in `pending` forever.
 struct CryptoReasm {
 mut:
 	ready          []u8
 	pending        map[u64][]u8
 	buffered_bytes int
+	base           u64 // absolute stream offset of ready[0]
+}
+
+// next_message pops one complete recordless handshake message off the front of
+// `ready` and advances `base` past it, keeping the buffered window aligned with
+// the peer's absolute offsets. Delivery must go through here: consuming `ready`
+// directly would leave `base` behind and break the contiguity rule above.
+// It returns an empty slice while the header or body is still incomplete, and
+// rejects a declared length past the handshake-message cap.
+fn (mut r CryptoReasm) next_message() ![]u8 {
+	msg := handshake.next_recordless_message(mut r.ready)!
+	r.base += u64(msg.len)
+	return msg
 }
 
 // insert adds a chunk at `offset`, then folds any pending chunks that have
@@ -30,11 +50,15 @@ fn (mut r CryptoReasm) insert(offset u64, data []u8) ! {
 		return error('quic: CRYPTO stream range exceeds ${max_crypto_buffer} byte limit')
 	}
 	end := offset + data_len
-	ready_end := u64(r.ready.len)
-	if offset < ready_end {
+	ready_end := r.base + u64(r.ready.len)
+	if offset < ready_end && end > r.base {
+		// Only bytes still held in ready can be compared. A chunk reaching back
+		// below `base` partly covers data already delivered to the framer, which is
+		// a duplicate the peer may legitimately retransmit, not a conflict.
+		overlap_start := if offset > r.base { offset } else { r.base }
 		overlap_end := if end < ready_end { end } else { ready_end }
-		for pos in offset .. overlap_end {
-			if r.ready[int(pos)] != data[int(pos - offset)] {
+		for pos in overlap_start .. overlap_end {
+			if r.ready[int(pos - r.base)] != data[int(pos - offset)] {
 				return error('quic: conflicting overlapping CRYPTO data')
 			}
 		}
@@ -54,24 +78,17 @@ fn (mut r CryptoReasm) insert(offset u64, data []u8) ! {
 	if offset <= ready_end {
 		// Overlaps or abuts the ready prefix: append only the new tail.
 		if end <= ready_end {
-			return // wholly duplicate
+			return // wholly duplicate of bytes already delivered or buffered
 		}
-		start := int(offset)
-		if start < r.ready.len {
-			overlap := r.ready.len - start
-			added := data.len - overlap
-			if r.buffered_bytes + added > max_crypto_buffer {
-				return error('quic: CRYPTO reassembly exceeds ${max_crypto_buffer} byte limit')
-			}
-			r.ready << data[overlap..]
-			r.buffered_bytes += added
-		} else {
-			if r.buffered_bytes + data.len > max_crypto_buffer {
-				return error('quic: CRYPTO reassembly exceeds ${max_crypto_buffer} byte limit')
-			}
-			r.ready << data
-			r.buffered_bytes += data.len
+		// Bytes below ready_end are already delivered (below base) or already
+		// buffered, so only the tail past ready_end is new.
+		covered := int(ready_end - offset)
+		added := data.len - covered
+		if r.buffered_bytes + added > max_crypto_buffer {
+			return error('quic: CRYPTO reassembly exceeds ${max_crypto_buffer} byte limit')
 		}
+		r.ready << data[covered..]
+		r.buffered_bytes += added
 	} else {
 		mut merged_start := offset
 		mut merged_end := end
@@ -141,15 +158,15 @@ fn (mut r CryptoReasm) drain_pending() {
 	mut progressed := true
 	for progressed {
 		progressed = false
+		ready_end := r.base + u64(r.ready.len)
 		for off, chunk in r.pending {
-			if off <= u64(r.ready.len) {
+			if off <= ready_end {
 				end := off + u64(chunk.len)
 				mut appended := 0
-				if end > u64(r.ready.len) {
-					start := int(off)
-					overlap := if start < r.ready.len { r.ready.len - start } else { 0 }
-					r.ready << chunk[overlap..]
-					appended = chunk.len - overlap
+				if end > ready_end {
+					covered := int(ready_end - off)
+					r.ready << chunk[covered..]
+					appended = chunk.len - covered
 				}
 				r.buffered_bytes += appended - chunk.len
 				r.pending.delete(off)

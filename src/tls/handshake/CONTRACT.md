@@ -28,7 +28,7 @@ Both facades expose the same handshake operations:
 ```v
 mut hs := new_tls_handshake(server_name)! // or new_quic_handshake(...)
 client_hello := hs.create_client_hello()!
-messages := hs.receive(level, bytes)!
+messages := hs.receive_msgs_at_level(level, bytes)!
 state := hs.state()
 alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
@@ -53,7 +53,7 @@ preserve the built-in defaults. An initial key-share group must also appear in
 `supported_groups`; a HelloRetryRequest may select another configured supported
 group. Explicit `legacy_session_id` and `random` values are intended only for
 deterministic test vectors.
-`receive()` accepts bytes at an `EncryptionLevel` (`initial` or `handshake`),
+`receive_msgs_at_level()` accepts bytes at an `EncryptionLevel` (`initial` or `handshake`),
 reassembles complete messages, and returns outbound `HandshakeMessage` values
 tagged with that TLS phase. QUIC packet levels are translated by its engine;
 they are not part of the shared handshake API. The same `EncryptionLevel`
@@ -104,7 +104,7 @@ frame or encrypt transport records or packets.
 
 ## Future API work
 
-`receive()` still returns only outbound messages. Adapters continue to observe
+`receive_msgs_at_level()` still returns only outbound messages. Adapters continue to observe
 `state()` to determine milestones such as handshake-key readiness. A structured
 progress result could make those milestones explicit later, once both adapters
 can migrate without changing message ordering, alert classification, or secret

@@ -139,11 +139,16 @@ fn build_empty_certificate(request_context []u8) []u8 {
 	return wrap_handshake_message(.certificate, body)
 }
 
-fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?QuicTransportParameters) {
+// parse_encrypted_extensions_for_transport extracts the two values the handshake
+// itself needs from EncryptedExtensions: the negotiated ALPN, and — on a QUIC
+// connection — the peer's transport parameters. Those parameters are returned as
+// raw bytes, because their id/length/value content belongs to QUIC and is decoded
+// by the adapter; this function only enforces the TLS-level placement rules.
+fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?[]u8) {
 	mut r := wire.new_reader(body)
 	ext_bytes := r.read_vector_u16()!
 	mut alpn := ''
-	mut quic_transport_parameters := ?QuicTransportParameters(none)
+	mut transport_parameters := ?[]u8(none)
 
 	exts := parse_extensions(ext_bytes)!
 	for ext in exts {
@@ -184,7 +189,9 @@ fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?
 			if !is_quic {
 				return error('handshake: QUIC transport parameters received on a TLS record connection')
 			}
-			quic_transport_parameters = parse_quic_transport_parameters(ext.data)!
+			// Clone: `body` is the recordless buffer this call does not own, and the
+			// adapter reads these bytes long after the handshake message is consumed.
+			transport_parameters = ext.data.clone()
 		} else {
 			// §4.3.1: everything else must have been offered and belong here.
 			return error('handshake: extension 0x${ext.typ:04x} in EncryptedExtensions was not offered (unsupported_extension)')
@@ -193,9 +200,12 @@ fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?
 	if r.remaining() != 0 {
 		return error('handshake: trailing bytes after EncryptedExtensions')
 	}
-	if is_quic && quic_transport_parameters == none {
+	if is_quic && transport_parameters == none {
+		// RFC 9001 §4.3/§8.2: a QUIC server must advertise transport parameters here;
+		// their contents are the adapter's concern, but omitting them entirely is a
+		// handshake-level violation and fails closed.
 		return error('handshake: server omitted QUIC transport parameters')
 	}
 
-	return alpn, quic_transport_parameters
+	return alpn, transport_parameters
 }

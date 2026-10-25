@@ -85,7 +85,14 @@ fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8
 			if subtle.constant_time_compare(server_share.key_exchange, []u8{len: 32, init: 0}) == 1 {
 				return h.fail(.illegal_parameter, 'handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
 			}
-			secret := h.priv_x25519.x25519(server_share.key_exchange)!
+			// The backend runs its own low-order and zero-result checks, so a
+			// small-order contribution can fail inside the scalar multiplication and
+			// never reach the result comparison below. Classify every failure of this
+			// exchange as the peer's fault: RFC 8446 §4.2.8.2 makes a bad key_share
+			// illegal_parameter, and pinning it keeps the sent alert off internal_error.
+			secret := h.priv_x25519.x25519(server_share.key_exchange) or {
+				return h.fail(.illegal_parameter, 'handshake: X25519 key_share is a small-order contribution (illegal_parameter)')
+			}
 			// Defense in depth: reject every small-order result, not just the all-zero one.
 			if is_x25519_small_order(secret) {
 				return h.fail(.illegal_parameter, 'handshake: computed X25519 shared secret is a small-order value (illegal_parameter)')
@@ -94,13 +101,18 @@ fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8
 		}
 		.secp256r1 {
 			// Only the uncompressed encoding is legal in TLS 1.3 (§4.2.8.2); compressed shares start 0x02/0x03.
+			// A malformed share is the sender's fault, so it must pin the alert.
 			if server_share.key_exchange[0] != 0x04 {
-				return error('handshake: P-256 key_share is not an uncompressed point (0x04 prefix)')
+				return h.fail(.illegal_parameter, 'handshake: P-256 key_share is not an uncompressed point (0x04 prefix)')
 			}
 			priv := h.priv_p256 or { return error('handshake: missing P-256 private key') }
+			// A point that does not decode is the sender's fault too, so pin the alert
+			// instead of letting a backend message surface as internal_error.
 			peer := ecdsa.PublicKey.from_uncompressed_bytes(server_share.key_exchange,
 				nid: .prime256v1
-			)!
+			) or {
+				return h.fail(.illegal_parameter, 'handshake: P-256 key_share is not a valid uncompressed point on the curve (illegal_parameter)')
+			}
 			secret := priv.derive_shared_secret(peer)!
 			if subtle.constant_time_compare(secret, []u8{len: secret.len, init: 0}) == 1 {
 				return h.fail(.illegal_parameter, 'handshake: computed P-256 shared secret is all-zero value (illegal_parameter)')

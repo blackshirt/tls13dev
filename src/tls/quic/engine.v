@@ -51,10 +51,11 @@ mut:
 	hs handshake.QuicHandshake // Shared TLS handshake and traffic-secret state.
 
 	// Connection IDs used for packet routing and Initial key derivation.
-	dcid      []u8 // Current destination CID used in outbound packets.
-	scid      []u8 // This endpoint's source CID, advertised to the peer.
-	orig_dcid []u8 // Original destination CID; Initial keys remain based on it.
-	adopted   bool // Whether a successfully decrypted server Initial set dcid.
+	dcid            []u8 // Current destination CID used in outbound packets.
+	scid            []u8 // This endpoint's source CID, advertised to the peer.
+	orig_dcid       []u8 // Destination CID of the first Initial; those keys derive from it.
+	adopted         bool // Whether a successfully decrypted server Initial set dcid.
+	initial_rekeyed bool // Whether Initial keys were re-derived after a HelloRetryRequest.
 
 	// Per-level packet protection, with independent send and receive state.
 	initial_tx   ?ProtectionState // Initial keys for outbound packets.
@@ -94,9 +95,13 @@ pub fn new_client_engine(server_name string, config Config) !Conn {
 // IDs. It is private because fixed IDs are only needed by package tests.
 fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOptions, dcid []u8, scid []u8) !Conn {
 	mut hs_options := options
-	hs_options.quic_transport_params = handshake.QuicTransportParameters{
+	// TLS carries these bytes verbatim into the quic_transport_parameters
+	// extension (RFC 9001 §8.2) and never reads them, so encoding them is the
+	// adapter's job. This assignment overrides any caller-supplied value: the
+	// advertised parameter must be this engine's own source connection ID.
+	hs_options.quic_transport_params = encode_transport_parameters(TransportParameters{
 		initial_scid: scid.clone()
-	}
+	})!
 	hs := handshake.new_quic_handshake(server_name, hs_options)!
 	mut eng := Conn{
 		hs:        hs
@@ -104,16 +109,40 @@ fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOpt
 		scid:      scid.clone()
 		orig_dcid: dcid.clone()
 	}
-	eng.install_initial_keys()!
+	eng.install_initial_keys(dcid)!
 	return eng
 }
 
 // install_initial_keys derives and stores the Initial protection in both
-// directions (RFC 9001 §5.2).
-fn (mut e Conn) install_initial_keys() ! {
-	ck, sk := derive_initial_keys(e.orig_dcid)!
+// directions from the destination connection ID the client's Current Initial
+// packet carries: the original DCID for the first ClientHello (RFC 9001 §5.2), or
+// the server-chosen one for the retry after a HelloRetryRequest (§5.5).
+fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
+	ck, sk := derive_initial_keys(client_dcid)!
 	e.initial_tx = new_initial_protection(ck)!
 	e.initial_rx = new_initial_protection(sk)!
+}
+
+// rederive_initial_keys_after_retry applies RFC 9001 §5.5 once, when the core has
+// accepted a HelloRetryRequest: the retry ClientHello is addressed to the
+// connection ID the server chose in its HRR packet, and Initial secrets are a
+// function of that destination ID, so both directions change (§5.5). The Initial
+// packet-number space resets with them (§5.5.2) - the peer starts numbering its
+// second Initial from 0 again, and reconstructing that number against a
+// high-water mark left over from the old keys would place it past the window.
+//
+// What does NOT reset is the CRYPTO stream at this level: offsets within a level
+// are absolute and monotonic (§19.6), which is what lets the retry ClientHello
+// continue past the original instead of rewriting offset 0.
+fn (mut e Conn) rederive_initial_keys_after_retry() ! {
+	if e.initial_rekeyed || !e.hs.hello_retry_request_received() {
+		return
+	}
+	e.install_initial_keys(e.dcid)!
+	e.initial_ns.next_pn = 0
+	e.initial_ns.largest_rx = 0
+	e.initial_ns.any_rx = false
+	e.initial_rekeyed = true
 }
 
 // state exposes the handshake state (handshake.HandshakeState) for polling.
@@ -138,8 +167,10 @@ pub fn (e &Conn) confirmed() bool {
 }
 
 // original_dcid returns the Destination Connection ID the engine used in its
-// first Initial packet. Initial keys are a fixed function of it (RFC 9001 §5.2),
-// so a peer needs it to derive matching Initial protection.
+// first Initial packet. Initial keys are a function of it (RFC 9001 §5.2) only
+// until a HelloRetryRequest changes the destination ID, after which both peers
+// re-derive from the server-chosen ID (§5.5); a peer still keyed on this value
+// cannot open the retry flight.
 pub fn (e &Conn) original_dcid() []u8 {
 	return e.orig_dcid
 }
@@ -186,13 +217,31 @@ pub fn (mut e Conn) receive(datagram []u8) ![]u8 {
 		}
 		off += consumed
 	}
-	out := e.flush()!
-	if params := e.hs.peer_transport_parameters() {
+	// RFC 9001 §5.5: an accepted HelloRetryRequest stales the Initial keys this
+	// engine holds, because the retry ClientHello is addressed to the connection ID
+	// the server chose. Re-key before anything is sealed.
+	e.rederive_initial_keys_after_retry()!
+	// The transport-parameter binding check runs before the flush, not after: RFC
+	// 9000 §7.3 requires the client to discard the server's keys when the connection
+	// IDs the server declares do not match the connection IDs this endpoint actually
+	// saw on the wire, so a mismatch must emit nothing rather than a Finished sealed
+	// under keys already known to be unbound. The handshake guarantees a QUIC server
+	// sent *something* here and hands it over undecoded; interpreting it is this
+	// adapter's responsibility.
+	if raw := e.hs.peer_transport_parameters() {
+		params := parse_transport_parameters(raw)!
+		// initial_source_connection_id binds the server's declaration to the source
+		// ID it really sent; original_destination_connection_id echoes the client's own
+		// first Destination ID, so checking it proves the flight belongs to this
+		// connection rather than one an attacker is trying to splice in.
 		if params.initial_scid != e.dcid {
 			return error('quic: server initial_source_connection_id does not match its source connection ID')
 		}
+		if params.original_dcid != e.orig_dcid {
+			return error('quic: server original_destination_connection_id does not match the original Destination Connection ID')
+		}
 	}
-	return out
+	return e.flush()!
 }
 
 // receive_packet handles one coalesced packet at the front of `buf`, returning
@@ -369,16 +418,18 @@ fn (mut e Conn) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
 
 // drain_contiguous feeds every complete handshake message at the front of the
 // level's CRYPTO stream to the core, then installs any new keys the core exposes.
+// Delivery goes through reasm.next_message(), which advances the reassembler's
+// absolute offset so a peer may keep appending to the stream past what we took.
 fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
 	level := level_of(ptype)!
 	mut produced := []handshake.HandshakeMessage{}
 	for {
 		mut ns := e.ns_mut(ptype)
-		msg := handshake.next_passthrough_message(mut ns.reasm.ready)!
+		msg := ns.reasm.next_message()!
 		if msg.len == 0 {
 			break
 		}
-		out := e.hs.receive(level, msg) or {
+		out := e.hs.receive_msgs_at_level(level, msg) or {
 			// A core failure must become a QUIC connection error: classify the
 			// alert, record the CRYPTO_ERROR code, and stop.
 			e.fail_close()!

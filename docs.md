@@ -211,7 +211,7 @@ building a QUIC adapter. The API contract is documented in
 new_tls_handshake(server_name string) !TLSHandshake
 new_quic_handshake(server_name string) !QuicHandshake
 (mut h) create_client_hello() ![]u8
-(mut h) receive(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
      (h) failure_alert() AlertDescription
 (mut h) fail_and_destroy_secrets()   /   zeroize_app_secrets()
@@ -230,7 +230,7 @@ new_quic_handshake(server_name string) !QuicHandshake
   input and derived traffic secrets one shared phase vocabulary, independent of
   transport packet levels. `.initial` means the initial TLS handshake phase
   before handshake keys are installed; it is not QUIC Initial packet
-  protection. `receive()` accepts only initial and handshake input, buffering
+  protection. `receive_msgs_at_level()` accepts only initial and handshake input, buffering
   each separately; traffic-key/secret access accepts handshake or application.
   QUIC Initial packet keys derive from the destination connection ID and are
   not part of this TLS secret API.

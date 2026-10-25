@@ -165,6 +165,32 @@ fn test_read_bounds_empty_record_flood() ! {
 	assert false, 'an empty-record flood must not spin read() forever'
 }
 
+// test_post_handshake_reassembly_is_bounded checks that a peer streaming
+// incomplete handshake fragments can never grow post_hs_buf past one capped
+// message plus header — the bound must fire as record_overflow before the
+// buffer climbs without limit (§5.2; mirrors the core's check_reassembly_bound).
+fn test_post_handshake_reassembly_is_bounded() ! {
+	mut c := new_test_conn()!
+	bound := record_header_len + handshake.max_handshake_message_len
+
+	// Header declares a 1 MiB body that never completes: every chunk stays
+	// reassembly-exempt from next_recordless_message's own oversized-declared
+	// check, so only the running bound can stop it.
+	mut chunk := [u8(0x0b), 0x0f, 0xff, 0xf8] // Certificate; declared len 1048568
+	chunk << []u8{len: 512, init: 0xbb}
+	for _ in 0 .. bound / chunk.len + 2 {
+		c.handle_post_handshake(chunk) or {
+			assert err.msg().contains('post-handshake reassembly exceeds')
+			// Conn.fail_alert is an option (unlike the core's plain field), so unwrap it.
+			pinned := c.fail_alert or { panic('the reassembly bound must pin a fail_alert') }
+			assert pinned == handshake.AlertDescription.record_overflow
+			return
+		}
+		assert c.post_hs_buf.len <= bound // below the bound the tail just buffers
+	}
+	assert false, 'unbounded post-handshake reassembly must fail closed'
+}
+
 // test_close_notify_is_clean_eof checks that close_notify surfaces as a clean
 // EOF (0) with no sticky error, so a caller can distinguish orderly shutdown.
 fn test_close_notify_is_clean_eof() ! {

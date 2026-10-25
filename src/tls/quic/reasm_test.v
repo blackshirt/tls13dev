@@ -85,3 +85,44 @@ fn test_crypto_reasm_limits_pending_chunk_count() {
 	}
 	assert false
 }
+
+// hello_msg is one complete recordless handshake message: type, 24-bit body
+// length, then a 2-byte body (RFC 8446 §4).
+fn hello_msg() []u8 {
+	return [u8(0x01), 0x00, 0x00, 0x02, 0xaa, 0xbb]
+}
+
+fn test_crypto_reasm_accepts_chunks_continuing_past_delivered_bytes() ! {
+	// A peer continues a level's CRYPTO stream after bytes we already handed to
+	// the framer — the retry ClientHello after a HelloRetryRequest, or the tail of
+	// a certificate split across packets. Measuring contiguity by ready.len alone
+	// made `base` collapse to 0 once ready drained, so such a chunk was stranded in
+	// pending forever and the handshake stalled (RFC 9000 §19.6).
+	mut reasm := CryptoReasm{}
+	first := hello_msg()
+	reasm.insert(0, first)!
+	msg := reasm.next_message()!
+	assert msg == first
+	assert reasm.base == 6, 'delivery must advance the absolute stream offset'
+	assert reasm.ready.len == 0
+	reasm.insert(6, 'xy'.bytes())!
+	assert reasm.ready == 'xy'.bytes(), 'a chunk continuing the stream must fold into ready'
+	assert reasm.pending.len == 0
+}
+
+fn test_crypto_reasm_rejects_conflicts_past_delivered_bytes() ! {
+	// The same bookkeeping must stay strict about data still held: once the stream
+	// base has advanced, rewriting a byte that is merely buffered, not delivered,
+	// is a conflict exactly as it is at offset 0.
+	mut reasm := CryptoReasm{}
+	reasm.insert(0, hello_msg())!
+	_ = reasm.next_message()!
+	reasm.insert(6, 'abcd'.bytes())!
+	reasm.insert(7, 'XX'.bytes()) or {
+		assert err.msg().contains('conflicting overlapping')
+		assert reasm.ready == 'abcd'.bytes()
+		assert reasm.base == 6
+		return
+	}
+	assert false, 'rewriting buffered stream bytes past the base must be rejected'
+}
