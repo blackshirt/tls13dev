@@ -3,10 +3,9 @@
 // QUIC packet headers (RFC 9000 §17). Protection lives in protection.v.
 module quic
 
-// Header form/fixed bits (RFC 9000 §17.2).
+// Long-header form and fixed-bit flags (RFC 9000 §17).
 const long_header_form = u8(0x80)
 const fixed_bit = u8(0x40)
-const short_header_form = u8(0x00)
 
 // long_header_type_mask selects the two type bits of a long header byte.
 const long_header_type_mask = u8(0x30)

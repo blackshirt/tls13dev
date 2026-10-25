@@ -184,11 +184,50 @@ fn test_post_handshake_reassembly_is_bounded() ! {
 			// Conn.fail_alert is an option (unlike the core's plain field), so unwrap it.
 			pinned := c.fail_alert or { panic('the reassembly bound must pin a fail_alert') }
 			assert pinned == handshake.AlertDescription.record_overflow
+			assert c.closed
+			assert c.fatal_error == err.msg()
+			assert c.post_hs_buf.len == 0
+			assert c.hs.state() == .failed
 			return
 		}
 		assert c.post_hs_buf.len <= bound // below the bound the tail just buffers
 	}
 	assert false, 'unbounded post-handshake reassembly must fail closed'
+}
+
+// test_post_handshake_certificate_request_fails_closed checks that an
+// unoffered post-handshake authentication request is terminal.
+fn test_post_handshake_certificate_request_fails_closed() ! {
+	mut c := new_test_conn()!
+	c.handle_post_handshake([u8(13), 0, 0, 0]) or {
+		assert err.msg().contains('unexpected post-handshake CertificateRequest')
+		assert c.closed
+		assert c.fatal_error == err.msg()
+		assert c.hs.state() == .failed
+		return
+	}
+	assert false
+}
+
+fn test_read_protocol_violation_fails_closed() ! {
+	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+		0xff, 0x00]
+	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
+	mut c := new_test_conn()!
+	mut writer := new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.server_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.recv_buf << writer.encrypt_record(.change_cipher_spec, [u8(1)])!.serialize()
+
+	mut buf := []u8{len: 1}
+	c.read(mut buf) or {
+		assert err.msg().contains('unexpected inner content type')
+		assert c.closed
+		assert c.fatal_error == err.msg()
+		assert c.hs.state() == .failed
+		assert c.server_app_cipher.iv.len == 0
+		return
+	}
+	assert false
 }
 
 // test_close_notify_is_clean_eof checks that close_notify surfaces as a clean

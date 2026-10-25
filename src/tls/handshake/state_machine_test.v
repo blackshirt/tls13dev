@@ -172,6 +172,28 @@ fn test_handshake_options_reject_unoffered_initial_group() ! {
 	assert false
 }
 
+fn test_handshake_options_reject_empty_alpn_name() {
+	new_tls_handshake('example.com', HandshakeOptions{
+		alpn:      ['']
+		validator: fixture_validator()
+	}) or {
+		assert err.msg().contains('ALPN protocol names must not be empty')
+		return
+	}
+	assert false
+}
+
+fn test_handshake_options_reject_overlong_alpn_name() {
+	new_tls_handshake('example.com', HandshakeOptions{
+		alpn:      ['a'.repeat(256)]
+		validator: fixture_validator()
+	}) or {
+		assert err.msg().contains('ALPN protocol name exceeds 255 bytes')
+		return
+	}
+	assert false
+}
+
 fn test_handshake_options_default_validator() ! {
 	h := new_tls_handshake('example.com')!
 	assert h.state() == .start

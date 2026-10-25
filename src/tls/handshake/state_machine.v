@@ -205,25 +205,6 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	return full_client_hello
 }
 
-// check_reassembly_bound enforces the maximum buffered size at a level; one
-// receive can coalesce a consumed message with an oversized tail.
-fn (mut h HandshakeCore) check_reassembly_bound(level EncryptionLevel) ! {
-	match level {
-		.initial {
-			if h.plaintext_reassembly.len > handshake_header_len + max_handshake_message_len {
-				return h.fail(.decode_error, 'handshake: initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
-			}
-		}
-		.handshake {
-			// Late retransmits at .connected skip the drain loop, so the cap is the backstop.
-			if h.hs_reassembly.len > handshake_header_len + max_handshake_message_len {
-				return h.fail(.decode_error, 'handshake: Handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
-			}
-		}
-		.application {}
-	}
-}
-
 // receive_msgs_at_level processes bytes using the encryption-level reassembly buffers
 // owned by the selected transport facade, returning any outbound messages triggered.
 pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
@@ -238,33 +219,62 @@ pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes 
 			if h.state != .wait_server_hello {
 				return error('handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state})')
 			}
-			h.plaintext_reassembly << bytes
-			out := h.drain_plaintext() or {
-				h.fail_and_destroy_secrets()
-				return err
-			}
-			h.check_reassembly_bound(level) or {
-				h.fail_and_destroy_secrets()
-				return err
-			}
-			return out
+			return h.append_and_drain(level, bytes)
 		}
 		.handshake {
-			h.hs_reassembly << bytes
-			out := h.drain_handshake() or {
-				h.fail_and_destroy_secrets()
-				return err
-			}
-			h.check_reassembly_bound(level) or {
-				h.fail_and_destroy_secrets()
-				return err
-			}
-			return out
+			return h.append_and_drain(level, bytes)
 		}
 		.application {
 			return error('handshake: receive_msgs_at_level() does not accept application-level bytes')
 		}
 	}
+}
+
+// append_and_drain bounds each append before allocating, while still allowing a
+// transport to deliver multiple complete messages in one call.
+fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+	mut out := []HandshakeMessage{}
+	mut offset := 0
+	limit := handshake_header_len + max_handshake_message_len
+	for {
+		buffer_len := if level == .initial {
+			h.plaintext_reassembly.len
+		} else {
+			h.hs_reassembly.len
+		}
+		available := limit - buffer_len
+		if offset < bytes.len && available == 0 {
+			alert := if level == .initial { 'initial-level' } else { 'Handshake-level' }
+			err := h.fail(.decode_error, 'handshake: ${alert} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
+			h.fail_and_destroy_secrets()
+			return err
+		}
+		take := if bytes.len - offset > available { available } else { bytes.len - offset }
+		if take > 0 {
+			if level == .initial {
+				h.plaintext_reassembly << bytes[offset..offset + take]
+			} else {
+				h.hs_reassembly << bytes[offset..offset + take]
+			}
+			offset += take
+		}
+		messages := if level == .initial {
+			h.drain_plaintext() or {
+				h.fail_and_destroy_secrets()
+				return err
+			}
+		} else {
+			h.drain_handshake() or {
+				h.fail_and_destroy_secrets()
+				return err
+			}
+		}
+		out << messages
+		if offset == bytes.len {
+			break
+		}
+	}
+	return out
 }
 
 // drain_plaintext consumes the complete ServerHello/HelloRetryRequest from the

@@ -331,8 +331,9 @@ fn validate_compat_ccs(payload []u8, seen int) !int {
 	return total
 }
 
-// write_records serializes records into one buffer and pushes it in a single
-// write(2), resuming from the first unwritten byte on a short write (RFC 8446 §5).
+// write_records serializes records into one buffer and writes the full batch,
+// continuing after short writes. It returns only after all bytes are sent or an
+// error occurs, so callers do not need a partial byte count (RFC 8446 §5).
 fn (mut c Conn) write_records(recs []Record) ! {
 	if c.sock == unsafe { nil } {
 		return error('tls: socket is nil')
@@ -452,6 +453,12 @@ fn (mut c Conn) rekeyed_read_cipher() ! {
 // handle_alert processes an alert received after the handshake. It marks the
 // connection closed and returns 0 for a clean close_notify, else an error.
 fn (mut c Conn) handle_alert(payload []u8) !int {
+	// read() may hold rlock while a concurrent write() owns the write cipher.
+	// Preserve the connection's rlock -> wlock order before wiping shared state.
+	c.wlock.lock()
+	defer {
+		c.wlock.unlock()
+	}
 	// Any alert is terminal: mark closed before decoding, even a malformed body.
 	c.closed = true
 	// Peer termination is final: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
@@ -508,14 +515,22 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		match rec.content_type {
 			.change_cipher_spec {
 				// RFC 8446 §5: a CCS record is illegal once application keys are in use.
-				return error('tls: received change_cipher_spec record after handshake (unexpected_message)')
+				return c.abort_connection(.unexpected_message, 'tls: received change_cipher_spec record after handshake (unexpected_message)')
 			}
 			.alert {
 				// RFC 8446 §6: post-handshake alerts must be encrypted; a plaintext one is rejected.
-				return error('tls: received unencrypted alert post-handshake (must be encrypted)')
+				return c.abort_connection(.unexpected_message, 'tls: received unencrypted alert post-handshake (must be encrypted)')
 			}
 			.application_data {
-				dec := c.server_app_cipher.decrypt_record(rec)!
+				dec := c.server_app_cipher.decrypt_record(rec) or {
+					if err.msg().contains('sequence limit') {
+						return c.abort_connection(.record_overflow, err.msg())
+					}
+					if err.msg().contains('AEAD decryption failed') {
+						return c.abort_connection(.bad_record_mac, err.msg())
+					}
+					return c.abort_connection(.unexpected_message, err.msg())
+				}
 				match dec.content_type {
 					.application_data {
 						if dec.plaintext.len == 0 {
@@ -543,12 +558,12 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 						continue
 					}
 					else {
-						return error('tls: unexpected inner content type ${dec.content_type}')
+						return c.abort_connection(.unexpected_message, 'tls: unexpected inner content type ${dec.content_type}')
 					}
 				}
 			}
 			else {
-				return error('tls: unexpected record type ${rec.content_type} after handshake')
+				return c.abort_connection(.unexpected_message, 'tls: unexpected record type ${rec.content_type} after handshake')
 			}
 		}
 	}
@@ -560,25 +575,37 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 // handle_post_handshake consumes NewSessionTicket and KeyUpdate messages from a
 // decrypted post-handshake plaintext, reassembling fragments (RFC 8446 §5.2).
 fn (mut c Conn) handle_post_handshake(data []u8) ! {
-	c.post_hs_buf << data
-	// Bound the post-handshake reassembly the same way the core bounds its
-	// initial/handshake reassembly (check_reassembly_bound): a peer that streams
-	// incomplete handshake fragments must not grow this buffer without limit.
-	if c.post_hs_buf.len > record_header_len + handshake.max_handshake_message_len {
-		c.fail_alert = .record_overflow
-		return error('tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
+	// Check before appending so a hostile fragment cannot make the buffer exceed
+	// the per-message cap, even transiently.
+	max_buffered := record_header_len + handshake.max_handshake_message_len
+	if data.len > max_buffered - c.post_hs_buf.len {
+		return c.abort_connection(.record_overflow, 'tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
 	}
+	c.post_hs_buf << data
 	for {
-		msg := handshake.next_recordless_message(mut c.post_hs_buf)!
+		msg := handshake.next_recordless_message(mut c.post_hs_buf) or {
+			return c.abort_connection(.decode_error, err.msg())
+		}
 		if msg.len == 0 {
 			return // header or body still incomplete; wait for the next record
 		}
 		mut r := wire.new_reader(msg)
-		msg_type, length := handshake.parse_handshake_header(mut r)!
-		body := r.read_bytes(length)!
+		msg_type, length := handshake.parse_handshake_header(mut r) or {
+			return c.abort_connection(.decode_error, err.msg())
+		}
+		body := r.read_bytes(length) or {
+			return c.abort_connection(.decode_error, err.msg())
+		}
 		match msg_type {
 			.new_session_ticket {
-				ticket := handshake.parse_new_session_ticket(body)!
+				ticket := handshake.parse_new_session_ticket(body) or {
+					alert := if err.msg().contains('illegal_parameter') {
+						handshake.AlertDescription.illegal_parameter
+					} else {
+						handshake.AlertDescription.decode_error
+					}
+					return c.abort_connection(alert, err.msg())
+				}
 				// Keep a bounded sample of the backlog; drop the overflow.
 				if c.session_tickets.len < max_stored_session_tickets {
 					c.session_tickets << ticket
@@ -586,23 +613,57 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 			}
 			.key_update {
 				// §4.6.3: a recipient always advances its read keys on receiving a KeyUpdate.
-				request_update := handshake.parse_key_update(body)!
-				c.hs.record_update_read_traffic_keys()!
+				request_update := handshake.parse_key_update(body) or {
+					alert := if body.len != 1 {
+						handshake.AlertDescription.decode_error
+					} else {
+						handshake.AlertDescription.illegal_parameter
+					}
+					return c.abort_connection(alert, err.msg())
+				}
+				c.hs.record_update_read_traffic_keys() or {
+					return c.abort_connection(.internal_error, err.msg())
+				}
 				// The core ratcheted secrets only; swap in the new read cipher (seq restarts at 0, §5.3).
-				c.rekeyed_read_cipher()!
+				c.rekeyed_read_cipher() or {
+					return c.abort_connection(.internal_error, err.msg())
+				}
 				if request_update {
-					c.send_key_update_response()!
+					c.send_key_update_response() or {
+						return c.abort_connection(.internal_error, err.msg())
+					}
 				}
 			}
 			.certificate_request {
-				// Client authentication: recognized, not answered by this client
+				// This client did not offer post_handshake_auth, so this request is forbidden.
+				return c.abort_connection(.unexpected_message, 'tls: unexpected post-handshake CertificateRequest (unexpected_message)')
 			}
 			else {
 				// RFC 8446 §4.6: any other message is a fatal unexpected_message error
-				return error('tls: unexpected post-handshake message ${msg_type} (unexpected_message)')
+				return c.abort_connection(.unexpected_message, 'tls: unexpected post-handshake message ${msg_type} (unexpected_message)')
 			}
 		}
 	}
+}
+
+// abort_connection sends a best-effort fatal alert, destroys connection secrets,
+// closes the socket, and makes the failure sticky for subsequent reads.
+fn (mut c Conn) abort_connection(alert handshake.AlertDescription, message string) IError {
+	c.fail_alert = alert
+	c.wlock.lock()
+	defer {
+		c.wlock.unlock()
+	}
+	c.closed = true
+	c.fatal_error = message
+	c.send_failure_alert()
+	c.wipe_on_failure()
+	for i in 0 .. c.post_hs_buf.len {
+		c.post_hs_buf[i] = 0
+	}
+	c.post_hs_buf = []u8{}
+	c.close_tcp_socket()
+	return error(message)
 }
 
 // write encrypts and sends application data.

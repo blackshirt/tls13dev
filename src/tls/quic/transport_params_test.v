@@ -8,7 +8,10 @@ module quic
 fn test_server_wire_carries_both_connection_id_parameters() ! {
 	original := [u8(0x83), 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]
 	source := [u8(0x51), 0x54, 0x9c]
-	server_bytes := [u8(0x00), u8(original.len)] + original + [u8(0x0f), u8(source.len)] + source
+	mut server_bytes := [u8(0x00), u8(original.len)]
+	server_bytes << original
+	server_bytes << [u8(0x0f), u8(source.len)]
+	server_bytes << source
 	params := parse_transport_parameters(server_bytes)!
 	assert params.original_dcid == original
 	assert params.initial_scid == source

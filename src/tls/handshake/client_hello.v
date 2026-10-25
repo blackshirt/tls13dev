@@ -8,8 +8,10 @@ import crypto.rand
 import tls.pki
 import tls.wire
 
+// default_supported_groups is the preference order used when none is configured.
 const default_supported_groups = [NamedGroup.x25519, .secp256r1]
 
+// default_signature_algorithms is the preference order used when none is configured.
 const default_signature_algorithms = [
 	SignatureScheme.rsa_pss_rsae_sha256,
 	.rsa_pss_rsae_sha384,
@@ -20,11 +22,27 @@ const default_signature_algorithms = [
 	.rsa_pkcs1_sha256,
 ]
 
+// offered_supported_groups returns the configured groups or their defaults.
 fn offered_supported_groups(groups []NamedGroup) []NamedGroup {
 	return if groups.len > 0 { groups } else { default_supported_groups }
 }
 
+// validate_handshake_options rejects values that cannot be encoded or that
+// would create ambiguous ClientHello capability lists.
 fn validate_handshake_options(options HandshakeOptions) ! {
+	mut alpn_list_len := 0
+	for protocol in options.alpn {
+		if protocol.len == 0 {
+			return error('handshake: ALPN protocol names must not be empty')
+		}
+		if protocol.len > 255 {
+			return error('handshake: ALPN protocol name exceeds 255 bytes')
+		}
+		alpn_list_len += 1 + protocol.len
+		if alpn_list_len > 65533 {
+			return error('handshake: encoded ALPN extension exceeds 65535 bytes')
+		}
+	}
 	groups := offered_supported_groups(options.supported_groups)
 	mut seen_groups := []NamedGroup{}
 	for group in groups {
@@ -110,8 +128,7 @@ mut:
 	quic_transport_params ?[]u8
 }
 
-// offered_cipher_suites returns the suites a client sends in its ClientHello:
-// the explicit configuration if present, otherwise the built-in default list.
+// offered_cipher_suites returns the configured suites or the built-in defaults.
 fn offered_cipher_suites(cfg &ClientHelloConfig) []CipherSuite {
 	if cfg.cipher_suites.len > 0 {
 		return cfg.cipher_suites
@@ -119,10 +136,12 @@ fn offered_cipher_suites(cfg &ClientHelloConfig) []CipherSuite {
 	return default_cipher_suites()
 }
 
+// offered_groups returns the configured supported groups or the defaults.
 fn offered_groups(cfg &ClientHelloConfig) []NamedGroup {
 	return offered_supported_groups(cfg.supported_groups)
 }
 
+// offered_signature_algorithms returns the configured schemes or the defaults.
 fn offered_signature_algorithms(cfg &ClientHelloConfig) []SignatureScheme {
 	if cfg.signature_algorithms.len > 0 {
 		return cfg.signature_algorithms
@@ -166,7 +185,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	mut ext_writer := wire.new_writer(256)
 
-	// server_name (SNI, RFC 6066 §3): literal IP addresses are forbidden.
+	// SNI host_name is a DNS name; omit it for IP literals (RFC 6066 §3).
 	if cfg.server_name.len > 0 && !pki.is_ip_literal(cfg.server_name) {
 		mut sni_w := wire.new_writer(cfg.server_name.len + 5)
 		// Two nested u16 vectors per RFC 6066 §3: ServerNameList and the host_name length.
