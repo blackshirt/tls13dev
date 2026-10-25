@@ -162,9 +162,10 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 	}
 }
 
-// wipe_tls_protection zeroes a protection state's IV in place and resets its
-// sequence number, so a dead connection leaves no nonce base behind.
-fn wipe_tls_protection(mut s TLSProtection) {
+// wipe zeroes a protection state's IV in place and resets its sequence number,
+// so a dead connection leaves no nonce base behind. Guarded by the loop bound, so
+// calling it on an already-wiped (empty-IV) state is a safe no-op.
+fn (mut s TLSProtection) wipe() {
 	for i in 0 .. s.iv.len {
 		s.iv[i] = 0
 	}

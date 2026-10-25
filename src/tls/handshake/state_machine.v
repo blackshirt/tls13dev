@@ -1,7 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
 // state_machine.v owns the shared TLS 1.3 client handshake state, public accessors,
-// reassembly and dispatch. The ServerHello transition lives in server_hello_flow.v,
+// reassembly and dispatch, plus the facade-shared HandshakeOptions. The ServerHello
+// transition lives in server_hello_flow.v,
 // ephemeral ECDHE in key_exchange.v, encrypted-flight processing in encrypted_flight.v,
 // and secret wiping/zeroization in secret_lifecycle.v. Transport-neutral: no record,
 // cipher, socket, or packet-level concept belongs here.
@@ -63,6 +64,36 @@ pub enum EncryptionLevel {
 	application // data protected with application traffic keys
 }
 
+// HandshakeOptions configures the shared TLS handshake, including peer
+// validation, ALPN, and the ClientHello preferences offered by the client.
+@[params]
+pub struct HandshakeOptions {
+pub:
+	// alpn is the preference-ordered list of application protocols to offer.
+	alpn []string
+	// validator verifies the server's certificate chain and hostname; omitted
+	// options use the system root CA bundle.
+	validator ?pki.Validator
+	// key_share_group is the group used for the initial ECDHE share.
+	key_share_group NamedGroup = .x25519
+	// supported_groups is preference-ordered; empty uses X25519 then P-256.
+	supported_groups []NamedGroup
+	// cipher_suites is preference-ordered; empty uses the built-in TLS 1.3 suites.
+	cipher_suites []CipherSuite
+	// signature_algorithms is preference-ordered; empty uses the built-in list.
+	signature_algorithms []SignatureScheme
+	// legacy_session_id and random are for deterministic test vectors only.
+	legacy_session_id []u8
+	random            []u8
+pub mut:
+	// quic_transport_params is the already-encoded content of the TLS
+	// quic_transport_parameters extension (RFC 9001 §8.2), sent only by the QUIC
+	// handshake facade. TLS copies these bytes in and stores them back out
+	// without interpreting them: transport parameters are QUIC's own vocabulary,
+	// so the adapter above encodes and decodes them.
+	quic_transport_params []u8
+}
+
 // HandshakeCore owns shared TLS 1.3 handshake state and behavior.
 @[noinit]
 struct HandshakeCore {
@@ -82,15 +113,15 @@ mut:
 	quic_params  ?[]u8         // server transport parameters received in EncryptedExtensions, kept as opaque bytes for the QUIC adapter
 
 	// Traffic secrets used to protect handshake and application data.
-	handshake_secret  []u8 // secret used to derive handshake traffic keys
-	client_hs_traffic []u8 // key material for client handshake messages
-	server_hs_traffic []u8 // key material for server handshake messages
-	client_ap_traffic []u8 // key material for client application data
-	server_ap_traffic []u8 // key material for server application data
+	handshake_secret   []u8 // secret used to derive handshake traffic keys
+	client_hsk_traffic []u8 // key material for client handshake messages
+	server_hsk_traffic []u8 // key material for server handshake messages
+	client_app_traffic []u8 // key material for client application data
+	server_app_traffic []u8 // key material for server application data
 
 	// Incoming handshake bytes that do not yet form a complete message.
-	plaintext_reassembly []u8 // initial-level bytes not yet forming a complete message
-	hs_reassembly        []u8 // handshake-level bytes not yet forming a complete message
+	init_buf []u8 // initial-level bytes not yet forming a complete message
+	hsk_buf  []u8 // handshake-level bytes not yet forming a complete message
 
 	// Peer certificate validation and client certificate response state.
 	validator       pki.Validator     // checks the server's certificate and hostname
@@ -106,7 +137,8 @@ mut:
 }
 
 // reassembly_buf_cap is the initial per-level reassembly allocation; the hard bound
-// a hostile peer must never exceed is check_reassembly_bound's message cap.
+// a hostile peer must never exceed is enforced inline in receive_msgs_at_level
+// against max_handshake_message_len.
 const reassembly_buf_cap = 4096
 
 // new_handshake_core creates shared state from the server name and complete
@@ -129,8 +161,8 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	}
 
 	mut core := HandshakeCore{
-		state:                .start
-		config:               ClientHelloConfig{
+		state:      .start
+		config:     ClientHelloConfig{
 			server_name:           server_name
 			alpn:                  options.alpn.clone()
 			session_id:            session_id
@@ -145,12 +177,12 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 				none
 			}
 		}
-		transcript:           new_transcript(.sha256)
-		hash_algo:            .sha256
-		key_len:              16
-		validator:            validator
-		plaintext_reassembly: []u8{cap: reassembly_buf_cap}
-		hs_reassembly:        []u8{cap: reassembly_buf_cap}
+		transcript: new_transcript(.sha256)
+		hash_algo:  .sha256
+		key_len:    16
+		validator:  validator
+		init_buf:   []u8{cap: reassembly_buf_cap}
+		hsk_buf:    []u8{cap: reassembly_buf_cap}
 	}
 	core.generate_key_share(options.key_share_group)!
 	core.config.client_share = KeyShareEntry{
@@ -246,34 +278,34 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 	limit := handshake_header_len + max_handshake_message_len
 	for {
 		buffer_len := if level == .initial {
-			h.plaintext_reassembly.len
+			h.init_buf.len
 		} else {
-			h.hs_reassembly.len
+			h.hsk_buf.len
 		}
 		available := limit - buffer_len
 		if offset < bytes.len && available == 0 {
-			alert := if level == .initial { 'initial-level' } else { 'Handshake-level' }
+			alert := if level == .initial { 'initial-level' } else { 'handshake-level' }
 			err := h.fail(.decode_error, 'handshake: ${alert} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
-			h.fail_and_destroy_secrets()
+			h.fail_and_zeroize_secrets()
 			return err
 		}
 		take := if bytes.len - offset > available { available } else { bytes.len - offset }
 		if take > 0 {
 			if level == .initial {
-				h.plaintext_reassembly << bytes[offset..offset + take]
+				h.init_buf << bytes[offset..offset + take]
 			} else {
-				h.hs_reassembly << bytes[offset..offset + take]
+				h.hsk_buf << bytes[offset..offset + take]
 			}
 			offset += take
 		}
 		messages := if level == .initial {
-			h.drain_plaintext() or {
-				h.fail_and_destroy_secrets()
+			h.drain_initial() or {
+				h.fail_and_zeroize_secrets()
 				return err
 			}
 		} else {
 			h.drain_handshake() or {
-				h.fail_and_destroy_secrets()
+				h.fail_and_zeroize_secrets()
 				return err
 			}
 		}
@@ -285,12 +317,12 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 	return out
 }
 
-// drain_plaintext consumes the complete ServerHello/HelloRetryRequest from the
+// drain_initial consumes the complete ServerHello/HelloRetryRequest from the
 // initial-level buffer; framing-boundary checks remain adapter policy.
-fn (mut h HandshakeCore) drain_plaintext() ![]HandshakeMessage {
+fn (mut h HandshakeCore) drain_initial() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state == .wait_server_hello {
-		msg := next_recordless_message(mut h.plaintext_reassembly)!
+		msg := next_recordless_message(mut h.init_buf)!
 		if msg.len == 0 {
 			break // header or body still incomplete
 		}
@@ -308,7 +340,7 @@ fn (mut h HandshakeCore) drain_plaintext() ![]HandshakeMessage {
 fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.state != .connected && h.state != .failed {
-		msg := next_recordless_message(mut h.hs_reassembly)!
+		msg := next_recordless_message(mut h.hsk_buf)!
 		if msg.len == 0 {
 			break
 		}
@@ -320,8 +352,8 @@ fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 // unconsumed_bytes reports bytes retained after complete TLS messages are consumed.
 fn (h &HandshakeCore) unconsumed_bytes(level EncryptionLevel) int {
 	return match level {
-		.initial { h.plaintext_reassembly.len }
-		.handshake { h.hs_reassembly.len }
+		.initial { h.init_buf.len }
+		.handshake { h.hsk_buf.len }
 		.application { 0 }
 	}
 }

@@ -48,8 +48,8 @@ mut:
 	hs   handshake.TLSHandshake // TLS handshake contract for the record adapter
 
 	// The four TLSProtections are the record layer's own state; the core never sees them.
-	server_hs_cipher  TLSProtection // AEAD state for records the server sends under handshake keys
-	client_hs_cipher  TLSProtection // AEAD state for records we send under handshake keys
+	server_hsk_cipher TLSProtection // AEAD state for records the server sends under handshake keys
+	client_hsk_cipher TLSProtection // AEAD state for records we send under handshake keys
 	server_app_cipher TLSProtection // AEAD state for records the server sends under app keys
 	client_app_cipher TLSProtection // AEAD state for records we send under app keys
 
@@ -60,14 +60,14 @@ mut:
 	// message (for example, NewSessionTicket) is split across records. It may
 	// also contain more than one message; handle_post_handshake consumes complete
 	// messages and retains any incomplete tail for the next record (RFC 8446 §5.2).
-	post_hs_buf []u8
+	post_hsk_buf []u8
 
 	// Read-side buffers: socket bytes are framed into records, then decrypted
 	// application bytes are delivered to callers.
-	// Fixed-size, connection-lifetime workspace for each sock.read in
-	// read_raw_record. Received bytes are appended to recv_buf before this buffer
-	// is reused, avoiding a fresh temporary allocation for every socket read.
-	read_scratch []u8
+	// Fixed-size, connection-lifetime staging buffer filled directly by each
+	// sock.read in read_raw_record. Received bytes are appended to recv_buf before
+	// it is reused, avoiding a fresh temporary allocation for every socket read.
+	sock_buf []u8
 	// TCP is a byte stream: a socket read may return part of a record or several
 	// records. read_raw_record appends bytes here and parses one complete framed
 	// record at a time, leaving any following record bytes for the next call.
@@ -171,7 +171,7 @@ pub fn dial(address string, config Config) !&Conn {
 		sock:              sock
 		hs:                hs
 		session_tickets:   []handshake.NewSessionTicket{cap: 4}
-		read_scratch:      []u8{len: recv_read_size} // reused by every socket read for this connection
+		sock_buf:          []u8{len: recv_read_size} // reused by every socket read for this connection
 		recv_buf:          []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
 		recv_pos:          0
 		app_buf:           []u8{cap: max_plaintext_record_len} // one full plaintext record
@@ -189,29 +189,13 @@ pub fn dial(address string, config Config) !&Conn {
 	// On failure send the classified fatal alert (RFC 8446 §6), wipe secrets, close the socket.
 	conn.do_handshake() or {
 		conn.send_failure_alert()
-		conn.wipe_on_failure()
+		conn.destroy_on_failure()
 		sock.close() or {}
 		return err
 	}
 	// The ALPN pick is exposed only after the handshake proved it was offered (RFC 7301 §3.1).
 	conn.negotiated_alpn = conn.hs.negotiated_alpn()
 	return conn
-}
-
-// host_from_address extracts the host part of a dial address ("host:port" or
-// "[ipv6]:port") so a bare address still supplies the SNI and verification name.
-fn host_from_address(address string) string {
-	// Bracketed form is an IPv6 literal: return the inner address, or the string unchanged.
-	if address.starts_with('[') {
-		end := address.index(']') or { return address }
-		return address[1..end]
-	}
-	// host:port — split on the LAST colon so the port separator is removed.
-	if colon := address.last_index(':') {
-		return address[..colon]
-	}
-	// No colon at all: the entire string is already just a host (e.g. "localhost").
-	return address
 }
 
 // do_handshake drives the full client flight over TCP: frame the ClientHello
@@ -263,7 +247,7 @@ fn (mut c Conn) do_handshake() ! {
 					return error('tls: incomplete ServerHello at record boundary (unexpected_message)')
 				}
 				if c.hs.state() == .wait_encrypted_extensions {
-					// The core cached the handshake TrafficKeys; install this side's ciphers now.
+					// The core has cached the handshake record keys; install this side's ciphers now.
 					c.install_handshake_ciphers()!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
@@ -277,14 +261,14 @@ fn (mut c Conn) do_handshake() ! {
 					c.fail_alert = .unexpected_message
 					return error('tls: unexpected encrypted record before ServerHello (unexpected_message)')
 				}
-				dec := c.server_hs_cipher.decrypt_record(rec)!
+				dec := c.server_hsk_cipher.decrypt_record(rec)!
 				// Inner-type routing is record-layer policy; the core has no ContentType concept.
 				match dec.content_type {
 					.handshake {
 						msgs := c.hs.receive_msgs_at_level(.handshake, dec.plaintext)!
 						for m in msgs {
 							// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
-							enc := c.client_hs_cipher.encrypt_record(.handshake, m.msg())!
+							enc := c.client_hsk_cipher.encrypt_record(.handshake, m.msg())!
 							c.write_records([enc])!
 						}
 					}
@@ -314,7 +298,7 @@ fn (mut c Conn) do_handshake() ! {
 	// The core verified the server Finished; install this adapter's post-handshake protection.
 	c.install_application_ciphers()!
 	// Nothing may protect or decrypt at the handshake level now, so the core may destroy its secrets (RFC 8446 §7.5).
-	c.hs.zeroize_handshake_traffic_secrets()!
+	c.hs.zeroize_traffic_secrets(.handshake)!
 }
 
 // ─── TCP transport: framing, write batching, dummy CCS ───
@@ -362,7 +346,7 @@ fn (mut c Conn) write_records(recs []Record) ! {
 // read_raw_record blocks until one complete TLS record (header + payload) is
 // buffered, then parses it in place off recv_buf; TCP may split or coalesce records.
 fn (mut c Conn) read_raw_record() !Record {
-	// read_scratch is refilled in place, so a record arriving in TCP pieces costs no allocation.
+	// sock_buf is refilled in place, so a record arriving in TCP pieces costs no allocation.
 	for {
 		avail := c.recv_buf.len - c.recv_pos
 		if avail >= record_header_len {
@@ -381,7 +365,7 @@ fn (mut c Conn) read_raw_record() !Record {
 				// Parse directly over the live recv_buf; read_bytes copies the payload out.
 				mut r := wire.new_reader(c.recv_buf[c.recv_pos..c.recv_pos + total])
 				c.recv_pos += total
-				rec := parse_record(mut r)!
+				rec := read_record(mut r)!
 				c.compact_recv_buf()
 				return rec
 			}
@@ -389,13 +373,13 @@ fn (mut c Conn) read_raw_record() !Record {
 		if c.sock == unsafe { nil } {
 			return error('tls: connection closed (no socket available to read further records)')
 		}
-		n := c.sock.read(mut c.read_scratch) or {
+		n := c.sock.read(mut c.sock_buf) or {
 			return error('tls: connection closed while reading record: ${err}')
 		}
 		if n == 0 {
 			return error('tls: connection closed while reading record')
 		}
-		c.recv_buf << c.read_scratch[..n]
+		c.recv_buf << c.sock_buf[..n]
 	}
 	// Every branch inside the loop returns or keeps looping; this fail-closed tail
 	// exists only so no future edit can fall out of the loop unreturned.
@@ -416,43 +400,43 @@ fn (mut c Conn) compact_recv_buf() {
 	}
 }
 
-// tls_protection_from_keys instantiates one direction's record protection
-// from the core's cached TrafficKeys; sequence numbers restart at 0 per generation (§5.3).
-fn tls_protection_from_keys(suite handshake.CipherSuite, keys handshake.TrafficKeys) !TLSProtection {
-	aead := handshake.new_aead_for_suite(suite, keys.key())!
-	return new_tls_protection(aead, keys.iv())!
+// tls_protection_from_keys instantiates one direction's record protection from
+// the core's derived key and IV bytes; sequence numbers restart at 0 per generation (§5.3).
+fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
+	aead := handshake.new_aead_for_suite(suite, key)!
+	return new_tls_protection(aead, iv)!
 }
 
 // install_handshake_ciphers builds both handshake-key record states from the
 // core's record_traffic_keys(.handshake); called once after the ServerHello is fed.
 fn (mut c Conn) install_handshake_ciphers() ! {
-	ck, sk := c.hs.record_traffic_keys(.handshake)!
+	ck, civ, sk, siv := c.hs.record_traffic_keys(.handshake)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_hs_cipher = tls_protection_from_keys(suite, ck)!
-	c.server_hs_cipher = tls_protection_from_keys(suite, sk)!
+	c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
+	c.server_hsk_cipher = tls_protection_from_keys(suite, sk, siv)!
 }
 
 // install_application_ciphers builds both application-key record states from the
 // core's record_traffic_keys(.application); called once at .connected.
 fn (mut c Conn) install_application_ciphers() ! {
-	ck, sk := c.hs.record_traffic_keys(.application)!
+	ck, civ, sk, siv := c.hs.record_traffic_keys(.application)!
 	suite := c.hs.negotiated_cipher_suite()
-	c.client_app_cipher = tls_protection_from_keys(suite, ck)!
-	c.server_app_cipher = tls_protection_from_keys(suite, sk)!
+	c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
+	c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
 }
 
 // rekeyed_write_cipher rebuilds only the write-side application state after the
-// core ratcheted the client secret (KeyUpdate); the read cipher is unchanged.
+// core updated the client secret (KeyUpdate); the read cipher is unchanged.
 fn (mut c Conn) rekeyed_write_cipher() ! {
-	ck, _ := c.hs.record_traffic_keys(.application)!
-	c.client_app_cipher = tls_protection_from_keys(c.hs.negotiated_cipher_suite(), ck)!
+	ck, civ, _, _ := c.hs.record_traffic_keys(.application)!
+	c.client_app_cipher = tls_protection_from_keys(c.hs.negotiated_cipher_suite(), ck, civ)!
 }
 
 // rekeyed_read_cipher rebuilds only the read-side application state after the
-// core ratcheted the server secret on receiving the peer's KeyUpdate.
+// core updated the server secret on receiving the peer's KeyUpdate.
 fn (mut c Conn) rekeyed_read_cipher() ! {
-	_, sk := c.hs.record_traffic_keys(.application)!
-	c.server_app_cipher = tls_protection_from_keys(c.hs.negotiated_cipher_suite(), sk)!
+	_, _, sk, siv := c.hs.record_traffic_keys(.application)!
+	c.server_app_cipher = tls_protection_from_keys(c.hs.negotiated_cipher_suite(), sk, siv)!
 }
 
 // handle_alert processes an alert received after the handshake. It marks the
@@ -467,15 +451,7 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// Any alert is terminal: mark closed before decoding, even a malformed body.
 	c.closed = true
 	// Peer termination is final: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
-	if c.hs.state() == .connected {
-		c.hs.zeroize_app_secrets()!
-	} else {
-		c.hs.fail_and_destroy_secrets()
-	}
-	wipe_tls_protection(mut c.server_hs_cipher)
-	wipe_tls_protection(mut c.client_hs_cipher)
-	wipe_tls_protection(mut c.server_app_cipher)
-	wipe_tls_protection(mut c.client_app_cipher)
+	c.destroy_on_close()!
 	peer_alert := handshake.parse_alert(payload) or {
 		// A malformed alert body is fatal: pin a sticky error so later reads re-report it.
 		c.fatal_error = 'tls: received malformed alert'
@@ -590,19 +566,19 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	// Check before appending so a hostile fragment cannot make the buffer exceed
 	// the per-message cap, even transiently.
 	max_buffered := record_header_len + handshake.max_handshake_message_len
-	if data.len > max_buffered - c.post_hs_buf.len {
+	if data.len > max_buffered - c.post_hsk_buf.len {
 		return c.abort_connection(.record_overflow, 'tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
 	}
-	c.post_hs_buf << data
+	c.post_hsk_buf << data
 	for {
-		msg := handshake.next_recordless_message(mut c.post_hs_buf) or {
+		msg := handshake.next_recordless_message(mut c.post_hsk_buf) or {
 			return c.abort_connection(.decode_error, err.msg())
 		}
 		if msg.len == 0 {
 			return // header or body still incomplete; wait for the next record
 		}
 		mut r := wire.new_reader(msg)
-		msg_type, length := handshake.parse_handshake_header(mut r) or {
+		msg_type, length := handshake.read_handshake_header(mut r) or {
 			return c.abort_connection(.decode_error, err.msg())
 		}
 		body := r.read_bytes(length) or {
@@ -636,7 +612,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				c.hs.record_update_read_traffic_keys() or {
 					return c.abort_connection(.internal_error, err.msg())
 				}
-				// The core ratcheted secrets only; swap in the new read cipher (seq restarts at 0, §5.3).
+				// The core updated secrets only; swap in the new read cipher (seq restarts at 0, §5.3).
 				c.rekeyed_read_cipher() or {
 					return c.abort_connection(.internal_error, err.msg())
 				}
@@ -675,16 +651,17 @@ fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, messag
 	c.closed = true
 	c.fatal_error = message
 	c.send_failure_alert()
-	c.wipe_on_failure()
-	for i in 0 .. c.post_hs_buf.len {
-		c.post_hs_buf[i] = 0
+	c.destroy_on_failure()
+	for i in 0 .. c.post_hsk_buf.len {
+		c.post_hsk_buf[i] = 0
 	}
-	c.post_hs_buf = []u8{}
+	c.post_hsk_buf = []u8{}
 	c.close_tcp_socket()
 	return error(message)
 }
 
 // write encrypts and sends application data.
+@[direct_array_access]
 pub fn (mut c Conn) write(data []u8) !int {
 	// Serialize against other writers and the read path's KeyUpdate response.
 	c.wlock.lock()
@@ -705,6 +682,7 @@ pub fn (mut c Conn) write(data []u8) !int {
 // write_application_data encrypts and sends application data while the caller
 // holds wlock. Any failure is terminal because sequence numbers or stream bytes
 // may already have advanced.
+@[direct_array_access]
 fn (mut c Conn) write_application_data(data []u8) !int {
 	return c.write_application_data_inner(data) or {
 		alert := if err.msg().contains('sequence limit') {
@@ -718,6 +696,7 @@ fn (mut c Conn) write_application_data(data []u8) !int {
 
 // write_application_data_inner performs record generation and socket writes.
 // The caller holds wlock and owns terminal error handling.
+@[direct_array_access]
 fn (mut c Conn) write_application_data_inner(data []u8) !int {
 	// Chunk to max_plaintext_record_len (2^14): TLS forbids larger records (RFC 8446 §5.1).
 	mut offset := 0
@@ -753,7 +732,7 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 }
 
 // send_key_update_response answers a KeyUpdate(update_requested): it sends the
-// KeyUpdate under the current write keys and then ratchets them (§4.6.3).
+// KeyUpdate under the current write keys and then updates them (§4.6.3).
 fn (mut c Conn) send_key_update_response() ! {
 	c.wlock.lock()
 	defer {
@@ -768,7 +747,7 @@ fn (mut c Conn) send_key_update_response() ! {
 }
 
 // force_write_rekey fulfills the §5.5 sender-side record limit: announce a
-// KeyUpdate with update_not_requested under the old write keys, then ratchet.
+// KeyUpdate with update_not_requested under the old write keys, then update them.
 fn (mut c Conn) force_write_rekey() ! {
 	msg := handshake.build_key_update(false)
 	enc := c.client_app_cipher.encrypt_record(.handshake, msg)!
@@ -796,26 +775,38 @@ pub fn (mut c Conn) close() ! {
 	}
 	c.closed = true
 	// Teardown is terminal: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
-	if c.hs.state() == .connected {
-		c.hs.zeroize_app_secrets()!
-	} else {
-		c.hs.fail_and_destroy_secrets()
-	}
-	wipe_tls_protection(mut c.server_hs_cipher)
-	wipe_tls_protection(mut c.client_hs_cipher)
-	wipe_tls_protection(mut c.server_app_cipher)
-	wipe_tls_protection(mut c.client_app_cipher)
+	c.destroy_on_close()!
 	c.close_tcp_socket()
 }
 
-// wipe_on_failure destroys every secret a failed handshake may have derived: the
-// core's key-schedule material plus this adapter's record protectors.
-fn (mut c Conn) wipe_on_failure() {
-	c.hs.fail_and_destroy_secrets()
-	wipe_tls_protection(mut c.server_hs_cipher)
-	wipe_tls_protection(mut c.client_hs_cipher)
-	wipe_tls_protection(mut c.server_app_cipher)
-	wipe_tls_protection(mut c.client_app_cipher)
+// wipe_protection_states zeroes this adapter's four record protectors; it is the
+// single place the record layer's own key material is destroyed (RFC 8446 §7.5).
+fn (mut c Conn) wipe_protection_states() {
+	c.server_hsk_cipher.wipe()
+	c.client_hsk_cipher.wipe()
+	c.server_app_cipher.wipe()
+	c.client_app_cipher.wipe()
+}
+
+// destroy_on_close is the terminal teardown for a closing connection: it drops the
+// application traffic secrets once the handshake reached .connected (or the whole
+// key schedule otherwise), then wipes this adapter's protectors, so no close path
+// can clear one layer and forget the other (RFC 8446 §1.3.1/§7.5).
+fn (mut c Conn) destroy_on_close() ! {
+	if c.hs.state() == .connected {
+		c.hs.zeroize_traffic_secrets(.application)!
+	} else {
+		c.hs.fail_and_zeroize_secrets()
+	}
+	c.wipe_protection_states()
+}
+
+// destroy_on_failure destroys every secret a failed handshake may have derived: the
+// core's key-schedule material plus this adapter's record protectors. It runs after
+// the fatal alert has been sent, so wiping the protectors cannot strand that alert.
+fn (mut c Conn) destroy_on_failure() {
+	c.hs.fail_and_zeroize_secrets()
+	c.wipe_protection_states()
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
@@ -832,8 +823,8 @@ fn (mut c Conn) send_failure_alert() {
 		c.write_records([enc]) or {}
 		return
 	}
-	if c.client_hs_cipher.iv.len == aead_nonce_len {
-		enc := c.client_hs_cipher.encrypt_record(.alert, payload) or { return }
+	if c.client_hsk_cipher.iv.len == aead_nonce_len {
+		enc := c.client_hsk_cipher.encrypt_record(.alert, payload) or { return }
 		c.write_records([enc]) or {}
 		return
 	}
@@ -869,4 +860,23 @@ fn (mut c Conn) send_close_notify() {
 // negotiated_alpn returns the negotiated ALPN protocol, if any.
 pub fn (c Conn) negotiated_alpn() string {
 	return c.negotiated_alpn
+}
+
+// Helpers
+//
+
+// host_from_address extracts the host part of a dial address ("host:port" or
+// "[ipv6]:port") so a bare address still supplies the SNI and verification name.
+fn host_from_address(address string) string {
+	// Bracketed form is an IPv6 literal: return the inner address, or the string unchanged.
+	if address.starts_with('[') {
+		end := address.index(']') or { return address }
+		return address[1..end]
+	}
+	// host:port — split on the LAST colon so the port separator is removed.
+	if colon := address.last_index(':') {
+		return address[..colon]
+	}
+	// No colon at all: the entire string is already just a host (e.g. "localhost").
+	return address
 }

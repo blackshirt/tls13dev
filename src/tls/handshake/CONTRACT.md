@@ -17,7 +17,7 @@ The implementation is split by ownership:
 
 - [`state_machine.v`](./state_machine.v) contains the private shared core.
 - [`tls_handshake.v`](./tls_handshake.v) defines and implements the
-  record facade and its cached TLS keys and KeyUpdate ratchets.
+  record facade and its cached TLS keys and the TLS KeyUpdate derivation.
 - [`quic_handshake.v`](./quic_handshake.v) defines and implements the QUIC
   facade and exposes TLS traffic secrets without deriving record keys.
 
@@ -33,18 +33,27 @@ state := hs.state()
 alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
 alert := hs.failure_alert()
-hs.fail_and_destroy_secrets()
-hs.zeroize_app_secrets()!
+hs.fail_and_zeroize_secrets()
+hs.zeroize_traffic_secrets(.application)!
 ```
 
-`fail_and_destroy_secrets()` marks the handshake failed and destroys its derived
+`fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
 secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
-wipes its cached record keys during failure cleanup. `zeroize_app_secrets()`
+wipes its cached record keys during failure cleanup. `zeroize_traffic_secrets(level)`
 is a fallible teardown operation and is accepted only after `.connected`, so
 an out-of-phase call cannot discard traffic material needed to finish a handshake.
 Adapters call these lifecycle operations when aborting or tearing down; callers
 driving a handshake normally need only construct, send the ClientHello, feed
 peer messages, and observe the resulting state.
+Each adapter funnels every terminal path through one internal teardown that pairs a
+core call above with a wipe of its *own* key holders, so no code path can clear one
+layer and forget the other: `tls.Conn` wipes its four `TLSProtection`s, and the QUIC
+engine zeroes each `ProtectionState` (AEAD key, IV, header-protection key) before
+releasing it. Both use the same module-private, idempotent `holder.wipe()` mechanism;
+users never call it — the only public terminal action is the adapter's `close()` or
+failure handling. Clearing verbs are tiered: `wipe_*` zeroes bytes or handles (the
+mechanism), `zeroize_*` clears secret material under lifecycle guard rules (RFC 8446
+§7.5), and `destroy_*` tears down a whole adapter connection.
 
 `create_client_hello()` returns the initial, complete handshake message.
 The constructors require only `server_name`. Optional named
@@ -83,11 +92,11 @@ adapters use `state()` to observe progress and errors to detect invalid input.
 - `record_update_read_traffic_keys()` and
   `record_update_write_traffic_keys()` implement TLS KeyUpdate and are valid
   only after the handshake reaches `.connected`.
-- `zeroize_handshake_traffic_secrets()` destroys handshake traffic secrets once
-  the adapter no longer needs them; the record facade also wipes its cached
-  handshake keys. This is cleanup, not a handshake-confirmation signal.
-- `zeroize_app_secrets()` is available after `.connected` and also wipes the
-  cached application record keys.
+- `zeroize_traffic_secrets(level)` destroys the traffic secrets for one
+  encryption level once the adapter no longer needs them; valid only after
+  `.connected`, and the record facade also wipes that level's cached record
+  keys. `.handshake` is cleanup, not a handshake-confirmation signal; the
+  `.initial` level has no secrets and is refused.
 
 ## QUIC-only operations
 
@@ -96,11 +105,12 @@ delegates to the core's private level-aware traffic-secret accessor, so both
 facades share one availability check while only the QUIC facade exports raw
 secrets; `TLSHandshake` cannot expose that accessor. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
-calls `zeroize_handshake_traffic_secrets()` only when QUIC no longer needs the
+calls `zeroize_traffic_secrets(.handshake)` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.
 `peer_transport_parameters()` returns the server's opaque extension bytes once
 received, and `hello_retry_request_received()` reports whether a retry occurred.
-`zeroize_app_secrets()` is available after `.connected` for adapter teardown.
+Application teardown calls the same inherited `zeroize_traffic_secrets(.application)`;
+both levels come from the shared core rather than a QUIC-facade declaration.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 are absent from `QuicHandshake`, rather than present as runtime-rejected calls.

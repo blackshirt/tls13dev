@@ -61,6 +61,24 @@ fn new_protection(k ProtectionKeys, suite handshake.CipherSuite) !ProtectionStat
 	}
 }
 
+// wipe zeroes this state's nonce base and header-protection key in place, so a
+// dead or closed connection leaves no packet-key material behind. The AEAD is a
+// vlib interface handle whose internal key cannot be zeroed or nulled from outside
+// (an interface field, unlike the pointer-typed priv_x25519 that
+// release_ephemeral_keys() can nil), so it is released when the holder drops the
+// whole state to none. Guarded by the loop bounds, so calling it on an
+// already-wiped state is a safe no-op.
+fn (mut s ProtectionState) wipe() {
+	for i in 0 .. s.iv.len {
+		s.iv[i] = 0
+	}
+	for i in 0 .. s.hp.len {
+		s.hp[i] = 0
+	}
+	s.iv = []u8{}
+	s.hp = []u8{}
+}
+
 // overhead returns AEAD tag length (RFC 9001 §5.3).
 fn (s &ProtectionState) overhead() int {
 	return s.aead.overhead()

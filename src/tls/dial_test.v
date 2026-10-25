@@ -38,7 +38,7 @@ fn scripted_read_record(mut c net.TcpConn) !Record {
 	copy(mut full[..record_header_len], hdr)
 	scripted_read_full(mut c, mut full, record_header_len)!
 	mut r := wire.new_reader(full)
-	return parse_record(mut r)!
+	return read_record(mut r)!
 }
 
 // start_scripted_server binds an ephemeral loopback listener, returns its

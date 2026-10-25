@@ -39,7 +39,7 @@ fn derive_hs_secrets(hash_algo HashAlgorithm, shared_secret []u8, th_ch_sh []u8)
 }
 
 // derive_app_secrets runs the §7.1 application phase from the Handshake Secret: the
-// Master Secret, then the client/server application traffic secrets (KeyUpdate ratchets them, §7.2).
+// Master Secret, then the client/server application traffic secrets (KeyUpdate updates them, §7.2).
 fn derive_app_secrets(hash_algo HashAlgorithm, handshake_secret []u8, th_sfin []u8) !TrafficSecrets {
 	derived_hs := derive_secret(hash_algo, handshake_secret, 'derived', empty_transcript_hash(hash_algo))!
 	master_secret := hkdf_extract(hash_algo, derived_hs, []u8{len: hash_algo.hash_len()})

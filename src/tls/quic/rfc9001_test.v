@@ -172,3 +172,15 @@ fn test_chacha20_short_header_packet_appendix_a5() ! {
 	packet := state.seal_packet([u8(0x42)], 654360564, 3, [u8(0x01)])!
 	assert hex.encode(packet) == '4cfe4189655e5cd55c41f69080575d7999c25a5bfb'
 }
+
+// test_protection_state_wipe_clears_keys checks that wipe zeroes the nonce base and
+// header-protection key so a closed engine leaves no packet key material behind
+// (RFC 8446 §7.5, RFC 9001 §4.9.2), and that a second wipe is a safe no-op.
+fn test_protection_state_wipe_clears_keys() ! {
+	mut state := new_a5_protection()!
+	state.wipe()
+	assert state.iv.len == 0
+	assert state.hp.len == 0
+	state.wipe()
+	assert state.iv.len == 0
+}

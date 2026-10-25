@@ -25,7 +25,7 @@ fn test_record_serialization_roundtrip() ! {
 	assert raw[4] == 0x05
 
 	mut r := wire.new_reader(raw)
-	parsed := parse_record(mut r)!
+	parsed := read_record(mut r)!
 	assert parsed.content_type == .handshake
 	assert parsed.legacy_version == legacy_record_version
 	assert parsed.payload == payload
@@ -113,45 +113,45 @@ fn test_change_cipher_spec_dummy_record() ! {
 	assert rec.payload == [u8(0x01)]
 }
 
-// test_parse_record_rejects_short_header: fewer than the 5-byte header is a
+// test_read_record_rejects_short_header: fewer than the 5-byte header is a
 // framing error rather than an out-of-bounds read.
-fn test_parse_record_rejects_short_header() ! {
+fn test_read_record_rejects_short_header() ! {
 	mut r := wire.new_reader([u8(0x16), 0x03, 0x03, 0x00])
-	parse_record(mut r) or {
+	read_record(mut r) or {
 		assert err.msg().contains('buffer too short')
 		return
 	}
 	assert false
 }
 
-// test_parse_record_rejects_invalid_content_type: correct framing but an
+// test_read_record_rejects_invalid_content_type: correct framing but an
 // undefined content-type byte (0x99) must be rejected before payload handling.
-fn test_parse_record_rejects_invalid_content_type() ! {
+fn test_read_record_rejects_invalid_content_type() ! {
 	mut r := wire.new_reader([u8(0x99), 0x03, 0x03, 0x00, 0x01, 0xaa])
-	parse_record(mut r) or {
+	read_record(mut r) or {
 		assert err.msg().contains('invalid content type')
 		return
 	}
 	assert false
 }
 
-// test_parse_record_rejects_oversized_length: a declared length above
+// test_read_record_rejects_oversized_length: a declared length above
 // max_ciphertext_record_len (RFC 8446 §5.2) is refused before any allocation.
-fn test_parse_record_rejects_oversized_length() ! {
+fn test_read_record_rejects_oversized_length() ! {
 	// length field 0x5000 = 20480 > max_ciphertext_record_len 16640
 	mut r := wire.new_reader([u8(0x17), 0x03, 0x03, 0x50, 0x00])
-	parse_record(mut r) or {
+	read_record(mut r) or {
 		assert err.msg().contains('exceeds maximum')
 		return
 	}
 	assert false
 }
 
-// test_parse_record_rejects_incomplete_payload: the header declares 200 bytes
+// test_read_record_rejects_incomplete_payload: the header declares 200 bytes
 // but only 2 are present, so the record is truncated and must error.
-fn test_parse_record_rejects_incomplete_payload() ! {
+fn test_read_record_rejects_incomplete_payload() ! {
 	mut r := wire.new_reader([u8(0x16), 0x03, 0x03, 0x00, 0xc8, 0xaa, 0xbb])
-	parse_record(mut r) or {
+	read_record(mut r) or {
 		assert err.msg().contains('incomplete record payload')
 		return
 	}
@@ -251,4 +251,20 @@ fn test_record_uninitialized_cipher_state_fails_closed() ! {
 		return
 	}
 	assert false
+}
+
+// test_tls_protection_wipe_clears_state checks that wipe zeroes the nonce base and
+// resets the sequence counter, so a dead connection leaves nothing behind (§7.5),
+// and that a second wipe on the emptied state is a safe no-op.
+fn test_tls_protection_wipe_clears_state() ! {
+	mut p := TLSProtection{
+		aead:    unsafe { nil }
+		iv:      [u8(9), 8, 7]
+		seq_num: 11
+	}
+	p.wipe()
+	assert p.iv.len == 0
+	assert p.seq_num == 0
+	p.wipe()
+	assert p.iv.len == 0
 }

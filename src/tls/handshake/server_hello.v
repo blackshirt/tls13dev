@@ -67,6 +67,7 @@ fn (sh ServerHello) is_offered_cipher_suite(cfg &ClientHelloConfig) bool {
 
 // parse_server_hello decodes a ServerHello message body (RFC 8446 §4.1.3).
 // §4.2 placement rules: only supported_versions, key_share and (HRR only) cookie may appear.
+@[direct_array_access]
 fn parse_server_hello(body []u8) !ServerHello {
 	// The body follows §4.1.3's fixed field order; a length mismatch desyncs the rest and is caught here.
 	mut r := wire.new_reader(body)

@@ -37,12 +37,6 @@ pub fn (h &QuicHandshake) hello_retry_request_received() bool {
 	return h.hrr_received
 }
 
-// zeroize_app_secrets destroys application traffic secrets after the handshake
-// is connected and the QUIC adapter is tearing down the connection.
-pub fn (mut h QuicHandshake) zeroize_app_secrets() ! {
-	h.HandshakeCore.zeroize_app_secrets()!
-}
-
 // quic_traffic_secrets returns copies of TLS traffic secrets for QUIC packet-key derivation.
 pub fn (h &QuicHandshake) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
 	return h.traffic_secret_pair(level)

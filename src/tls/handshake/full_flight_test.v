@@ -16,7 +16,7 @@ fn fixture_trusted_validator() pki.Validator {
 }
 
 // expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —
-// the expected state once zeroize_handshake_traffic_secrets() dropped the handshake material.
+// the expected state once zeroize_traffic_secrets(.handshake) dropped the handshake material.
 fn expect_no_handshake_keys(h &TLSHandshake) bool {
 	h.record_traffic_keys(.handshake) or {
 		return true
@@ -27,7 +27,7 @@ fn expect_no_handshake_keys(h &TLSHandshake) bool {
 // expect_no_exported_handshake_secrets reports whether the handshake traffic
 // secrets are gone — the expected state once they were wiped.
 fn expect_no_exported_handshake_secrets(h &TLSHandshake) bool {
-	return h.client_hs_traffic.len == 0 && h.server_hs_traffic.len == 0
+	return h.client_hsk_traffic.len == 0 && h.server_hsk_traffic.len == 0
 }
 
 // assert_handshake_material_destroyed checks the failure-path contract: after a
@@ -108,19 +108,19 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert h.server_certs.len == 1
 
 	// Application traffic keys are the reusable post-handshake state (§7.1).
-	ck, sk := h.record_traffic_keys(.application)!
-	assert ck.key.len == 16
-	assert ck.iv.len == 12
-	assert sk.key.len == 16
-	assert sk.iv.len == 12
+	ck, civ, sk, siv := h.record_traffic_keys(.application)!
+	assert ck.len == 16
+	assert civ.len == 12
+	assert sk.len == 16
+	assert siv.len == 12
 
 	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
-	h.zeroize_handshake_traffic_secrets()!
+	h.zeroize_traffic_secrets(.handshake)!
 	assert expect_no_handshake_keys(&h)
-	akc, aks := h.record_traffic_keys(.application)!
-	assert akc.key.len == 16
-	assert aks.key.len == 16
-	assert aks.iv.len == 12
+	akc, _, aks, aks_iv := h.record_traffic_keys(.application)!
+	assert akc.len == 16
+	assert aks.len == 16
+	assert aks_iv.len == 12
 }
 
 // test_hello_retry_request_change_group_reaches_connected checks that the
@@ -278,7 +278,7 @@ fn test_rejects_substring_alpn() ! {
 // test_fail_before_secrets_is_safe checks failure cleanup before anything is derived.
 fn test_fail_before_secrets_is_safe() ! {
 	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
-	h.fail_and_destroy_secrets()
+	h.fail_and_zeroize_secrets()
 	assert h.state() == .failed
 	assert expect_no_handshake_keys(h)
 	assert expect_no_exported_handshake_secrets(h)

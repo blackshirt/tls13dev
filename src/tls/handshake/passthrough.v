@@ -27,6 +27,7 @@ const handshake_header_len = 4
 // incomplete, so callers loop until the result is empty; a non-empty result is consumed
 // from buf in place (the caller's buffer keeps its identity). A declared length over
 // max_handshake_message_len is the only error, rejected at the header before buffering.
+@[direct_array_access]
 pub fn next_recordless_message(mut buf []u8) ![]u8 {
 	if buf.len < handshake_header_len {
 		return []u8{} // even the handshake header has not fully arrived

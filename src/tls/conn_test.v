@@ -209,9 +209,9 @@ fn test_application_write_failure_fails_closed() ! {
 }
 
 // test_post_handshake_reassembly_is_bounded checks that a peer streaming
-// incomplete handshake fragments can never grow post_hs_buf past one capped
+// incomplete handshake fragments can never grow post_hsk_buf past one capped
 // message plus header — the bound must fire as record_overflow before the
-// buffer climbs without limit (§5.2; mirrors the core's check_reassembly_bound).
+// buffer climbs without limit (§5.2; mirrors the core's max_handshake_message_len bound).
 fn test_post_handshake_reassembly_is_bounded() ! {
 	mut c := new_test_conn()!
 	bound := record_header_len + handshake.max_handshake_message_len
@@ -229,11 +229,11 @@ fn test_post_handshake_reassembly_is_bounded() ! {
 			assert pinned == handshake.AlertDescription.record_overflow
 			assert c.closed
 			assert c.fatal_error == err.msg()
-			assert c.post_hs_buf.len == 0
+			assert c.post_hsk_buf.len == 0
 			assert c.hs.state() == .failed
 			return
 		}
-		assert c.post_hs_buf.len <= bound // below the bound the tail just buffers
+		assert c.post_hsk_buf.len <= bound // below the bound the tail just buffers
 	}
 	assert false, 'unbounded post-handshake reassembly must fail closed'
 }

@@ -378,8 +378,7 @@ fn (mut e Conn) handle_frames(ptype PacketType, payload []u8) ! {
 			}
 			frame_handshake_done {
 				e.confirmed = true
-				e.hs.zeroize_handshake_traffic_secrets()!
-				e.drop_handshake_keys()
+				e.drop_handshake_keys()!
 				off++
 			}
 			frame_connection_close_transport, frame_connection_close_application {
@@ -570,12 +569,12 @@ fn (mut e Conn) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len in
 // fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
 // records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
 // §7.5). The record adapter wipes its core secrets on failure (its
-// wipe_on_failure); the QUIC adapter must do the same, or a dead handshake
+// destroy_on_failure); the QUIC adapter must do the same, or a dead handshake
 // leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
 // The caller emits a CONNECTION_CLOSE with the recorded code.
 fn (mut e Conn) fail_close() ! {
 	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
-	e.hs.fail_and_destroy_secrets()
+	e.hs.fail_and_zeroize_secrets()
 	e.closed = true
 }
 
@@ -587,13 +586,17 @@ pub fn (mut e Conn) close(error_code u32, reason string) ![]u8 {
 	e.closed = true
 	e.close_error = error_code
 	frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
+	// Seal the CONNECTION_CLOSE while the packet keys are still present, then destroy.
+	mut packet := []u8{}
 	if e.app_tx != none {
-		return e.seal_raw(.one_rtt, frame)!
+		packet = e.seal_raw(.one_rtt, frame)!
+	} else if e.handshake_tx != none {
+		packet = e.seal_raw(.handshake, frame)!
+	} else {
+		packet = e.seal_raw(.initial, frame)!
 	}
-	if e.handshake_tx != none {
-		return e.seal_raw(.handshake, frame)!
-	}
-	return e.seal_raw(.initial, frame)!
+	e.destroy_on_close()!
+	return packet
 }
 
 // seal_raw seals an arbitrary frame payload (not CRYPTO) into one packet at the
@@ -613,11 +616,59 @@ fn (mut e Conn) seal_raw(ptype PacketType, payload []u8) ![]u8 {
 	return packet
 }
 
-// drop_handshake_keys discards the Handshake-level protection after
-// HANDSHAKE_DONE (RFC 9001 §4.9.2).
-fn (mut e Conn) drop_handshake_keys() {
+// drop_handshake_keys releases the Handshake-level packet keys AND the core's
+// handshake traffic secrets together after HANDSHAKE_DONE, so an adapter cannot
+// discard one and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
+// handshake protection states before releasing them, and is idempotent.
+fn (mut e Conn) drop_handshake_keys() ! {
+	e.hs.zeroize_traffic_secrets(.handshake)!
+	mut tx := e.handshake_tx or { ProtectionState{ aead: unsafe { nil } } }
+	tx.wipe()
 	e.handshake_tx = none
+	mut rx := e.handshake_rx or { ProtectionState{ aead: unsafe { nil } } }
+	rx.wipe()
 	e.handshake_rx = none
+}
+
+// wipe_packet_keys zeroes and releases every packet-protection state this engine
+// owns, so a dead or closed connection leaves no AEAD key, IV, or header-protection
+// key behind (RFC 8446 §7.5, RFC 9001 §4.9.2). Idempotent.
+fn (mut e Conn) wipe_packet_keys() {
+	mut k1 := e.initial_tx or { ProtectionState{ aead: unsafe { nil } } }
+	k1.wipe()
+	e.initial_tx = none
+	mut k2 := e.initial_rx or { ProtectionState{ aead: unsafe { nil } } }
+	k2.wipe()
+	e.initial_rx = none
+	mut k3 := e.handshake_tx or { ProtectionState{ aead: unsafe { nil } } }
+	k3.wipe()
+	e.handshake_tx = none
+	mut k4 := e.handshake_rx or { ProtectionState{ aead: unsafe { nil } } }
+	k4.wipe()
+	e.handshake_rx = none
+	mut k5 := e.app_tx or { ProtectionState{ aead: unsafe { nil } } }
+	k5.wipe()
+	e.app_tx = none
+	mut k6 := e.app_rx or { ProtectionState{ aead: unsafe { nil } } }
+	k6.wipe()
+	e.app_rx = none
+}
+
+// destroy_on_close is the QUIC adapter's single terminal teardown: it drops the
+// application traffic secrets once the handshake reached .connected (or the whole
+// key schedule otherwise) and zeroes every packet-protection state, so no close path
+// can clear one layer and forget the other (RFC 8446 §1.3.1/§7.5, RFC 9001 §4.9.2).
+// It runs only after the final CONNECTION_CLOSE has been sealed, since sealing still
+// needs the packet keys; that is why the failure path (fail_close) does not call it.
+fn (mut e Conn) destroy_on_close() ! {
+	if e.hs.state() == .connected {
+		e.hs.zeroize_traffic_secrets(.application)!
+	} else {
+		e.hs.fail_and_zeroize_secrets()
+	}
+	e.wipe_packet_keys()
+	e.tx_crypto_initial = []u8{}
+	e.tx_crypto_hands = []u8{}
 }
 
 // --- small helpers -----------------------------------------------------------

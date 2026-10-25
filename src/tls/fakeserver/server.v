@@ -128,10 +128,10 @@ mut:
 	share_group         u16
 	hrr_requested_group u16
 	hrr_cookie_sent     []u8
-	client_hs_traffic   []u8
-	server_hs_traffic   []u8
-	client_ap_traffic   []u8
-	server_ap_traffic   []u8
+	client_hsk_traffic  []u8
+	server_hsk_traffic  []u8
+	client_app_traffic  []u8
+	server_app_traffic  []u8
 	// pending_tail holds the server-flight messages deferred until the client's
 	// empty Certificate is folded into the transcript.
 	pending_tail [][]u8
@@ -341,7 +341,7 @@ fn (mut s Server) build_server_tail() ![][]u8 {
 
 	// Server Finished covers the transcript through CertificateVerify (§4.4.4).
 	th_sfin := s.transcript.hash()
-	mut verify_data := finished_verify_data(s.server_hs_traffic, th_sfin)!
+	mut verify_data := finished_verify_data(s.server_hsk_traffic, th_sfin)!
 	if s.cfg.bad_finished {
 		verify_data[verify_data.len - 1] = verify_data[verify_data.len - 1] ^ 0xff
 	}
@@ -408,7 +408,7 @@ pub fn (mut s Server) handle_client_finished(msg []u8) ! {
 		return error('fakeserver: client Finished verify_data is ${body.len} bytes, expected ${hash_len}')
 	}
 	th := s.transcript.hash()
-	expected := finished_verify_data(s.client_hs_traffic, th)!
+	expected := finished_verify_data(s.client_hsk_traffic, th)!
 	if body != expected {
 		return error('fakeserver: client Finished verify_data mismatch')
 	}
@@ -425,8 +425,8 @@ fn (mut s Server) derive_handshake_secrets() ! {
 	derived_early := derive_secret(early_secret, 'derived', empty)!
 	handshake_secret := hkdf_extract(derived_early, s.shared_secret)
 	th := s.transcript.hash()
-	s.client_hs_traffic = derive_secret(handshake_secret, 'c hs traffic', th)!
-	s.server_hs_traffic = derive_secret(handshake_secret, 's hs traffic', th)!
+	s.client_hsk_traffic = derive_secret(handshake_secret, 'c hs traffic', th)!
+	s.server_hsk_traffic = derive_secret(handshake_secret, 's hs traffic', th)!
 	// Retained: the Master Secret derives from it in the application phase (§7.1).
 	s.handshake_secret = handshake_secret
 }
@@ -439,62 +439,62 @@ fn (mut s Server) derive_application_secrets() ! {
 	zeros := []u8{len: hash_len}
 	master_secret := hkdf_extract(derived_hs, zeros)
 	th := s.transcript.hash()
-	s.client_ap_traffic = derive_secret(master_secret, 'c ap traffic', th)!
-	s.server_ap_traffic = derive_secret(master_secret, 's ap traffic', th)!
+	s.client_app_traffic = derive_secret(master_secret, 'c ap traffic', th)!
+	s.server_app_traffic = derive_secret(master_secret, 's ap traffic', th)!
 }
 
 // server_handshake_keys returns the server-direction handshake key and IV, so the
 // test transport can encrypt the flight records.
 pub fn (s &Server) server_handshake_keys() !([]u8, []u8) {
-	if s.server_hs_traffic.len == 0 {
+	if s.server_hsk_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
 	}
-	return traffic_keys(s.server_hs_traffic)
+	return traffic_keys(s.server_hsk_traffic)
 }
 
 // client_handshake_keys returns the client-direction handshake key and IV, so the
 // test transport can decrypt the client Finished.
 pub fn (s &Server) client_handshake_keys() !([]u8, []u8) {
-	if s.client_hs_traffic.len == 0 {
+	if s.client_hsk_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
 	}
-	return traffic_keys(s.client_hs_traffic)
+	return traffic_keys(s.client_hsk_traffic)
 }
 
 // server_handshake_secret returns the raw §7.1 server handshake traffic secret,
 // for a QUIC test peer's RFC 9001 §5.1 "quic key"/"quic iv"/"quic hp" expansions.
 pub fn (s &Server) server_handshake_secret() ![]u8 {
-	if s.server_hs_traffic.len == 0 {
+	if s.server_hsk_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
 	}
-	return s.server_hs_traffic.clone()
+	return s.server_hsk_traffic.clone()
 }
 
 // client_handshake_secret returns the raw §7.1 client handshake traffic secret,
 // for a QUIC test peer to derive packet protection.
 pub fn (s &Server) client_handshake_secret() ![]u8 {
-	if s.client_hs_traffic.len == 0 {
+	if s.client_hsk_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
 	}
-	return s.client_hs_traffic.clone()
+	return s.client_hsk_traffic.clone()
 }
 
 // server_app_keys returns the server-direction application key and IV, so the
 // test transport can send post-handshake records the client will accept.
 pub fn (s &Server) server_app_keys() !([]u8, []u8) {
-	if s.server_ap_traffic.len == 0 {
+	if s.server_app_traffic.len == 0 {
 		return error('fakeserver: application secrets not derived yet (server Finished not built)')
 	}
-	return traffic_keys(s.server_ap_traffic)
+	return traffic_keys(s.server_app_traffic)
 }
 
 // server_app_secret returns the raw §7.1 server application traffic secret, for a
 // QUIC test peer to derive 1-RTT packet protection.
 pub fn (s &Server) server_app_secret() ![]u8 {
-	if s.server_ap_traffic.len == 0 {
+	if s.server_app_traffic.len == 0 {
 		return error('fakeserver: application secrets not derived yet (server Finished not built)')
 	}
-	return s.server_ap_traffic.clone()
+	return s.server_app_traffic.clone()
 }
 
 // new_session_ticket builds a valid NewSessionTicket (RFC 8446 §4.6.1) the

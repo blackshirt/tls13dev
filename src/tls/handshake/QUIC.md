@@ -32,7 +32,7 @@ The core was therefore split so that the carrier is always someone else's job:
    │  Key schedule: key_schedule.v / handshake_keys.v                               │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
-   │  Record facade: tls_handshake.v owns TLS TrafficKeys and KeyUpdate ratchets    │
+   │  Record facade: tls_handshake.v owns TLS TrafficKeys and the KeyUpdate path    │
    │  QUIC facade: quic_handshake.v exports TLS traffic secrets                     │
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
@@ -123,7 +123,7 @@ start
 
 `failed` is terminal: once reached, `receive_msgs_at_level()` refuses further input. A protocol
 violation moves the machine to `failed` and wipes all derived material (see
-§5). The public accessors `state()`, `negotiated_alpn()`, and
+`fail_and_zeroize_secrets()` in [CONTRACT.md](./CONTRACT.md)). The public accessors `state()`, `negotiated_alpn()`, and
 `negotiated_cipher_suite()` let an adapter poll progress and outcome.
 
 ### The ClientHello and HelloRetryRequest
@@ -192,12 +192,14 @@ A QUIC server may keep sending at the Handshake level until the client
 confirms the handshake with `HANDSHAKE_DONE` (RFC 9001 §4.1.2), not merely
 until the client sends its Finished. So the core deliberately retains the
 handshake traffic secrets past `.connected`; the engine owns its derived packet
-keys and calls `zeroize_handshake_traffic_secrets()` when it processes
-`HANDSHAKE_DONE` (§4.9.2).
-The TCP adapter calls `zeroize_handshake_traffic_secrets()` after sending its
-Finished because record-based TLS has no such window; **a QUIC engine must not**
-zeroize them before it has finished using the Handshake packet keys. In the
-repository's `Conn`, processing `HANDSHAKE_DONE` performs this cleanup.
+keys and, when it processes `HANDSHAKE_DONE` (§4.9.2), calls `drop_handshake_keys()`
+— a single step that zeroizes the core's `.handshake` traffic secrets *and* zeroes
+the Handshake packet-protection states together, so neither half can be forgotten.
+The TCP adapter reaches the same `zeroize_traffic_secrets(.handshake)` after sending
+its Finished because record-based TLS has no such window; **a QUIC engine must not**
+release them before it has finished using the Handshake packet keys. Terminal cleanup
+is centralized in `close()`, which seals the final `CONNECTION_CLOSE` first and only
+then zeroizes the core secrets and every remaining packet key (`destroy_on_close()`).
 
 ### 3.4 KeyUpdate is replaced by Key Phase
 
@@ -225,7 +227,7 @@ record layer's parser — extracts one complete message from the front of a byte
 buffer, capping the declared length at `max_handshake_message_len` (1 MiB) from
 the header alone so a hostile peer cannot make the adapter buffer indefinitely.
 It is public precisely so an engine can reuse it engine-side. The shared core
-owns the TLS plaintext and Handshake message buffers for each handshake instance.
+owns the initial- and handshake-level reassembly buffers for each handshake instance.
 
 ---
 
@@ -286,7 +288,7 @@ for m in flight {
 
 // 8. For a custom client adapter, release handshake-stage material after
 //    receiving HANDSHAKE_DONE. Conn does this automatically.
-hs.zeroize_handshake_traffic_secrets()!
+hs.zeroize_traffic_secrets(.handshake)!
 
 // 9. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_recordless_message and decode with parse_new_session_ticket.
@@ -307,7 +309,7 @@ hs.zeroize_handshake_traffic_secrets()!
 
 ---
 
-## 6. API reference
+## 5. API reference
 
 The canonical list of shared and transport-specific methods, lifecycle rules,
 and public helper APIs is in the [handshake adapter contract](./CONTRACT.md).
@@ -329,7 +331,7 @@ mut conn := quic.new_client_engine('example.com', quic.Config{
 
 ---
 
-## 7. What this module does *not* give you
+## 6. What this module does *not* give you
 
 The handshake core is complete, but a QUIC stack is more than the handshake.
 The following are outside `tls.handshake`; some packet-level handshake
@@ -339,7 +341,7 @@ functionality is provided separately by this repository's
 - **General packet handling** — the engine builds and parses packets for its
   handshake flow, but does not provide a complete QUIC packet stack.
 - **Key Phase** — the 1-RTT key update mechanism that replaces TLS KeyUpdate
-  (§6); the engine does not implement key updates.
+  (RFC 9001 §6); the engine does not implement key updates.
 - **Full connection machinery** — streams, flow control, loss recovery,
   congestion control, migration, and Retry/0-RTT. The engine handles ACK and
   CONNECTION_CLOSE frames during its handshake flow; it parses ACKs but does
@@ -352,7 +354,7 @@ has to be a transport.
 
 ---
 
-## 8. See also
+## 7. See also
 
 - `src/tls/handshake/CONTRACT.md` — the shared-core and transport-facade
   contract, including the remaining opportunity to report handshake milestones

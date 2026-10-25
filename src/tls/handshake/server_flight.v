@@ -30,6 +30,7 @@ fn signature_scheme_from_u16(raw u16) !SignatureScheme {
 
 // parse_certificate_message decodes the Certificate message body (RFC 8446 §4.4.2)
 // and returns the DER-encoded chain; pki.parse_certificate decodes a single certificate.
+@[direct_array_access]
 fn parse_certificate_message(body []u8) ![][]u8 {
 	mut r := wire.new_reader(body)
 	req_ctx := r.read_vector_u8()!
@@ -63,6 +64,7 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 }
 
 // parse_certificate_verify decodes the CertificateVerify body (RFC 8446 §4.4.3).
+@[direct_array_access]
 fn parse_certificate_verify(body []u8) !ParsedCertificateVerify {
 	mut r := wire.new_reader(body)
 	algo_u16 := r.read_u16()!
@@ -96,6 +98,7 @@ fn certificate_verify_signed_content(transcript_hash []u8) []u8 {
 
 // parse_finished reads the verify_data from a Finished message (RFC 8446 §4.4.4).
 // The body is exactly verify_data, so its length is fixed at Hash.length.
+@[direct_array_access]
 fn parse_finished(body []u8, hash_len int) ![]u8 {
 	if body.len != hash_len {
 		return error('handshake: Finished verify_data is ${body.len} bytes, expected ${hash_len} (Hash.length, RFC 8446 §4.4.4)')
@@ -116,6 +119,7 @@ struct CertificateRequest {
 
 // parse_certificate_request decodes the CertificateRequest body (RFC 8446 §4.3.2).
 // The extensions must be well-formed and bounded; their content is not interpreted here.
+@[direct_array_access]
 fn parse_certificate_request(body []u8) !CertificateRequest {
 	mut r := wire.new_reader(body)
 	request_context := r.read_vector_u8()!
@@ -144,6 +148,7 @@ fn build_empty_certificate(request_context []u8) []u8 {
 // connection — the peer's transport parameters. Those parameters are returned as
 // raw bytes, because their id/length/value content belongs to QUIC and is decoded
 // by the adapter; this function only enforces the TLS-level placement rules.
+@[direct_array_access]
 fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?[]u8) {
 	mut r := wire.new_reader(body)
 	ext_bytes := r.read_vector_u16()!

@@ -4,20 +4,17 @@
 // semantics. Record traffic keys and TLS KeyUpdate state live here.
 module handshake
 
-// RecordKeyPair caches the client/server record keys for one encryption level.
-struct RecordKeyPair {
-mut:
-	client TrafficKeys // Keys for records sent by the client.
-	server TrafficKeys // Keys for records received from the server.
-}
-
 // TLSHandshake exposes only operations needed by the TLS record layer.
+// The four record-key fields are ordered protocol-first to mirror the core's
+// client/server_*_traffic secret names.
 @[noinit]
 pub struct TLSHandshake {
 	HandshakeCore
 mut:
-	hs_keys  RecordKeyPair // Cached record keys for the handshake level.
-	app_keys RecordKeyPair // Cached record keys for the application level.
+	client_hsk_keys TrafficKeys // Cached record keys for the client at the handshake level.
+	server_hsk_keys TrafficKeys // Cached record keys for the server at the handshake level.
+	client_app_keys TrafficKeys // Cached record keys for the client at the application level.
+	server_app_keys TrafficKeys // Cached record keys for the server at the application level.
 }
 
 // new_tls_handshake creates a TLS-over-records handshake facade.
@@ -38,44 +35,48 @@ pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes [
 		return err
 	}
 	h.sync_record_keys() or {
-		h.fail_and_destroy_secrets()
+		h.fail_and_zeroize_secrets()
 		return err
 	}
 	return messages
 }
 
-// fail_and_destroy_secrets marks the handshake failed and wipes TLS secrets and
+// fail_and_zeroize_secrets marks the handshake failed and wipes TLS secrets and
 // all cached record keys. It does not close the TCP connection.
-pub fn (mut h TLSHandshake) fail_and_destroy_secrets() {
-	h.HandshakeCore.fail_and_destroy_secrets()
+pub fn (mut h TLSHandshake) fail_and_zeroize_secrets() {
+	h.HandshakeCore.fail_and_zeroize_secrets()
 	h.wipe_record_keys()
 }
 
-// zeroize_app_secrets destroys application traffic secrets and cached record
-// keys, for example when the connection is closed.
-pub fn (mut h TLSHandshake) zeroize_app_secrets() ! {
-	h.HandshakeCore.zeroize_app_secrets()!
-	h.app_keys.wipe()
+// zeroize_traffic_secrets destroys the traffic secrets for one encryption level
+// plus that level's cached record keys; valid only after .connected (core guard)
+// and the initial level is refused. Used both for application teardown and, once
+// the record adapter no longer needs them, for the handshake keys/secrets.
+pub fn (mut h TLSHandshake) zeroize_traffic_secrets(level EncryptionLevel) ! {
+	h.HandshakeCore.zeroize_traffic_secrets(level)!
+	h.wipe_record_keys_at(level)
 }
 
 // record_traffic_keys returns independent copies of the cached client/server
-// TrafficKeys at one TLS encryption level.
-pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !(TrafficKeys, TrafficKeys) {
+// record key and IV bytes at one TLS encryption level, ordered as
+// (client_key, client_iv, server_key, server_iv). TrafficKeys stays a module-internal
+// type: the tls record layer receives plain []u8 instead of a named key handle.
+pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !([]u8, []u8, []u8, []u8) {
 	match level {
 		.initial {
 			return error('handshake: initial level has no traffic keys')
 		}
 		.handshake {
-			if h.hs_keys.client.key.len == 0 || h.hs_keys.server.key.len == 0 {
-				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_traffic_secrets)')
+			if h.client_hsk_keys.key.len == 0 || h.server_hsk_keys.key.len == 0 {
+				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
 			}
-			return clone_traffic_keys(h.hs_keys.client), clone_traffic_keys(h.hs_keys.server)
+			return h.client_hsk_keys.key.clone(), h.client_hsk_keys.iv.clone(), h.server_hsk_keys.key.clone(), h.server_hsk_keys.iv.clone()
 		}
 		.application {
-			if h.app_keys.client.key.len == 0 || h.app_keys.server.key.len == 0 {
+			if h.client_app_keys.key.len == 0 || h.server_app_keys.key.len == 0 {
 				return error('handshake: application traffic keys unavailable before the server Finished')
 			}
-			return clone_traffic_keys(h.app_keys.client), clone_traffic_keys(h.app_keys.server)
+			return h.client_app_keys.key.clone(), h.client_app_keys.iv.clone(), h.server_app_keys.key.clone(), h.server_app_keys.iv.clone()
 		}
 	}
 }
@@ -86,54 +87,57 @@ pub fn (h &TLSHandshake) record_unconsumed_bytes(level EncryptionLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 
-// zeroize_handshake_traffic_secrets destroys handshake secrets and cached keys
-// after the record adapter no longer needs them; only valid when connected.
-pub fn (mut h TLSHandshake) zeroize_handshake_traffic_secrets() ! {
-	h.HandshakeCore.zeroize_handshake_traffic_secrets()!
-	h.hs_keys.wipe()
-}
-
-// record_update_read_traffic_keys ratchets the server application keys after
-// receiving a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
+// record_update_read_traffic_keys updates the server application traffic keys
+// after receiving a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
 pub fn (mut h TLSHandshake) record_update_read_traffic_keys() ! {
-	if h.state() != .connected {
-		return error('handshake: cannot update server application traffic keys before the handshake is connected (state: ${h.state()})')
-	}
-	if h.server_ap_traffic.len == 0 {
-		return error('handshake: cannot ratchet the server application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
-	}
-	new_secret, next := ratchet_application_traffic(h.hash_algo, h.key_len, h.server_ap_traffic) or {
-		h.fail_and_destroy_secrets()
-		return err
-	}
-	wipe_secret(mut h.server_ap_traffic)
-	h.server_ap_traffic = new_secret
-	wipe_traffic_keys(mut h.app_keys.server)
-	h.app_keys.server = next
+	h.update_app_traffic_keys(true)!
 }
 
-// record_update_write_traffic_keys ratchets the client application keys before
-// sending a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
+// record_update_write_traffic_keys updates the client application traffic keys
+// before sending a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
 pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
-	if h.state() != .connected {
-		return error('handshake: cannot update client application traffic keys before the handshake is connected (state: ${h.state()})')
-	}
-	if h.client_ap_traffic.len == 0 {
-		return error('handshake: cannot ratchet the client application traffic secret (unavailable before the server Finished, destroyed by zeroize_app_secrets)')
-	}
-	new_secret, next := ratchet_application_traffic(h.hash_algo, h.key_len, h.client_ap_traffic) or {
-		h.fail_and_destroy_secrets()
-		return err
-	}
-	wipe_secret(mut h.client_ap_traffic)
-	h.client_ap_traffic = new_secret
-	wipe_traffic_keys(mut h.app_keys.client)
-	h.app_keys.client = next
+	h.update_app_traffic_keys(false)!
 }
 
-// ratchet_application_traffic advances one application traffic secret with the
-// TLS KeyUpdate "traffic upd" label and derives the next cached keys.
-fn ratchet_application_traffic(hash_algo HashAlgorithm, key_len int, secret []u8) !([]u8, TrafficKeys) {
+// update_app_traffic_keys derives the next application traffic secret and its
+// cached keys for one direction after a TLS KeyUpdate. The read (server) and write
+// (client) sides were byte-for-byte the same routine over a different secret/keys
+// field pair (server_app_traffic/server_app_keys or client_app_traffic/client_app_keys),
+// so they share this body: is_server selects the pair and the direction word
+// in the two guards.
+fn (mut h TLSHandshake) update_app_traffic_keys(is_server bool) ! {
+	side := if is_server { 'server' } else { 'client' }
+	if h.state() != .connected {
+		return error('handshake: cannot update ${side} application traffic keys before the handshake is connected (state: ${h.state()})')
+	}
+	secret := if is_server {
+		h.server_app_traffic
+	} else {
+		h.client_app_traffic
+	}
+	if secret.len == 0 {
+		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_traffic_secrets(.application))')
+	}
+	new_secret, next := derive_updated_traffic_keys(h.hash_algo, h.key_len, secret) or {
+		h.fail_and_zeroize_secrets()
+		return err
+	}
+	if is_server {
+		wipe_secret(mut h.server_app_traffic)
+		h.server_app_traffic = new_secret
+		wipe_traffic_keys(mut h.server_app_keys)
+		h.server_app_keys = next
+	} else {
+		wipe_secret(mut h.client_app_traffic)
+		h.client_app_traffic = new_secret
+		wipe_traffic_keys(mut h.client_app_keys)
+		h.client_app_keys = next
+	}
+}
+
+// derive_updated_traffic_keys performs the TLS KeyUpdate "traffic upd" derivation:
+// the next application traffic secret from the current one, then its cached keys.
+fn derive_updated_traffic_keys(hash_algo HashAlgorithm, key_len int, secret []u8) !([]u8, TrafficKeys) {
 	new_secret := hkdf_expand_label(hash_algo, secret, 'traffic upd', []u8{},
 		hash_algo.hash_len())!
 	next := derive_traffic_keys(hash_algo, new_secret, key_len, aead_nonce_len)!
@@ -141,42 +145,43 @@ fn ratchet_application_traffic(hash_algo HashAlgorithm, key_len int, secret []u8
 }
 
 // sync_record_keys derives and caches record keys when the core exposes
-// corresponding handshake or application traffic secrets.
+// corresponding handshake or application traffic secrets. The client key of each
+// level doubles as the derived-once marker, so each level expands exactly once.
+// Both directions are derived before either field is written, so a derivation
+// failure can never leave a level half-installed (matches the old atomic commit).
 fn (mut h TLSHandshake) sync_record_keys() ! {
-	if h.hs_keys.client.key.len == 0 && h.client_hs_traffic.len > 0 {
-		h.hs_keys = derive_record_key_pair(h.hash_algo, h.client_hs_traffic,
-			h.server_hs_traffic, h.key_len)!
+	if h.client_hsk_keys.key.len == 0 && h.client_hsk_traffic.len > 0 {
+		ck := derive_traffic_keys(h.hash_algo, h.client_hsk_traffic, h.key_len, aead_nonce_len)!
+		sk := derive_traffic_keys(h.hash_algo, h.server_hsk_traffic, h.key_len, aead_nonce_len)!
+		h.client_hsk_keys = ck
+		h.server_hsk_keys = sk
 	}
-	if h.app_keys.client.key.len == 0 && h.client_ap_traffic.len > 0 {
-		h.app_keys = derive_record_key_pair(h.hash_algo, h.client_ap_traffic,
-			h.server_ap_traffic, h.key_len)!
-	}
-}
-
-// derive_record_key_pair expands both directions of one encryption level.
-fn derive_record_key_pair(hash_algo HashAlgorithm, client_secret []u8, server_secret []u8, key_len int) !RecordKeyPair {
-	return RecordKeyPair{
-		client: derive_traffic_keys(hash_algo, client_secret, key_len, aead_nonce_len)!
-		server: derive_traffic_keys(hash_algo, server_secret, key_len, aead_nonce_len)!
+	if h.client_app_keys.key.len == 0 && h.client_app_traffic.len > 0 {
+		ck := derive_traffic_keys(h.hash_algo, h.client_app_traffic, h.key_len, aead_nonce_len)!
+		sk := derive_traffic_keys(h.hash_algo, h.server_app_traffic, h.key_len, aead_nonce_len)!
+		h.client_app_keys = ck
+		h.server_app_keys = sk
 	}
 }
 
-// wipe zeroes both directions of a cached record-key pair.
-fn (mut keys RecordKeyPair) wipe() {
-	wipe_traffic_keys(mut keys.client)
-	wipe_traffic_keys(mut keys.server)
+// wipe_record_keys_at zeroes the cached client/server record keys for one level;
+// the initial level has no cached keys.
+fn (mut h TLSHandshake) wipe_record_keys_at(level EncryptionLevel) {
+	match level {
+		.initial {}
+		.handshake {
+			wipe_traffic_keys(mut h.client_hsk_keys)
+			wipe_traffic_keys(mut h.server_hsk_keys)
+		}
+		.application {
+			wipe_traffic_keys(mut h.client_app_keys)
+			wipe_traffic_keys(mut h.server_app_keys)
+		}
+	}
 }
 
 // wipe_record_keys clears all cached handshake and application record keys.
 fn (mut h TLSHandshake) wipe_record_keys() {
-	h.hs_keys.wipe()
-	h.app_keys.wipe()
-}
-
-// clone_traffic_keys returns an independent copy of a traffic key and IV.
-fn clone_traffic_keys(keys TrafficKeys) TrafficKeys {
-	return TrafficKeys{
-		key: keys.key.clone()
-		iv:  keys.iv.clone()
-	}
+	h.wipe_record_keys_at(.handshake)
+	h.wipe_record_keys_at(.application)
 }

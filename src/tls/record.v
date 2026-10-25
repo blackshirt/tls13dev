@@ -82,9 +82,9 @@ fn (r &Record) serialize() []u8 {
 	return buf
 }
 
-// parse_record reads a single TLS record: a 5-byte header (content type, legacy
+// read_record reads a single TLS record: a 5-byte header (content type, legacy
 // version, payload length) followed by `length` payload bytes (RFC 8446 §5.2).
-fn parse_record(mut r wire.Reader) !Record {
+fn read_record(mut r wire.Reader) !Record {
 	if r.remaining() < record_header_len {
 		return error('record: buffer too short for TLS record header (${r.remaining()} < ${record_header_len})')
 	}

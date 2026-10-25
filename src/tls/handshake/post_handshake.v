@@ -7,6 +7,7 @@ import tls.wire
 
 // parse_key_update decodes a KeyUpdate body (RFC 8446 §4.6.3) and reports whether
 // the sender requested that we also update our keys.
+@[direct_array_access]
 pub fn parse_key_update(body []u8) !bool {
 	if body.len != 1 {
 		return error('handshake: KeyUpdate body must be 1 byte')
@@ -56,6 +57,7 @@ pub fn (t &NewSessionTicket) bytes() []u8 {
 
 // parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1); ticket
 // storage belongs to the stack above this core (RFC 9001 §4.5).
+@[direct_array_access]
 pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	mut r := wire.new_reader(body)
 	lifetime := r.read_u32()!

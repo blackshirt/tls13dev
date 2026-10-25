@@ -150,7 +150,7 @@ that imports it must sit beside it.
   over the §4.4.3 signed content, transcript-hash binding throughout
 - **ALPN** negotiation with RFC 7301 §3.1 selection checks
 - **Post-handshake**: `NewSessionTicket` collection, `KeyUpdate` handling
-  (read keys ratchet on receipt; a response is sent with correct §4.6.3
+  (read keys update on receipt; a response is sent with correct §4.6.3
   old-key-before-new ordering when the server requests it), sender-side
   automatic rekey at the §5.5 per-key record limit, `close_notify`
 - **Client authentication**: a server `CertificateRequest` is answered with the

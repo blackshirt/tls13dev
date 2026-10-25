@@ -113,21 +113,12 @@ fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 }
 
 // TrafficKeys holds the derived AEAD key and IV for one traffic direction at one
-// encryption level; its fields are module-private and read-only from outside.
-pub struct TrafficKeys {
+// encryption level. It is module-private: the record accessor hands the tls layer
+// the key and IV as plain []u8, so the type never crosses the module boundary.
+struct TrafficKeys {
 mut:
 	key []u8 // AEAD key, suite-length bytes (16 for AES-128-GCM, 32 for the others)
 	iv  []u8 // 12-byte nonce base; per-record nonces XOR in the sequence number
-}
-
-// key returns the AEAD key bytes.
-pub fn (t &TrafficKeys) key() []u8 {
-	return t.key
-}
-
-// iv returns the 12-byte nonce base.
-pub fn (t &TrafficKeys) iv() []u8 {
-	return t.iv
 }
 
 // wipe_secret overwrites a secret buffer before releasing its contents. The

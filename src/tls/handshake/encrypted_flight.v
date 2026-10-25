@@ -92,7 +92,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	server_verify_data := parse_finished(body, h.hash_algo.hash_len())!
 	th_before_sfin := h.transcript.current_hash()
 
-	expected_verify_data := compute_finished_verify_data(h.hash_algo, h.server_hs_traffic, th_before_sfin)!
+	expected_verify_data := compute_finished_verify_data(h.hash_algo, h.server_hsk_traffic, th_before_sfin)!
 	// Constant-time compare: verify_data is a MAC over the transcript, and a naive compare would leak a byte-by-byte Finished forgery.
 	if subtle.constant_time_compare(server_verify_data, expected_verify_data) != 1 {
 		return h.fail(.decrypt_error, 'handshake: server Finished verify_data mismatch')
@@ -102,21 +102,21 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// Advance the key schedule to the application phase: Master Secret, then the application traffic secrets bound to the transcript including server Finished.
 	th_sfin := h.transcript.current_hash()
 	ap := derive_app_secrets(h.hash_algo, h.handshake_secret, th_sfin)!
-	h.client_ap_traffic = ap.client_traffic
-	h.server_ap_traffic = ap.server_traffic
+	h.client_app_traffic = ap.client_traffic
+	h.server_app_traffic = ap.server_traffic
 
 	// The client Finished uses the handshake traffic secret over the transcript now including server Finished, sent under the (still active) handshake keys.
-	client_verify_data := compute_finished_verify_data(h.hash_algo, h.client_hs_traffic, th_sfin)!
+	client_verify_data := compute_finished_verify_data(h.hash_algo, h.client_hsk_traffic, th_sfin)!
 	client_fin_msg := build_finished(client_verify_data)
 	h.update_transcript(client_fin_msg)!
 
-	if h.hs_reassembly.len > 0 {
+	if h.hsk_buf.len > 0 {
 		return h.fail(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
 	}
 
 	h.state = .connected
 	// Forward-secrecy cleanup: every ephemeral/handshake secret consumed to reach this point is now dead (RFC 8446 §7.5 / §1.3.1).
-	h.zeroize_handshake_secrets()
+	h.wipe_key_schedule_secrets()
 	// Hand the raw client Finished to the transport, which encrypts it under the still-active handshake keys.
 	return [new_handshake_message(.handshake, client_fin_msg)!]
 }

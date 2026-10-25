@@ -58,8 +58,8 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	th_ch_sh := h.transcript.current_hash()
 	hs := derive_hs_secrets(h.hash_algo, shared_secret, th_ch_sh)!
 	h.handshake_secret = hs.handshake_secret
-	h.client_hs_traffic = hs.client_traffic
-	h.server_hs_traffic = hs.server_traffic
+	h.client_hsk_traffic = hs.client_traffic
+	h.server_hsk_traffic = hs.server_traffic
 
 	h.state = .wait_encrypted_extensions
 	return []HandshakeMessage{}

@@ -15,7 +15,7 @@ pub enum HandshakeType as u8 {
 	end_of_early_data    = 5 // 0-RTT; recognized but not implemented
 	encrypted_extensions = 8
 	certificate          = 11
-	certificate_request  = 13 // server→client auth; not implemented by this client
+	certificate_request  = 13 // server→client auth; client holds no credential, so it answers with an empty Certificate (§4.4.2)
 	certificate_verify   = 15
 	finished             = 20
 	key_update           = 24
@@ -121,6 +121,7 @@ mut:
 
 // parse_extensions decodes an extensions block of [u16 type][u16 length][data].
 // Duplicate types are rejected: §4.2 forbids repeats. Unknown types are returned verbatim.
+@[direct_array_access]
 fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	mut r := wire.new_reader(ext_bytes)
 	mut out := []WireExtension{}
@@ -140,9 +141,9 @@ fn parse_extensions(ext_bytes []u8) ![]WireExtension {
 	return out
 }
 
-// parse_handshake_header reads the 4-byte handshake header from a reader.
+// read_handshake_header reads the 4-byte handshake header from a reader.
 // Pub so adapters can dispatch post-handshake messages through the core's framing.
-pub fn parse_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
+pub fn read_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
 	if r.remaining() < 4 {
 		return error('handshake: message header truncated')
 	}
@@ -152,9 +153,11 @@ pub fn parse_handshake_header(mut r wire.Reader) !(HandshakeType, int) {
 	return typ, length
 }
 
+// split_handshake_message splits a full handshake message into its header and body.
+@[direct_array_access]
 fn split_handshake_message(full_msg []u8) !(HandshakeType, []u8) {
 	mut r := wire.new_reader(full_msg)
-	msg_type, length := parse_handshake_header(mut r)!
+	msg_type, length := read_handshake_header(mut r)!
 	if r.remaining() != length {
 		return error('handshake: handshake message header declares ${length} body bytes, message carries ${r.remaining()}')
 	}
