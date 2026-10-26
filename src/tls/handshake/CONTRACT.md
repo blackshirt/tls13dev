@@ -111,6 +111,10 @@ readiness.
 - `record_traffic_keys()` returns derived record keys.
 - `record_unconsumed_bytes()` lets the record adapter enforce the
   ServerHello record-boundary rule.
+- `take_buffered_handshake_bytes()` moves any handshake-level bytes the core
+  still held at `.connected` (a server ticket coalesced after its `Finished`,
+  §4.6.1) into the record adapter's post-handshake reassembler and wipes the
+  core copy.
 - `record_update_read_traffic_keys()` and
   `record_update_write_traffic_keys()` implement TLS KeyUpdate and are valid
   only after the handshake reaches `.connected`.

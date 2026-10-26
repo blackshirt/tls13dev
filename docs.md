@@ -193,7 +193,9 @@ folded into the transcript before the server flight is verified — the library
 has no client certificate to offer, so it declines rather than aborting.
 Post-handshake messages (`NewSessionTicket`, `KeyUpdate`) are reassembled from
 the decrypted record stream even when a single message is split across records
-(the core's 1 MiB cap still bounds the buffer).
+(the core's 1 MiB cap still bounds the buffer), and a ticket coalesced into the
+same record as the server's `Finished` is drained to this reassembler at the end
+of the handshake instead of orphaning in the core (§4.6.1).
 
 ### 1.5 Adapter contract (`tls.handshake`)
 
@@ -287,6 +289,13 @@ Behavior and guarantees:
   the name the certificate is verified against.
 - **Timeouts** — `config.timeout` (or 30 s when unset/zero) is applied to both
   socket directions before the handshake, so a stalled peer cannot hang `dial()`.
+  The handshake phase additionally carries a total deadline of 4× that per-operation
+  timeout: a slow-loris peer dribbling valid bytes under every individual read
+  timeout is still cut off, while post-handshake `read()` stays bound only by the
+  per-operation timeout.
+- **Server name gate** — a name over the 253-character DNS ceiling (RFC 1035 §2.3.4)
+  or carrying stray whitespace is rejected before the socket opens, so the name
+  dialed is always the name sent in SNI and the name verified.
 - **Trust anchors, by precedence** — explicit `config.root_cas` is used as-is;
   else the system CA bundle is loaded — parsed once per process, then cached for
   every later `dial()` (a load failure is a dial error) — unless
@@ -298,6 +307,10 @@ Behavior and guarantees:
   the state machine reaches `.connected`. Handshake traffic secrets remain
   until `zeroize_handshake_traffic_secrets()` because QUIC may still need them;
   application traffic secrets are released at `close()` or on a fatal alert.
+  The §7.1 derivations also zeroize their own in-function intermediates — the
+  Early and Master secrets, the `derived` seeds, every HKDF-Expand round input,
+  and the single-use Finished MAC key — so no orphaned key material outlives
+  the call that produced it.
 - **ALPN is enforced** — a server selecting a protocol that wasn't offered aborts
   the handshake (RFC 7301 §3.1); an empty `alpn` list forbids any ALPN response.
 - **Resource bounds** — a handshake message declaring more than 1 MiB is refused
@@ -306,7 +319,18 @@ Behavior and guarantees:
   chains that long, CA RSA keys shorter than 2048 bits, and a leaf under the
   `min_rsa_bits` floor; at most two middlebox
   dummy ChangeCipherSpec records are tolerated during the handshake, so a streamed
-  CCS flood cannot pin the loop; the post-handshake `NewSessionTicket` backlog is
+  CCS flood cannot pin the loop, and the whole server flight is additionally capped
+  at 64 records with empty inner-handshake payloads refused, so even state-neutral
+  but decryptable records cannot burn AEAD work past a deterministic bound instead
+  of only the wall-clock deadline; a HelloRetryRequest cookie longer than 8 KiB is
+  refused at parse time so the echoing ClientHello stays frameable in one record;
+  unconsumed framed bytes are capped at two maximal
+  records plus one socket read while handshaking, so dribbled incomplete records
+  cannot grow memory without bound; a single `read()` call skips at most 100
+  tolerated records (zero-length padding or post-handshake messages) before
+  failing, and one record may deliver at most 1000 complete post-handshake
+  messages before their parse/rekey work is cut off, so a verified flood cannot
+  starve the caller; the post-handshake `NewSessionTicket` backlog is
   capped at 32 stored tickets.
 
 ### 2.2 `Conn`
@@ -337,7 +361,13 @@ clean end of stream (peer `close_notify` or connection already closed).
 
 - A decrypted record larger than `buf` is buffered internally; subsequent calls
   drain the remainder before reading new records — no plaintext is dropped or reordered.
-- Zero-length (padding-only) records are skipped transparently.
+- Zero-length (padding-only) records and inner-type-handshake records are skipped
+  transparently, up to the per-`read()` tolerated-record bound (§2.1 Resource bounds);
+  past it the connection fails closed with `unexpected_message`.
+- **Plaintext hygiene** — the decrypted staging copy is scrubbed the moment its
+  bytes are delivered, the undelivered `app_buf` remainder is zeroed when it
+  drains or on terminal teardown, and post-handshake reassembly bytes are wiped
+  when the connection dies (RFC 8446 §7.5 spirit: freed memory retains no plaintext).
 - A **plaintext outer alert after the handshake is
   <span style="color:#2ea44f">rejected</span>**, and so is a
   plaintext ChangeCipherSpec record — RFC 8446 §5/§6 make both fatal
@@ -347,7 +377,9 @@ clean end of stream (peer `close_notify` or connection already closed).
 - Post-handshake encrypted records are demultiplexed by inner content type:
   `NewSessionTicket` messages are collected, `KeyUpdate` read-key updates are
   applied (a response is sent with the correct §4.6.3 old-key-before-new ordering
-  when the server requests one), and encrypted `alert`s end the stream.
+  when the server requests one, and §4.5's rule against more than one KeyUpdate
+  in a row is enforced on receipt — a second consecutive one aborts before its
+  rekey work is paid for), and encrypted `alert`s end the stream.
 - Reading with an empty `buf` returns `0` without I/O.
 
 #### `write`
@@ -665,10 +697,16 @@ recorded session (§7.5).
 | Handshake message declaring > 1 MiB | <span style="color:#cf222e">`dial()` error</span> (reassembly cap) |
 | Plaintext alert or ChangeCipherSpec post-handshake | <span style="color:#cf222e">`read()` error</span> (fatal `unexpected_message`; injection rejected) |
 | More than two dummy ChangeCipherSpec records during the handshake | <span style="color:#cf222e">`dial()` error</span> (flood bound `max_compat_ccs_records`, `unexpected_message`) |
+| More than 64 records consumed by one server flight, or an empty inner-handshake payload | <span style="color:#cf222e">`dial()` error</span> (flight bound `max_handshake_flight_records`, `unexpected_message`) |
+| `HelloRetryRequest` cookie longer than 8 KiB | <span style="color:#cf222e">`dial()` error</span> (echo bound `max_hrr_cookie_len`, decode_error) |
 | Peer exceeds §5.5 per-key record limit without rekeying | <span style="color:#cf222e">`read()` error</span> |
 | `Certificate` list with more than 32 entries | <span style="color:#cf222e">`dial()` error</span> (rejected at parse, before decoding) |
 | `NewSessionTicket` with trailing bytes after its extensions | <span style="color:#cf222e">`dial()` error</span> (decode_error) |
 | X25519 shared secret of small order (0, 1, or p−1) | <span style="color:#cf222e">`dial()` error</span> (illegal_parameter) |
+| P-256 `key_share` is the encoded point at infinity (`0x04 \|\| 0 \|\| 0`) | <span style="color:#cf222e">`dial()` error</span> (illegal_parameter, refused before scalar multiplication) |
+| More than one consecutive `KeyUpdate` from the peer (§4.5) | <span style="color:#cf222e">`read()` error</span> (unexpected_message, aborted before the second rekey derivation) |
+| Locally built ClientHello larger than one record (§5.1) | <span style="color:#cf222e">`dial()` error</span> — refused before framing a non-compliant record |
+| Own `key_share` malformed: wrong size, missing `0x04` point marker, or group not in `supported_groups` (§4.2.8) | <span style="color:#cf222e">`dial()` error</span> at ClientHello build time |
 
 ### 4.3 Certificate & trust-policy rejections
 

@@ -129,3 +129,20 @@ fn test_server_hello_accepts_minimal_good_shape() ! {
 	assert !sh.is_hello_retry_req
 	assert sh.session_id_echo == [u8(0x11), 0x22, 0x33]
 }
+
+// test_server_hello_rejects_oversized_hrr_cookie pins the echo-budget bound: the
+// retry ClientHello must fit one record, so a near-64 KiB cookie is refused at
+// parse time instead of being echoed into an unframeable flight.
+fn test_server_hello_rejects_oversized_hrr_cookie() ! {
+	mut cookie_body := [u8(0x20), 0x01] // u16 vector length 8193 == max_hrr_cookie_len + 1
+	cookie_body << []u8{len: max_hrr_cookie_len + 1, init: 0xaa}
+	mut exts := wire.new_writer(8300)
+	exts.write_bytes(ext_block(u16(ExtensionType.supported_versions), [u8(0x03), 0x04])!)
+	exts.write_bytes(ext_block(u16(ExtensionType.cookie), cookie_body)!)
+	mut rejected := false
+	parse_server_hello(sh_body_at(hello_retry_request_random.clone(), exts.bytes())!) or {
+		assert err.msg().contains('cookie exceeds')
+		rejected = true
+	}
+	assert rejected, 'an oversized HRR cookie must be rejected'
+}

@@ -22,6 +22,12 @@ const hello_retry_request_random = [u8(0xcf), 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61
 	0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e,
 	0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c]
 
+// max_hrr_cookie_len bounds the HelloRetryRequest cookie the client must echo
+// verbatim in the retry ClientHello. §4.1.4/§5.1 keep that ClientHello inside one
+// record, so a near-64 KiB cookie (the wire maximum) could make our own reply
+// unframeable; real cookies are tens of bytes, so this stays far below any limit.
+const max_hrr_cookie_len = 8 * 1024
+
 // ServerHello holds the parsed ServerHello/HelloRetryRequest fields the client acts on.
 // Extension extraction obeys the §4.2 placement allowlist; semantic checks live on validate.
 struct ServerHello {
@@ -143,6 +149,9 @@ fn parse_server_hello(body []u8) !ServerHello {
 				cookie = data_r.read_vector_u16()!
 				if cookie.len == 0 {
 					return error('handshake: HelloRetryRequest cookie must be non-empty')
+				}
+				if cookie.len > max_hrr_cookie_len {
+					return error('handshake: HelloRetryRequest cookie exceeds ${max_hrr_cookie_len} bytes')
 				}
 				if data_r.remaining() != 0 {
 					return error('handshake: trailing bytes in HelloRetryRequest cookie')

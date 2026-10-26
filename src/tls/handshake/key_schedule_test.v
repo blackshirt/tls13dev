@@ -106,3 +106,31 @@ fn test_rfc8448_section3_key_schedule() ! {
 	assert hex.encode(server_app_keys.key) == '9f02283b6c9c07efc26bb9f2ac92e356'
 	assert hex.encode(server_app_keys.iv) == 'cf782b88dd83549aadf1e984'
 }
+
+// test_rfc8448_composite_phase_helpers pins derive_hs_secrets and derive_app_secrets
+// to the same RFC 8448 chain after their in-place intermediate wipes: a wipe that
+// aliased an input or an output would break these known answers.
+fn test_rfc8448_composite_phase_helpers() ! {
+	hash := HashAlgorithm.sha256
+	ecdh_shared := hex.decode(rfc8448_ecdhe_shared_secret)!
+	transcript_ch_sh := hex.decode(rfc8448_transcript_hash_ch_sh)!
+	hs := derive_hs_secrets(hash, ecdh_shared, transcript_ch_sh)!
+	assert hex.encode(hs.handshake_secret) == rfc8448_handshake_secret
+	assert hex.encode(hs.client_traffic) == rfc8448_client_hs_traffic
+	assert hex.encode(hs.server_traffic) == rfc8448_server_hs_traffic
+
+	transcript_ch_sfin := hex.decode(rfc8448_transcript_hash_ch_sfin)!
+	ap := derive_app_secrets(hash, hs.handshake_secret, transcript_ch_sfin)!
+	assert hex.encode(ap.client_traffic) == rfc8448_client_ap_traffic_0
+	assert hex.encode(ap.server_traffic) == rfc8448_server_ap_traffic_0
+}
+
+// test_hkdf_expand_rejects_nonpositive_length checks the fail-closed guard: a
+// zero-length expansion would silently hand back an empty "key" instead of erroring.
+fn test_hkdf_expand_rejects_nonpositive_length() ! {
+	hkdf_expand(HashAlgorithm.sha256, [u8(0x0b)], []u8{}, 0) or {
+		assert err.msg().contains('not positive')
+		return
+	}
+	assert false, 'a zero-length HKDF-Expand must fail closed'
+}

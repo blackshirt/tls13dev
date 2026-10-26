@@ -27,6 +27,103 @@ fn test_build_client_hello() ! {
 	assert full_msg[3] == u8(body.len & 0xff)
 }
 
+// client_hello_error calls the framing primitive and returns its rejection
+// message, or '' when the build succeeds. The tuple result of
+// build_client_hello cannot be defaulted inside a counted-rejection `or`
+// block, so the message is captured through a diverging return instead.
+fn client_hello_error(cfg ClientHelloConfig) string {
+	_, _ = build_client_hello(cfg) or {
+		return err.msg()
+	}
+	return ''
+}
+
+// test_build_client_hello_enforces_legacy_field_sizes guards the framing
+// primitive itself: a direct ClientHelloConfig builder bypasses
+// validate_handshake_options, so an overlong legacy_session_id (RFC 8446 §4.1.2
+// caps it at 32) or a mis-sized fixed Random field must be refused here instead
+// of framed onto the wire.
+fn test_build_client_hello_enforces_legacy_field_sizes() ! {
+	base := ClientHelloConfig{
+		server_name:  'example.com'
+		client_share: KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+	}
+	mut cfg := base
+	cfg.session_id = []u8{len: 33, init: 0x11} // one past the §4.1.2 cap
+	mut rejected := 0
+	mut msg := client_hello_error(cfg)
+	if msg.contains('legacy_session_id exceeds 32 bytes') {
+		rejected++
+	}
+	cfg = base
+	cfg.random = [u8(0x22)] // Random is a fixed 32-byte field; only 0 or 32 is legal
+	msg = client_hello_error(cfg)
+	if msg.contains('random must be exactly 32 bytes') {
+		rejected++
+	}
+	assert rejected == 2, 'over-cap and mis-sized fixed fields must be refused at build time'
+	// A short-but-legal session id (§4.1.2 allows up to 32) must pass through with
+	// its own length byte, untouched.
+	cfg = base
+	cfg.session_id = []u8{len: 16, init: 0x11}
+	_, full := build_client_hello(cfg)!
+	// Layout: 4-byte handshake header + legacy_version(2) + random(32) puts the
+	// legacy_session_id length byte at offset 38.
+	assert full[38] == u8(16)
+	assert full[39] == u8(0x11)
+}
+
+// test_build_client_hello_rejects_malformed_key_share mirrors the peer-side share
+// gates onto the client's own key_share: wrong size, a missing uncompressed-point
+// marker, or a group absent from supported_groups must be refused at build time,
+// not surfacing as the server's illegal_parameter far from the cause.
+fn test_build_client_hello_rejects_malformed_key_share() ! {
+	base := ClientHelloConfig{
+		server_name:  'example.com'
+		client_share: KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+	}
+	mut cfg := base
+	cfg.client_share.key_exchange = []u8{len: 31, init: 0xaa}
+	mut rejected := 0
+	mut msg := client_hello_error(cfg)
+	if msg.contains('key_share is 31 bytes, expected 32') {
+		rejected++
+	}
+	cfg = base
+	cfg.client_share.group = .secp256r1 // an x25519 blob is the wrong size for P-256
+	msg = client_hello_error(cfg)
+	if msg.contains('expected 65') {
+		rejected++
+	}
+	cfg = base
+	cfg.client_share.group = .secp256r1
+	cfg.client_share.key_exchange = []u8{len: 65, init: 0x05} // right size, no point marker
+	msg = client_hello_error(cfg)
+	if msg.contains('uncompressed point') {
+		rejected++
+	}
+	cfg = base
+	cfg.supported_groups = [.secp256r1] // share group not among those offered
+	msg = client_hello_error(cfg)
+	if msg.contains('not in supported_groups') {
+		rejected++
+	}
+	assert rejected == 4, 'a malformed key_share must be refused at build time'
+	// Positive control: a well-formed P-256 share passes the same gate.
+	cfg = base
+	cfg.client_share.group = .secp256r1
+	mut p256 := [u8(0x04)]
+	p256 << []u8{len: 64, init: 0x11}
+	cfg.client_share.key_exchange = p256
+	_, _ = build_client_hello(cfg)!
+}
+
 // The handshake is a courier for QUIC transport parameters: it frames the bytes
 // its adapter encoded and must not rewrite or interpret them, so these fixtures
 // are already-encoded extension content (RFC 9001 §8.2).

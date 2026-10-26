@@ -26,7 +26,9 @@ pub fn build_key_update(request_update bool) []u8 {
 }
 
 // NewSessionTicket holds a parsed NewSessionTicket (RFC 8446 §4.6.1); its fields are
-// module-private and reachable only through the accessors below.
+// module-private. Only lifetime() and bytes() have consumers today — the ticket is
+// stored, not resumed — so the age-obfuscation values stay private and accessor-less
+// until resumption gives them one.
 @[noinit]
 pub struct NewSessionTicket {
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
@@ -40,23 +42,14 @@ pub fn (t &NewSessionTicket) lifetime() u32 {
 	return t.ticket_lifetime
 }
 
-// age_add returns the ticket_age_add obfuscation value.
-fn (t &NewSessionTicket) age_add() u32 {
-	return t.ticket_age_add
-}
-
-// nonce returns the ticket nonce.
-fn (t &NewSessionTicket) nonce() []u8 {
-	return t.ticket_nonce
-}
-
 // bytes returns the opaque ticket (the resumption token) to store for a future ClientHello.
 pub fn (t &NewSessionTicket) bytes() []u8 {
 	return t.ticket
 }
 
 // parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1); ticket
-// storage belongs to the stack above this core (RFC 9001 §4.5).
+// storage belongs to the stack above this core (§4.6.1: the client keeps them
+// for a future connection).
 @[direct_array_access]
 pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	mut r := wire.new_reader(body)

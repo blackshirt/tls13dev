@@ -195,6 +195,89 @@ fn test_handshake_options_reject_overlong_alpn_name() {
 	assert false
 }
 
+// test_handshake_options_reject_overlong_legacy_session_id pins RFC 8446 §4.1.2:
+// legacy_session_id MUST NOT exceed 32 bytes — the wire vector would frame up to
+// 255, so the config gate is the normative bound.
+fn test_handshake_options_reject_overlong_legacy_session_id() {
+	new_tls_handshake('example.com', HandshakeOptions{
+		legacy_session_id: []u8{len: 33, init: 0x55}
+		validator:         fixture_validator()
+	}) or {
+		assert err.msg().contains('legacy_session_id exceeds 32 bytes')
+		return
+	}
+	assert false
+}
+
+// test_handshake_options_keeps_legacy_session_id_verbatim guards both edges of
+// the legal range: the App. D.4 default length (32) and a short (still legal)
+// value must reach config unchanged, because the ServerHello echo check compares
+// by equality — any rewrite would break it silently.
+fn test_handshake_options_keeps_legacy_session_id_verbatim() ! {
+	sid := []u8{len: 32, init: 0x55}
+	h := new_tls_handshake('example.com', HandshakeOptions{
+		legacy_session_id: sid
+		validator:         fixture_validator()
+	})!
+	assert h.config.session_id == sid
+	short := [u8(0xAA), 0xBB]
+	h2 := new_tls_handshake('example.com', HandshakeOptions{
+		legacy_session_id: short
+		validator:         fixture_validator()
+	})!
+	assert h2.config.session_id == short
+}
+
+// test_handshake_options_reject_unsupported_cipher_suite closes the raw-cast hole:
+// an unsafe CipherSuite(0x1399) cast is constructible in V, would be advertised on
+// the wire, and an echoed server choice would match it against the offered list.
+// Config must fail fast at a membership gate instead.
+fn test_handshake_options_reject_unsupported_cipher_suite() {
+	// Held in a variable: a literal unsafe cast constant-folds into an enum-value
+	// warning, while the runtime value is exactly the un-checkable cast a
+	// hostile config caller could produce.
+	raw_suite := u16(0x1399)
+	new_tls_handshake('example.com', HandshakeOptions{
+		cipher_suites: [unsafe { CipherSuite(raw_suite) }]
+		validator:     fixture_validator()
+	}) or {
+		assert err.msg().contains('unsupported configured cipher suite')
+		return
+	}
+	assert false
+}
+
+// test_handshake_options_reject_unsupported_signature_scheme: offering a scheme
+// the verifier cannot check in CertificateVerify is a self-inflicted failure;
+// only the signature_scheme_from_u16 set is acceptable.
+fn test_handshake_options_reject_unsupported_signature_scheme() {
+	raw_scheme := u16(0x0999) // runtime value, same warning-avoiding indirection
+	new_tls_handshake('example.com', HandshakeOptions{
+		signature_algorithms: [unsafe { SignatureScheme(raw_scheme) }]
+		validator:            fixture_validator()
+	}) or {
+		assert err.msg().contains('unsupported configured signature scheme')
+		return
+	}
+	assert false
+}
+
+// test_handshake_options_accepts_full_capability_lists guards over-rejection:
+// every implementable suite, scheme, and group configured at once must pass.
+fn test_handshake_options_accepts_full_capability_lists() ! {
+	h := new_tls_handshake('example.com', HandshakeOptions{
+		validator:            fixture_validator()
+		key_share_group:      .x25519
+		supported_groups:     default_supported_groups
+		cipher_suites:        [CipherSuite.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384,
+			.tls_chacha20_poly1305_sha256]
+		signature_algorithms: default_signature_algorithms
+	})!
+	assert h.config.cipher_suites.len == 3
+	assert h.config.signature_algorithms.len == 7
+	assert h.config.supported_groups.len == 2
+}
+
 fn test_handshake_options_default_validator() ! {
 	h := new_tls_handshake('example.com')!
 	assert h.state() == .start
@@ -592,7 +675,7 @@ fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
 fn test_second_hello_reproduces_pinned_random() ! {
 	mut cfg := ClientHelloConfig{
 		server_name:  'example.com'
-		session_id:   [u8(0xAA), 0xBB]
+		session_id:   []u8{len: 32, init: 0xAA} // App. D.4's default length; §4.1.2 caps at 32
 		random:       []u8{len: 32, init: 0x42}
 		client_share: KeyShareEntry{
 			group:        .x25519

@@ -52,8 +52,14 @@ fn hkdf_extract(hash HashAlgorithm, salt []u8, ikm []u8) []u8 {
 
 // hkdf_expand implements HKDF-Expand(prk, info, length) (RFC 5869 §2.3), producing
 // T(1) || T(2) || … where T(i) = HMAC(PRK, T(i-1) || info || i).
+@[direct_array_access]
 fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 	hash_len := hash.hash_len()
+	// A zero or negative expansion is meaningless; fail closed instead of returning
+	// an empty slice that would silently shorten every derived key.
+	if length <= 0 {
+		return error('handshake: HKDF-Expand requested length ${length} is not positive')
+	}
 	// At most 255 blocks are reachable (one byte of counter); more would repeat a block (RFC 5869 §2.3).
 	if length > 255 * hash_len {
 		return error('handshake: HKDF-Expand requested length ${length} exceeds maximum (${255 * hash_len})')
@@ -68,6 +74,9 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 		step_input << prev
 		step_input << info
 		step_input << counter
+		// prev is now copied into step_input, so wipe the previous block before the
+		// handle is rebound — orphaned HMAC outputs are key material (§7.5).
+		wipe_secret(mut prev)
 
 		prev = hash.compute_hmac(prk, step_input)
 		// Append only the bytes still required, landing `out` on exactly `length`.
@@ -75,7 +84,11 @@ fn hkdf_expand(hash HashAlgorithm, prk []u8, info []u8, length int) ![]u8 {
 		to_copy := if needed < prev.len { needed } else { prev.len }
 		out << prev[..to_copy]
 		counter++
+		// The round input embeds the prk-derived chain; zero it as the handle dies.
+		wipe_secret(mut step_input)
 	}
+	// The final T(i) was copied into out; wipe the live handle too.
+	wipe_secret(mut prev)
 	return out
 }
 
@@ -168,6 +181,10 @@ fn derive_finished_key(hash HashAlgorithm, base_key []u8) ![]u8 {
 // transcript_hash (RFC 8446 §4.4.4).
 @[direct_array_access]
 fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_hash []u8) ![]u8 {
-	finished_key := derive_finished_key(hash, base_key)!
+	mut finished_key := derive_finished_key(hash, base_key)!
+	// The finished MAC key is single-use: wipe it the moment the HMAC consumed it.
+	defer {
+		wipe_secret(mut finished_key)
+	}
 	return hash.compute_hmac(finished_key, transcript_hash)
 }

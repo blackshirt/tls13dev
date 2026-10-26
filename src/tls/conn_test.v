@@ -25,6 +25,8 @@ fn new_test_conn() !&Conn {
 		closed:            false
 		close_notify_sent: false
 		fatal_error:       ''
+		deadline_ms:       0 // socket-free fixture: post-handshake shape, no framing cap
+		sock_timeout:      0 // unused without the do_handshake loop
 		rlock:             sync.new_mutex()
 		wlock:             sync.new_mutex()
 		negotiated_alpn:   ''
@@ -130,7 +132,7 @@ fn test_validate_compat_ccs_bounds_stream() ! {
 }
 
 // test_read_bounds_empty_record_flood checks that Conn.read() gives up after
-// max_empty_records_per_read consecutive zero-length padding records instead of
+// max_tolerated_records_per_read consecutive zero-length padding records instead of
 // spinning forever, and still delivers real data below the bound (§5.2).
 fn test_read_bounds_empty_record_flood() ! {
 	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
@@ -143,23 +145,29 @@ fn test_read_bounds_empty_record_flood() ! {
 	c.server_app_cipher = reader
 
 	// Below the bound: a run of empty padding records followed by real data.
-	for _ in 0 .. max_empty_records_per_read {
+	for _ in 0 .. max_tolerated_records_per_read {
 		c.recv_buf << writer.encrypt_record(.application_data, []u8{})!.serialize()
 	}
-	c.recv_buf << writer.encrypt_record(.application_data, [u8(42)])!.serialize()
+	c.recv_buf << writer.encrypt_record(.application_data, [u8(42), 43, 44])!.serialize()
 	mut buf := []u8{len: 1}
 	assert c.read(mut buf)! == 1
 	assert buf[0] == 42
+	// The undelivered remainder keeps read() returning until it is drained, and
+	// the final drain scrubs the staged plaintext instead of just shortening.
+	assert c.read(mut buf)! == 1
+	assert c.read(mut buf)! == 1
+	assert c.app_buf.len == 0
+	assert c.app_pos == 0
 
 	// Past the bound: the very next run of empty records must abort the read.
 	// Both sides restart their sequence numbers, as a fresh key generation would.
 	writer.seq_num = 0
 	c.server_app_cipher.seq_num = 0
-	for _ in 0 .. max_empty_records_per_read + 1 {
+	for _ in 0 .. max_tolerated_records_per_read + 1 {
 		c.recv_buf << writer.encrypt_record(.application_data, []u8{})!.serialize()
 	}
 	c.read(mut buf) or {
-		assert err.msg().contains('too many empty application-data records')
+		assert err.msg().contains('too many skipped records')
 		assert c.closed
 		assert c.fatal_error == err.msg()
 		assert c.hs.state() == .failed
@@ -252,6 +260,58 @@ fn test_post_handshake_certificate_request_fails_closed() ! {
 	assert false
 }
 
+// test_read_bounds_handshake_record_flood checks that inner-type-handshake records
+// share the skipped-record bound with empty padding: a verified NewSessionTicket
+// or KeyUpdate flood must not spin read() without ever delivering data (§4.6).
+fn test_read_bounds_handshake_record_flood() ! {
+	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+		0xff, 0x00]
+	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
+
+	mut c := new_test_conn()!
+	mut writer := new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.server_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	// An incomplete post-handshake fragment (declared body 1048568, never finished):
+	// handle_post_handshake buffers and returns without processing, so no parse
+	// error can preempt the bound — only the skipped-record cap may stop the flood.
+	msg := [u8(4), 0x0f, 0xff, 0xf8] // NewSessionTicket header, declared len 1048568
+	for _ in 0 .. max_tolerated_records_per_read + 1 {
+		c.recv_buf << writer.encrypt_record(.handshake, msg)!.serialize()
+	}
+	mut buf := []u8{len: 1}
+	c.read(mut buf) or {
+		assert err.msg().contains('too many skipped records')
+		assert c.closed
+		assert c.fatal_error == err.msg()
+		return
+	}
+	assert false, 'a handshake-record flood must not spin read() forever'
+}
+
+// test_post_handshake_bounds_messages_per_record checks that one record packing
+// more complete messages than the cap is refused before the per-message work
+// (parse, rekey, response write) climbs further: a maximal record can pack over
+// 3000 eight-byte message bodies. Valid NewSessionTickets are used because a
+// ticket is parsed and stored/dropped without touching the nil test socket,
+// while a KeyUpdate(update_requested) would fail on its response write first.
+fn test_post_handshake_bounds_messages_per_record() ! {
+	mut c := new_test_conn()!
+	nst_body := [u8(0), 0, 0, 1, 0, 0, 0, 0, 1, 0xab, 0, 2, 0xcd, 0xce, 0, 2, 0xef, 0xf0]
+	mut payload := []u8{}
+	for _ in 0 .. max_post_handshake_messages_per_record + 1 {
+		payload << [u8(4), 0, 0, u8(nst_body.len)] // NewSessionTicket, complete
+		payload << nst_body
+	}
+	c.handle_post_handshake(payload) or {
+		assert err.msg().contains('too many post-handshake messages in one record')
+		pinned := c.fail_alert or { panic('the message bound must pin a fail_alert') }
+		assert pinned == handshake.AlertDescription.unexpected_message
+		assert c.closed
+		return
+	}
+	assert false, 'a per-record message flood must fail closed at the cap'
+}
+
 fn test_read_protocol_violation_fails_closed() ! {
 	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
 		0xff, 0x00]
@@ -314,6 +374,7 @@ fn test_close_is_idempotent_with_live_socket() ! {
 		hs:                hs
 		recv_buf:          []u8{}
 		app_buf:           []u8{}
+		app_pos:           0
 		closed:            false
 		close_notify_sent: false
 		sock_closed:       false

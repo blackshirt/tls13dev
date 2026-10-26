@@ -85,7 +85,9 @@ pub enum CipherSuite as u16 {
 // client_hello_random_len is the fixed ClientHello.random size (RFC 8446 §4.1.2).
 const client_hello_random_len = 32
 
-// legacy_session_id_len is the 32-byte legacy session id for middlebox compatibility (RFC 8446 App. D.4).
+// legacy_session_id_len is the cap on ClientHello.legacy_session_id (§4.1.2 MUST NOT exceed
+// 32 bytes); shorter values are legal, and unset config applies the App. D.4 default of 32
+// fresh random bytes for middlebox compatibility.
 const legacy_session_id_len = 32
 
 // KeyShareEntry holds a group and public key share (RFC 8446 §4.2.8).

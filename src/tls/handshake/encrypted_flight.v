@@ -123,8 +123,14 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	client_fin_msg := build_finished(client_verify_data)
 	h.update_transcript(client_fin_msg)!
 
+	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
+	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
+	// adapter's take_buffered_handshake_bytes. Any other leader is flight garbage.
 	if h.hsk_buf.len > 0 {
-		return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
+		leading := h.hsk_buf[0]
+		if leading != u8(4) && leading != u8(24) {
+			return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
+		}
 	}
 
 	h.state = .connected

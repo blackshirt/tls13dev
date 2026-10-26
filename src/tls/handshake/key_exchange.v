@@ -65,14 +65,20 @@ fn is_x25519_small_order(secret []u8) bool {
 	return subtle.constant_time_compare(secret, x25519_secret_p_minus_1) == 1
 }
 
+// expected_share_len is the §4.2.8.2 key_exchange size per group (x25519 32;
+// secp256r1 65 = 0x04||X||Y): one source for the peer gate and ClientHello builder.
+fn expected_share_len(g NamedGroup) int {
+	return match g {
+		.x25519 { 32 }
+		.secp256r1 { 65 }
+	}
+}
+
 // compute_shared_secret performs the ECDHE exchange against the server's key
 // share, returning the raw shared secret that seeds the key schedule.
 fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8 {
 	// §4.2.8.2 fixes key_exchange size per group; gate it here so a wrong size yields a named protocol error.
-	expected_len := match server_share.group {
-		.x25519 { 32 }
-		.secp256r1 { 65 } // 0x04 || X || Y uncompressed point
-	}
+	expected_len := expected_share_len(server_share.group)
 	if server_share.key_exchange.len != expected_len {
 		return h.classify_failure(.illegal_parameter, 'handshake: ${server_share.group} key_share is ${server_share.key_exchange.len} bytes, expected ${expected_len}')
 	}
@@ -104,6 +110,13 @@ fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8
 			// A malformed share is the sender's fault, so it must pin the alert.
 			if server_share.key_exchange[0] != 0x04 {
 				return h.classify_failure(.illegal_parameter, 'handshake: P-256 key_share is not an uncompressed point (0x04 prefix)')
+			}
+			// 0x04 || 0^32 || 0^32 encodes the point at infinity: the exchange would
+			// contribute nothing to the secret. Reject the identity encoding itself,
+			// deterministically, instead of trusting the backend to refuse it.
+			if subtle.constant_time_compare(server_share.key_exchange[1..server_share.key_exchange.len],
+				[]u8{len: 64, init: 0}) == 1 {
+				return h.classify_failure(.illegal_parameter, 'handshake: P-256 key_share is the point at infinity (illegal_parameter)')
 			}
 			priv := h.priv_p256 or { return error('handshake: missing P-256 private key') }
 			// A point that does not decode is the sender's fault too, so pin the alert

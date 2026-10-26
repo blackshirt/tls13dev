@@ -52,20 +52,17 @@ pub fn (mut ts TrustStore) add_der(der []u8) ! {
 	ts.certs << cert
 }
 
-// add_pem parses and appends every X.509 certificate from a PEM string. Each
-// block's PEM grammar (RFC 1421 headers, base64 assembly, BEGIN/END label
-// matching) is delegated to crypto.pem; blocks whose type is not CERTIFICATE
-// (CRLs, private keys, PKCS #7 wrappers) are filtered out before DER parsing.
-// Splitting on the BEGIN marker isolates each block so one malformed envelope
-// costs only itself — every later anchor in a 150-root system bundle still
-// loads. Three hard bounds fail CLOSED (return an error, not a silent partial
-// load) so an operator never ends up with a partially-populated trust store:
+// add_pem parses and appends every X.509 certificate from a PEM string. PEM
+// grammar is delegated to crypto.pem; non-CERTIFICATE blocks (CRLs, private
+// keys, PKCS #7) are filtered before DER parsing. Blocks are isolated so one
+// malformed envelope costs only itself — every later anchor in a 150-root
+// system bundle still loads. The bounds fail as follows:
 //   - total input bytes  > max_pem_bundle_bytes        → error
 //   - block count        > max_pem_blocks_per_bundle   → error
 //   - single DER size    > max_certificate_der_bytes   → block skipped
-// The last is per-block rather than fatal because an over-long DER that still
-// decodes as PEM has to be a hostile or corrupted envelope, not a missing
-// anchor the caller can recover elsewhere.
+// The first two fail CLOSED (never a silent partial load, so an operator can't
+// end up with a short trust store); the DER cap is per-block because an
+// over-long envelope is a hostile input, not a missing anchor.
 pub fn (mut ts TrustStore) add_pem(pem_content string) !int {
 	// Bound the input BEFORE split so a hostile file cannot drive an oversized
 	// allocation via the chunk vector.

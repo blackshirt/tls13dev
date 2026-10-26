@@ -107,19 +107,42 @@ fn expect_dial_failure(addr string, want string, res_ch chan string) ! {
 }
 
 // ---- Full handshake over TCP ----
-// full_handshake_script is the record-layer twin of the fakeserver flight, with
-// split_ticket spreading the NewSessionTicket over two application-key records.
+// full_handshake_script is the record-layer twin of the fakeserver flight.
 fn full_handshake_script(mut c net.TcpConn) ! {
-	run_full_handshake(mut c, false)!
+	run_full_handshake(mut c, false, false, []u8{})!
 }
 
 // split_ticket_script is run_full_handshake with the NewSessionTicket fragmented.
 fn split_ticket_script(mut c net.TcpConn) ! {
-	run_full_handshake(mut c, true)!
+	run_full_handshake(mut c, true, false, []u8{})!
 }
 
-// run_full_handshake drives the whole server flight; split_ticket fragments the ticket.
-fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
+// coalesced_ticket_script is run_full_handshake with the NewSessionTicket riding
+// the same handshake-key record as the server Finished (§4.6.1).
+fn coalesced_ticket_script(mut c net.TcpConn) ! {
+	run_full_handshake(mut c, false, true, []u8{})!
+}
+
+// key_update_pair_script is the standard flight plus two consecutive KeyUpdate
+// messages coalesced into one application-key record (§4.5 forbids the run).
+fn key_update_pair_script(mut c net.TcpConn) ! {
+	mut ku_pair := [u8(24), 0, 0, 1, 0] // KeyUpdate(update_not_requested), 1-byte body
+	ku_pair << [u8(24), 0, 0, 1, 0] // second in a row: the violation
+	run_full_handshake(mut c, false, false, ku_pair)!
+}
+
+// silent_peer_script accepts and immediately closes: the client must fail on its
+// own oversized ClientHello before any byte reaches the peer.
+fn silent_peer_script(mut c net.TcpConn) ! {
+	c.close() or {}
+}
+
+// run_full_handshake drives the whole server flight; split_ticket fragments the
+// ticket across two app-key records, coalesce_ticket instead rides it behind the
+// server Finished in one handshake-key record (§4.6.1), and extra_post_msg (when
+// non-empty) is appended as one coalesced handshake record under the server
+// application keys, after the app data.
+fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8) ! {
 	ch_rec := scripted_read_record(mut c)!
 	if ch_rec.content_type != .handshake {
 		return error('expected a handshake record first, got ${ch_rec.content_type}')
@@ -148,8 +171,13 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
 	mut senc := new_tls_protection(aead, siv)!
-	for m in fl.rest {
-		enc := senc.encrypt_record(.handshake, m)!
+	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
+	for i, m in fl.rest {
+		mut payload := m.clone() // loop elements are immutable; append needs an owned copy
+		if coalesce_ticket && i == fl.rest.len - 1 {
+			payload << nst // the ticket trails Finished in the same record
+		}
+		enc := senc.encrypt_record(.handshake, payload)!
 		c.write(enc.serialize()) or { return err }
 	}
 
@@ -168,17 +196,21 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool) ! {
 	akey, aiv := srv.server_app_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
 	mut aenc := new_tls_protection(aaead, aiv)!
-	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
-	if split_ticket {
-		// Split the ticket across two records: RFC 8446 §5.2 permits a message to span records.
-		cut := 8
-		c.write(aenc.encrypt_record(.handshake, nst[..cut])!.serialize()) or { return err }
-		c.write(aenc.encrypt_record(.handshake, nst[cut..])!.serialize()) or { return err }
-	} else {
-		c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+	if !coalesce_ticket {
+		if split_ticket {
+			// Split the ticket across two records: RFC 8446 §5.2 permits a message to span records.
+			cut := 8
+			c.write(aenc.encrypt_record(.handshake, nst[..cut])!.serialize()) or { return err }
+			c.write(aenc.encrypt_record(.handshake, nst[cut..])!.serialize()) or { return err }
+		} else {
+			c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+		}
 	}
 	payload := 'hello from fakeserver'.bytes()
 	c.write(aenc.encrypt_record(.application_data, payload)!.serialize()) or { return err }
+	if extra_post_msg.len > 0 {
+		c.write(aenc.encrypt_record(.handshake, extra_post_msg)!.serialize()) or { return err }
+	}
 }
 
 // test_dial_completes_full_handshake_and_reads_app_data checks a full handshake
@@ -242,6 +274,94 @@ fn test_dial_reassembles_post_handshake_message_across_records() ! {
 	assert res == 'OK'
 }
 
+// test_dial_accepts_ticket_coalesced_after_finished proves the §4.6.1 route: a
+// NewSessionTicket riding the server-Finished record must reach the ticket
+// backlog during dial, not strand unread in the core's handshake buffer.
+fn test_dial_accepts_ticket_coalesced_after_finished() ! {
+	addr, res_ch := start_scripted_server(coalesced_ticket_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	assert conn.session_tickets.len == 1 // handled inside do_handshake itself
+	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
+	assert conn.hs.record_unconsumed_bytes(.handshake) == 0 // drained, not orphaned
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)!
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// test_dial_rejects_consecutive_key_update pins RFC 8446 §4.5 end to end: after
+// the app record, one application-key record packs two KeyUpdate messages. The
+// first must rekey cleanly; the second must abort at the run guard, before its
+// rekey derivation is paid for.
+fn test_dial_rejects_consecutive_key_update() ! {
+	addr, res_ch := start_scripted_server(key_update_pair_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)! // the ticket and the app record precede the KU pair
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+
+	conn.read(mut buf) or {
+		assert err.msg().contains('consecutive KeyUpdate')
+		assert conn.closed
+		conn.close() or {}
+		res := <-res_ch
+		assert res == 'OK'
+		return
+	}
+	assert false, 'two KeyUpdate messages in a row must be terminal'
+}
+
+// test_dial_rejects_oversized_client_hello checks the §5.1 single-record rule
+// locally: an ALPN flood the option validator accepts (each name ≤255, total
+// within the extension cap) still cannot exceed one plaintext record, and the
+// adapter must abort instead of framing a non-compliant ClientHello.
+fn test_dial_rejects_oversized_client_hello() ! {
+	addr, res_ch := start_scripted_server(silent_peer_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	mut alpn := []string{}
+	for _ in 0 .. 80 {
+		alpn << 'a'.repeat(250) // 80 × 251 framed bytes: past 2^14 once the CH is built
+	}
+	ts := fakeserver.test_trust_store()!
+	dial(addr,
+		server_name: fakeserver.server_name
+		hsk_options: handshake.HandshakeOptions{
+			alpn: alpn
+		}
+		root_cas:    ts
+		timeout:     5 * time.second
+	) or {
+		assert err.msg().contains('ClientHello exceeds one record')
+		assert <-res_ch == 'OK'
+		return
+	}
+	assert false, 'an oversized ClientHello must abort before framing'
+}
+
 // ---- Plaintext / malformed-record negatives ----
 
 // alert_before_sh_script rejects the ClientHello with a plaintext fatal alert,
@@ -289,6 +409,80 @@ fn test_dial_rejects_trailing_bytes_after_server_hello() ! {
 		return error(addr)
 	}
 	expect_dial_failure(addr, 'misframed ServerHello', res_ch)!
+}
+
+// ---- Slow-loris and malformed-name negatives ----
+
+// slow_loris_script answers the ClientHello, then dribbles an incomplete
+// handshake record in small chunks every 300ms: each socket read completes well
+// under the per-read timeout, so only the absolute handshake deadline can end it.
+fn slow_loris_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)!
+	mut srv := fakeserver.new_server() or { return error('fakeserver: ${err.msg()}') }
+	fl := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH: ${err.msg()}') }
+	c.write(new_record(.handshake, fl.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+	// A declared 1000-byte record dribbled 8 bytes at a time, never completed.
+	c.write([u8(0x16), 0x03, 0x03, 0x03, 0xe8]) or { return err }
+	mut sent := 0
+	for sent < 400 {
+		time.sleep(300 * time.millisecond)
+		// Best-effort: the client aborts at its handshake deadline, and the
+		// closing RST makes later writes fail — the dribble merely keeps the
+		// per-read timeout from firing first.
+		c.write([u8(0), 0, 0, 0, 0, 0, 0, 0]) or { break }
+		sent += 8
+	}
+}
+
+// test_dial_handshake_deadline_ends_slow_loris checks that a peer dribbling valid
+// bytes under every per-read timeout is cut off by the absolute handshake deadline.
+fn test_dial_handshake_deadline_ends_slow_loris() ! {
+	addr, res_ch := start_scripted_server(slow_loris_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store() or { return error('fakeserver trust store: ${err.msg()}') }
+	start := time.now()
+	dial(addr, server_name: fakeserver.server_name, root_cas: ts, timeout: 1 * time.second) or {
+		if !err.msg().contains('handshake deadline exceeded') {
+			return error('dial failed with "${err.msg()}", expected the handshake deadline')
+		}
+		// The deadline is 4x the 1s timeout; the dial must end near it, not hang.
+		assert time.now() - start < 10 * time.second
+		res := <-res_ch
+		if res != 'OK' {
+			return error('scripted server did not finish cleanly: ${res}')
+		}
+		return
+	}
+	return error('dial unexpectedly succeeded; wanted the handshake deadline failure')
+}
+
+// test_dial_rejects_server_name_with_stray_whitespace pins the pre-socket name
+// gate: a padded name must fail before a TCP connection is opened, so it can
+// never travel verbatim into SNI or hostname verification.
+fn test_dial_rejects_server_name_with_stray_whitespace() ! {
+	dial('127.0.0.1:1', server_name: 'example.com ') or {
+		assert err.msg().contains('stray whitespace')
+		return
+	}
+	return error('dial unexpectedly accepted a padded server name')
+}
+
+// test_dial_rejects_overlong_server_name pins the DNS-ceiling bound on the
+// verification name before any ClientHello encoding is attempted.
+fn test_dial_rejects_overlong_server_name() ! {
+	host := 'a'.repeat(max_server_name_len + 1) + '.example.com'
+	dial('127.0.0.1:1', server_name: host) or {
+		assert err.msg().contains('exceeds 253 characters')
+		return
+	}
+	return error('dial unexpectedly accepted an overlong server name')
 }
 
 // excess_ccs_script floods the client with three dummy CCS records; RFC 8446

@@ -2,12 +2,11 @@
 //
 // state_machine.v owns the shared TLS 1.3 client handshake state, public accessors,
 // reassembly and dispatch, plus the facade-shared HandshakeOptions. The ServerHello
-// transition lives in server_hello_flow.v,
-// ephemeral ECDHE in key_exchange.v, encrypted-flight processing in encrypted_flight.v,
-// and secret wiping/zeroization in secret_lifecycle.v. Transport-neutral: no record,
-// cipher, socket, or packet-level concept belongs here.
-//
-// Public transport facades live in tls_handshake.v and quic_handshake.v.
+// transition lives in server_hello_flow.v, ephemeral ECDHE in key_exchange.v,
+// encrypted-flight processing in encrypted_flight.v, and secret wiping in
+// secret_lifecycle.v. Transport-neutral: no record, cipher, socket, or
+// packet-level concept belongs here. Public transport facades live in
+// tls_handshake.v and quic_handshake.v.
 module handshake
 
 import crypto.ecdsa
@@ -209,13 +208,10 @@ pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
 
-// SecretPhases reports which TLS traffic-secret phases the core currently holds
-// (derived and not yet zeroized). It is transport-neutral: the record adapter
-// expands these into TLS record keys and the QUIC adapter into packet keys. A
-// phase is true only while both directions' secrets are present, so it goes false
-// again after zeroize_traffic_secrets() for that level or after a failure wipes the
-// schedule. This lets adapters install their transport keys when the material
-// actually exists instead of re-deriving readiness from HandshakeState.
+// SecretPhases reports which traffic-secret phases the core currently holds
+// (derived, not yet zeroized, both directions present). Transport-neutral: it lets
+// adapters install record or packet keys when the material actually exists instead
+// of re-deriving readiness from HandshakeState.
 pub struct SecretPhases {
 pub:
 	handshake   bool // client+server handshake traffic secrets available
@@ -230,13 +226,12 @@ pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	}
 }
 
-// classify_failure is the single terminal-failure primitive for the core: it
-// pins the alert the adapter must surface, zeroes every derived secret (via
-// fail_and_zeroize_secrets), parks the machine in .failed, and returns the IError
-// for the caller to propagate (RFC 8446 §7.5). It never recovers a connection.
-// Named for what it does now — classify AND tear down — so a call site cannot
-// record an alert and forget to zeroize. Idempotent, so an outer receive-loop
-// safety net (fail_and_zeroize_secrets) remains harmless when it re-runs teardown.
+// classify_failure is the single terminal-failure primitive for the core: it pins
+// the alert the adapter must surface, zeroes every derived secret, parks the
+// machine in .failed, and returns the IError to propagate (RFC 8446 §7.5). Named
+// for what it does — classify AND tear down — so a call site cannot record an
+// alert and forget to zeroize. Idempotent, so outer teardown safety nets stay
+// harmless.
 fn (mut h HandshakeCore) classify_failure(alert AlertDescription, message string) IError {
 	h.fail_alert = alert
 	h.fail_and_zeroize_secrets()
@@ -300,11 +295,9 @@ pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes 
 }
 
 // append_and_drain bounds each append before allocating, while still allowing a
-// transport to deliver multiple complete messages in one call. Every classified
-// failure inside already tears the core down (classify_failure); the fail_and_zeroize_secrets()
-// safety nets below catch any error that did not come from a classify_failure
-// (a non-panicking accessor that returned `err`, for example) — teardown is
-// idempotent, so the belt-and-suspenders call is harmless.
+// transport to deliver multiple complete messages in one call. Inner failures
+// already tear down via classify_failure; the fail_and_zeroize_secrets() safety
+// nets below catch anything else — teardown is idempotent.
 fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	mut offset := 0
@@ -397,6 +390,18 @@ fn (h &HandshakeCore) unconsumed_bytes(level EncryptionLevel) int {
 		.handshake { h.hsk_buf.len }
 		.application { 0 }
 	}
+}
+
+// take_buffered_handshake_bytes moves whatever the drain left buffered at
+// .connected (legal only per RFC 8446 §4.6.1 coalescing) to the adapter,
+// zeroizing the core's copy (§7.5).
+fn (mut h HandshakeCore) take_buffered_handshake_bytes() []u8 {
+	taken := h.hsk_buf.clone()
+	for i in 0 .. h.hsk_buf.len {
+		h.hsk_buf[i] = 0
+	}
+	h.hsk_buf = []u8{}
+	return taken
 }
 
 // negotiated_cipher_suite reports the suite selected by the server in ServerHello.

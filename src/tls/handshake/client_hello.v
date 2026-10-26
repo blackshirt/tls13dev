@@ -27,8 +27,8 @@ fn offered_supported_groups(groups []NamedGroup) []NamedGroup {
 	return if groups.len > 0 { groups } else { default_supported_groups }
 }
 
-// validate_handshake_options rejects values that cannot be encoded or that
-// would create ambiguous ClientHello capability lists.
+// validate_handshake_options rejects values that cannot be encoded, that this stack
+// cannot implement, or that would create ambiguous ClientHello capability lists.
 fn validate_handshake_options(options HandshakeOptions) ! {
 	mut alpn_list_len := 0
 	for protocol in options.alpn {
@@ -60,6 +60,12 @@ fn validate_handshake_options(options HandshakeOptions) ! {
 	if options.cipher_suites.len > 0 {
 		mut seen_suites := []CipherSuite{}
 		for suite in options.cipher_suites {
+			// Membership, not just uniqueness: a raw-cast unimplementable suite would
+			// be advertised and could echo-match the server's choice; dedup then
+			// bounds the list at 3 entries.
+			if !is_supported_cipher_suite(suite) {
+				return error('handshake: unsupported configured cipher suite ${suite}')
+			}
 			if suite in seen_suites {
 				return error('handshake: duplicate configured cipher suite ${suite}')
 			}
@@ -69,12 +75,20 @@ fn validate_handshake_options(options HandshakeOptions) ! {
 	if options.signature_algorithms.len > 0 {
 		mut seen_schemes := []SignatureScheme{}
 		for scheme in options.signature_algorithms {
+			// A client must only offer schemes its verifier can check; membership +
+			// the duplicate scan bounds the list at 7 entries.
+			if !is_supported_signature_scheme(scheme) {
+				return error('handshake: unsupported configured signature scheme ${scheme}')
+			}
 			if scheme in seen_schemes {
 				return error('handshake: duplicate configured signature scheme ${scheme}')
 			}
 			seen_schemes << scheme
 		}
 	}
+	// RFC 8446 §4.1.2: legacy_session_id MUST NOT exceed 32 bytes; shorter values are
+	// legal and echo-checked by equality. Unset applies the App. D.4 default of 32
+	// fresh random bytes.
 	if options.legacy_session_id.len > legacy_session_id_len {
 		return error('handshake: configured legacy_session_id exceeds ${legacy_session_id_len} bytes')
 	}
@@ -152,6 +166,16 @@ fn offered_signature_algorithms(cfg &ClientHelloConfig) []SignatureScheme {
 // build_client_hello generates the ClientHello of RFC 8446 §4.1.2, returning the
 // message body followed by the full handshake message (header + body).
 fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
+	// A direct ClientHelloConfig caller bypasses validate_handshake_options, so the
+	// framing primitive enforces the sizes itself: §4.1.2 caps legacy_session_id at
+	// 32 bytes (0 means "generate fresh random", the App. D.4 default), while Random
+	// is a fixed 32-byte field, so a configured value must be exactly 32.
+	if cfg.session_id.len > legacy_session_id_len {
+		return error('handshake: ClientHello legacy_session_id exceeds ${legacy_session_id_len} bytes')
+	}
+	if cfg.random.len != 0 && cfg.random.len != client_hello_random_len {
+		return error('handshake: ClientHello random must be exactly ${client_hello_random_len} bytes')
+	}
 	mut body := wire.new_writer(512)
 
 	// Legacy version 0x0303 (TLS 1.2) pinned for middleboxes; the real version comes from supported_versions (§4.2.1).
@@ -232,6 +256,19 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// key_share (RFC 8446 §4.2.8): a u16 vector of group (u16) plus u16-length-prefixed key_exchange entries.
 	{
+		// The client's own share gets the same gates compute_shared_secret applies
+		// to the peer's: a direct ClientHelloConfig builder bypasses
+		// validate_handshake_options, so the framing primitive refuses a malformed
+		// or unoffered key_share rather than putting it on the wire (§4.2.8).
+		if cfg.client_share.group !in offered_groups(&cfg) {
+			return error('handshake: ClientHello key_share group ${cfg.client_share.group} is not in supported_groups')
+		}
+		if cfg.client_share.key_exchange.len != expected_share_len(cfg.client_share.group) {
+			return error('handshake: ClientHello ${cfg.client_share.group} key_share is ${cfg.client_share.key_exchange.len} bytes, expected ${expected_share_len(cfg.client_share.group)}')
+		}
+		if cfg.client_share.group == .secp256r1 && cfg.client_share.key_exchange[0] != 0x04 {
+			return error('handshake: ClientHello secp256r1 key_share is not a 0x04-prefixed uncompressed point')
+		}
 		mut ks_w := wire.new_writer(cfg.client_share.key_exchange.len + 6)
 		mut entry_w := wire.new_writer(cfg.client_share.key_exchange.len + 4)
 		entry_w.write_u16(u16(cfg.client_share.group))

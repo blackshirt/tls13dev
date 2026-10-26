@@ -87,6 +87,14 @@ pub fn (h &TLSHandshake) record_unconsumed_bytes(level EncryptionLevel) int {
 	return h.HandshakeCore.unconsumed_bytes(level)
 }
 
+// take_buffered_handshake_bytes transfers the bytes the core left buffered after
+// .connected (a NewSessionTicket coalesced behind the server's Finished, §4.6.1)
+// into the record adapter's post-handshake reassembler; the core's copy is
+// zeroized.
+pub fn (mut h TLSHandshake) take_buffered_handshake_bytes() []u8 {
+	return h.HandshakeCore.take_buffered_handshake_bytes()
+}
+
 // record_update_read_traffic_keys updates the server application traffic keys
 // after receiving a TLS KeyUpdate (RFC 8446 §7.2); only valid once connected.
 pub fn (mut h TLSHandshake) record_update_read_traffic_keys() ! {
@@ -100,11 +108,9 @@ pub fn (mut h TLSHandshake) record_update_write_traffic_keys() ! {
 }
 
 // update_app_traffic_keys derives the next application traffic secret and its
-// cached keys for one direction after a TLS KeyUpdate. The read (server) and write
-// (client) sides were byte-for-byte the same routine over a different secret/keys
-// field pair (server_app_traffic/server_app_keys or client_app_traffic/client_app_keys),
-// so they share this body: is_server selects the pair and the direction word
-// in the two guards.
+// cached keys for one direction after a TLS KeyUpdate. The read and write legs
+// are the same routine over different secret/keys field pairs, so they share this
+// body: is_server selects the pair and the direction word in the two guards.
 fn (mut h TLSHandshake) update_app_traffic_keys(is_server bool) ! {
 	side := if is_server { 'server' } else { 'client' }
 	if h.state() != .connected {

@@ -166,3 +166,22 @@ fn test_valid_x25519_share_is_accepted() ! {
 	expected := peer.x25519(own_pub_bytes)!
 	assert subtle.constant_time_compare(secret, expected) == 1
 }
+
+// test_rejects_p256_identity_point pins the explicit point-at-infinity refusal
+// (0x04 || 0^32 || 0^32): the identity contributes nothing to the shared secret,
+// so the encoding is rejected deterministically rather than via the backend.
+fn test_rejects_p256_identity_point() ! {
+	mut h := core_with_group(.secp256r1)!
+	mut rejected := false
+	mut identity := [u8(0x04)]
+	identity << []u8{len: 64} // 0x04 || 0^32 || 0^32
+	h.compute_shared_secret(KeyShareEntry{
+		group:        .secp256r1
+		key_exchange: identity
+	}) or {
+		assert err.msg().contains('point at infinity')
+		assert h.fail_alert == .illegal_parameter
+		rejected = true
+	}
+	assert rejected, 'the P-256 identity point must be rejected'
+}

@@ -3,7 +3,7 @@
 // conn.v is the public entry point of this TLS stack: dial() runs the TLS 1.3
 // handshake and Conn exposes the protected stream over TCP — RFC 8446 §5 record
 // framing, batched flights, reassembly of split records. The handshake core
-// (tls.handshake's state_machine.v) stays transport-neutral; recordless QUIC (RFC 9001 §4) uses none.
+// (tls.handshake) stays transport-neutral; recordless QUIC (RFC 9001 §4) shares it.
 module tls
 
 import net
@@ -33,10 +33,45 @@ const write_batch_threshold = 131072
 // awaiting a flight, so a peer cannot pin the handshake (RFC 8446 §5 / App. D.4).
 const max_compat_ccs_records = 2
 
-// max_empty_records_per_read bounds the zero-length padding records one Conn.read()
-// call may skip before failing: the records are AEAD-verified, but an unbounded run
-// would spin the loop and starve the caller (RFC 8446 §5.2 permits empty payloads).
-const max_empty_records_per_read = 1000
+// handshake_deadline_multiplier bounds the whole handshake at this multiple of the
+// per-operation socket timeout: per-read timeouts alone cannot stop a slow-loris
+// peer that dribbles valid bytes just under each timeout and stalls the flight forever.
+const handshake_deadline_multiplier = 4
+
+// max_server_name_len bounds the SNI/verification name at the DNS ceiling (RFC 1035
+// §2.3.4), so a hostile or mistyped name cannot overflow the u16 SNI vector encoding.
+const max_server_name_len = 253
+
+// max_handshake_recv_buf_len caps unconsumed framed bytes during the handshake: one
+// maximal ciphertext record plus one socket-read slack (a compliant server's flight
+// is fully consumed before the next read). Post-handshake streaming coalesces freely,
+// so the cap is enforced only while dial() is handshaking (deadline_ms != 0).
+const max_handshake_recv_buf_len = 2 * max_ciphertext_record_len + record_header_len + recv_read_size
+
+// max_handshake_flight_records bounds every record do_handshake consumes. A
+// compliant flight stays far below it; a peer flooding state-neutral but
+// decryptable records meets a deterministic cap instead of only the caller's
+// wall-clock deadline (RFC 8446 §4 orders the flight; nothing legit repeats it).
+const max_handshake_flight_records = 64
+
+// epoch_ms is the module's epoch-ms clock, assembled from one time.now() snapshot;
+// this V build has no time.millis() getter (unix_milli(i64) is a constructor).
+fn epoch_ms() i64 {
+	now := time.now()
+	return now.unix() * 1000 + i64(now.nanosecond) / i64(time.millisecond)
+}
+
+// max_tolerated_records_per_read bounds the records one Conn.read() may skip
+// without delivering data — zero-length padding and post-handshake messages are
+// legal (RFC 8446 §5.2/§4.6), but a verified flood must not starve the caller.
+// The cap mirrors Go crypto/tls maxUserRecords.
+const max_tolerated_records_per_read = 100
+
+// max_post_handshake_messages_per_record bounds the complete messages one
+// handshake-inner-type record may deliver to handle_post_handshake: a maximal
+// record packs ~3300 eight-byte KeyUpdate or ticket bodies, each costing a
+// rekey (plus a KeyUpdate response write), so the bound fires before that work.
+const max_post_handshake_messages_per_record = 1000
 
 // Conn is a TLS 1.3 client connection over TCP, built only by dial(). read() and
 // write() take separate mutexes; the lock order is always rlock → wlock.
@@ -53,14 +88,17 @@ mut:
 	server_app_cipher TLSProtection // AEAD state for records the server sends under app keys
 	client_app_cipher TLSProtection // AEAD state for records we send under app keys
 
-	// Post-handshake messages can span records and produce retained tickets.
-	// session_tickets holds the NewSessionTicket backlog the core parses but does not keep (RFC 9001 §4.5).
+	// session_tickets holds the NewSessionTicket backlog the core parses but does
+	// not keep; exceeding it drops the ticket, never the connection (RFC 8446 §4.6.1).
 	session_tickets []handshake.NewSessionTicket
-	// Holds decrypted handshake bytes between records when a post-handshake
-	// message (for example, NewSessionTicket) is split across records. It may
-	// also contain more than one message; handle_post_handshake consumes complete
-	// messages and retains any incomplete tail for the next record (RFC 8446 §5.2).
+	// Holds decrypted handshake bytes when a post-handshake message (e.g. a
+	// NewSessionTicket) spans records; handle_post_handshake keeps the
+	// incomplete tail for the next record (RFC 8446 §5.2).
 	post_hsk_buf []u8
+	// Set on processing a peer KeyUpdate, cleared by any delivered traffic: RFC
+	// 8446 §4.5 forbids two in a row, so a second aborts before its rekey is
+	// paid for — cutting rekey amplification at the first message.
+	peer_key_update bool
 
 	// Read-side buffers: socket bytes are framed into records, then decrypted
 	// application bytes are delivered to callers.
@@ -112,6 +150,14 @@ mut:
 	// Suppresses a fatal-alert response when the peer has already terminated.
 	peer_terminated bool
 	fail_alert      ?handshake.AlertDescription // adapter-classified alert; when unset, send_failure_alert falls back to the core's hs.failure_alert()
+
+	// Absolute monotonic-ms deadline bounding the whole handshake; 0 after dial
+	// succeeds (and in @[noinit] defaults) so Conn.read() is never deadline-bound.
+	deadline_ms i64
+	// Per-operation socket timeout applied to both directions at dial. The
+	// handshake loop shrinks the read side toward the deadline; dial restores
+	// this value on success so Conn.read() keeps the caller's own bound.
+	sock_timeout time.Duration
 }
 
 // dial connects to address (host:port), performs a TLS 1.3 handshake, and returns
@@ -123,6 +169,14 @@ pub fn dial(address string, config Config) !&Conn {
 	} else {
 		host_from_address(address)
 	}
+	// A name with stray whitespace would travel verbatim into SNI and into hostname
+	// verification — reject it before the socket opens rather than dial ambiguously.
+	if server_name != server_name.trim_space() {
+		return error('tls: server name has stray whitespace')
+	}
+	if server_name.len > max_server_name_len {
+		return error('tls: server name exceeds ${max_server_name_len} characters')
+	}
 
 	// Open the TCP transport first: every later failure path must close it.
 	mut sock := net.dial_tcp(address)!
@@ -130,6 +184,9 @@ pub fn dial(address string, config Config) !&Conn {
 	timeout := if config.timeout > 0 { config.timeout } else { 30 * time.second }
 	sock.set_read_timeout(timeout)
 	sock.set_write_timeout(timeout)
+	// Absolute bound for the whole handshake (see handshake_deadline_multiplier).
+	// The socket timeout is ns-based, so it is converted to ms to match epoch_ms().
+	deadline_ms := epoch_ms() + i64(timeout) * handshake_deadline_multiplier / i64(time.millisecond)
 
 	handshake_options := config.hsk_options
 	mut validator := if configured := handshake_options.validator {
@@ -183,6 +240,8 @@ pub fn dial(address string, config Config) !&Conn {
 		close_notify_sent: false
 		sock_closed:       false
 		fatal_error:       ''
+		deadline_ms:       deadline_ms
+		sock_timeout:      timeout
 		rlock:             sync.new_mutex()
 		wlock:             sync.new_mutex()
 		negotiated_alpn:   ''
@@ -202,6 +261,12 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 	// The ALPN pick is exposed only after the handshake proved it was offered (RFC 7301 §3.1).
 	conn.negotiated_alpn = conn.hs.negotiated_alpn()
+	// Retire the handshake-only markers: the framing cap and deadline guard key
+	// off deadline_ms, and steady-state reads must obey only the per-op timeout.
+	conn.deadline_ms = 0
+	// do_handshake shrinks the read timeout toward the handshake deadline; a
+	// successful dial must hand the caller the full per-operation timeout again.
+	sock.set_read_timeout(conn.sock_timeout)
 	return conn
 }
 
@@ -209,13 +274,31 @@ pub fn dial(address string, config Config) !&Conn {
 // (+dummy CCS), then feed records into the core until it reports .connected (§5.1).
 fn (mut c Conn) do_handshake() ! {
 	ch := c.hs.create_client_hello()!
+	// RFC 8446 §5.1: the initial ClientHello must fit exactly one record; an
+	// oversized locally built one is our own fault, so abort before framing it.
+	if ch.len > max_plaintext_record_len {
+		return c.abort_connection(.internal_error, 'tls: ClientHello exceeds one record (${ch.len} > ${max_plaintext_record_len} bytes)')
+	}
 	c.write_records([new_record(.handshake, ch), change_cipher_spec()])!
 
-	// The core's state machine is transport-neutral:
-	// it has no concept of record framing.
 	mut ccs_seen := 0
+	mut flight_records := 0
 	for c.hs.state() != .connected {
+		// Cheap early check; the fill loop enforces the same deadline per read.
+		remaining_ms := c.deadline_ms - epoch_ms()
+		if remaining_ms <= 0 {
+			return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
+		}
+		// Shrink the per-read timeout to the deadline left, so the read itself
+		// surfaces as the deadline error instead of racing a raw timeout.
+		if remaining_ms * i64(time.millisecond) < i64(c.sock_timeout) {
+			c.sock.set_read_timeout(remaining_ms * time.millisecond)
+		}
 		rec := c.read_raw_record()!
+		flight_records++
+		if flight_records > max_handshake_flight_records {
+			return c.classify_failure(.unexpected_message, 'tls: too many records in the server flight (unexpected_message)')
+		}
 
 		match rec.content_type {
 			.change_cipher_spec {
@@ -283,6 +366,11 @@ fn (mut c Conn) do_handshake() ! {
 				// Inner-type routing is record-layer policy; the core has no ContentType concept.
 				match dec.content_type {
 					.handshake {
+						// §5.1: handshake content must carry message bytes; an empty inner
+						// payload advances no state and would only burn AEAD opens.
+						if dec.plaintext.len == 0 {
+							return c.classify_failure(.unexpected_message, 'tls: empty handshake record under handshake keys (unexpected_message)')
+						}
 						msgs := c.hs.receive_msgs_at_level(.handshake, dec.plaintext)!
 						for m in msgs {
 							// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
@@ -316,6 +404,13 @@ fn (mut c Conn) do_handshake() ! {
 	}
 	// The core verified the server Finished; install this adapter's post-handshake protection.
 	c.install_application_ciphers()!
+	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
+	// core's drain stops at .connected, so take (and scrub) its buffered bytes.
+	coalesced := c.hs.take_buffered_handshake_bytes()
+	if coalesced.len > 0 {
+		// handle_post_handshake failures already abort_connection; don't re-alert.
+		c.handle_post_handshake(coalesced)!
+	}
 	// Nothing may protect or decrypt at the handshake level now, so the core may destroy its secrets (RFC 8446 §7.5).
 	c.hs.zeroize_traffic_secrets(.handshake)!
 }
@@ -387,12 +482,34 @@ fn (mut c Conn) read_raw_record() !Record {
 				rec := read_record(mut r)!
 				c.compact_recv_buf()
 				return rec
+			} else if c.deadline_ms != 0 && avail > max_handshake_recv_buf_len {
+				// Handshake-phase only: dribbled bytes must not grow the framing
+				// buffer without bound while no record completes.
+				c.fail_alert = .unexpected_message
+				return error('record: ${avail} unconsumed bytes exceed the handshake framing bound ${max_handshake_recv_buf_len}')
 			}
 		}
 		if c.sock == unsafe { nil } {
 			return error('tls: connection closed (no socket available to read further records)')
 		}
+		// The deadline must also bite inside an incomplete record: a slow-loris
+		// dribble never completes one, so this fill loop is where the stall lives.
+		// Cap each read at the time left; a read ending past it reports the deadline.
+		mut read_wait_ms := i64(c.sock_timeout) / i64(time.millisecond)
+		if c.deadline_ms != 0 {
+			remaining_ms := c.deadline_ms - epoch_ms()
+			if remaining_ms <= 0 {
+				return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
+			}
+			if remaining_ms < read_wait_ms {
+				read_wait_ms = remaining_ms
+				c.sock.set_read_timeout(read_wait_ms * time.millisecond)
+			}
+		}
 		n := c.sock.read(mut c.sock_buf) or {
+			if c.deadline_ms != 0 && epoch_ms() >= c.deadline_ms {
+				return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
+			}
 			return error('tls: connection closed while reading record: ${err}')
 		}
 		if n == 0 {
@@ -417,6 +534,16 @@ fn (mut c Conn) compact_recv_buf() {
 		c.recv_buf = c.recv_buf[c.recv_pos..].clone()
 		c.recv_pos = 0
 	}
+}
+
+// clear_app_buf zeroes then drops the staged-but-undelivered application
+// plaintext, so freed buffer memory never retains decrypted bytes (§7.5 spirit).
+fn (mut c Conn) clear_app_buf() {
+	for i in 0 .. c.app_buf.len {
+		c.app_buf[i] = 0
+	}
+	c.app_buf.clear()
+	c.app_pos = 0
 }
 
 // tls_protection_from_keys instantiates one direction's record protection from
@@ -471,6 +598,12 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	c.closed = true
 	// Peer termination is final: drop the app traffic secrets and the protectors' IVs (RFC 8446 §1.3.1/§7.5).
 	c.destroy_on_close()!
+	// Scrub undelivered plaintext still staged for the caller (same rlock side).
+	c.clear_app_buf()
+	for i in 0 .. c.post_hsk_buf.len {
+		c.post_hsk_buf[i] = 0
+	}
+	c.post_hsk_buf = []u8{}
 	peer_alert := handshake.parse_alert(payload) or {
 		// A malformed alert body is fatal: pin a sticky error so later reads re-report it.
 		c.fatal_error = 'tls: received malformed alert'
@@ -504,8 +637,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		n := copy(mut buf, c.app_buf[c.app_pos..])
 		c.app_pos += n
 		if c.app_pos == c.app_buf.len {
-			c.app_buf.clear()
-			c.app_pos = 0
+			c.clear_app_buf()
 		}
 		return n
 	}
@@ -513,7 +645,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		return 0
 	}
 
-	mut empty_records := 0
+	mut tolerated_records := 0
 	for {
 		rec := c.read_raw_record() or {
 			alert := c.fail_alert or { handshake.AlertDescription.decode_error }
@@ -529,7 +661,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				return c.abort_connection(.unexpected_message, 'tls: received unencrypted alert post-handshake (must be encrypted)')
 			}
 			.application_data {
-				dec := c.server_app_cipher.decrypt_record(rec) or {
+				mut dec := c.server_app_cipher.decrypt_record(rec) or {
 					if err.msg().contains('sequence limit') {
 						return c.abort_connection(.record_overflow, err.msg())
 					}
@@ -540,18 +672,26 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				}
 				match dec.content_type {
 					.application_data {
+						// Application traffic of any length breaks a KeyUpdate run (§4.5).
+						c.peer_key_update = false
 						if dec.plaintext.len == 0 {
 							// Zero-length records are legal (padding only), but a verified flood
-							// must not spin this loop forever (max_empty_records_per_read).
-							empty_records++
-							if empty_records > max_empty_records_per_read {
-								return c.abort_connection(.unexpected_message, 'tls: too many empty application-data records in one read (unexpected_message)')
+							// must not spin this loop forever (max_tolerated_records_per_read).
+							tolerated_records++
+							if tolerated_records > max_tolerated_records_per_read {
+								return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
 							}
 							continue
 						}
 						n := copy(mut buf, dec.plaintext)
 						if n < dec.plaintext.len {
 							c.app_buf << dec.plaintext[n..]
+						}
+						// Scrub the decrypted staging copy the moment it is fully
+						// delivered; the undelivered remainder is scrubbed when
+						// app_buf drains (§7.5 spirit: no plaintext left in freed memory).
+						for i in 0 .. dec.plaintext.len {
+							dec.plaintext[i] = 0
 						}
 						return n
 					}
@@ -560,7 +700,12 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 						return c.handle_alert(dec.plaintext)
 					}
 					.handshake {
-						// NewSessionTicket/KeyUpdate must not surface as application data.
+						// NewSessionTicket/KeyUpdate must not surface as application data, but a
+						// record flood of them is the same starvation vector as empty padding.
+						tolerated_records++
+						if tolerated_records > max_tolerated_records_per_read {
+							return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
+						}
 						c.handle_post_handshake(dec.plaintext)!
 						continue
 					}
@@ -589,12 +734,19 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 		return c.abort_connection(.record_overflow, 'tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
 	}
 	c.post_hsk_buf << data
+	mut messages_seen := 0
 	for {
 		msg := handshake.next_recordless_message(mut c.post_hsk_buf) or {
 			return c.abort_connection(.decode_error, err.msg())
 		}
 		if msg.len == 0 {
 			return // header or body still incomplete; wait for the next record
+		}
+		// Bound before the message is parsed, rekeyed, or answered, so the flood's
+		// work is cut off at the cap rather than paid for one extra message.
+		messages_seen++
+		if messages_seen > max_post_handshake_messages_per_record {
+			return c.abort_connection(.unexpected_message, 'tls: too many post-handshake messages in one record (unexpected_message)')
 		}
 		mut r := wire.new_reader(msg)
 		msg_type, length := handshake.read_handshake_header(mut r) or {
@@ -617,8 +769,17 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				if c.session_tickets.len < max_stored_session_tickets {
 					c.session_tickets << ticket
 				}
+				// An accepted non-KeyUpdate message breaks the run (§4.5).
+				c.peer_key_update = false
 			}
 			.key_update {
+				// §4.5: "Clients and servers MUST NOT send more than one KeyUpdate
+				// message in a row." Checked before parse and rekey so the violation is
+				// terminal at zero derivation cost, not an endless HKDF-amplification loop.
+				if c.peer_key_update {
+					return c.abort_connection(.unexpected_message, 'tls: consecutive KeyUpdate from peer (unexpected_message)')
+				}
+				c.peer_key_update = true
 				// §4.6.3: a recipient always advances its read keys on receiving a KeyUpdate.
 				request_update := handshake.parse_key_update(body) or {
 					alert := if body.len != 1 {
@@ -671,6 +832,7 @@ fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, messag
 	c.fatal_error = message
 	c.send_failure_alert()
 	c.destroy_on_failure()
+	c.clear_app_buf()
 	for i in 0 .. c.post_hsk_buf.len {
 		c.post_hsk_buf[i] = 0
 	}
@@ -680,14 +842,10 @@ fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, messag
 }
 
 // classify_failure records the alert the adapter must surface for a handshake-phase
-// failure and returns the terminating error, so a call site cannot pin half of it
-// (the two-step `c.fail_alert = ..; return error(..)` that a new `return` can skip).
-// Unlike abort_connection — used once the socket is live and doing its own teardown —
-// this deliberately does NOT tear down: every error it produces propagates out of
-// do_handshake() to dial()'s single teardown wrapper, which sends the alert, destroys
-// secrets and closes the socket. Pinning here is what makes a peer-triggered adapter
-// error surface the RFC-correct code (decode_error, bad_record_mac) instead of the
-// stale .internal_error that send_failure_alert falls back to when fail_alert is unset.
+// failure and returns the terminating error, so a call site cannot pin half of it.
+// Unlike abort_connection, it deliberately does NOT tear down: every error
+// propagates to dial()'s single teardown wrapper, which sends the pinned alert
+// instead of the stale .internal_error fallback for an unset fail_alert.
 fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message string) IError {
 	c.fail_alert = alert
 	return error(message)

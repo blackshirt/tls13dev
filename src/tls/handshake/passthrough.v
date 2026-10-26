@@ -15,18 +15,14 @@ pub const max_handshake_message_len = 1 << 20
 const handshake_header_len = 4
 
 // next_recordless_message extracts one complete handshake message from the front of a
-// CRYPTO byte stream, capped at max_handshake_message_len.
+// CRYPTO byte stream, capped at max_handshake_message_len. "Recordless" is RFC 9001
+// §4: the message self-frames with its own 4-byte header inside an opaque stream, so
+// one framer serves every recordless surface — core reassembly, QUIC CRYPTO streams,
+// and the adapter's post-handshake buffer.
 //
-// "recordless" is the RFC 9001 §4 concept: the message bypasses the TLS record layer,
-// self-framed by its own 4-byte header inside an opaque stream. The same framer therefore serves
-// every recordless surface — the core's plaintext/handshake reassembly, the QUIC
-// per-level CRYPTO streams, and the record adapter's post-handshake buffer — rather
-// than being QUIC-specific.
-//
-// Contract: returns an empty slice — NOT an error — while the header or body is still
-// incomplete, so callers loop until the result is empty; a non-empty result is consumed
-// from buf in place (the caller's buffer keeps its identity). A declared length over
-// max_handshake_message_len is the only error, rejected at the header before buffering.
+// Contract: an incomplete header or body returns an empty slice — NOT an error — so
+// callers loop until empty; a non-empty result is consumed from buf in place. Only an
+// over-cap declared length errors, rejected at the header before buffering.
 @[direct_array_access]
 pub fn next_recordless_message(mut buf []u8) ![]u8 {
 	if buf.len < handshake_header_len {
