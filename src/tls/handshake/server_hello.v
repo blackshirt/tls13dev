@@ -6,14 +6,16 @@ module handshake
 
 import tls.wire
 
-// cipher_suite_from_u16 decodes a 2-byte cipher suite code (RFC 8446 §B.4).
+// cipher_suite_from_u16 decodes a 2-byte cipher suite code against
+// supported_cipher_suites (RFC 8446 §B.4), the same list the offer and
+// configuration gates use.
 fn cipher_suite_from_u16(raw u16) !CipherSuite {
-	return match raw {
-		0x1301 { .tls_aes_128_gcm_sha256 }
-		0x1302 { .tls_aes_256_gcm_sha384 }
-		0x1303 { .tls_chacha20_poly1305_sha256 }
-		else { error('handshake: unsupported cipher suite 0x${raw:04x}') }
+	for cs in supported_cipher_suites {
+		if u16(cs) == raw {
+			return cs
+		}
 	}
+	return error('handshake: unsupported cipher suite 0x${raw:04x}')
 }
 
 // hello_retry_request_random is the HRR sentinel random (RFC 8446 §4.1.3); an HRR is
@@ -35,21 +37,23 @@ mut:
 	session_id_echo []u8          // legacy_session_id echoed from the ClientHello (middlebox compatibility)
 	cipher_suite    CipherSuite   // suite selected by the server
 	server_share    KeyShareEntry // server's ECDHE public share
-	// is_hello_retry_req is set solely by the §4.1.3 sentinel-random comparison; an HRR parses into this struct.
+	// is_hello_retry_req: set solely by the §4.1.3 sentinel-random comparison.
 	is_hello_retry_req bool
-	// has_key_share reports whether a key_share was present; for an HRR it separates a group change from a cookie-only request.
+	// has_key_share: key_share present; on an HRR it separates group change from cookie-only.
 	has_key_share bool
 	// cookie holds the cookie value from a HelloRetryRequest, empty otherwise.
 	cookie []u8
 }
 
-// named_group_from_u16 converts the 16-bit group identifier to NamedGroup.
+// named_group_from_u16 converts the 16-bit group identifier against
+// supported_named_groups — the same list the offer and configuration gates use.
 fn named_group_from_u16(raw u16) !NamedGroup {
-	return match raw {
-		0x0017 { .secp256r1 }
-		0x001d { .x25519 }
-		else { error('handshake: unsupported group 0x${raw:04x}') }
+	for g in supported_named_groups {
+		if u16(g) == raw {
+			return g
+		}
 	}
+	return error('handshake: unsupported group 0x${raw:04x}')
 }
 
 // validate performs the ServerHello/HelloRetryRequest checks independent of the message

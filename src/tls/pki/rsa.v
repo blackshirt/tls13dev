@@ -71,7 +71,8 @@ fn parse_rsa_public_key(der []u8) !RsaPublicKey {
 	if e == 0 {
 		return error('rsa: public exponent must be non-zero')
 	}
-	// RFC 8017 §5.1.3 / FIPS 186-5: a valid public exponent is odd and >= 3; e == 1 makes RSAVP1 the identity (universal forgery).
+	// RFC 8017 §5.1.3 / FIPS 186-5: a valid public exponent is odd and >= 3;
+	// e == 1 makes RSAVP1 the identity (universal forgery).
 	if e == 1 {
 		return error('rsa: public exponent 1 is degenerate')
 	}
@@ -165,7 +166,8 @@ fn mgf1_for(digest_type string, seed []u8, mask_len int) ![]u8 {
 	return mask
 }
 
-// verify_pss verifies an RSASSA-PSS signature (RFC 8017 §8.1.2 & §9.1.2), TLS 1.3 first (RFC 8446 §4.2.3).
+// verify_pss verifies an RSASSA-PSS signature (RFC 8017 §8.1.2 & §9.1.2),
+// TLS 1.3 first (RFC 8446 §4.2.3).
 pub fn (k &RsaPublicKey) verify_pss(digest_type string, m_hash []u8, sig []u8) !bool {
 	h_len := match digest_type {
 		'sha256' { 32 }

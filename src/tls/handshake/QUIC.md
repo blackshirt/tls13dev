@@ -27,9 +27,8 @@ The core was therefore split so that the carrier is always someone else's job:
 
 ```
    ┌──────────────────────────── tls.handshake (this module) ───────────────────────────┐
-   │  Shared core: state_machine.v / server_hello_flow.v / encrypted_flight.v       │
-   │  ECDHE: key_exchange.v  Secrets: secret_lifecycle.v                            │
-   │  Key schedule: key_schedule.v / handshake_keys.v                               │
+   │  Shared core: state_machine.v (transitions, flight, ECDHE, secrets)           │
+   │  Key schedule: key_schedule.v                                                  │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
    │  Record facade: tls_handshake.v owns TLS TrafficKeys and the KeyUpdate path    │
@@ -38,7 +37,7 @@ The core was therefore split so that the carrier is always someone else's job:
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
         │ receive_msgs_at_level                │ record_traffic_keys /                │ create_client_hello /
-        │                                      │ quic_traffic_secrets                 │ receive_msgs_at_level
+        │                                      │ peer_traffic_secrets                 │ receive_msgs_at_level
         │                                      │                                      │
    ┌────┴──────────────┐              ┌───────┴───────────┐               ┌─────────┴──────────┐
    │ tls TCP adapter   │              │ a QUIC engine     │               │ tests / other      │
@@ -181,10 +180,11 @@ RFC 9001 §5.1 expansions itself:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-`quic_traffic_secrets(level)` hands out `(client, server)` clones of those secrets.
+`peer_traffic_secrets(level)` (defined on the `QuicHandshake` facade itself)
+hands out `(client, server)` clones of those secrets.
 `record_traffic_keys(level)` is provided by `TLSHandshake`; a
 `QuicHandshake` does not expose it. A QUIC engine uses
-`quic_traffic_secrets()` + the public `hkdf_expand_label()`.
+`peer_traffic_secrets()` + the public `hkdf_expand_label()`.
 
 ### 3.3 Handshake keys survive until no longer needed
 
@@ -206,7 +206,7 @@ then zeroizes the core secrets and every remaining packet key (`destroy_on_close
 Over QUIC, TLS KeyUpdate does not exist: an endpoint MUST NOT send one and MUST
 treat a received one as a connection error (RFC 9001 §6). The next generation
 of 1-RTT secrets is derived engine-side with the `quic ku` label
-(§6.1) — **not** via `record_update_read_traffic_keys()`/`record_update_write_traffic_keys()`,
+(§6.1) — **not** via `update_traffic_keys(is_server)`,
 whose `traffic upd` label is the TLS record path's. The header-protection key
 never updates.
 
@@ -246,15 +246,15 @@ mut hs := handshake.new_quic_handshake('example.com', handshake.HandshakeOptions
 	alpn: ['h3']
 })!
 
-// 2. First ClientHello. `ch1` is a complete handshake message; place it into a
+// 1. First ClientHello. `ch1` is a complete handshake message; place it into a
 //    CRYPTO frame in an Initial packet (which YOU protect with Initial keys
 //    derived from the destination connection ID, RFC 9001 §5.2).
 ch1 := hs.create_client_hello()!
 
-// 3. Send ch1 in Initial CRYPTO; read Initial packets; strip Initial protection;
+// 2. Send ch1 in Initial CRYPTO; read Initial packets; strip Initial protection;
 //    concatenate CRYPTO frame payloads into `initial_stream`.
 
-// 4. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
+// 3. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
 msgs := hs.receive_msgs_at_level(.initial, initial_stream)!
 for m in msgs {
     // The only .initial output here is the retry ClientHello after a
@@ -262,17 +262,17 @@ for m in msgs {
     _ = m
 }
 
-// 5. Now derive Handshake keys from the exported secrets and protect Handshake
+// 4. Now derive Handshake keys from the exported secrets and protect Handshake
 //    packets with them; the server flight (EE, [CertReq], Cert, CV, Finished)
 //    rides Handshake CRYPTO.
-(ck, sk) := hs.quic_traffic_secrets(.handshake)!
+(ck, sk) := hs.peer_traffic_secrets(.handshake)!
 suite := hs.negotiated_cipher_suite()
 hash := handshake.suite_hash_algo(suite)
 key_len := handshake.suite_key_len(suite)
 qkey := handshake.hkdf_expand_label(hash, ck, 'quic key', []u8{}, key_len)!
 // ... 'quic iv' (12 bytes) and 'quic hp' (key_len) likewise ...
 
-// 6. Feed the reassembled Handshake CRYPTO stream. The return carries the
+// 5. Feed the reassembled Handshake CRYPTO stream. The return carries the
 //    client Finished (tagged .handshake) once the server flight verifies.
 flight := hs.receive_msgs_at_level(.handshake, handshake_stream)!
 for m in flight {
@@ -282,15 +282,15 @@ for m in flight {
     }
 }
 
-// 7. Application secrets are live at .connected. Derive 1-RTT packet keys with
-//    the 'quic key'/'quic iv'/'quic hp' labels from quic_traffic_secrets(.application).
-(cap, sap) := hs.quic_traffic_secrets(.application)!
+// 6. Application secrets are live at .connected. Derive 1-RTT packet keys with
+//    the 'quic key'/'quic iv'/'quic hp' labels from peer_traffic_secrets(.application).
+(cap, sap) := hs.peer_traffic_secrets(.application)!
 
-// 8. For a custom client adapter, release handshake-stage material after
+// 7. For a custom client adapter, release handshake-stage material after
 //    receiving HANDSHAKE_DONE. Conn does this automatically.
 hs.zeroize_traffic_secrets(.handshake)!
 
-// 9. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
+// 8. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_recordless_message and decode with parse_new_session_ticket.
 //    A KeyUpdate here is a connection error (RFC 9001 §6) — do NOT feed keys.
 ```

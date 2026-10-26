@@ -16,7 +16,7 @@ Full module and API reference documentation lives in [`docs.md`](docs.md).
 ## Quick start
 
 ```bash
-v test .                                # unit tests across all four modules
+v test .                                # unit tests across all modules
 v run src/example/simple_example.v      # minimal client: HTTPS GET
 v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
 v run src/example/trust_store_example.v # client supplying its own root_cas
@@ -31,33 +31,25 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 // conn.read(mut buf), conn.negotiated_alpn(), conn.close() ...
 ```
 
-`Conn.close()` performs TLS shutdown when possible by sending `close_notify`,
-then releases the TCP socket. If the peer has already sent `close_notify`,
-`read()` returns clean EOF but the caller should still call `close()` to release
-the socket.
+`Conn.close()` sends `close_notify` when possible, then releases the TCP
+socket; after a peer `close_notify`, `read()` returns clean EOF but `close()`
+is still needed to release the socket.
 
-`Config` exposes the caller-facing knobs: `server_name` (SNI + the name the
-certificate is checked against), `hsk_options` (including offered ALPN
-protocols — the server's pick is verified against this list), `root_cas`
+`Config` is a `@[params]` struct: pass named arguments straight to `dial()`,
+and any field you omit keeps its declared default (`default_config()` is an
+explicit way to build the same value). The caller-facing knobs are
+`server_name` (SNI + the name the certificate is checked against),
+`hsk_options` (offered ALPN protocols and handshake preferences), `root_cas`
 (override the system trust store), and `insecure_skip_verify` (test/lab only;
-it removes all authentication). See
-[`docs.md`](docs.md) for the complete API reference — signatures, defaults,
-behavioral guarantees, and usage recipes. Those fields are read-only; because
-`Config` is a `@[params]` struct you customise it by passing named arguments
-straight to `dial()`. ALPN is configured in `hsk_options.alpn` (for
-example, `['h2']` to offer HTTP/2). Any field you omit keeps the default
-declared on it (`default_config()` remains an explicit way to build the same
-value).
+it removes all authentication). The complete field table, defaults, and
+behavioral guarantees live in [`docs.md`](docs.md).
 
-For a TLS-over-TCP client the entry point is the `tls` module, which
-deliberately exports only `Conn`, `dial()`, `Config` (plus the
-`default_config()` helper) and the `pki.TrustStore` (from `tls.pki`) used to
-populate `Config.root_cas`. The record layer, cipher state, and TCP transport
-stay `tls`-private. The handshake core itself is not hidden: it is a separate,
-deliberately importable module (`tls.handshake`) whose `pub` surface is the
-adapter contract in [CONTRACT.md](src/tls/handshake/CONTRACT.md), so a non-TCP
-transport (QUIC) can drive it directly
-without ever importing `tls`.
+The `tls` module deliberately exports only `dial()`, `Conn`, `Config`,
+`default_config()`, and the `pki.TrustStore` behind `Config.root_cas`; the
+record layer and TCP transport stay module-private. The handshake core is
+separately importable (`tls.handshake`) — its `pub` seam is the adapter
+contract in [CONTRACT.md](src/tls/handshake/CONTRACT.md) — so a non-TCP
+transport like QUIC can drive it without ever importing `tls`.
 
 ## Repository layout
 
@@ -72,14 +64,16 @@ src/
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation
     wire/           module `tls.wire`: bounds-checked byte reader/writer
+    quic/           module `tls.quic`: QUIC client engine over the same core
+    fakeserver/     module `tls.fakeserver`: test-only fake TLS 1.3 server
 ```
 
 Each module keeps its `*_test.v` files alongside its sources. V resolves
 submodules by directory path, so `v.mod` stays rooted at `tls` and the child
-directories become `tls.handshake`, `tls.pki`, and `tls.wire`. The demo lives
-under `src/` (not a top-level `example/`) because V resolves the library's bare
-sibling import (`tls`) relative to the executable's own directory — a runnable
-that imports it must sit beside it.
+directories become `tls.handshake`, `tls.pki`, `tls.quic`, `tls.wire`, and the
+test-only `tls.fakeserver`. The demo lives under `src/` (not a top-level
+`example/`) because V resolves the library's bare sibling import (`tls`)
+relative to the executable's own directory.
 
 ## What is implemented
 
@@ -89,11 +83,10 @@ that imports it must sit beside it.
   including full **HelloRetryRequest** handling with cookie support
 - **Certificate verification**: chain to a trusted root (system bundle or
   caller-provided), validity windows, basic constraints, EKU `serverAuth`,
-  RFC 6125 hostname matching (dNSName SANs with CN fallback only when no SAN
-  list exists, single-label wildcards, IP SANs), Name Constraints
-  (permitted/excluded dNSName and iPAddress subtrees, RFC 5280 §4.2.1.10), and
-  a default-on RSA leaf-key strength floor (≥2048 bits, adjustable or disabled
-  via `Validator.set_min_rsa_bits`)
+  RFC 6125 hostname matching (SANs with CN fallback only when no SAN list
+  exists, single-label wildcards, IP SANs), Name Constraints
+  (RFC 5280 §4.2.1.10), and a default-on RSA key-strength floor (≥2048 bits,
+  adjustable)
 - **Signature schemes**: RSA-PSS (SHA-256/384/512), ECDSA P-256/P-384, and
   Ed25519 for CertificateVerify and chain signatures; RSA-PKCS1-v1_5 SHA-256
   is accepted for chain signatures only — RFC 8446 §4.4.3 restricts
@@ -108,9 +101,8 @@ that imports it must sit beside it.
 - **Client authentication**: a server `CertificateRequest` is answered with the
   empty `Certificate` a credential-less client must send (RFC 8446 §4.4.2),
   bound into the transcript before the server flight is verified
-- **Failure handling**: a failed handshake classifies its alert (`internal_error`
-  as the §6 catch-all, with `unexpected_message`/`illegal_parameter`/
-  `decrypt_error`/`bad_certificate` set where the cause is known) and sends it —
+- **Failure handling**: a failed handshake classifies its fatal alert (with
+  the §6 `internal_error` catch-all where the cause is unknown) and sends it —
   plaintext before the ServerHello, under the handshake keys after — before
   destroying every derived secret (§7.5) and closing the socket
 
@@ -119,26 +111,19 @@ that imports it must sit beside it.
 - Session resumption / PSK / 0-RTT (tickets are received but not usable;
   the key schedule always runs the no-PSK "early secret" path)
 - Certificate **revocation** — CRL and OCSP are not implemented, so a
-  revoked-but-unexpired certificate is accepted. There is no callback hook
-  either; a caller needing revocation must validate out of band before
-  trusting the connection. See [`docs.md`](docs.md) for the rationale and the
-  recommended pattern.
+  revoked-but-unexpired certificate is accepted; there is no callback hook
+  either. See [`docs.md`](docs.md) for the rationale and the recommended
+  out-of-band pattern.
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
-- A QUIC transport stack (RFC 9001) — packet building, header protection,
-  packet-number spaces, and `CONNECTION_CLOSE` signaling are out of scope. The
-  handshake core is nonetheless built to be driven over QUIC: it lives in the
-  importable `tls.handshake` module (with the recordless framing helpers, the
-  level-tagged `receive_msgs_at_level`/`record_traffic_keys`/`quic_traffic_secrets` seam, and the
-  `AlertDescription → quic_connection_error()` mapping), so a QUIC engine needs
-  only `tls.handshake` + `tls.pki` and never imports `tls`; the full
-  eight-step engine loop over that seam is walked through in
-  [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). The API contract and
-  the separate shared-core, record-facade, and QUIC-facade source files are
-  documented in
-  [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md),
-  [`state_machine.v`](src/tls/handshake/state_machine.v),
-  [`tls_handshake.v`](src/tls/handshake/tls_handshake.v), and
-  [`quic_handshake.v`](src/tls/handshake/quic_handshake.v).
+- A full **QUIC transport stack** (RFC 9000/9001). The in-repo `tls.quic`
+  module is a handshake *engine*, not a transport: it runs the full RFC 9001
+  handshake — packet (de)serialization, packet-number spaces, header
+  protection, and CRYPTO reassembly — needing only `tls.handshake` + `tls.pki`
+  and never importing `tls`, but leaves out ACK-based loss recovery, congestion
+  control, streams, flow control, migration, Retry/0-RTT, and the 1-RTT Key
+  Phase update. The engine loop is walked through in
+  [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md) and the core's seam
+  in [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md).
 - A server mode — this library is client-only
 
 ## Testing
@@ -147,50 +132,37 @@ that imports it must sit beside it.
 v test .
 ```
 
-covers: wire framing and bounds, record round trips and AEAD tamper
-detection, the RFC 8448 §3 key-schedule and transcript vectors, handshake
-message codecs against RFC 8448's ServerHello plus hand-built malformed
-fixtures (duplicate/unpermitted/trailing-byte extensions, bad share sizes,
-bad CertificateVerify framing, strict validity-time and pathLenConstraint
-encodings, non-context-tag GeneralNames, duplicate certificate extensions,
-and the dummy-CCS flood bound), the full HRR state-machine path (group
-change, cookie echo, cipher-suite binding, replay rejection), X.509 decoding
-end to end — a full hand-built v3 certificate with extensions, truncation
-regressions for the element-count guards, and OID edge inputs — plus name
-matching including the SAN-vs-CN precedence rule, Name Constraints subtree
-enforcement (permitted/excluded dNSName and iPAddress), the RSA exponent
-policy and leaf strength floor, CertificateVerify scheme-vs-key-type and
-curve binding, forward-secrecy zeroization of handshake and application
-secrets, and TCP record (re)framing in the connection layer.
+Covers the wire and record layers (framing bounds, AEAD round trips and
+tamper detection), the RFC 8448 §3 key-schedule vectors, the handshake
+message codecs and malformed-fixture negatives (extension strictness, key
+share sizes, the full HRR state-machine path), X.509 decoding and the PKI
+rules (name matching, Name Constraints, RSA strength, CertificateVerify
+binding, secret zeroization), and TCP record (re)framing in the connection
+layer.
 
-The core flight is additionally exercised end to end against an in-repo fake
-TLS 1.3 server (`src/tls/fakeserver/`, a test-only module): tests drive the
-real `TLSHandshake` through a complete X25519 handshake byte by byte,
-asserting the client's ServerHello/Finished/alert bytes and the derived
-traffic keys, then the same handshake over a live loopback TCP socket through
-`tls.dial()` — including HelloRetryRequest, a CertificateRequest answered
-with an empty `Certificate`, post-handshake messages split across records, and
-the negative paths (bad Finished, bad CertificateVerify, unoffered ALPN,
-out-of-order certificate, plaintext alert, trailing ServerHello junk, excess
-ChangeCipherSpec, illegal content type). The fake server reimplements the key
-schedule locally and imports only `tls.wire`/`tls.pki`, so it never shares code
-with the implementation under test.
+The flight also runs end to end against an in-repo test-only fake TLS 1.3
+server (`src/tls/fakeserver/`): byte-exact handshake assertions plus a live
+loopback dial through `tls.dial()`, including HelloRetryRequest and the
+negative paths. The fake server reimplements the key schedule locally and
+imports only `tls.wire`/`tls.pki`, so it shares no code with the
+implementation under test.
 
-Coverage honesty: the RFC 8448 worked vectors exercise the AES-128-GCM /
-SHA-256 key-schedule and transcript path from the fixed shared secret
-outward (the ECDHE computation itself is not vector-pinned); AES-256-GCM,
-SHA-384, and ChaCha20-Poly1305 are verified by round trips and
-suite-parameter consistency rather than external vectors, and real-server
-behavior (all suites, HRR retries, interop quirks) is what the runnable demo
-(`v run src/example/dial_example.v`) is for — the HRR retry path itself is
-proven by both the state-machine tests and the fake-server flight.
+Honest limits: the RFC 8448 vectors pin the AES-128-GCM / SHA-256 path (the
+ECDHE computation itself is not vector-pinned); the other suites are
+verified by round trips and suite-parameter consistency. Real-server
+behavior across all suites is what the demo
+(`v run src/example/dial_example.v`) exercises.
 
 ## References
 
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) — TLS 1.3
 - [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448) — test vectors
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the `tls.handshake` core is importable by a QUIC adapter; §4 CRYPTO framing, §4.1 secret levels, §4.8 alert→error mapping, §6 Key Phase)
-- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport (CONNECTION_CLOSE frame types and packet-number spaces referenced by the QUIC walkthrough in `tls.handshake`)
+- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) — TLS 1.3 over QUIC (the
+  `tls.handshake` core is importable by a QUIC adapter; §4 CRYPTO framing, §4.1
+  secret levels, §4.8 alert→error mapping, §6 Key Phase)
+- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport
+  (CONNECTION_CLOSE frame types and packet-number spaces referenced by the QUIC
+  walkthrough in `tls.handshake`)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
 - [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017) — RSA (PKCS#1 v1.5 / PSS)

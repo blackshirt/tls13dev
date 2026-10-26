@@ -1,7 +1,9 @@
+// Copyright (c) 2026 blackshirt.
+//
+// transport_params_test.v covers the framing the handshake deliberately refuses
+// to do: reading and writing QUIC transport-parameter id/length/value triplets
+// (RFC 9000 §7.3), including the duplicate-, size-, and presence-guards.
 module quic
-
-// These tests cover the framing the handshake deliberately refuses to do: reading
-// and writing QUIC transport-parameter id/length/value triplets (RFC 9000 §7.3).
 
 // A server declares both connection-ID parameters this stack checks, and parses
 // them in the wire order this stack's fakeserver emits them: 0x00 then 0x0f.

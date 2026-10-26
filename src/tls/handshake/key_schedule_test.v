@@ -134,3 +134,16 @@ fn test_hkdf_expand_rejects_nonpositive_length() ! {
 	}
 	assert false, 'a zero-length HKDF-Expand must fail closed'
 }
+
+// test_derive_record_key_pair pins the shared per-level expansion to the RFC 8448 §3
+// handshake keys: the pair must equal the two derive_traffic_keys calls it replaced.
+fn test_derive_record_key_pair() ! {
+	hash := HashAlgorithm.sha256
+	client_secret := hex.decode(rfc8448_client_hs_traffic)!
+	server_secret := hex.decode(rfc8448_server_hs_traffic)!
+	ck, sk := derive_record_key_pair(hash, 16, client_secret, server_secret)!
+	assert hex.encode(ck.key) == 'dbfaa693d1762c5b666af5d950258d01'
+	assert hex.encode(ck.iv) == '5bd3c71b836e0b76bb73265f'
+	assert hex.encode(sk.key) == '3fce516009c21727d0f2e4e86ee403bc'
+	assert hex.encode(sk.iv) == '5d313eb2671276ee13000b30'
+}

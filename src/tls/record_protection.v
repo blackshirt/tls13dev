@@ -65,17 +65,25 @@ fn record_aad(content_type ContentType, version u16, length int) []u8 {
 	]
 }
 
-// encrypt_record encrypts a plaintext payload into an encrypted Record (§5.2);
-// the outer ContentType is always application_data (23), hiding the real type.
-fn (mut s TLSProtection) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
-	// Fail closed: an uninitialized cipher would index a zero-length IV or call a nil AEAD.
+// check_ready enforces the two preconditions both record paths share: an
+// initialized nonce base, and a sequence number below the §5.5 per-key limit.
+// Error strings match the prior inline guards so callers still distinguish
+// "not initialized" from rekey exhaustion (record_overflow).
+fn (s &TLSProtection) check_ready() ! {
 	if s.iv.len != aead_nonce_len {
+		// Fail closed: an uninitialized cipher would index a zero-length IV or call a nil AEAD.
 		return error('record: TLS 1.3 protection not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
 	}
 	if s.seq_num >= record_seq_limit {
 		// RFC 8446 §5.5: rekeying is mandatory before this bound — refuse rather than reuse nonces.
 		return error('record: sequence limit reached; rekey required (§5.5)')
 	}
+}
+
+// encrypt_record encrypts a plaintext payload into an encrypted Record (§5.2);
+// the outer ContentType is always application_data (23), hiding the real type.
+fn (mut s TLSProtection) encrypt_record(inner_type ContentType, plaintext []u8) !Record {
+	s.check_ready()!
 	if plaintext.len > max_plaintext_record_len {
 		return error('record: plaintext length ${plaintext.len} exceeds maximum allowed ${max_plaintext_record_len}')
 	}
@@ -108,14 +116,7 @@ mut:
 // decrypt_record decrypts an encrypted Record, verifies the AEAD tag, and
 // extracts the true inner ContentType and plaintext (RFC 8446 §5.2).
 fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
-	// Fail closed: an uninitialized cipher would index a zero-length IV or call a nil AEAD.
-	if s.iv.len != aead_nonce_len {
-		return error('record: TLS 1.3 protection not initialized (IV length ${s.iv.len}, expected ${aead_nonce_len})')
-	}
-	if s.seq_num >= record_seq_limit {
-		// §5.5: a peer that exceeded the limit without rekeying is non-compliant (record_overflow).
-		return error('record: sequence limit reached; rekey required (§5.5)')
-	}
+	s.check_ready()!
 	if rec.content_type != .application_data {
 		return error('record: encrypted record must have outer content type application_data (23), got ${rec.content_type}')
 	}
@@ -165,6 +166,10 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 // wipe zeroes a protection state's IV in place and resets its sequence number,
 // so a dead connection leaves no nonce base behind. Guarded by the loop bound, so
 // calling it on an already-wiped (empty-IV) state is a safe no-op.
+// Known boundary: the cipher.AEAD backend holds its own copy of the expanded key
+// behind the interface, and V cannot zero or reassign through an interface value;
+// wipe() clears everything this layer owns, and the backend key dies when the
+// unreferenced AEAD object is collected.
 fn (mut s TLSProtection) wipe() {
 	for i in 0 .. s.iv.len {
 		s.iv[i] = 0

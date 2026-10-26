@@ -14,18 +14,16 @@ mut:
 	signature []u8            // raw signature bytes over the transcript-derived content
 }
 
-// signature_scheme_from_u16 decodes a 2-byte SignatureScheme code (RFC 8446 §4.2.3).
+// signature_scheme_from_u16 decodes a 2-byte SignatureScheme code against
+// supported_signature_schemes (RFC 8446 §4.2.3) — the same list the offer and
+// configuration gates use.
 fn signature_scheme_from_u16(raw u16) !SignatureScheme {
-	return match raw {
-		0x0401 { .rsa_pkcs1_sha256 }
-		0x0403 { .ecdsa_secp256r1_sha256 }
-		0x0503 { .ecdsa_secp384r1_sha384 }
-		0x0804 { .rsa_pss_rsae_sha256 }
-		0x0805 { .rsa_pss_rsae_sha384 }
-		0x0806 { .rsa_pss_rsae_sha512 }
-		0x0807 { .ed25519 }
-		else { error('handshake: unsupported signature scheme 0x${raw:04x}') }
+	for s in supported_signature_schemes {
+		if u16(s) == raw {
+			return s
+		}
 	}
+	return error('handshake: unsupported signature scheme 0x${raw:04x}')
 }
 
 // parse_certificate_message decodes the Certificate message body (RFC 8446 §4.4.2)
@@ -44,7 +42,8 @@ fn parse_certificate_message(body []u8) ![][]u8 {
 	mut cert_r := wire.new_reader(cert_list_bytes)
 	mut certs := [][]u8{}
 	for cert_r.remaining() > 0 {
-		// Reject an over-long chain before every entry is ASN.1-parsed, so a peer cannot pack thousands of tiny entries.
+		// Reject an over-long chain before every entry is ASN.1-parsed, so a peer
+		// cannot pack thousands of tiny entries.
 		if certs.len >= pki.max_cert_chain_depth {
 			return error('handshake: certificate chain exceeds maximum depth ${pki.max_cert_chain_depth} (illegal_parameter)')
 		}
@@ -144,10 +143,9 @@ fn build_empty_certificate(request_context []u8) []u8 {
 }
 
 // parse_encrypted_extensions_for_transport extracts the two values the handshake
-// itself needs from EncryptedExtensions: the negotiated ALPN, and — on a QUIC
-// connection — the peer's transport parameters. Those parameters are returned as
-// raw bytes, because their id/length/value content belongs to QUIC and is decoded
-// by the adapter; this function only enforces the TLS-level placement rules.
+// itself needs from EncryptedExtensions: the negotiated ALPN and, on a QUIC
+// connection, the peer's transport parameters as raw bytes — their content belongs
+// to QUIC and is decoded by the adapter; this only enforces TLS placement rules.
 @[direct_array_access]
 fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?[]u8) {
 	mut r := wire.new_reader(body)
@@ -179,10 +177,12 @@ fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?
 				return error('handshake: server sent a non-empty server_name in EncryptedExtensions')
 			}
 		} else if ext.typ == u16(ExtensionType.supported_groups) {
-			// Interop carve-out: §4.2 makes supported_groups ClientHello-only, but some servers echo it; it carries no authority.
+			// Interop carve-out: §4.2 makes supported_groups ClientHello-only, but
+			// some servers echo it; it carries no authority.
 			continue
 		} else if ext.typ == u16(ExtensionType.renegotiation_info) {
-			// Interop carve-out: OpenSSL sends this unoffered; RFC 5746 §3.4 fixes the content to an empty renegotiated_connection.
+			// Interop carve-out: OpenSSL sends this unoffered; RFC 5746 §3.4 fixes
+			// the content to an empty renegotiated_connection.
 			mut ri_r := wire.new_reader(ext.data)
 			if ri_r.remaining() > 0 {
 				renegotiated := ri_r.read_vector_u8()!

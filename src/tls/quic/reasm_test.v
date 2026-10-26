@@ -1,3 +1,8 @@
+// Copyright (c) 2026 blackshirt.
+//
+// reasm_test.v pins the CRYPTO-stream reassembler: out-of-order delivery and
+// matching overlaps are accepted, conflicting overlaps and out-of-range or
+// flood-shaped inserts are refused (RFC 9001 §4; bounds are this stack's).
 module quic
 
 fn test_crypto_reasm_accepts_matching_overlaps_and_out_of_order_data() ! {

@@ -103,7 +103,7 @@ pub fn parse_certificate(der []u8) !Certificate {
 	// certificates are 1–4 KB; anything past 32 KB is either a malformed
 	// input, a hostile blob designed to drive the parser deep, or a bug in
 	// the caller. This cap protects every entry point uniformly — TLS
-	// handshake via encrypted_flight.v, TrustStore.add_der, and
+	// handshake via the state_machine.v flight handlers, TrustStore.add_der, and
 	// TrustStore.add_pem — with one invariant rather than per-site bounds.
 	if der.len > max_certificate_der_bytes {
 		return error('x509: certificate DER of ${der.len} bytes exceeds ${max_certificate_der_bytes} cap')
@@ -146,7 +146,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 
 	mut idx := 0
 
-	// 1. Version [0] EXPLICIT, absent for v1 (the default): consume it only when the first element carries context tag 0.
+	// 1. Version [0] EXPLICIT, absent for v1 (the default): consume it only when
+	// the first element carries context tag 0.
 	mut version := 1
 	if (tbs_elements[0].tag & 0x1f) == 0 {
 		mut version_r := wire.new_reader(tbs_elements[0].data)
@@ -158,7 +159,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 		idx++
 	}
 
-	// The six mandatory fields after the optional version must all be present: measuring against the post-version idx closes the v3 index-shift gap.
+	// The six mandatory fields after the optional version must all be present:
+	// measuring against the post-version idx closes the v3 index-shift gap.
 	if tbs_elements.len - idx < 6 {
 		return error('x509: malformed TBSCertificate (need 6 fields after version, have ${tbs_elements.len - idx})')
 	}
@@ -177,11 +179,13 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut tbs_sig_hash_oid := ''
 	if sig_alg_inner.len > 0 {
 		tbs_sig_algo_oid = parse_oid(sig_alg_inner[0].data)
-		// For id-RSASSA-PSS (1.2.840.113549.1.1.10), extract the hash OID from the RSASSA-PSS-params SEQUENCE's hashAlgorithm [0] field.
+		// For id-RSASSA-PSS (1.2.840.113549.1.1.10), extract the hash OID from the
+		// RSASSA-PSS-params SEQUENCE's hashAlgorithm [0] field.
 		if tbs_sig_algo_oid == '1.2.840.113549.1.1.10' && sig_alg_inner.len >= 2 {
 			pss_params := parse_sequence(sig_alg_inner[1].data) or { []Asn1Element{} }
 			for param in pss_params {
-				// [0] EXPLICIT -- hashAlgorithm: 0xa0 = context-specific class + constructed bit, & 0x1f == 0 pins the tag to [0].
+				// [0] EXPLICIT -- hashAlgorithm: 0xa0 = context-specific class +
+				// constructed bit, & 0x1f == 0 pins the tag to [0].
 				if (param.tag & 0xe0) == 0xa0 && (param.tag & 0x1f) == 0 {
 					hash_alg_inner := parse_sequence(param.data) or { []Asn1Element{} }
 					if hash_alg_inner.len > 0 {
@@ -201,7 +205,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 
 	// 5. Validity (SEQUENCE: notBefore, notAfter)
 	val_elems := parse_sequence(tbs_elements[idx].data)!
-	// RFC 5280 §4.1.2.5: both fields are mandatory; an unparseable time is a fatal decode error, never a stored 0.
+	// RFC 5280 §4.1.2.5: both fields are mandatory; an unparseable time is a fatal
+	// decode error, never a stored 0.
 	if val_elems.len < 2 {
 		return error('x509: validity must hold notBefore and notAfter (${val_elems.len} elements)')
 	}
@@ -285,7 +290,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut excluded_dns := []string{}
 	mut permitted_ip := [][]u8{}
 	mut excluded_ip := [][]u8{}
-	// RFC 5280 §4.2: each extension OID may appear at most once; a duplicate must not overwrite the first.
+	// RFC 5280 §4.2: each extension OID may appear at most once; a duplicate must
+	// not overwrite the first.
 	mut seen_ext_oids := []string{}
 
 	for i in idx .. tbs_elements.len {
@@ -304,7 +310,9 @@ pub fn parse_certificate(der []u8) !Certificate {
 						return error('x509: duplicate extension ${ext_oid}')
 					}
 					seen_ext_oids << ext_oid
-					// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue }: with the critical flag omitted extnValue sits at index 1, else index 2.
+					// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE,
+					// extnValue }: with the critical flag omitted extnValue sits at
+					// index 1, else index 2.
 					mut critical := false
 					ext_val_bytes := if parts.len == 2 {
 						parts[1].data
@@ -341,7 +349,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 							permitted_dns, excluded_dns, permitted_ip, excluded_ip = parse_name_constraints(ext_val_bytes)!
 						}
 						else {
-							// RFC 5280 §4.2: an unknown critical extension MUST be rejected (a constrained CA must not issue outside its sandbox).
+							// RFC 5280 §4.2: an unknown critical extension MUST be rejected
+							// (a constrained CA must not issue outside its sandbox).
 							if critical {
 								return error('x509: unsupported critical extension ${ext_oid}')
 							}
@@ -403,7 +412,8 @@ fn (c &Certificate) ecdsa_public_key() !ecdsa.PublicKey {
 	if c.public_key_raw.len == 0 {
 		return error('x509: empty ECDSA public key')
 	}
-	// public_key_raw is already the uncompressed 0x04||X||Y point; the stored curve NID completes the input.
+	// public_key_raw is already the uncompressed 0x04||X||Y point; the stored
+	// curve NID completes the input.
 	return ecdsa.PublicKey.from_uncompressed_bytes(c.public_key_raw, nid: c.ecdsa_curve)!
 }
 
@@ -515,7 +525,8 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 
 	for general_names_r.remaining() > 0 {
 		gn := read_asn1_element(mut general_names_r) or { break }
-		// GeneralName choices are context-specific and primitive ([2] = 0x82, [7] = 0x87); a clear constructed bit stops a tag collision.
+		// GeneralName choices are context-specific and primitive ([2] = 0x82,
+		// [7] = 0x87); a clear constructed bit stops a tag collision.
 		if (gn.tag & 0xc0) != 0x80 || (gn.tag & 0x20) != 0 {
 			continue
 		}
@@ -615,7 +626,8 @@ fn parse_name_constraints(ext_bytes []u8) !([]string, []string, [][]u8, [][]u8) 
 					}
 				}
 				7 { // [7] iPAddress
-					// In nameConstraints an iPAddress subtree is address+mask (8 bytes IPv4, 32 IPv6), not the bare 4/16 of a SAN.
+					// In nameConstraints an iPAddress subtree is address+mask (8 bytes
+					// IPv4, 32 IPv6), not the bare 4/16 of a SAN.
 					if base.data.len != 8 && base.data.len != 32 {
 						return error('x509: nameConstraints iPAddress subtree has length ${base.data.len}, expected address+mask (8 or 32)')
 					}
@@ -671,7 +683,8 @@ fn parse_path_len_constraint(data []u8) int {
 }
 
 // parse_basic_constraints parses the cA boolean and pathLenConstraint (RFC 5280 §4.2.1.9).
-// The path limit is -1 only when the INTEGER is absent (unlimited); a present-but-malformed one yields 0.
+// The path limit is -1 only when the INTEGER is absent (unlimited); a
+// present-but-malformed one yields 0.
 @[direct_array_access]
 fn parse_basic_constraints(ext_bytes []u8) (bool, int) {
 	inner := unwrap_octet_string(ext_bytes)
@@ -710,14 +723,16 @@ fn parse_key_usage(ext_bytes []u8) []u8 {
 	}
 	unused_bits := seq.data[0]
 	bits := seq.data[1..]
-	// BIT STRING constraint of X.690 §10.5: unused bits must fit in the last octet; a violation makes the whole extension untrustworthy.
+	// BIT STRING constraint of X.690 §10.5: unused bits must fit in the last
+	// octet; a violation makes the whole extension untrustworthy.
 	if unused_bits > 7 || (bits.len == 0 && unused_bits != 0) {
 		return []u8{}
 	}
 	return bits.clone()
 }
 
-// key_usage_bit reports whether named bit `n` (0 = digitalSignature, from the MSB of the first octet per RFC 5280 §4.2.1.3) is asserted.
+// key_usage_bit reports whether named bit `n` (0 = digitalSignature, from the
+// MSB of the first octet per RFC 5280 §4.2.1.3) is asserted.
 fn key_usage_bit(ku []u8, n int) bool {
 	byte_idx := n >> 3
 	if byte_idx >= ku.len {

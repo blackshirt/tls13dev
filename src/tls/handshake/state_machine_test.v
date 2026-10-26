@@ -56,7 +56,7 @@ fn test_encryption_level_rejects_unsupported_operation() ! {
 		validator: fixture_validator()
 	})!
 	rejected = false
-	quic.quic_traffic_secrets(.initial) or {
+	quic.peer_traffic_secrets(.initial) or {
 		assert err.msg().contains('initial level has no traffic secrets')
 		rejected = true
 	}
@@ -106,27 +106,27 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 
 	first := h.receive_msgs_at_level(.initial, full[..split])!
 	assert first.len == 0
-	assert h.record_unconsumed_bytes(.initial) == split
+	assert h.unconsumed_bytes(.initial) == split
 
 	// Completing the frame consumes it; the garbage body then fails to parse.
 	h.receive_msgs_at_level(.initial, full[split..]) or {
-		assert h.record_unconsumed_bytes(.initial) == 0
+		assert h.unconsumed_bytes(.initial) == 0
 		return
 	}
 	assert false // a garbage ServerHello body must never parse cleanly
 }
 
-// test_record_unconsumed_bytes_levels_start_empty checks that both handshake
+// test_unconsumed_bytes_levels_start_empty checks that both handshake
 // reassembly buffers start empty and the accessor tracks a parked fragment.
-fn test_record_unconsumed_bytes_levels_start_empty() ! {
+fn test_unconsumed_bytes_levels_start_empty() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	assert h.record_unconsumed_bytes(.handshake) == 0
-	assert h.record_unconsumed_bytes(.initial) == 0
+	assert h.unconsumed_bytes(.handshake) == 0
+	assert h.unconsumed_bytes(.initial) == 0
 	_ = h.create_client_hello()!
 	h.state = .wait_encrypted_extensions
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
 	_ = h.receive_msgs_at_level(.handshake, [u8(2), 0x00])!
-	assert h.record_unconsumed_bytes(.handshake) == 2
+	assert h.unconsumed_bytes(.handshake) == 2
 }
 
 // ---- state machine accessor ----
@@ -268,14 +268,74 @@ fn test_handshake_options_accepts_full_capability_lists() ! {
 	h := new_tls_handshake('example.com', HandshakeOptions{
 		validator:            fixture_validator()
 		key_share_group:      .x25519
-		supported_groups:     default_supported_groups
+		supported_groups:     default_supported_groups()
 		cipher_suites:        [CipherSuite.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384,
 			.tls_chacha20_poly1305_sha256]
-		signature_algorithms: default_signature_algorithms
+		signature_algorithms: default_signature_algorithms()
 	})!
 	assert h.config.cipher_suites.len == 3
 	assert h.config.signature_algorithms.len == 7
 	assert h.config.supported_groups.len == 2
+}
+
+// ---- capability single-source lock (dedup regression) ----
+
+// test_capability_decoders_roundtrip pins that every member of a supported_*
+// list decodes from its own wire code — the *_from_u16 scanners and the lists
+// in messages.v cannot drift, because the scanner walks the same list.
+fn test_capability_decoders_roundtrip() ! {
+	for cs in supported_cipher_suites {
+		assert cipher_suite_from_u16(u16(cs))! == cs
+	}
+	for s in supported_signature_schemes {
+		assert signature_scheme_from_u16(u16(s))! == s
+	}
+	for g in supported_named_groups {
+		assert named_group_from_u16(u16(g))! == g
+	}
+}
+
+// test_capability_unknown_codes_rejected_by_decoder_and_gate locks that an
+// absent wire code fails BOTH paths with the pinned decoder message: the
+// decoder rejects it on the wire, the membership gate rejects it at config, so
+// acceptance and advertisement stay one source.
+fn test_capability_unknown_codes_rejected_by_decoder_and_gate() ! {
+	unknown_suites := [u16(0x1399), 0x1300, 0x0000]
+	unknown_schemes := [u16(0x0201), 0x0808, 0x0402]
+	unknown_groups := [u16(0x001f), 0x001e, 0x0000]
+	for raw in unknown_suites {
+		cipher_suite_from_u16(raw) or {
+			assert err.msg() == 'handshake: unsupported cipher suite 0x${raw:04x}'
+		}
+		assert !(is_supported_cipher_suite(unsafe { CipherSuite(raw) }))
+	}
+	for raw in unknown_schemes {
+		signature_scheme_from_u16(raw) or {
+			assert err.msg() == 'handshake: unsupported signature scheme 0x${raw:04x}'
+		}
+		assert !(is_supported_signature_scheme(unsafe { SignatureScheme(raw) }))
+	}
+	for raw in unknown_groups {
+		named_group_from_u16(raw) or {
+			assert err.msg() == 'handshake: unsupported group 0x${raw:04x}'
+		}
+		assert !(is_supported_group(unsafe { NamedGroup(raw) }))
+	}
+}
+
+// test_capability_default_offer_order pins the wire-byte identity of the default
+// offer lists: preference order carries meaning (ChaCha20 first for the
+// software-only AEAD), so any reorder must be a deliberate, fixture-reviewed
+// change to the supported_* lists in messages.v.
+fn test_capability_default_offer_order() ! {
+	assert default_cipher_suites() == [CipherSuite.tls_chacha20_poly1305_sha256,
+		.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384]
+	assert default_signature_algorithms() == [SignatureScheme.rsa_pss_rsae_sha256,
+		.rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512, .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384,
+		.ed25519, .rsa_pkcs1_sha256]
+	assert default_supported_groups() == [NamedGroup.x25519, .secp256r1]
+	// The offered-set fallback reads the same single source.
+	assert offered_supported_groups([]) == supported_named_groups
 }
 
 fn test_handshake_options_default_validator() ! {
@@ -305,9 +365,9 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 
 	assert record.HandshakeCore.init_buf.len == 2
 	assert quic.HandshakeCore.init_buf.len == 1
-	assert record.record_unconsumed_bytes(.initial) == 2
+	assert record.unconsumed_bytes(.initial) == 2
 	record.fail_and_zeroize_secrets()
-	assert record.record_unconsumed_bytes(.initial) == 0
+	assert record.unconsumed_bytes(.initial) == 0
 	assert quic.HandshakeCore.init_buf.len == 1
 }
 
@@ -328,7 +388,7 @@ fn test_feed_rejects_out_of_order_message() ! {
 	cert := wrap_hsk(.certificate, []u8{len: 4, init: 0x01})
 	h.receive_msgs_at_level(.handshake, cert) or {
 		assert err.msg().contains('only expected after ServerHello')
-		assert h.record_unconsumed_bytes(.handshake) == 0
+		assert h.unconsumed_bytes(.handshake) == 0
 		assert h.state() == .wait_server_hello
 		return
 	}
@@ -463,13 +523,13 @@ fn test_feed_handshake_level_after_connected_refused() ! {
 	h.receive_msgs_at_level(.handshake, wrap_hsk(.new_session_ticket, [u8(0)])) or {
 		assert err.msg().contains('only expected after ServerHello')
 		assert h.state == .connected
-		assert h.record_unconsumed_bytes(.handshake) == 0
+		assert h.unconsumed_bytes(.handshake) == 0
 		return
 	}
 	assert false
 }
 
-// ---- traffic_keys / quic_traffic_secrets lifecycle (white-box) ----
+// ---- traffic_keys / peer_traffic_secrets lifecycle (white-box) ----
 
 // test_traffic_keys_unavailable_before_derivation checks that the accessors
 // refuse until the handshake derives keys.
@@ -590,14 +650,14 @@ fn test_zeroize_traffic_secrets_refuses_initial() ! {
 	assert false
 }
 
-// test_record_update_traffic_keys_refuse_missing_secrets checks that a key
+// test_update_traffic_keys_refuse_missing_secrets checks that a key
 // update refuses while the application traffic secrets are still empty.
-fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
+fn test_update_traffic_keys_refuse_missing_secrets() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = .connected
-	h.record_update_read_traffic_keys() or {
+	h.update_traffic_keys(true) or {
 		assert err.msg().contains('server application traffic secret')
-		h.record_update_write_traffic_keys() or {
+		h.update_traffic_keys(false) or {
 			assert err.msg().contains('client application traffic secret')
 			return
 		}
@@ -607,21 +667,21 @@ fn test_record_update_traffic_keys_refuse_missing_secrets() ! {
 	assert false
 }
 
-// test_record_update_traffic_keys_refuse_before_connected ensures a caller
+// test_update_traffic_keys_refuse_before_connected ensures a caller
 // cannot update secrets merely because they are present in the core.
-fn test_record_update_traffic_keys_refuse_before_connected() ! {
+fn test_update_traffic_keys_refuse_before_connected() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.server_app_traffic = []u8{len: 32, init: 1}
 	h.client_app_traffic = []u8{len: 32, init: 2}
 	old_server := h.server_app_traffic.clone()
 	old_client := h.client_app_traffic.clone()
 
-	h.record_update_read_traffic_keys() or {
+	h.update_traffic_keys(true) or {
 		assert err.msg().contains('before the handshake is connected')
 		assert h.state() == .start
 		assert h.server_app_traffic == old_server
 		assert h.server_app_keys.key.len == 0
-		h.record_update_write_traffic_keys() or {
+		h.update_traffic_keys(false) or {
 			assert err.msg().contains('before the handshake is connected')
 			assert h.state() == .start
 			assert h.client_app_traffic == old_client
@@ -634,17 +694,17 @@ fn test_record_update_traffic_keys_refuse_before_connected() ! {
 	assert false
 }
 
-// test_record_update_traffic_keys_derives_next_keys checks that the key update
+// test_update_traffic_keys_derives_next_keys checks that the key update
 // derives the next secrets and rebuilds the cached keys (§7.2).
-fn test_record_update_traffic_keys_derives_next_keys() ! {
+fn test_update_traffic_keys_derives_next_keys() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = .connected
 	h.server_app_traffic = []u8{len: 32, init: 1}
 	h.client_app_traffic = []u8{len: 32, init: 2}
 	old_server := h.server_app_traffic.clone()
 	old_client := h.client_app_traffic.clone()
-	h.record_update_read_traffic_keys()!
-	h.record_update_write_traffic_keys()!
+	h.update_traffic_keys(true)!
+	h.update_traffic_keys(false)!
 	assert h.server_app_traffic != old_server
 	assert h.client_app_traffic != old_client
 	assert h.server_app_traffic.len == 32
@@ -653,15 +713,15 @@ fn test_record_update_traffic_keys_derives_next_keys() ! {
 	assert key.len > 0
 }
 
-// test_record_update_traffic_keys_refuses_after_zeroize checks that a key update
+// test_update_traffic_keys_refuses_after_zeroize checks that a key update
 // after teardown is refused instead of resurrecting the secret.
-fn test_record_update_traffic_keys_refuses_after_zeroize() ! {
+fn test_update_traffic_keys_refuses_after_zeroize() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = .connected
 	h.client_app_traffic = [u8(1), 2, 3]
 	h.client_app_keys = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
 	h.zeroize_traffic_secrets(.application)!
-	h.record_update_write_traffic_keys() or {
+	h.update_traffic_keys(false) or {
 		assert err.msg().contains('destroyed by zeroize_traffic_secrets(.application)')
 		return
 	}
@@ -753,9 +813,9 @@ fn test_traffic_keys_returns_independent_copies() ! {
 	assert sk == [u8(6), 7]
 }
 
-// test_record_update_traffic_keys_wipes_superseded_generation checks that the
+// test_update_traffic_keys_wipes_superseded_generation checks that the
 // superseded generation is zeroed in place after the key update.
-fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
+fn test_update_traffic_keys_wipes_superseded_generation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = .connected
 	h.server_app_traffic = []u8{len: 32, init: 7}
@@ -764,7 +824,7 @@ fn test_record_update_traffic_keys_wipes_superseded_generation() ! {
 	old_secret := h.server_app_traffic
 	old_key := h.server_app_keys.key
 
-	h.record_update_read_traffic_keys()!
+	h.update_traffic_keys(true)!
 
 	// The update derives the successor first, then zeroes the superseded material in place.
 	assert old_secret.len == 32

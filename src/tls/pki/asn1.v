@@ -54,7 +54,8 @@ fn read_asn1_element(mut r wire.Reader) !Asn1Element {
 			}
 			length = (length << 8) | u32(b)
 		}
-		// DER mandates minimal length encoding (X.690 §10.1): long form is only legal when the value is ≥ 0x80 and carries no leading zero octet.
+		// DER mandates minimal length encoding (X.690 §10.1): long form is only
+		// legal when the value is ≥ 0x80 and carries no leading zero octet.
 		if first_len_byte == 0 {
 			return error('asn1: non-minimal DER length (leading zero octet)')
 		}

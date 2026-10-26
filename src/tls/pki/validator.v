@@ -96,7 +96,8 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	now := time.now().unix()
 	leaf := chain[0]
 
-	// Hostname validation: IP literals match iPAddress SANs only (RFC 6125 §6.4.3 / RFC 2818 §3.1); an empty name fails closed.
+	// Hostname validation: IP literals match iPAddress SANs only (RFC 6125 §6.4.3 /
+	// RFC 2818 §3.1); an empty name fails closed.
 	if hostname == '' {
 		return error('pki: empty server name; cannot verify certificate hostname')
 	}
@@ -112,7 +113,8 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		}
 	}
 
-	// Validity period: parse_certificate rejects unparseable times, so a stored value is always a real date (RFC 5280 §4.1.2.5).
+	// Validity period: parse_certificate rejects unparseable times, so a stored
+	// value is always a real date (RFC 5280 §4.1.2.5).
 	if now < leaf.not_before_unix {
 		return error('pki: leaf certificate is not yet valid (notBefore=${leaf.not_before})')
 	}
@@ -144,7 +146,9 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		}
 	}
 
-	// Validate signatures along the chain: C_i must be signed by C_{i+1}, whose issuer name must match the child's subject; every issuer must be a CA (RFC 5280 §4.2.1.9).
+	// Validate signatures along the chain: C_i must be signed by C_{i+1}, whose
+	// issuer name must match the child's subject; every issuer must be a CA
+	// (RFC 5280 §4.2.1.9).
 	for i in 0 .. chain.len - 1 {
 		child := chain[i]
 		parent := chain[i + 1]
@@ -158,7 +162,8 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		if parent.has_key_usage && !key_usage_bit(parent.key_usage, 5) {
 			return error('pki: CA at chain index ${i + 1} keyUsage does not permit keyCertSign')
 		}
-		// pathLenConstraint (RFC 5280 §4.2.1.9): the number of non-CA certs below this CA must not exceed the limit; a stored -1 means the INTEGER was absent.
+		// pathLenConstraint (RFC 5280 §4.2.1.9): the number of non-CA certs below
+		// this CA must not exceed the limit; a stored -1 means the INTEGER was absent.
 		if parent.max_path_len >= 0 && i > parent.max_path_len {
 			return error('pki: CA at chain index ${i + 1} violates pathLenConstraint (${i} intermediate certs below > limit ${parent.max_path_len})')
 		}
@@ -332,7 +337,8 @@ fn verify_cert_signature(child Certificate, parent Certificate) ! {
 			rsa_key := parent.rsa_public_key or {
 				return error('pki: parent certificate missing valid RSA public key')
 			}
-			// CA signing keys are floored at 2048 bits regardless of trust-store contents (CA/Browser Forum baseline).
+			// CA signing keys are floored at 2048 bits regardless of trust-store
+			// contents (CA/Browser Forum baseline).
 			if rsa_key.size_bytes < 256 {
 				return error('pki: CA RSA key too short (${rsa_key.size_bytes * 8} bits < 2048)')
 			}

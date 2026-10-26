@@ -2,12 +2,14 @@
 //
 // Socket-free tests for the Conn read-side plumbing: read_raw_record reassembles
 // TLS records from a TCP byte stream, exercised here by pre-staging recv_buf —
-// a populated buffer never reaches the nil sock.
+// a populated buffer never reaches the nil sock. Also covers the caller-facing
+// Config defaults and the connection close path.
 module tls
 
 import crypto.aes
 import net
 import sync
+import time
 import tls.handshake
 import tls.pki
 
@@ -288,12 +290,12 @@ fn test_read_bounds_handshake_record_flood() ! {
 	assert false, 'a handshake-record flood must not spin read() forever'
 }
 
-// test_post_handshake_bounds_messages_per_record checks that one record packing
-// more complete messages than the cap is refused before the per-message work
-// (parse, rekey, response write) climbs further: a maximal record can pack over
-// 3000 eight-byte message bodies. Valid NewSessionTickets are used because a
-// ticket is parsed and stored/dropped without touching the nil test socket,
-// while a KeyUpdate(update_requested) would fail on its response write first.
+// test_post_handshake_bounds_messages_per_record checks that a record packing
+// more complete messages than the cap is refused before the parse/rekey/response
+// work climbs further — a maximal record can pack over 3000 eight-byte bodies.
+// Valid NewSessionTickets are used: they are parsed and stored/dropped, whereas
+// a KeyUpdate(update_requested) would fail on its response write at the nil
+// test socket first.
 fn test_post_handshake_bounds_messages_per_record() ! {
 	mut c := new_test_conn()!
 	nst_body := [u8(0), 0, 0, 1, 0, 0, 0, 0, 1, 0xab, 0, 2, 0xcd, 0xce, 0, 2, 0xef, 0xf0]
@@ -393,4 +395,25 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	// The second close must be a no-op for the fd: no panic, no re-close.
 	c.close()!
 	assert c.sock_closed
+}
+
+// test_decrypt_failure_alert_mapping pins the shared record-layer decrypt classifier:
+// rekey exhaustion is record_overflow, a failed AEAD tag is bad_record_mac, and any
+// other failure (e.g. an uninitialized protection state) defaults to unexpected_message.
+fn test_decrypt_failure_alert_mapping() {
+	assert decrypt_failure_alert('record: sequence limit reached; rekey required (§5.5)') == handshake.AlertDescription.record_overflow
+	assert decrypt_failure_alert('record: AEAD decryption failed: bad tag') == handshake.AlertDescription.bad_record_mac
+	assert decrypt_failure_alert('record: TLS 1.3 protection not initialized') == handshake.AlertDescription.unexpected_message
+}
+
+// test_default_config_applies_field_defaults checks a default Config still
+// carries the conservative values (no ALPN offer, 30s timeout, verification on).
+fn test_default_config_applies_field_defaults() {
+	cfg := default_config('example.com')
+	assert cfg.server_name == 'example.com'
+	assert cfg.hsk_options.alpn.len == 0
+	// The insecure escape hatch stays off.
+	assert cfg.insecure_skip_verify == false
+	// timeout inherits the declared 30s default rather than the 0 unset value.
+	assert cfg.timeout == 30 * time.second
 }

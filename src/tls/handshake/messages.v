@@ -1,8 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
 // messages.v owns shared RFC 8446 §4 handshake framing primitives and extension
-// block decoding. Message-family codecs live in client_hello.v, server_hello.v,
-// server_flight.v and post_handshake.v.
+// block decoding.
 module handshake
 
 import tls.wire
@@ -53,7 +52,7 @@ enum ExtensionType as u16 {
 	cookie                    = 44
 	key_share                 = 51
 	quic_transport_parameters = 57
-	// RFC 5746 §4.1, not an RFC 8446 extension: TLS 1.3 servers carry it in EncryptedExtensions even when unoffered.
+	// RFC 5746 §4.1, not RFC 8446: servers may carry it in EncryptedExtensions unoffered.
 	renegotiation_info        = 65281 // 0xff01
 }
 
@@ -62,6 +61,25 @@ enum ExtensionType as u16 {
 pub enum NamedGroup as u16 {
 	secp256r1 = 0x0017
 	x25519    = 0x001d
+}
+
+// supported_named_groups is the single source of the groups this stack offers,
+// accepts on the wire, and performs ECDHE for; order is the default offer order.
+const supported_named_groups = [NamedGroup.x25519, .secp256r1]
+
+// is_supported_group reports whether the group is in this stack's supported set
+// — the same source the wire decoder and the default offer list derive from.
+fn is_supported_group(g NamedGroup) bool {
+	return g in supported_named_groups
+}
+
+// expected_share_len is the §4.2.8.2 key_exchange size per group (x25519 32;
+// secp256r1 65 = 0x04||X||Y): one source for the peer gate and ClientHello builder.
+fn expected_share_len(g NamedGroup) int {
+	return match g {
+		.x25519 { 32 }
+		.secp256r1 { 65 }
+	}
 }
 
 // SignatureScheme defines cryptographic signature algorithms (RFC 8446 §4.2.3).
@@ -75,11 +93,38 @@ pub enum SignatureScheme as u16 {
 	ed25519                = 0x0807
 }
 
+// supported_signature_schemes is the single source of the schemes this stack
+// offers, accepts on the wire, and can verify in CertificateVerify; order is the
+// default offer order. A client must never offer a scheme it could not verify.
+const supported_signature_schemes = [SignatureScheme.rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384,
+	.rsa_pss_rsae_sha512, .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .ed25519,
+	.rsa_pkcs1_sha256]
+
+// is_supported_signature_scheme reports whether the scheme is in this stack's
+// supported set — offerable, decodable, and verifiable by the same source, so a
+// client can never offer a scheme it could not verify in CertificateVerify.
+fn is_supported_signature_scheme(s SignatureScheme) bool {
+	return s in supported_signature_schemes
+}
+
 // CipherSuite defines TLS 1.3 cipher suites (RFC 8446 §B.4).
 pub enum CipherSuite as u16 {
 	tls_aes_128_gcm_sha256       = 0x1301
 	tls_aes_256_gcm_sha384       = 0x1302
 	tls_chacha20_poly1305_sha256 = 0x1303
+}
+
+// supported_cipher_suites is the single source of the suites this stack offers,
+// accepts on the wire, and implements (RFC 8446 §B.4); order is the default offer
+// order — ChaCha20-Poly1305 leads because the AEAD backend is software-only.
+const supported_cipher_suites = [CipherSuite.tls_chacha20_poly1305_sha256, .tls_aes_128_gcm_sha256,
+	.tls_aes_256_gcm_sha384]
+
+// is_supported_cipher_suite reports whether the suite is in this stack's
+// supported set: offered, decoded, and implemented from one list, so
+// advertisement and acceptance cannot drift apart.
+fn is_supported_cipher_suite(cs CipherSuite) bool {
+	return cs in supported_cipher_suites
 }
 
 // client_hello_random_len is the fixed ClientHello.random size (RFC 8446 §4.1.2).

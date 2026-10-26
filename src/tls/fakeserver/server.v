@@ -67,7 +67,7 @@ mut:
 	is_quic     bool
 }
 
-// HrrMode selects the HelloRetryRequest behaviour of the next new_server.
+// HrrMode selects the HelloRetryRequest behavior of the next new_server.
 pub enum HrrMode {
 	none         // answer the first ClientHello with a normal ServerHello
 	change_group // HRR that requests secp256r1 instead of the offered x25519

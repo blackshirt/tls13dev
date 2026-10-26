@@ -109,15 +109,19 @@ readiness.
 `TLSHandshake` exposes operations needed by TLS over TCP:
 
 - `record_traffic_keys()` returns derived record keys.
-- `record_unconsumed_bytes()` lets the record adapter enforce the
-  ServerHello record-boundary rule.
+- `unconsumed_bytes()` lets the record adapter enforce the
+  ServerHello record-boundary rule; it and `take_buffered_handshake_bytes()`
+  are defined on the facade itself, called directly by `tls.Conn` (only the
+  record layer feeds through TLS record framing, so the pair has no QUIC
+  caller).
 - `take_buffered_handshake_bytes()` moves any handshake-level bytes the core
   still held at `.connected` (a server ticket coalesced after its `Finished`,
   §4.6.1) into the record adapter's post-handshake reassembler and wipes the
   core copy.
-- `record_update_read_traffic_keys()` and
-  `record_update_write_traffic_keys()` implement TLS KeyUpdate and are valid
-  only after the handshake reaches `.connected`.
+- `update_traffic_keys(is_server)` implements TLS KeyUpdate — the read leg
+  (`true`, server keys, after receiving) and the write leg (`false`, client
+  keys, before sending) — and is valid only after the handshake reaches
+  `.connected`.
 - `zeroize_traffic_secrets(level)` destroys the traffic secrets for one
   encryption level once the adapter no longer needs them; valid only after
   `.connected`, and the record facade also wipes that level's cached record
@@ -126,10 +130,10 @@ readiness.
 
 ## QUIC-only operations
 
-`QuicHandshake` exposes `quic_traffic_secrets()` instead of record keys. It
-delegates to the core's private level-aware traffic-secret accessor, so both
-facades share one availability check while only the QUIC facade exports raw
-secrets; `TLSHandshake` cannot expose that accessor. The QUIC adapter expands
+`QuicHandshake` defines `peer_traffic_secrets()` on the facade itself and
+exposes raw traffic secrets instead of record keys: raw-secret export has no
+TLS caller — the record adapter keeps its cached-key surface
+(`record_traffic_keys()`) and never reads the secrets. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
 calls `zeroize_traffic_secrets(.handshake)` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.

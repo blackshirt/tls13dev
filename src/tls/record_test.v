@@ -1,7 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
 // Record layer tests: wire framing round-trips through serialize/parse, the AEAD
-// cipher state advances in sequence-number lockstep, a flipped ciphertext byte
+// protection state advances in sequence-number lockstep, a flipped ciphertext byte
 // fails the tag check, and the §5.5 per-key record limit plus the §5.2
 // inner-plaintext shape are refused. The QUIC CRYPTO recordless framing is
 // tested in tls.handshake's passthrough_test.v.
@@ -186,7 +186,7 @@ fn test_decrypt_record_rejects_empty_inner_plaintext() ! {
 	assert false
 }
 
-// test_record_seq_limit_backstops_sender checks that the cipher state refuses
+// test_record_seq_limit_backstops_sender checks that the protection state refuses
 // records past the 2^24 per-key limit (RFC 8446 §5.5).
 fn test_record_seq_limit_backstops_sender() ! {
 	assert record_seq_limit == 16777216

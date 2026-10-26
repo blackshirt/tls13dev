@@ -620,7 +620,8 @@ fn test_certificate_verify_signed_content() {
 	th := [u8(0x01), 0x02, 0x03, 0x04]
 	content := certificate_verify_signed_content(th)
 
-	// 64 spaces (0x20) + "TLS 1.3, server CertificateVerify" (33 bytes) + 0x00 + transcript_hash (4 bytes)
+	// 64 spaces (0x20) + "TLS 1.3, server CertificateVerify" (33 bytes) + 0x00 +
+	// transcript_hash (4 bytes)
 	assert content.len == 64 + 33 + 1 + 4
 	for i in 0 .. 64 {
 		assert content[i] == 0x20

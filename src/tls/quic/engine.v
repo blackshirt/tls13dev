@@ -461,7 +461,7 @@ fn (mut e Conn) install_exported_keys() ! {
 	// zeroized secrets. The adapter keeps its own install-once flags.
 	phases := e.hs.available_secret_phases()
 	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none && phases.handshake {
-		ck, sk := e.hs.quic_traffic_secrets(.handshake)!
+		ck, sk := e.hs.peer_traffic_secrets(.handshake)!
 		suite := e.hs.negotiated_cipher_suite()
 		chash := handshake.suite_hash_algo(suite)
 		klen := handshake.suite_key_len(suite)
@@ -471,7 +471,7 @@ fn (mut e Conn) install_exported_keys() ! {
 		e.handshake_rx = new_protection(server_keys, suite)!
 	}
 	if phases.application && e.app_tx == none && e.app_rx == none {
-		ck, sk := e.hs.quic_traffic_secrets(.application)!
+		ck, sk := e.hs.peer_traffic_secrets(.application)!
 		suite := e.hs.negotiated_cipher_suite()
 		chash := handshake.suite_hash_algo(suite)
 		klen := handshake.suite_key_len(suite)

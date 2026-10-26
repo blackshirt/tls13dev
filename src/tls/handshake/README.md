@@ -41,20 +41,16 @@ CA bundle.
 ## File map
 
 ```
-state_machine.v       private HandshakeCore: states, EncryptionLevel,
-                      HandshakeOptions, create_client_hello, receive_msgs_at_level
-tls_handshake.v       TLS record facade: cached TrafficKeys, KeyUpdate
-quic_handshake.v      QUIC facade: exposes traffic secrets, peer transport params
-secret_lifecycle.v    fail_and_zeroize_secrets / zeroize_traffic_secrets (§7.5)
+state_machine.v       the whole shared HandshakeCore: states, EncryptionLevel,
+                      HandshakeOptions, create_client_hello, receive_msgs_at_level,
+                      ServerHello/HRR transition, encrypted flight, ECDHE, secrets
+tls_handshake.v       TLS record facade: cached TrafficKeys, KeyUpdate, reassembly hooks
+quic_handshake.v      QUIC facade: peer_traffic_secrets, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
-server_hello_flow.v   ServerHello/HRR transition, transcript rewrite, retried CH
-encrypted_flight.v    process the encrypted flight, emit the client Finished
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
 certificate_verify.v  verify the §4.4.3 CertificateVerify (pure, no state change)
-key_exchange.v        ephemeral ECDHE shared secret (X25519, P-256)
-key_schedule.v        §7.1 HKDF-Expand-Label, HashAlgorithm
-handshake_keys.v      adapt §7.1 derivations to the flow
+key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations
 transcript.v          running transcript the schedule and CertificateVerify hash over
 messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + header
 aead.v                cipher-suite → AEAD/hash helpers

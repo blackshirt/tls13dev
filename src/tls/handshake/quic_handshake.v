@@ -1,7 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
 // QuicHandshake is the QUIC adapter facade over shared TLS handshake
-// semantics. QUIC derives packet protection from the exported traffic secrets.
+// semantics. QUIC derives packet protection from the exported traffic secrets,
+// so the raw-secret accessor peer_traffic_secrets() lives here: the record
+// facade caches derived TrafficKeys and has no caller for it.
 module handshake
 
 // QuicHandshake exposes only operations needed by a QUIC adapter.
@@ -15,6 +17,31 @@ pub struct QuicHandshake {
 pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshake {
 	return QuicHandshake{
 		HandshakeCore: new_handshake_core(server_name, options, true)!
+	}
+}
+
+// peer_traffic_secrets returns copies of the client and server traffic secrets
+// for one encryption level; the initial level has no TLS traffic secrets. QUIC
+// seam: the engine expands the pair into RFC 9001 §5.1 packet keys itself, and
+// the TLS record path never reads raw secrets — TLSHandshake serves
+// record_traffic_keys() from its cached TrafficKeys instead.
+pub fn (h &QuicHandshake) peer_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
+	match level {
+		.initial {
+			return error('handshake: initial level has no traffic secrets')
+		}
+		.handshake {
+			if h.client_hsk_traffic.len == 0 || h.server_hsk_traffic.len == 0 {
+				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
+			}
+			return h.client_hsk_traffic.clone(), h.server_hsk_traffic.clone()
+		}
+		.application {
+			if h.client_app_traffic.len == 0 || h.server_app_traffic.len == 0 {
+				return error('handshake: application traffic secrets unavailable before the server Finished')
+			}
+			return h.client_app_traffic.clone(), h.server_app_traffic.clone()
+		}
 	}
 }
 
@@ -35,9 +62,4 @@ pub fn (h &QuicHandshake) peer_transport_parameters() ?[]u8 {
 // that ID, so the adapter's Initial keys go stale here (RFC 9001 §5.5).
 pub fn (h &QuicHandshake) hello_retry_request_received() bool {
 	return h.hrr_received
-}
-
-// quic_traffic_secrets returns copies of TLS traffic secrets for QUIC packet-key derivation.
-pub fn (h &QuicHandshake) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
-	return h.traffic_secret_pair(level)
 }

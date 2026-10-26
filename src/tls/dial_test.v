@@ -291,7 +291,7 @@ fn test_dial_accepts_ticket_coalesced_after_finished() ! {
 
 	assert conn.session_tickets.len == 1 // handled inside do_handshake itself
 	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
-	assert conn.hs.record_unconsumed_bytes(.handshake) == 0 // drained, not orphaned
+	assert conn.hs.unconsumed_bytes(.handshake) == 0 // drained, not orphaned
 
 	mut buf := []u8{len: 64}
 	n := conn.read(mut buf)!
@@ -453,7 +453,11 @@ fn test_dial_handshake_deadline_ends_slow_loris() ! {
 			return error('dial failed with "${err.msg()}", expected the handshake deadline')
 		}
 		// The deadline is 4x the 1s timeout; the dial must end near it, not hang.
-		assert time.now() - start < 10 * time.second
+		// The lower bound catches a fast clock scale (wrong ns divisor) just as
+		// the upper bound catches a slow one — the 16.8s miss this pins against.
+		elapsed := time.now() - start
+		assert 3 * time.second <= elapsed
+		assert elapsed < 10 * time.second
 		res := <-res_ch
 		if res != 'OK' {
 			return error('scripted server did not finish cleanly: ${res}')
@@ -712,7 +716,8 @@ fn alert_back_pre_sh_script(mut c net.TcpConn) ! {
 		return error('expected a handshake record first, got ${ch_rec.content_type}')
 	}
 	_ := scripted_read_record(mut c)!
-	// A complete ServerHello header with an empty body: the client fails in parse, before installing keys.
+	// A complete ServerHello header with an empty body: the client fails in parse,
+	// before installing keys.
 	c.write(new_record(.handshake, [u8(0x02), 0x00, 0x00, 0x00]).serialize()) or { return err }
 
 	alert_rec := scripted_read_record(mut c)!

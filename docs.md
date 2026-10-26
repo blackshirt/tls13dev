@@ -2,8 +2,8 @@
 
 ![V](https://img.shields.io/badge/language-V-2d7dd2) ![TLS&nbsp;1.3](https://img.shields.io/badge/protocol-RFC_8446-2ea44f) ![client--only](https://img.shields.io/badge/role-client--only-6f42c1) ![no%20deps](https://img.shields.io/badge/OpenSSL--free-000000) ![status](https://img.shields.io/badge/status-experimental-e8930c)
 
-A **<span style="color:#2d7dd2">TLS 1.3 client</span>** library written in [V](https://vlang.io), implementing
-[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) directly on standard-library
+A **<span style="color:#2d7dd2">TLS 1.3 client</span>** library written in [V](https://vlang.io),
+implementing [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) directly on standard-library
 crypto — no OpenSSL bindings, no third-party dependencies.
 
 | | |
@@ -54,7 +54,7 @@ crypto — no OpenSSL bindings, no third-party dependencies.
 
 ## 1. Module architecture
 
-The library is organised as four V modules under `src/tls/`, each declaring its
+The library is organized as six V modules under `src/tls/`, each declaring its
 own `module` and importing only the layers beneath it:
 
 | Module | Directory | Role |
@@ -63,9 +63,12 @@ own `module` and importing only the layers beneath it:
 | `tls.handshake` | `src/tls/handshake/` | Transport-neutral handshake core (importable by non-TCP transports such as QUIC) |
 | `tls.pki` | `src/tls/pki/` | X.509 / ASN.1 parsing and chain validation |
 | `tls.wire` | `src/tls/wire/` | Bounds-checked byte reader / writer |
+| `tls.quic` | `src/tls/quic/` | QUIC client engine — the sibling of `tls` that drives the same core without importing it |
+| `tls.fakeserver` | `src/tls/fakeserver/` | Test-only fake TLS 1.3 server flight; no role in the shipped library |
 
 The dependency graph is strictly downward —
-`tls → tls.handshake → tls.pki → tls.wire` — so
+`tls → tls.handshake → tls.pki → tls.wire`, with `tls.quic` riding the same
+rail on top of `tls.handshake` — so
 <span style="color:#2ea44f">lower layers never reference higher ones</span>, and
 the separation is enforced by the compiler rather than by convention alone.
 In particular a grep gate over `src/tls/handshake/` proves the core owns no
@@ -87,7 +90,7 @@ For a TLS-over-TCP caller the entry point is `tls`, which exports only:
 | `default_config()` | function | Explicit conservative `Config` constructor |
 | `pki.TrustStore` | struct (`tls.pki`) | Custom root-CA set for `Config.root_cas` |
 
-Within `tls`, the record layer, cipher state, and TCP transport are
+Within `tls`, the record layer, protection states, and TCP transport are
 module-private implementation detail. The handshake core, by contrast, is a
 deliberately **importable** module: `tls.handshake` exposes a small `pub` seam —
 the [adapter contract](#15-adapter-contract-tlshandshake) below — so a QUIC
@@ -107,15 +110,15 @@ role; this table summarizes it by owning module.
    caller
       ▼
  ┌───────────────────────────────────────────────┐
- │ module tls         conn.v · config.v ·        │  public TCP API: dial() · Conn ·
- │                    record.v ·                 │  Config · record layer (§5) ·
- │                    record_protection.v         │  record protection · alert records
+ │ module tls         conn.v · record.v ·        │  public TCP API: dial() · Conn ·
+ │                    record_protection.v        │  Config · record layer (§5) ·
+ │                                               │  record protection · alert records
  ├───────────────────────────────────────────────┤
  │ module tls.handshake                          │  transport-neutral core (adapter
  │   state_machine.v · messages.v ·              │  contract): sequencing, §7.1
  │   key_schedule.v · transcript.v ·             │  ladder, codecs, AEAD ctors,
- │   handshake_keys.v · aead.v · alert.v ·       │  alert vocabulary, recordless
- │   certificate_verify.v · passthrough.v        │  CRYPTO-stream passthrough
+ │   aead.v · alert.v · certificate_verify.v ·   │  alert vocabulary, recordless
+ │   passthrough.v                               │  CRYPTO-stream passthrough
  ├───────────────────────────────────────────────┤
  │ module tls.pki     validator.v · x509.v ·     │  chain of trust, DER decoding,
  │                    asn1.v · rsa.v ·           │  hostname matching, roots
@@ -125,13 +128,20 @@ role; this table summarizes it by owning module.
  └───────────────────────────────────────────────┘
 ```
 
+The map draws the TLS-over-TCP stack only; `tls.quic` is a sibling of `tls`
+plugging into the same `tls.handshake` core (walked through in
+[`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md)) and `tls.fakeserver`
+is test-only scaffolding — both are listed in the table below.
+
 | Module | Files | Responsibility |
 |---|---|---|
 | `tls.wire` | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
-| `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal DER reader (strict on non-minimal lengths), X.509 v3 decoding (validity, keyUsage, basicConstraints + pathLen, EKU, SAN, name constraints) behind element-count guards that fail truncated certificates — including the optional-version-shifted ones — as decode errors rather than indexing past the array, raw RSA (odd exponents only) / PKCS#1 v1.5 verification, RFC 5280 chain building to a trusted root, RFC 5280 §4.2.1.10 name-constraint enforcement (permitted/excluded dNSName and iPAddress subtrees on the leaf) with a default-on leaf RSA strength floor, RFC 6125 hostname matching (SAN-over-CN precedence enforced internally), system trust bundle loading. `TrustStore` is public so `Config.root_cas` can be populated. |
-| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `handshake_keys.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v` | The transport-neutral core: RFC 8446 §4 message structures (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished, extensions) and the running Transcript-Hash (§4.4.1), kept as raw messages so the HelloRetryRequest checkpoint can rewrite history; the §7.1 HKDF-Extract/Expand ladder (`key_schedule.v`) which `handshake_keys.v` adapts — with the offered-group policy — to the handshake flow without touching the transcript; the AEAD constructors a suite maps to (`aead.v`); the CertificateVerify signature check over the §4.4.3 content (`certificate_verify.v`); the shared alert vocabulary — `AlertDescription`, its `encode`/`parse_alert`, and the RFC 9001 §4.8 `quic_connection_error` mapping (`alert.v`); and the recordless CRYPTO-stream passthrough reassembly `next_recordless_message` with the 1 MiB `max_handshake_message_len` cap (RFC 9001 §4, `passthrough.v`). The `state_machine.v` sequences it all, owns the key ratchet, and speaks raw handshake messages at its `pub` boundary — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. Its transport is fixed by the facade chosen at construction (`TLSHandshake` from `new_tls_handshake`, `QuicHandshake` from `new_quic_handshake`), so transport-only operations live on the matching facade and are absent from the other rather than rejected at runtime. It scrubs handshake secrets and both ephemeral private keys at `.connected` and application traffic secrets at teardown (RFC 8446 §1.3.1/§7.5 forward-secrecy hygiene), deferring handshake-stage material to `zeroize_handshake_traffic_secrets()` so a QUIC adapter can still use it per RFC 9001 §4.1.2/§4.9.2. |
+| `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal strict DER reader and X.509 v3 decoding behind element-count guards, RFC 5280 chain building to a trusted root with name-constraint enforcement, RFC 6125 hostname matching, RSA/PSS/ECDSA/Ed25519 signature verification, and system trust-bundle loading. The rejection rules are enumerated in §4.3; `TrustStore` is public so `Config.root_cas` can be populated. |
+| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v`, `client_hello.v`, `server_hello.v`, `server_flight.v`, `tls_handshake.v`, `quic_handshake.v` | The transport-neutral core: RFC 8446 §4 message structures and the running Transcript-Hash (§4.4.1), the §7.1 HKDF ladder with the phase derivations (`key_schedule.v`), AEAD constructors (`aead.v`), the CertificateVerify check (`certificate_verify.v`), the shared alert vocabulary with the RFC 9001 §4.8 mapping (`alert.v`), and recordless CRYPTO-stream reassembly (`passthrough.v`). `state_machine.v` holds the entire shared `HandshakeCore` — sequencing, the ServerHello/HRR and encrypted-flight transitions, ECDHE, and the secret lifecycle — and owns the key ratchet behind the `pub` seam; facade-exclusive methods live on the facades, never promoted from it — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. Facade choice at construction fixes the transport (§1.5); secret-hygiene timing is in §2.1 and the source preambles. |
 | `tls` | `record.v`, `record_protection.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `alert_record` wrapper, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side helpers (`alert_record`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
-| `tls` | `conn.v`, `config.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `TLSProtection` installation from `record_traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits); `config.v` holds `Config`/`default_config()`. |
+| `tls` | `conn.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, the caller-facing `Config`/`default_config()`, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `TLSProtection` installation from `record_traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits). |
+| `tls.quic` | `engine.v`, `config.v`, `packet.v`, `packet_parse.v`, `protection.v`, `initial_keys.v`, `frame.v`, `varint.v`, `cid.v`, `reasm.v`, `transport_params.v` | The QUIC client engine (RFC 9000/9001): the eight-step loop driving `tls.handshake` through the recordless `QuicHandshake` facade, long/short header (de)serialization and sample-based packet + header protection, Initial-key derivation from the original DCID, CRYPTO-stream reassembly, varints, frames, and the `original_destination_connection_id`-guarded transport parameters. Construction and the protection layers never import `tls`; see [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). |
+| `tls.fakeserver` | `server.v`, `fixtures.v`, `keys.v` | Test-only adaptive TLS 1.3 server flight generator: builds a spec-conformant server response — full flight or HelloRetryRequest — from the client's actual ClientHello so the end-to-end tests can drive the real client byte by byte. Ships no library API. |
 
 ### 1.3 Data flow of `dial()`
 
@@ -210,8 +220,9 @@ building a QUIC adapter. The API contract is documented in
 
 ```v
 // shared handshake driving
-new_tls_handshake(server_name string) !TLSHandshake
-new_quic_handshake(server_name string) !QuicHandshake
+// HandshakeOptions fields may be passed as optional named arguments.
+new_tls_handshake(server_name string, options HandshakeOptions) !TLSHandshake
+new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshake
 (mut h) create_client_hello() ![]u8
 (mut h) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
@@ -219,13 +230,13 @@ new_quic_handshake(server_name string) !QuicHandshake
 (mut h) fail_and_zeroize_secrets()   // bulk, unguarded; wipes everything and parks .failed
 (mut h) zeroize_traffic_secrets(level EncryptionLevel) !   // guarded per-level teardown: .handshake or .application
 
-// TLS record path only
-     (h) record_unconsumed_bytes(level EncryptionLevel) int                         // §5.1 hook
+// TLS record path (hooks defined on the TLSHandshake facade itself)
+     (h) unconsumed_bytes(level EncryptionLevel) int                         // §5.1 ServerHello record-boundary hook
      (h) record_traffic_keys(level EncryptionLevel) !([]u8, []u8, []u8, []u8)   // client_key, client_iv, server_key, server_iv
-(mut h) record_update_read_traffic_keys() !   /   (mut h) record_update_write_traffic_keys() !   // §7.2 key update
+(mut h) update_traffic_keys(is_server bool) !   // §7.2 key update: true = read/server leg, false = write/client leg
 
-// QUIC path only
-     (h) quic_traffic_secrets(level EncryptionLevel) !([]u8, []u8)
+// QUIC path (accessors defined on the QuicHandshake facade itself)
+     (h) peer_traffic_secrets(level EncryptionLevel) !([]u8, []u8)   // raw client/server traffic secrets; the adapter expands RFC 9001 §5.1 packet keys itself
 ```
 
 - **`EncryptionLevel`** (`initial`/`handshake`/`application`) gives handshake
@@ -241,9 +252,11 @@ new_quic_handshake(server_name string) !QuicHandshake
   secrets for RFC 9001 packet-key derivation; the QUIC engine owns packet keys
   and QUIC key updates.
 - **Lifecycle and framing stay explicit.** Both facades share failure cleanup
-  and handshake-secret zeroization. `TLSHandshake` alone
-  exposes the plaintext reassembly count needed for the TLS ServerHello record
-  boundary rule; QUIC maps alert descriptions to QUIC connection errors.
+  and handshake-secret zeroization. The reassembly count the record adapter
+  needs for the TLS ServerHello record-boundary rule lives on the
+  `TLSHandshake` facade as `unconsumed_bytes()` — it and
+  `take_buffered_handshake_bytes()` have no QUIC caller; QUIC maps alert
+  descriptions to QUIC connection errors.
 
 ---
 
@@ -300,7 +313,8 @@ Behavior and guarantees:
   else the system CA bundle is loaded — parsed once per process, then cached for
   every later `dial()` (a load failure is a dial error) — unless
   `insecure_skip_verify` is set, in which case an empty store suffices.
-- <span style="color:#2ea44f">**No fd leaks**</span> — any handshake failure closes the socket it opened before
+- <span style="color:#2ea44f">**No fd leaks**</span> — any handshake failure
+  closes the socket it opened before
   returning the error; a half-connected `Conn` is never returned.
 - <span style="color:#2ea44f">**Forward secrecy of retained secrets**</span> — the
   handshake secret and ephemeral X25519 / P-256 private keys are released when
@@ -322,7 +336,7 @@ Behavior and guarantees:
   CCS flood cannot pin the loop, and the whole server flight is additionally capped
   at 64 records with empty inner-handshake payloads refused, so even state-neutral
   but decryptable records cannot burn AEAD work past a deterministic bound instead
-  of only the wall-clock deadline; a HelloRetryRequest cookie longer than 8 KiB is
+  of only the monotonic handshake deadline; a HelloRetryRequest cookie longer than 8 KiB is
   refused at parse time so the echoing ClientHello stays frameable in one record;
   unconsumed framed bytes are capped at two maximal
   records plus one socket read while handshaking, so dribbled incomplete records
@@ -407,9 +421,10 @@ pub fn (mut c Conn) close() !
 ```
 
 Sends `close_notify` (encrypted with application keys when they exist, per
-§6.1/§A.4), zeroizes the retained application traffic secrets, and closes the
-TCP socket. <span style="color:#2ea44f">**Idempotent**</span>: a second `close()` neither re-sends `close_notify`
-nor double-closes the socket, and never errors. Use it in a `defer` block.
+§5.2/§6.1), zeroizes the retained application traffic secrets, and closes the
+TCP socket. <span style="color:#2ea44f">**Idempotent**</span>: a second
+`close()` neither re-sends `close_notify` nor double-closes the socket, and
+never errors. Use it in a `defer` block.
 If the peer sends `close_notify`, `read()` returns `0` but leaves the TCP socket
 open; call `close()` to release it.
 
@@ -662,8 +677,9 @@ If your threat model needs revocation:
 ## 4. Error handling summary
 
 All fallible operations return `!` (V option/result errors); there are
-<span style="color:#2ea44f">**no panics on malformed input**</span> — bad framing, oversized records, duplicate or
-unpermitted extensions, truncated certificates, and bad share sizes are
+<span style="color:#2ea44f">**no panics on malformed input**</span> — bad
+framing, oversized records, duplicate or unpermitted extensions, truncated
+certificates, and bad share sizes are
 <span style="color:#2ea44f">handshake errors, never memory-safety events</span>.
 
 When the handshake fails, `dial()` sends a fatal alert before closing: a

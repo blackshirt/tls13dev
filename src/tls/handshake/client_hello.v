@@ -8,23 +8,23 @@ import crypto.rand
 import tls.pki
 import tls.wire
 
-// default_supported_groups is the preference order used when none is configured.
-const default_supported_groups = [NamedGroup.x25519, .secp256r1]
+// default_supported_groups returns the group preference order used when none is
+// configured — the full supported set, whose single source is
+// supported_named_groups in messages.v.
+fn default_supported_groups() []NamedGroup {
+	return supported_named_groups
+}
 
-// default_signature_algorithms is the preference order used when none is configured.
-const default_signature_algorithms = [
-	SignatureScheme.rsa_pss_rsae_sha256,
-	.rsa_pss_rsae_sha384,
-	.rsa_pss_rsae_sha512,
-	.ecdsa_secp256r1_sha256,
-	.ecdsa_secp384r1_sha384,
-	.ed25519,
-	.rsa_pkcs1_sha256,
-]
+// default_signature_algorithms returns the scheme preference order used when none
+// is configured — the full supported set, whose single source is
+// supported_signature_schemes in messages.v.
+fn default_signature_algorithms() []SignatureScheme {
+	return supported_signature_schemes
+}
 
 // offered_supported_groups returns the configured groups or their defaults.
 fn offered_supported_groups(groups []NamedGroup) []NamedGroup {
-	return if groups.len > 0 { groups } else { default_supported_groups }
+	return if groups.len > 0 { groups } else { default_supported_groups() }
 }
 
 // validate_handshake_options rejects values that cannot be encoded, that this stack
@@ -97,14 +97,11 @@ fn validate_handshake_options(options HandshakeOptions) ! {
 	}
 }
 
-// default_cipher_suites returns the suite list offered when the caller configures none.
-// ChaCha20-Poly1305 leads because the AEAD backend is software-only.
+// default_cipher_suites returns the suite list offered when the caller configures
+// none — the full supported set, whose single source (including the ChaCha20-first
+// software-AEAD rationale) is supported_cipher_suites in messages.v.
 fn default_cipher_suites() []CipherSuite {
-	return [
-		CipherSuite.tls_chacha20_poly1305_sha256,
-		CipherSuite.tls_aes_128_gcm_sha256,
-		CipherSuite.tls_aes_256_gcm_sha384,
-	]
+	return supported_cipher_suites
 }
 
 // ClientHelloConfig holds the parameters used to build a ClientHello.
@@ -160,7 +157,7 @@ fn offered_signature_algorithms(cfg &ClientHelloConfig) []SignatureScheme {
 	if cfg.signature_algorithms.len > 0 {
 		return cfg.signature_algorithms
 	}
-	return default_signature_algorithms
+	return default_signature_algorithms()
 }
 
 // build_client_hello generates the ClientHello of RFC 8446 §4.1.2, returning the
@@ -178,7 +175,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	}
 	mut body := wire.new_writer(512)
 
-	// Legacy version 0x0303 (TLS 1.2) pinned for middleboxes; the real version comes from supported_versions (§4.2.1).
+	// Legacy version 0x0303 (TLS 1.2) pinned for middleboxes; the real version
+	// comes from supported_versions (§4.2.1).
 	body.write_u16(0x0303)
 
 	// An explicit cfg.random replays RFC test vectors; real handshakes leave it empty (§4.1.4).
@@ -189,7 +187,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	}
 	body.write_bytes(random_bytes)
 
-	// Legacy session id for middlebox compatibility (App. D.4); echoed in ServerHello for the legacy_session_id_echo check.
+	// Legacy session id for middlebox compatibility (App. D.4); echoed in
+	// ServerHello for the legacy_session_id_echo check.
 	session_id := if cfg.session_id.len > 0 {
 		cfg.session_id.clone()
 	} else {
@@ -254,7 +253,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		write_extension(mut ext_writer, .signature_algorithms, sa_w.bytes())!
 	}
 
-	// key_share (RFC 8446 §4.2.8): a u16 vector of group (u16) plus u16-length-prefixed key_exchange entries.
+	// key_share (RFC 8446 §4.2.8): a u16 vector of group (u16) plus
+	// u16-length-prefixed key_exchange entries.
 	{
 		// The client's own share gets the same gates compute_shared_secret applies
 		// to the peer's: a direct ClientHelloConfig builder bypasses
