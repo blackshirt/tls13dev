@@ -91,60 +91,6 @@ pub fn new_client_engine(server_name string, config Config) !Conn {
 		random_cid(8)!, random_cid(8)!)!
 }
 
-// new_client_engine_with_ids constructs an engine with caller-chosen connection
-// IDs. It is private because fixed IDs are only needed by package tests.
-fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOptions, dcid []u8, scid []u8) !Conn {
-	mut hs_options := options
-	// TLS carries these bytes verbatim into the quic_transport_parameters
-	// extension (RFC 9001 §8.2) and never reads them, so encoding them is the
-	// adapter's job. This assignment overrides any caller-supplied value: the
-	// advertised parameter must be this engine's own source connection ID.
-	hs_options.quic_transport_params = encode_transport_parameters(TransportParameters{
-		initial_scid: scid.clone()
-	})!
-	hs := handshake.new_quic_handshake(server_name, hs_options)!
-	mut eng := Conn{
-		hs:        hs
-		dcid:      dcid.clone()
-		scid:      scid.clone()
-		orig_dcid: dcid.clone()
-	}
-	eng.install_initial_keys(dcid)!
-	return eng
-}
-
-// install_initial_keys derives and stores the Initial protection in both
-// directions from the destination connection ID the client's Current Initial
-// packet carries: the original DCID for the first ClientHello (RFC 9001 §5.2), or
-// the server-chosen one for the retry after a HelloRetryRequest (§5.5).
-fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
-	ck, sk := derive_initial_keys(client_dcid)!
-	e.initial_tx = new_initial_protection(ck)!
-	e.initial_rx = new_initial_protection(sk)!
-}
-
-// rederive_initial_keys_after_retry applies RFC 9001 §5.5 once, when the core has
-// accepted a HelloRetryRequest: the retry ClientHello is addressed to the
-// connection ID the server chose in its HRR packet, and Initial secrets are a
-// function of that destination ID, so both directions change (§5.5). The Initial
-// packet-number space resets with them (§5.5.2) - the peer starts numbering its
-// second Initial from 0 again, and reconstructing that number against a
-// high-water mark left over from the old keys would place it past the window.
-//
-// What does NOT reset is the CRYPTO stream at this level: offsets within a level
-// are absolute and monotonic (§19.6), which is what lets the retry ClientHello
-// continue past the original instead of rewriting offset 0.
-fn (mut e Conn) rederive_initial_keys_after_retry() ! {
-	if e.initial_rekeyed || !e.hs.hello_retry_request_received() {
-		return
-	}
-	e.install_initial_keys(e.dcid)!
-	e.initial_ns.next_pn = 0
-	e.initial_ns.largest_rx = 0
-	e.initial_ns.any_rx = false
-	e.initial_rekeyed = true
-}
-
 // state exposes the handshake state (handshake.HandshakeState) for polling.
 pub fn (e &Conn) state() handshake.HandshakeState {
 	return e.hs.state()
@@ -242,6 +188,96 @@ pub fn (mut e Conn) receive(datagram []u8) ![]u8 {
 		}
 	}
 	return e.flush()!
+}
+
+// flush turns all pending outbound CRYPTO bytes into protected packets. Each
+// level's bytes are sent in as many packets as needed; the datagrams are
+// concatenated in level order (Initial, Handshake, 1-RTT), as the coalescing
+// rules require (RFC 9000 §12.2).
+pub fn (mut e Conn) flush() ![]u8 {
+	mut out := []u8{}
+	initial := e.flush_level(.initial)!
+	out << initial
+	hands := e.flush_level(.handshake)!
+	out << hands
+	app := e.flush_level(.one_rtt)!
+	out << app
+	return out
+}
+
+// close builds a CONNECTION_CLOSE datagram carrying a transport error code and
+// reason, for the caller to send (RFC 9000 §19.19). It uses 1-RTT protection if
+// the handshake got far enough to install application keys, otherwise Initial
+// protection.
+pub fn (mut e Conn) close(error_code u32, reason string) ![]u8 {
+	e.closed = true
+	e.close_error = error_code
+	frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
+	// Seal the CONNECTION_CLOSE while the packet keys are still present, then destroy.
+	mut packet := []u8{}
+	if e.app_tx != none {
+		packet = e.seal_raw(.one_rtt, frame)!
+	} else if e.handshake_tx != none {
+		packet = e.seal_raw(.handshake, frame)!
+	} else {
+		packet = e.seal_raw(.initial, frame)!
+	}
+	e.destroy_on_close()!
+	return packet
+}
+
+// new_client_engine_with_ids constructs an engine with caller-chosen connection
+// IDs. It is private because fixed IDs are only needed by package tests.
+fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOptions, dcid []u8, scid []u8) !Conn {
+	mut hs_options := options
+	// TLS carries these bytes verbatim into the quic_transport_parameters
+	// extension (RFC 9001 §8.2) and never reads them, so encoding them is the
+	// adapter's job. This assignment overrides any caller-supplied value: the
+	// advertised parameter must be this engine's own source connection ID.
+	hs_options.quic_transport_params = encode_transport_parameters(TransportParameters{
+		initial_scid: scid.clone()
+	})!
+	hs := handshake.new_quic_handshake(server_name, hs_options)!
+	mut eng := Conn{
+		hs:        hs
+		dcid:      dcid.clone()
+		scid:      scid.clone()
+		orig_dcid: dcid.clone()
+	}
+	eng.install_initial_keys(dcid)!
+	return eng
+}
+
+// install_initial_keys derives and stores the Initial protection in both
+// directions from the destination connection ID the client's Current Initial
+// packet carries: the original DCID for the first ClientHello (RFC 9001 §5.2), or
+// the server-chosen one for the retry after a HelloRetryRequest (§5.5).
+fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
+	ck, sk := derive_initial_keys(client_dcid)!
+	e.initial_tx = new_initial_protection(ck)!
+	e.initial_rx = new_initial_protection(sk)!
+}
+
+// rederive_initial_keys_after_retry applies RFC 9001 §5.5 once, when the core has
+// accepted a HelloRetryRequest: the retry ClientHello is addressed to the
+// connection ID the server chose in its HRR packet, and Initial secrets are a
+// function of that destination ID, so both directions change (§5.5). The Initial
+// packet-number space resets with them (§5.5.2) - the peer starts numbering its
+// second Initial from 0 again, and reconstructing that number against a
+// high-water mark left over from the old keys would place it past the window.
+//
+// What does NOT reset is the CRYPTO stream at this level: offsets within a level
+// are absolute and monotonic (§19.6), which is what lets the retry ClientHello
+// continue past the original instead of rewriting offset 0.
+fn (mut e Conn) rederive_initial_keys_after_retry() ! {
+	if e.initial_rekeyed || !e.hs.hello_retry_request_received() {
+		return
+	}
+	e.install_initial_keys(e.dcid)!
+	e.initial_ns.next_pn = 0
+	e.initial_ns.largest_rx = 0
+	e.initial_ns.any_rx = false
+	e.initial_rekeyed = true
 }
 
 // receive_packet handles one coalesced packet at the front of `buf`, returning
@@ -495,21 +531,6 @@ fn expand_direction(hash handshake.HashAlgorithm, secret []u8, key_len int) !Pro
 	}
 }
 
-// flush turns all pending outbound CRYPTO bytes into protected packets. Each
-// level's bytes are sent in as many packets as needed; the datagrams are
-// concatenated in level order (Initial, Handshake, 1-RTT), as the coalescing
-// rules require (RFC 9000 §12.2).
-pub fn (mut e Conn) flush() ![]u8 {
-	mut out := []u8{}
-	initial := e.flush_level(.initial)!
-	out << initial
-	hands := e.flush_level(.handshake)!
-	out << hands
-	app := e.flush_level(.one_rtt)!
-	out << app
-	return out
-}
-
 // flush_level emits the pending CRYPTO bytes for one level as one or more
 // protected packets.
 fn (mut e Conn) flush_level(ptype PacketType) ![]u8 {
@@ -569,39 +590,6 @@ fn (mut e Conn) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len in
 	}
 }
 
-// fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
-// records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
-// §7.5). The record adapter wipes its core secrets on failure (its
-// destroy_on_failure); the QUIC adapter must do the same, or a dead handshake
-// leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
-// The caller emits a CONNECTION_CLOSE with the recorded code.
-fn (mut e Conn) fail_close() ! {
-	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
-	e.hs.fail_and_zeroize_secrets()
-	e.closed = true
-}
-
-// close builds a CONNECTION_CLOSE datagram carrying a transport error code and
-// reason, for the caller to send (RFC 9000 §19.19). It uses 1-RTT protection if
-// the handshake got far enough to install application keys, otherwise Initial
-// protection.
-pub fn (mut e Conn) close(error_code u32, reason string) ![]u8 {
-	e.closed = true
-	e.close_error = error_code
-	frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
-	// Seal the CONNECTION_CLOSE while the packet keys are still present, then destroy.
-	mut packet := []u8{}
-	if e.app_tx != none {
-		packet = e.seal_raw(.one_rtt, frame)!
-	} else if e.handshake_tx != none {
-		packet = e.seal_raw(.handshake, frame)!
-	} else {
-		packet = e.seal_raw(.initial, frame)!
-	}
-	e.destroy_on_close()!
-	return packet
-}
-
 // seal_raw seals an arbitrary frame payload (not CRYPTO) into one packet at the
 // chosen level. It is used for CONNECTION_CLOSE, which no CRYPTO buffer holds.
 fn (mut e Conn) seal_raw(ptype PacketType, payload []u8) ![]u8 {
@@ -617,6 +605,18 @@ fn (mut e Conn) seal_raw(ptype PacketType, payload []u8) ![]u8 {
 	e.store_tx(ptype, tx)
 	e.bump_pn(ptype)
 	return packet
+}
+
+// fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
+// records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
+// §7.5). The record adapter wipes its core secrets on failure (its
+// destroy_on_failure); the QUIC adapter must do the same, or a dead handshake
+// leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
+// The caller emits a CONNECTION_CLOSE with the recorded code.
+fn (mut e Conn) fail_close() ! {
+	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
+	e.hs.fail_and_zeroize_secrets()
+	e.closed = true
 }
 
 // drop_handshake_keys releases the Handshake-level packet keys AND the core's
@@ -673,8 +673,6 @@ fn (mut e Conn) destroy_on_close() ! {
 	e.tx_crypto_initial = []u8{}
 	e.tx_crypto_hands = []u8{}
 }
-
-// --- small helpers -----------------------------------------------------------
 
 // ns_mut returns the LevelKeys for a parsed packet type.
 fn (mut e Conn) ns_mut(ptype PacketType) &LevelKeys {

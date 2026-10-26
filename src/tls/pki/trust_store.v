@@ -46,6 +46,13 @@ const max_pem_bundle_bytes = 2 * 1024 * 1024
 // stay in lock-step (a block that would pass add_pem's size filter and then
 // trip parse_certificate's own cap would produce a confusing double guard).
 
+// cached_system_roots memoizes the parsed system trust bundle so dial() does
+// not re-read a ~150-root file on every connection. The mutex guards the slice
+// header against concurrent first dials; system_root_cas() hands each caller a
+// private clone, so mutating the returned store cannot corrupt the cache.
+__global cached_system_roots []Certificate
+__global cached_system_roots_mu sync.Mutex
+
 // add_der parses and appends a single DER-encoded certificate into the store.
 pub fn (mut ts TrustStore) add_der(der []u8) ! {
 	cert := parse_certificate(der)!
@@ -136,13 +143,6 @@ pub fn (mut ts TrustStore) load_system_ca_bundle() !int {
 	}
 	return error('trust_store: no system root CA bundle found')
 }
-
-// cached_system_roots memoizes the parsed system trust bundle so dial() does
-// not re-read a ~150-root file on every connection. The mutex guards the slice
-// header against concurrent first dials; system_root_cas() hands each caller a
-// private clone, so mutating the returned store cannot corrupt the cache.
-__global cached_system_roots []Certificate
-__global cached_system_roots_mu sync.Mutex
 
 // system_root_cas returns a TrustStore backed by the process-wide parsed
 // system bundle, parsing it on first use. dial() uses this instead of

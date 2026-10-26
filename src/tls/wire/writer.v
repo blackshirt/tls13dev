@@ -80,7 +80,7 @@ pub fn (mut w Writer) write_bytes(data []u8) {
 	w.buf << data
 }
 
-// Vector writers produce the `opaque T<V>` framing of RFC 8446 §3 (length prefix + bytes).
+// These emit the `opaque T<V>` framing of RFC 8446 §3 (length prefix + bytes).
 
 // write_vector_u8 appends a byte slice prefixed with its 1-byte length.
 pub fn (mut w Writer) write_vector_u8(data []u8) ! {

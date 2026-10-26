@@ -3,8 +3,8 @@
 // state_machine.v owns the entire transport-neutral handshake core shared by
 // both adapters: client state, public accessors, reassembly and dispatch, the
 // facade-shared HandshakeOptions, the ServerHello/HelloRetryRequest transition,
-// encrypted-flight processing, ephemeral ECDHE, and the secret lifecycle (all
-// in the sections below). Transport-specific methods are defined on their
+// encrypted-flight processing, ephemeral ECDHE, and the secret lifecycle.
+// Transport-specific methods are defined on their
 // facade — tls_handshake.v and quic_handshake.v — never promoted from here.
 // Message codecs, the transcript, and the key schedule keep their own files.
 module handshake
@@ -14,6 +14,8 @@ import crypto.rand
 import crypto.subtle
 import x.crypto.curve25519
 import tls.pki
+
+//  Types: state, messages, options, and the core state struct
 
 // HandshakeState tracks client progress; the wait_* order mirrors the fixed
 // post-ServerHello flight (RFC 8446 §1/§4.1), each handler asserting its state.
@@ -139,6 +141,8 @@ mut:
 // against max_handshake_message_len.
 const reassembly_buf_cap = 4096
 
+//  Construction
+
 // new_handshake_core creates shared state from the server name and complete
 // handshake options, including ALPN and certificate validation.
 fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool) !HandshakeCore {
@@ -190,6 +194,8 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	return core
 }
 
+//  Public accessors
+
 // state reports current handshake progress; adapters poll it to know
 // when the handshake completed and which messages are still legal on the wire.
 pub fn (h &HandshakeCore) state() HandshakeState {
@@ -199,6 +205,11 @@ pub fn (h &HandshakeCore) state() HandshakeState {
 // negotiated_alpn returns the ALPN protocol the server picked ('' when none).
 pub fn (h &HandshakeCore) negotiated_alpn() string {
 	return h.negotiated_alpn
+}
+
+// negotiated_cipher_suite reports the suite selected by the server in ServerHello.
+pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
+	return h.cipher_suite
 }
 
 // failure_alert returns the alert description an adapter should surface when
@@ -225,6 +236,8 @@ pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	}
 }
 
+//  Terminal-failure and transcript primitives
+
 // classify_failure is the single terminal-failure primitive for the core: it pins
 // the alert the adapter must surface, zeroes every derived secret, parks the
 // machine in .failed, and returns the IError to propagate (RFC 8446 §7.5), so a
@@ -243,6 +256,8 @@ fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 		return h.classify_failure(.decode_error, err.msg())
 	}
 }
+
+//  Reassembly and dispatch
 
 // create_client_hello generates the initial ClientHello, advances to
 // .wait_server_hello and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
@@ -383,11 +398,6 @@ fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
 	return out
 }
 
-// negotiated_cipher_suite reports the suite selected by the server in ServerHello.
-pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
-	return h.cipher_suite
-}
-
 // handle_handshake_message processes one complete encrypted-flight message:
 // EE, optional CertificateRequest, Certificate, CertificateVerify, or Finished.
 fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMessage {
@@ -409,7 +419,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 	}
 }
 
-// ─── Ephemeral ECDHE key exchange (RFC 8446 §4.2.8) ───
+//  Ephemeral ECDHE key exchange (RFC 8446 §4.2.8)
 
 // generate_key_share creates a fresh ephemeral private key for the requested group.
 fn (mut h HandshakeCore) generate_key_share(group NamedGroup) ! {
@@ -535,7 +545,7 @@ fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8
 	return error('handshake: unsupported key_share group ${server_share.group}')
 }
 
-// ─── ServerHello / HelloRetryRequest transition (RFC 8446 §4.1.3/§4.1.4) ───
+//  ServerHello / HelloRetryRequest transition (RFC 8446 §4.1.3/§4.1.4)
 
 // handle_server_hello_message consumes one complete initial-level ServerHello
 // or HelloRetryRequest and returns the follow-up messages (RFC 8446 §4.1.3).
@@ -677,7 +687,7 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	return [new_handshake_message(.initial, full_ch2)!]
 }
 
-// ─── Encrypted flight: EE, Certificate, CertificateVerify, Finished (§4.3–§4.4) ───
+//  Encrypted flight: EE, Certificate, CertificateVerify, Finished (§4.3–§4.4)
 
 // handle_encrypted_extensions records ALPN and QUIC transport parameters.
 fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) ![]HandshakeMessage {
@@ -821,7 +831,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	return [new_handshake_message(.handshake, client_fin_msg)!]
 }
 
-// ─── Secret lifecycle: wiping and zeroization (RFC 8446 §1.3.1/§7.5) ───
+//  Secret lifecycle: wiping and zeroization (RFC 8446 §1.3.1/§7.5)
 
 // wipe_traffic_secrets zeroes the client and server traffic secrets for one
 // encryption level; the initial level has no TLS traffic secrets. It mirrors the

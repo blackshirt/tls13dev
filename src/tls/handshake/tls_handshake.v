@@ -19,6 +19,8 @@ mut:
 	server_app_keys TrafficKeys // Cached record keys for the server at the application level.
 }
 
+//  Public API: construction and dispatch driver
+
 // new_tls_handshake creates a TLS-over-records handshake facade.
 // HandshakeOptions fields can be supplied as optional named arguments.
 pub fn new_tls_handshake(server_name string, options HandshakeOptions) !TLSHandshake {
@@ -43,6 +45,8 @@ pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes [
 	return messages
 }
 
+//  Public API: record-layer accessors and reassembly hooks
+
 // unconsumed_bytes reports bytes the core's reassembly retained after complete
 // TLS messages were consumed. Record-path scope: only the TLS adapter enforces
 // the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO stream.
@@ -64,22 +68,6 @@ pub fn (mut h TLSHandshake) take_buffered_handshake_bytes() []u8 {
 	}
 	h.hsk_buf = []u8{}
 	return taken
-}
-
-// fail_and_zeroize_secrets marks the handshake failed and wipes TLS secrets and
-// all cached record keys. It does not close the TCP connection.
-pub fn (mut h TLSHandshake) fail_and_zeroize_secrets() {
-	h.HandshakeCore.fail_and_zeroize_secrets()
-	h.wipe_record_keys()
-}
-
-// zeroize_traffic_secrets destroys the traffic secrets for one encryption level
-// plus that level's cached record keys; valid only after .connected (core guard)
-// and the initial level is refused. Used both for application teardown and, once
-// the record adapter no longer needs them, for the handshake keys/secrets.
-pub fn (mut h TLSHandshake) zeroize_traffic_secrets(level EncryptionLevel) ! {
-	h.HandshakeCore.zeroize_traffic_secrets(level)!
-	h.wipe_record_keys_at(level)
 }
 
 // record_traffic_keys returns independent copies of the cached client/server
@@ -141,6 +129,26 @@ pub fn (mut h TLSHandshake) update_traffic_keys(is_server bool) ! {
 		h.client_app_keys = next
 	}
 }
+
+//  Public API: secret lifecycle (facade overrides of the core)
+
+// fail_and_zeroize_secrets marks the handshake failed and wipes TLS secrets and
+// all cached record keys. It does not close the TCP connection.
+pub fn (mut h TLSHandshake) fail_and_zeroize_secrets() {
+	h.HandshakeCore.fail_and_zeroize_secrets()
+	h.wipe_record_keys()
+}
+
+// zeroize_traffic_secrets destroys the traffic secrets for one encryption level
+// plus that level's cached record keys; valid only after .connected (core guard)
+// and the initial level is refused. Used both for application teardown and, once
+// the record adapter no longer needs them, for the handshake keys/secrets.
+pub fn (mut h TLSHandshake) zeroize_traffic_secrets(level EncryptionLevel) ! {
+	h.HandshakeCore.zeroize_traffic_secrets(level)!
+	h.wipe_record_keys_at(level)
+}
+
+//  Private: record-key cache derivation and wiping
 
 // derive_updated_traffic_keys performs the TLS KeyUpdate "traffic upd" derivation:
 // the next application traffic secret from the current one, then its cached keys.

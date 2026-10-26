@@ -94,7 +94,7 @@ pub fn (mut r Reader) read_bytes(n int) ![]u8 {
 	return slice
 }
 
-// Vector accessors decode the `opaque T<V>` syntax: length prefix + bytes (RFC 8446 §3).
+// These decode the `opaque T<V>` syntax: length prefix + bytes (RFC 8446 §3).
 
 // read_vector_u8 reads a vector prefixed with a 1-byte length.
 pub fn (mut r Reader) read_vector_u8() ![]u8 {

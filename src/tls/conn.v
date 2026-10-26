@@ -14,6 +14,8 @@ import tls.handshake
 import tls.pki
 import tls.wire
 
+//  Tunable limits
+
 // max_stored_session_tickets bounds the NewSessionTicket backlog kept on the
 // Conn; resumption is unimplemented, so the queue is only diagnostic
 // (RFC 8446 §4.6.1).
@@ -56,15 +58,6 @@ const max_handshake_recv_buf_len = 2 * max_ciphertext_record_len + record_header
 // handshake deadline (RFC 8446 §4 orders the flight; nothing legit repeats it).
 const max_handshake_flight_records = 64
 
-// mono_ms is the module's monotonic millisecond clock, read from
-// time.sys_mono_now() (CLOCK_MONOTONIC, nanoseconds ÷ 1e6 per millisecond): an NTP
-// step or wall-clock edit cannot stretch or truncate the handshake window. The
-// origin is system boot, not the epoch, so only differences against a mono_ms()
-// baseline are used.
-fn mono_ms() i64 {
-	return i64(time.sys_mono_now()) / i64(time.millisecond)
-}
-
 // max_tolerated_records_per_read bounds the records one Conn.read() may skip
 // without delivering data — zero-length padding and post-handshake messages are
 // legal (RFC 8446 §5.2/§4.6), but a verified flood must not starve the caller.
@@ -76,6 +69,8 @@ const max_tolerated_records_per_read = 100
 // record packs ~3300 eight-byte KeyUpdate or ticket bodies, each costing a
 // rekey (plus a KeyUpdate response write), so the bound fires before that work.
 const max_post_handshake_messages_per_record = 1000
+
+//  Public types
 
 // Conn is a TLS 1.3 client connection over TCP, built only by dial(). read() and
 // write() take separate mutexes; the lock order is always rlock → wlock.
@@ -178,6 +173,8 @@ pub:
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }
+
+//  Public API
 
 // default_config builds a Config for the given hostname that trusts the system
 // root store (root_cas stays none, so dial loads it) and keeps verification on.
@@ -299,6 +296,155 @@ pub fn dial(address string, config Config) !&Conn {
 	sock.set_read_timeout(conn.sock_timeout)
 	return conn
 }
+
+// read decrypts application data into buf. Returns bytes read (0 on clean close).
+pub fn (mut c Conn) read(mut buf []u8) !int {
+	// Serialize the whole read path: recv_buf, the read cipher and the sticky error.
+	c.rlock.lock()
+	defer {
+		c.rlock.unlock()
+	}
+	if buf.len == 0 {
+		return 0
+	}
+	// A fatal alert is sticky: report it on every later read, never 0.
+	if c.fatal_error != '' {
+		return error(c.fatal_error)
+	}
+	// Drain leftovers first so no plaintext is dropped or reordered.
+	if c.app_buf.len > c.app_pos {
+		n := copy(mut buf, c.app_buf[c.app_pos..])
+		c.app_pos += n
+		if c.app_pos == c.app_buf.len {
+			c.clear_app_buf()
+		}
+		return n
+	}
+	if c.closed {
+		return 0
+	}
+
+	mut tolerated_records := 0
+	for {
+		rec := c.read_raw_record() or {
+			alert := c.fail_alert or { handshake.AlertDescription.decode_error }
+			return c.abort_connection(alert, err.msg())
+		}
+		match rec.content_type {
+			.change_cipher_spec {
+				// RFC 8446 §5: a CCS record is illegal once application keys are in use.
+				return c.abort_connection(.unexpected_message, 'tls: received change_cipher_spec record after handshake (unexpected_message)')
+			}
+			.alert {
+				// RFC 8446 §6: post-handshake alerts must be encrypted; a plaintext one is rejected.
+				return c.abort_connection(.unexpected_message, 'tls: received unencrypted alert post-handshake (must be encrypted)')
+			}
+			.application_data {
+				mut dec := c.server_app_cipher.decrypt_record(rec) or {
+					return c.abort_connection(decrypt_failure_alert(err.msg()), err.msg())
+				}
+				match dec.content_type {
+					.application_data {
+						// Application traffic of any length breaks a KeyUpdate run (§4.5).
+						c.peer_key_update = false
+						if dec.plaintext.len == 0 {
+							// Zero-length records are legal (padding only), but a verified flood
+							// must not spin this loop forever (max_tolerated_records_per_read).
+							tolerated_records++
+							if tolerated_records > max_tolerated_records_per_read {
+								return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
+							}
+							continue
+						}
+						n := copy(mut buf, dec.plaintext)
+						if n < dec.plaintext.len {
+							c.app_buf << dec.plaintext[n..]
+						}
+						// Scrub the decrypted staging copy the moment it is fully
+						// delivered; the undelivered remainder is scrubbed when
+						// app_buf drains (§7.5 spirit: no plaintext left in freed memory).
+						for i in 0 .. dec.plaintext.len {
+							dec.plaintext[i] = 0
+						}
+						return n
+					}
+					.alert {
+						// Post-handshake alerts arrive encrypted as the inner type (RFC 8446 §5.1/§6).
+						return c.handle_alert(dec.plaintext)
+					}
+					.handshake {
+						// NewSessionTicket/KeyUpdate must not surface as application data, but a
+						// record flood of them is the same starvation vector as empty padding.
+						tolerated_records++
+						if tolerated_records > max_tolerated_records_per_read {
+							return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
+						}
+						c.handle_post_handshake(dec.plaintext)!
+						continue
+					}
+					else {
+						return c.abort_connection(.unexpected_message, 'tls: unexpected inner content type ${dec.content_type}')
+					}
+				}
+			}
+			else {
+				return c.abort_connection(.unexpected_message, 'tls: unexpected record type ${rec.content_type} after handshake')
+			}
+		}
+	}
+	// The loop only exits through the explicit returns inside the match arms or an
+	// error propagation; this fail-closed tail exists so no future path can fall out.
+	return error('tls: unreachable')
+}
+
+// write encrypts and sends application data.
+@[direct_array_access]
+pub fn (mut c Conn) write(data []u8) !int {
+	// Serialize against other writers and the read path's KeyUpdate response.
+	c.wlock.lock()
+	defer {
+		c.wlock.unlock()
+	}
+	// Refuse to encrypt onto a finished connection.
+	if c.closed {
+		return error('tls: connection closed')
+	}
+	// Application keys exist only once connected.
+	if c.hs.state() != .connected {
+		return error('tls: handshake not complete')
+	}
+	return c.write_application_data(data)
+}
+
+// close sends a close_notify alert and closes the underlying TCP connection.
+pub fn (mut c Conn) close() ! {
+	// Take the write lock only: a blocked reader is unblocked by closing the socket.
+	c.wlock.lock()
+	defer {
+		c.wlock.unlock()
+	}
+	// Idempotent teardown: no second close_notify, no double socket close.
+	if c.closed {
+		c.close_tcp_socket()
+		return
+	}
+	// Emit close_notify at most once, guarded separately from `closed`.
+	if !c.close_notify_sent {
+		c.close_notify_sent = true
+		c.send_close_notify()
+	}
+	c.closed = true
+	// Teardown is terminal: destroy both key layers (RFC 8446 §1.3.1/§7.5).
+	c.destroy_on_close()!
+	c.close_tcp_socket()
+}
+
+// negotiated_alpn returns the negotiated ALPN protocol, if any.
+pub fn (c Conn) negotiated_alpn() string {
+	return c.negotiated_alpn
+}
+
+//  Handshake driving
 
 // do_handshake drives the full client flight over TCP: frame the ClientHello
 // (+dummy CCS), then feed records into the core until it reports .connected (§5.1).
@@ -437,7 +583,6 @@ fn (mut c Conn) do_handshake() ! {
 	c.hs.zeroize_traffic_secrets(.handshake)!
 }
 
-// ─── TCP transport: framing, write batching, dummy CCS ───
 // validate_compat_ccs checks one dummy ChangeCipherSpec record and enforces max_compat_ccs_records.
 fn validate_compat_ccs(payload []u8, seen int) !int {
 	mut total := seen + 1
@@ -451,33 +596,63 @@ fn validate_compat_ccs(payload []u8, seen int) !int {
 	return total
 }
 
-// write_records serializes records into one buffer and writes the full batch,
-// continuing after short writes. It returns only after all bytes are sent or an
-// error occurs, so callers do not need a partial byte count (RFC 8446 §5).
-fn (mut c Conn) write_records(recs []Record) ! {
-	if c.sock == unsafe { nil } {
-		return error('tls: socket is nil')
+//  Record protection state
+
+// tls_protection_from_keys instantiates one direction's record protection from
+// the core's derived key and IV bytes; sequence numbers restart at 0 per generation (§5.3).
+fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
+	aead := handshake.new_aead_for_suite(suite, key)!
+	return new_tls_protection(aead, iv)!
+}
+
+// decrypt_failure_alert maps a decrypt_record error to the fatal alert the record
+// layer must surface: rekey exhaustion is record_overflow, a failed tag is
+// bad_record_mac, anything else is unexpected_message (RFC 8446 §5.5/§6).
+fn decrypt_failure_alert(msg string) handshake.AlertDescription {
+	if msg.contains('sequence limit') {
+		return .record_overflow
 	}
-	if recs.len == 0 {
-		return
+	if msg.contains('AEAD decryption failed') {
+		return .bad_record_mac
 	}
-	mut total := 0
-	for rec in recs {
-		total += record_header_len + rec.payload.len
+	return .unexpected_message
+}
+
+// install_ciphers builds both protection states for one key generation from the
+// core's record_traffic_keys(level); called once after the ServerHello is fed
+// (.handshake) and once at .connected (.application). Initial keys are refused:
+// this adapter never installs them, so a misleveled future call fails closed.
+fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
+	if level == .initial {
+		return error('tls: no record protection exists for the initial level')
 	}
-	mut batched := []u8{cap: total}
-	for rec in recs {
-		rec.serialize_into(mut batched)
-	}
-	mut written := 0
-	for written < batched.len {
-		n := c.sock.write(batched[written..])!
-		if n <= 0 {
-			return error('tls: socket write made no progress (${written}/${batched.len} bytes)')
-		}
-		written += n
+	ck, civ, sk, siv := c.hs.record_traffic_keys(level)!
+	suite := c.hs.negotiated_cipher_suite()
+	if level == .handshake {
+		c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
+		c.server_hsk_cipher = tls_protection_from_keys(suite, sk, siv)!
+	} else {
+		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
+		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
 	}
 }
+
+// rekey_cipher rebuilds one application protection state after the core updated
+// the matching secret (RFC 8446 §4.6.3): is_server=true swaps the read (server)
+// leg, false the write (client) leg — the same direction vocabulary the core's
+// update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
+// restart at 0 per generation (§5.3).
+fn (mut c Conn) rekey_cipher(is_server bool) ! {
+	ck, civ, sk, siv := c.hs.record_traffic_keys(.application)!
+	suite := c.hs.negotiated_cipher_suite()
+	if is_server {
+		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
+	} else {
+		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
+	}
+}
+
+//  Read path internals
 
 // read_raw_record blocks until one complete TLS record (header + payload) is
 // buffered, then parses it in place off recv_buf; TCP may split or coalesce records.
@@ -558,84 +733,6 @@ fn (mut c Conn) compact_recv_buf() {
 	}
 }
 
-// zero_bytes wipes a buffer in place before it is dropped or reused, so freed
-// memory retains no plaintext (RFC 8446 §7.5 spirit); one implementation for
-// every staged-bytes scrub below.
-fn zero_bytes(mut buf []u8) {
-	for i in 0 .. buf.len {
-		buf[i] = 0
-	}
-}
-
-// clear_app_buf zeroes then drops the staged-but-undelivered application
-// plaintext, so freed buffer memory never retains decrypted bytes (§7.5 spirit).
-fn (mut c Conn) clear_app_buf() {
-	zero_bytes(mut c.app_buf)
-	c.app_buf.clear()
-	c.app_pos = 0
-}
-
-// clear_post_hsk_buf zeroes then drops staged post-handshake bytes so freed memory
-// retains no partial handshake message (RFC 8446 §5.2; §7.5 spirit).
-fn (mut c Conn) clear_post_hsk_buf() {
-	zero_bytes(mut c.post_hsk_buf)
-	c.post_hsk_buf = []u8{}
-}
-
-// decrypt_failure_alert maps a decrypt_record error to the fatal alert the record
-// layer must surface: rekey exhaustion is record_overflow, a failed tag is
-// bad_record_mac, anything else is unexpected_message (RFC 8446 §5.5/§6).
-fn decrypt_failure_alert(msg string) handshake.AlertDescription {
-	if msg.contains('sequence limit') {
-		return .record_overflow
-	}
-	if msg.contains('AEAD decryption failed') {
-		return .bad_record_mac
-	}
-	return .unexpected_message
-}
-
-// tls_protection_from_keys instantiates one direction's record protection from
-// the core's derived key and IV bytes; sequence numbers restart at 0 per generation (§5.3).
-fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
-	aead := handshake.new_aead_for_suite(suite, key)!
-	return new_tls_protection(aead, iv)!
-}
-
-// install_ciphers builds both protection states for one key generation from the
-// core's record_traffic_keys(level); called once after the ServerHello is fed
-// (.handshake) and once at .connected (.application). Initial keys are refused:
-// this adapter never installs them, so a misleveled future call fails closed.
-fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
-	if level == .initial {
-		return error('tls: no record protection exists for the initial level')
-	}
-	ck, civ, sk, siv := c.hs.record_traffic_keys(level)!
-	suite := c.hs.negotiated_cipher_suite()
-	if level == .handshake {
-		c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
-		c.server_hsk_cipher = tls_protection_from_keys(suite, sk, siv)!
-	} else {
-		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
-		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
-	}
-}
-
-// rekey_cipher rebuilds one application protection state after the core updated
-// the matching secret (RFC 8446 §4.6.3): is_server=true swaps the read (server)
-// leg, false the write (client) leg — the same direction vocabulary the core's
-// update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
-// restart at 0 per generation (§5.3).
-fn (mut c Conn) rekey_cipher(is_server bool) ! {
-	ck, civ, sk, siv := c.hs.record_traffic_keys(.application)!
-	suite := c.hs.negotiated_cipher_suite()
-	if is_server {
-		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
-	} else {
-		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
-	}
-}
-
 // handle_alert processes an alert received after the handshake. It marks the
 // connection closed and returns 0 for a clean close_notify, else an error.
 fn (mut c Conn) handle_alert(payload []u8) !int {
@@ -665,106 +762,6 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// Every other description is fatal (RFC 8446 §6): surface the peer's code, sticky.
 	c.fatal_error = 'tls: received alert ${peer_alert.description}'
 	return error(c.fatal_error)
-}
-
-// read decrypts application data into buf. Returns bytes read (0 on clean close).
-pub fn (mut c Conn) read(mut buf []u8) !int {
-	// Serialize the whole read path: recv_buf, the read cipher and the sticky error.
-	c.rlock.lock()
-	defer {
-		c.rlock.unlock()
-	}
-	if buf.len == 0 {
-		return 0
-	}
-	// A fatal alert is sticky: report it on every later read, never 0.
-	if c.fatal_error != '' {
-		return error(c.fatal_error)
-	}
-	// Drain leftovers first so no plaintext is dropped or reordered.
-	if c.app_buf.len > c.app_pos {
-		n := copy(mut buf, c.app_buf[c.app_pos..])
-		c.app_pos += n
-		if c.app_pos == c.app_buf.len {
-			c.clear_app_buf()
-		}
-		return n
-	}
-	if c.closed {
-		return 0
-	}
-
-	mut tolerated_records := 0
-	for {
-		rec := c.read_raw_record() or {
-			alert := c.fail_alert or { handshake.AlertDescription.decode_error }
-			return c.abort_connection(alert, err.msg())
-		}
-		match rec.content_type {
-			.change_cipher_spec {
-				// RFC 8446 §5: a CCS record is illegal once application keys are in use.
-				return c.abort_connection(.unexpected_message, 'tls: received change_cipher_spec record after handshake (unexpected_message)')
-			}
-			.alert {
-				// RFC 8446 §6: post-handshake alerts must be encrypted; a plaintext one is rejected.
-				return c.abort_connection(.unexpected_message, 'tls: received unencrypted alert post-handshake (must be encrypted)')
-			}
-			.application_data {
-				mut dec := c.server_app_cipher.decrypt_record(rec) or {
-					return c.abort_connection(decrypt_failure_alert(err.msg()), err.msg())
-				}
-				match dec.content_type {
-					.application_data {
-						// Application traffic of any length breaks a KeyUpdate run (§4.5).
-						c.peer_key_update = false
-						if dec.plaintext.len == 0 {
-							// Zero-length records are legal (padding only), but a verified flood
-							// must not spin this loop forever (max_tolerated_records_per_read).
-							tolerated_records++
-							if tolerated_records > max_tolerated_records_per_read {
-								return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
-							}
-							continue
-						}
-						n := copy(mut buf, dec.plaintext)
-						if n < dec.plaintext.len {
-							c.app_buf << dec.plaintext[n..]
-						}
-						// Scrub the decrypted staging copy the moment it is fully
-						// delivered; the undelivered remainder is scrubbed when
-						// app_buf drains (§7.5 spirit: no plaintext left in freed memory).
-						for i in 0 .. dec.plaintext.len {
-							dec.plaintext[i] = 0
-						}
-						return n
-					}
-					.alert {
-						// Post-handshake alerts arrive encrypted as the inner type (RFC 8446 §5.1/§6).
-						return c.handle_alert(dec.plaintext)
-					}
-					.handshake {
-						// NewSessionTicket/KeyUpdate must not surface as application data, but a
-						// record flood of them is the same starvation vector as empty padding.
-						tolerated_records++
-						if tolerated_records > max_tolerated_records_per_read {
-							return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
-						}
-						c.handle_post_handshake(dec.plaintext)!
-						continue
-					}
-					else {
-						return c.abort_connection(.unexpected_message, 'tls: unexpected inner content type ${dec.content_type}')
-					}
-				}
-			}
-			else {
-				return c.abort_connection(.unexpected_message, 'tls: unexpected record type ${rec.content_type} after handshake')
-			}
-		}
-	}
-	// The loop only exits through the explicit returns inside the match arms or an
-	// error propagation; this fail-closed tail exists so no future path can fall out.
-	return error('tls: unreachable')
 }
 
 // handle_post_handshake consumes NewSessionTicket and KeyUpdate messages from a
@@ -858,57 +855,34 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	}
 }
 
-// abort_connection sends a best-effort fatal alert, destroys connection secrets,
-// closes the socket, and makes the failure sticky for subsequent reads.
-fn (mut c Conn) abort_connection(alert handshake.AlertDescription, message string) IError {
-	c.wlock.lock()
-	defer {
-		c.wlock.unlock()
-	}
-	return c.abort_connection_locked(alert, message)
-}
+//  Write path internals
 
-// abort_connection_locked terminates the connection while its write lock is
-// already held, avoiding recursive locking from write() failure handling.
-fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, message string) IError {
-	c.fail_alert = alert
-	c.closed = true
-	c.fatal_error = message
-	c.send_failure_alert()
-	c.destroy_on_failure()
-	c.clear_app_buf()
-	c.clear_post_hsk_buf()
-	c.close_tcp_socket()
-	return error(message)
-}
-
-// classify_failure records the alert the adapter must surface for a handshake-phase
-// failure and returns the terminating error, so a call site cannot pin half of it.
-// Unlike abort_connection, it deliberately does NOT tear down: every error
-// propagates to dial()'s single teardown wrapper, which sends the pinned alert
-// instead of the stale .internal_error fallback for an unset fail_alert.
-fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message string) IError {
-	c.fail_alert = alert
-	return error(message)
-}
-
-// write encrypts and sends application data.
-@[direct_array_access]
-pub fn (mut c Conn) write(data []u8) !int {
-	// Serialize against other writers and the read path's KeyUpdate response.
-	c.wlock.lock()
-	defer {
-		c.wlock.unlock()
+// write_records serializes records into one buffer and writes the full batch,
+// continuing after short writes. It returns only after all bytes are sent or an
+// error occurs, so callers do not need a partial byte count (RFC 8446 §5).
+fn (mut c Conn) write_records(recs []Record) ! {
+	if c.sock == unsafe { nil } {
+		return error('tls: socket is nil')
 	}
-	// Refuse to encrypt onto a finished connection.
-	if c.closed {
-		return error('tls: connection closed')
+	if recs.len == 0 {
+		return
 	}
-	// Application keys exist only once connected.
-	if c.hs.state() != .connected {
-		return error('tls: handshake not complete')
+	mut total := 0
+	for rec in recs {
+		total += record_header_len + rec.payload.len
 	}
-	return c.write_application_data(data)
+	mut batched := []u8{cap: total}
+	for rec in recs {
+		rec.serialize_into(mut batched)
+	}
+	mut written := 0
+	for written < batched.len {
+		n := c.sock.write(batched[written..])!
+		if n <= 0 {
+			return error('tls: socket write made no progress (${written}/${batched.len} bytes)')
+		}
+		written += n
+	}
 }
 
 // write_application_data encrypts and sends application data while the caller
@@ -986,27 +960,40 @@ fn (mut c Conn) send_key_update_response() ! {
 	c.send_key_update_record_locked()!
 }
 
-// close sends a close_notify alert and closes the underlying TCP connection.
-pub fn (mut c Conn) close() ! {
-	// Take the write lock only: a blocked reader is unblocked by closing the socket.
+//  Failure & teardown
+
+// abort_connection sends a best-effort fatal alert, destroys connection secrets,
+// closes the socket, and makes the failure sticky for subsequent reads.
+fn (mut c Conn) abort_connection(alert handshake.AlertDescription, message string) IError {
 	c.wlock.lock()
 	defer {
 		c.wlock.unlock()
 	}
-	// Idempotent teardown: no second close_notify, no double socket close.
-	if c.closed {
-		c.close_tcp_socket()
-		return
-	}
-	// Emit close_notify at most once, guarded separately from `closed`.
-	if !c.close_notify_sent {
-		c.close_notify_sent = true
-		c.send_close_notify()
-	}
+	return c.abort_connection_locked(alert, message)
+}
+
+// abort_connection_locked terminates the connection while its write lock is
+// already held, avoiding recursive locking from write() failure handling.
+fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, message string) IError {
+	c.fail_alert = alert
 	c.closed = true
-	// Teardown is terminal: destroy both key layers (RFC 8446 §1.3.1/§7.5).
-	c.destroy_on_close()!
+	c.fatal_error = message
+	c.send_failure_alert()
+	c.destroy_on_failure()
+	c.clear_app_buf()
+	c.clear_post_hsk_buf()
 	c.close_tcp_socket()
+	return error(message)
+}
+
+// classify_failure records the alert the adapter must surface for a handshake-phase
+// failure and returns the terminating error, so a call site cannot pin half of it.
+// Unlike abort_connection, it deliberately does NOT tear down: every error
+// propagates to dial()'s single teardown wrapper, which sends the pinned alert
+// instead of the stale .internal_error fallback for an unset fail_alert.
+fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message string) IError {
+	c.fail_alert = alert
+	return error(message)
 }
 
 // wipe_protection_states zeroes this adapter's four record protection states; it is the
@@ -1087,13 +1074,42 @@ fn (mut c Conn) send_close_notify() {
 	c.write_records([enc]) or {}
 }
 
-// negotiated_alpn returns the negotiated ALPN protocol, if any.
-pub fn (c Conn) negotiated_alpn() string {
-	return c.negotiated_alpn
+//  Buffer hygiene
+
+// zero_bytes wipes a buffer in place before it is dropped or reused, so freed
+// memory retains no plaintext (RFC 8446 §7.5 spirit); one implementation for
+// every staged-bytes scrub below.
+fn zero_bytes(mut buf []u8) {
+	for i in 0 .. buf.len {
+		buf[i] = 0
+	}
 }
 
-// Helpers
-//
+// clear_app_buf zeroes then drops the staged-but-undelivered application
+// plaintext, so freed buffer memory never retains decrypted bytes (§7.5 spirit).
+fn (mut c Conn) clear_app_buf() {
+	zero_bytes(mut c.app_buf)
+	c.app_buf.clear()
+	c.app_pos = 0
+}
+
+// clear_post_hsk_buf zeroes then drops staged post-handshake bytes so freed memory
+// retains no partial handshake message (RFC 8446 §5.2; §7.5 spirit).
+fn (mut c Conn) clear_post_hsk_buf() {
+	zero_bytes(mut c.post_hsk_buf)
+	c.post_hsk_buf = []u8{}
+}
+
+//  Utilities
+
+// mono_ms is the module's monotonic millisecond clock, read from
+// time.sys_mono_now() (CLOCK_MONOTONIC, nanoseconds ÷ 1e6 per millisecond): an NTP
+// step or wall-clock edit cannot stretch or truncate the handshake window. The
+// origin is system boot, not the epoch, so only differences against a mono_ms()
+// baseline are used.
+fn mono_ms() i64 {
+	return i64(time.sys_mono_now()) / i64(time.millisecond)
+}
 
 // host_from_address extracts the host part of a dial address ("host:port" or
 // "[ipv6]:port") so a bare address still supplies the SNI and verification name.
