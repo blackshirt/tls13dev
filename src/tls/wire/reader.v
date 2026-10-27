@@ -78,7 +78,10 @@ pub fn (mut r Reader) read_u32() !u32 {
 // read_u64 reads a 64-bit big-endian unsigned integer.
 pub fn (mut r Reader) read_u64() !u64 {
 	r.ensure(8, 'u64')!
-	v := (u64(r.data[r.cursor]) << 56) | (u64(r.data[r.cursor + 1]) << 48) | (u64(r.data[r.cursor + 2]) << 40) | (u64(r.data[r.cursor + 3]) << 32) | (u64(r.data[r.cursor + 4]) << 24) | (u64(r.data[r.cursor + 5]) << 16) | (u64(r.data[r.cursor + 6]) << 8) | u64(r.data[r.cursor + 7])
+	mut v := u64(0)
+	for i := 0; i < 8; i++ {
+		v = (v << 8) | u64(r.data[r.cursor + i])
+	}
 	r.cursor += 8
 	return v
 }

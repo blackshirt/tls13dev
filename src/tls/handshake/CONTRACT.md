@@ -17,8 +17,8 @@ The implementation is split by ownership:
 
 - [`state_machine.v`](./state_machine.v) contains the private shared core.
 - [`key_schedule.v`](./key_schedule.v) runs the §7.1 HKDF ladder and holds the
-  core's derived-secret holders (`TrafficSecretPair`, `PhaseSecrets`, `SecretPhases`)
-  with the §7.5 wiping and zeroization lifecycle methods.
+  core's flat derived-secret fields (`c_hsk_tsec`/`s_hsk_tsec`/`c_app_tsec`/`s_app_tsec`) and the
+  `SecretPhases` readiness type, with the §7.5 wiping and zeroization lifecycle methods.
 - [`key_exchange.v`](./key_exchange.v) implements the core's ephemeral ECDHE
   methods: per-group key generation, the public share, and the peer-share
   validation and secret derivation.
@@ -80,7 +80,7 @@ parse/framing failure routes through it; `append_and_drain()` keeps an
 `or { fail_and_zeroize_secrets() }` safety net for any non-classified internal error
 (teardown is idempotent, so the belt-and-suspenders call is harmless). On the record
 facade this still triggers the cached-record-key wipe: `TLSHandshake.receive_msgs_at_level()`
-detects the `.failed` state and drops its `TrafficKeys`. Out-of-phase API guards in
+detects the `.failed` state and drops its cached record keys. Out-of-phase API guards in
 `receive_msgs_at_level()` deliberately return a plain error *without* `classify_failure`,
 so a rejected mis-ordered call cannot discard usable keys.
 
@@ -173,7 +173,7 @@ to the facade's phase-checked handshake entry points.
 The core owns TLS handshake ordering, transcript updates, certificate
 validation, the TLS key schedule, shared traffic secrets, and per-level TLS
 message reassembly buffers.
-`TLSHandshake` derives and owns the cached TLS `TrafficKeys`; `QuicHandshake`
+`TLSHandshake` derives and owns the cached TLS record keys; `QuicHandshake`
 only exposes traffic secrets for QUIC key derivation. The record adapter owns
 TLS records and record protection. The QUIC adapter owns CRYPTO offset
 reassembly, packets, packet protection, and QUIC key updates. The core does not

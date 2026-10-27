@@ -16,7 +16,7 @@ There is a single private `HandshakeCore` holding the shared TLS semantics, prom
 public transport facades:
 
 - **`TLSHandshake`** (`new_tls_handshake(server_name, options)`) — the record adapter for
-  TLS-over-TCP. Also derives and owns the cached TLS `TrafficKeys` and implements the TLS KeyUpdate
+  TLS-over-TCP. Also derives and owns the cached TLS record keys and implements the TLS KeyUpdate
   derivation.
 - **`QuicHandshake`** (`new_quic_handshake(server_name, options)`) — the QUIC adapter. Exposes raw
   traffic secrets for RFC 9001 key expansion instead of record keys; QUIC packet levels and CRYPTO
@@ -46,7 +46,7 @@ state_machine.v       the whole shared HandshakeCore: states, EncryptionLevel,
                       ServerHello/HRR transition, encrypted flight
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
-tls_handshake.v       TLS record facade: cached TrafficKeys, KeyUpdate, reassembly hooks
+tls_handshake.v       TLS record facade: cached record keys, KeyUpdate, reassembly hooks
 quic_handshake.v      QUIC facade: peer_traffic_secrets, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
@@ -74,10 +74,12 @@ Each `*_test.v` sits beside its source.
   `failure_alert()` will surface, zeroizes secrets, and returns the error — a peer-triggered decode
   error always both tears down and reports the RFC-correct alert, never a stale default. `fail_with()`
   is the `err.msg()`-unwrapping shorthand used by parse sites.
-- **Grouped phase material.** Handshake and application secrets are stored as client/server
-  `TrafficSecretPair`s inside `PhaseSecrets`; the TLS facade caches matching `TrafficKeyPair`s. Both
-  level buffers live in `ReassemblyBuffers`. Grouping keeps each level's two directions, and each
-  core's reassembly state, from being cleared or advanced independently.
+- **Named phase material.** Handshake and application traffic secrets are stored as flat
+  `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the TLS
+  facade caches matching record-key fields (`c_hsk_key`/`c_hsk_iv`, and so on). Both
+  level buffers live in `ReassemblyBuffers`. Per-level wipe and install helpers take a whole
+  level's two directions (and each key with its nonce base) together, so they cannot be cleared or
+  advanced independently.
 - **One state machine.** `HandshakeState` is the single public enum, mirroring the client
   states of RFC 8446 Appendix A.1 (`start`, `wait_sh`, `wait_ee`, `wait_cert_cr`, `wait_cert`,
   `wait_cv`, `wait_finished`, `connected`, plus an implementation `failed`). It is itself the

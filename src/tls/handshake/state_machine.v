@@ -134,7 +134,10 @@ mut:
 
 	// Key-schedule material used to protect handshake and application data.
 	handshake_secret []u8 // secret used to derive handshake traffic keys
-	secrets          PhaseSecrets
+	c_hsk_tsec       []u8 // client handshake traffic secret
+	c_app_tsec       []u8 // client application traffic secret
+	s_hsk_tsec       []u8 // server handshake traffic secret
+	s_app_tsec       []u8 // server application traffic secret
 
 	// Incoming handshake bytes that do not yet form complete messages.
 	buffers ReassemblyBuffers
@@ -550,12 +553,24 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 
 	// The handshake secret is retained because the Master Secret derives from it.
 	th_ch_sh := h.transcript.current_hash()
-	hs := derive_hs_secrets(h.hash_algo, shared_secret, th_ch_sh)!
-	h.handshake_secret = hs.handshake_secret
-	h.secrets.handshake = TrafficSecretPair{
-		client: hs.client_traffic
-		server: hs.server_traffic
+	// Derive the retained Handshake Secret first, then expand each direction's traffic
+	// secret from it; all three land in locals before moving to the core's flat fields.
+	// The Handshake Secret is retained (stored to h.handshake_secret below), so it
+	// cannot be defer-wiped — a defer would zero the shared buffer the field still
+	// needs. Instead each expansion wipes it on its own error path, before any field
+	// owns it, so the split's cross-function value never leaks even if HKDF fails.
+	mut hs_secret := derive_handshake_secret(h.hash_algo, shared_secret)!
+	c_hs := derive_client_hs_secret(h.hash_algo, hs_secret, th_ch_sh) or {
+		wipe_secret(mut hs_secret)
+		return err
 	}
+	s_hs := derive_server_hs_secret(h.hash_algo, hs_secret, th_ch_sh) or {
+		wipe_secret(mut hs_secret)
+		return err
+	}
+	h.handshake_secret = hs_secret
+	h.c_hsk_tsec = c_hs
+	h.s_hsk_tsec = s_hs
 
 	h.state = .wait_ee
 	return []HandshakeMessage{}
@@ -720,7 +735,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	}
 	th_before_sfin := h.transcript.current_hash()
 
-	expected_verify_data := compute_finished_verify_data(h.hash_algo, h.secrets.handshake.server,
+	expected_verify_data := compute_finished_verify_data(h.hash_algo, h.s_hsk_tsec,
 		th_before_sfin)!
 	// Constant-time compare: verify_data is a MAC over the transcript, and a naive
 	// compare would leak a byte-by-byte Finished forgery.
@@ -732,15 +747,22 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// Advance the key schedule to the application phase: Master Secret, then the
 	// application traffic secrets bound to the transcript including server Finished.
 	th_sfin := h.transcript.current_hash()
-	ap := derive_app_secrets(h.hash_algo, h.handshake_secret, th_sfin)!
-	h.secrets.application = TrafficSecretPair{
-		client: ap.client_traffic
-		server: ap.server_traffic
-	}
+	mut master_secret := derive_master_secret(h.hash_algo, h.handshake_secret)!
+	// The Master Secret now crosses into the caller, so defer wipes it on every exit
+	// path — including an error from the two expansions below — so it cannot leak.
+	defer { wipe_secret(mut master_secret) }
+	c_ap := derive_client_app_secret(h.hash_algo, master_secret, th_sfin)!
+	s_ap := derive_server_app_secret(h.hash_algo, master_secret, th_sfin)!
+	// §7.5: erase as soon as no longer required; the defer above is idempotent, so this
+	// early wipe just shortens the happy-path lifetime. The Master Secret is never
+	// stored — KeyUpdate (§7.2) chains from the traffic secrets alone.
+	wipe_secret(mut master_secret)
+	h.c_app_tsec = c_ap
+	h.s_app_tsec = s_ap
 
 	// The client Finished uses the handshake traffic secret over the transcript now
 	// including server Finished, sent under the (still active) handshake keys.
-	client_verify_data := compute_finished_verify_data(h.hash_algo, h.secrets.handshake.client,
+	client_verify_data := compute_finished_verify_data(h.hash_algo, h.c_hsk_tsec,
 		th_sfin)!
 	client_fin_msg := build_finished(client_verify_data)
 	h.update_transcript(client_fin_msg)!

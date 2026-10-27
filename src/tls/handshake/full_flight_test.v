@@ -27,14 +27,14 @@ fn expect_no_handshake_keys(h &TLSHandshake) bool {
 // expect_no_exported_handshake_secrets reports whether the handshake traffic
 // secrets are gone — the expected state once they were wiped.
 fn expect_no_exported_handshake_secrets(h &TLSHandshake) bool {
-	return h.secrets.handshake.client.len == 0 && h.secrets.handshake.server.len == 0
+	return h.c_hsk_tsec.len == 0 && h.s_hsk_tsec.len == 0
 }
 
 // assert_handshake_material_destroyed checks the failure-path contract: after a
 // failed feed the machine is .failed and every derived secret is gone (RFC 8446 §7.5).
 fn assert_handshake_material_destroyed(h &TLSHandshake) {
 	assert h.state() == .failed
-	assert expect_no_handshake_keys(h), 'handshake TrafficKeys survived a failed feed'
+	assert expect_no_handshake_keys(h), 'handshake record keys survived a failed feed'
 	assert expect_no_exported_handshake_secrets(h), 'handshake traffic secrets survived a failed feed'
 }
 

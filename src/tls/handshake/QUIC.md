@@ -31,7 +31,7 @@ The core was therefore split so that the carrier is always someone else's job:
    │  Key schedule: key_schedule.v (holders + §7.5 lifecycle)                       │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
-   │  Record facade: tls_handshake.v owns TLS TrafficKeys and the KeyUpdate path    │
+   │  Record facade: tls_handshake.v owns TLS record keys and the KeyUpdate path    │
    │  QUIC facade: quic_handshake.v exports TLS traffic secrets                     │
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
@@ -175,7 +175,7 @@ QUIC derives its **Initial** packet keys from the destination connection ID
 represented by `EncryptionLevel`; the engine derives them itself, below this
 layer. The shared handshake API starts with plaintext ServerHello processing.
 
-### 3.2 Secrets, not TrafficKeys, cross the boundary
+### 3.2 Secrets, not record keys, cross the boundary
 
 A QUIC engine needs the raw §7.1 **traffic secrets** so it can run the
 RFC 9001 §5.1 expansions itself:

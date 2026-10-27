@@ -1,7 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// messages.v owns shared RFC 8446 §4 handshake framing primitives and extension
-// block decoding.
+// messages.v owns the shared RFC 8446 §4 handshake vocabulary — the message, extension,
+// group, signature-scheme, and cipher-suite codes with their single-source supported
+// lists and `*_from_uN` decoders — plus the framing and extension-block parsing built on them.
 module handshake
 
 import tls.wire
@@ -73,6 +74,17 @@ fn is_supported_group(g NamedGroup) bool {
 	return g in supported_named_groups
 }
 
+// named_group_from_u16 converts the 16-bit group identifier against
+// supported_named_groups — the same list the offer and configuration gates use.
+fn named_group_from_u16(raw u16) !NamedGroup {
+	for g in supported_named_groups {
+		if u16(g) == raw {
+			return g
+		}
+	}
+	return error('handshake: unsupported group 0x${raw:04x}')
+}
+
 // SignatureScheme defines cryptographic signature algorithms (RFC 8446 §4.2.3).
 pub enum SignatureScheme as u16 {
 	rsa_pkcs1_sha256       = 0x0401
@@ -98,6 +110,18 @@ fn is_supported_signature_scheme(s SignatureScheme) bool {
 	return s in supported_signature_schemes
 }
 
+// signature_scheme_from_u16 decodes a 2-byte SignatureScheme code against
+// supported_signature_schemes (RFC 8446 §4.2.3) — the same list the offer and
+// configuration gates use.
+fn signature_scheme_from_u16(raw u16) !SignatureScheme {
+	for s in supported_signature_schemes {
+		if u16(s) == raw {
+			return s
+		}
+	}
+	return error('handshake: unsupported signature scheme 0x${raw:04x}')
+}
+
 // CipherSuite defines TLS 1.3 cipher suites (RFC 8446 §B.4).
 pub enum CipherSuite as u16 {
 	tls_aes_128_gcm_sha256       = 0x1301
@@ -116,6 +140,18 @@ const supported_cipher_suites = [CipherSuite.tls_chacha20_poly1305_sha256, .tls_
 // advertisement and acceptance cannot drift apart.
 fn is_supported_cipher_suite(cs CipherSuite) bool {
 	return cs in supported_cipher_suites
+}
+
+// cipher_suite_from_u16 decodes a 2-byte cipher suite code against
+// supported_cipher_suites (RFC 8446 §B.4), the same list the offer and
+// configuration gates use.
+fn cipher_suite_from_u16(raw u16) !CipherSuite {
+	for cs in supported_cipher_suites {
+		if u16(cs) == raw {
+			return cs
+		}
+	}
+	return error('handshake: unsupported cipher suite 0x${raw:04x}')
 }
 
 // client_hello_random_len is the fixed ClientHello.random size (RFC 8446 §4.1.2).

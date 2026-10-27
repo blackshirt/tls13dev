@@ -138,7 +138,7 @@ is test-only scaffolding — both are listed in the table below.
 | `tls.wire` | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
 | `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal strict DER reader and X.509 v3 decoding behind element-count guards, RFC 5280 chain building to a trusted root with name-constraint enforcement, RFC 6125 hostname matching, RSA/PSS/ECDSA/Ed25519 signature verification, and system trust-bundle loading. The rejection rules are enumerated in §4.3; `TrustStore` is public so `Config.root_cas` can be populated. |
 | `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v`, `key_exchange.v`, `client_hello.v`, `server_hello.v`, `server_flight.v`, `post_handshake.v`, `tls_handshake.v`, `quic_handshake.v` | The transport-neutral core: RFC 8446 §4 message structures and the running Transcript-Hash (§4.4.1), the §7.1 HKDF ladder and phase derivations with the retained secret holders and their §7.5 lifecycle (`key_schedule.v`), AEAD constructors (`aead.v`), the CertificateVerify check (`certificate_verify.v`), the shared alert vocabulary with the RFC 9001 §4.8 mapping (`alert.v`), recordless CRYPTO-stream reassembly (`passthrough.v`), and post-handshake NewSessionTicket/KeyUpdate parsing (`post_handshake.v`). `state_machine.v` holds the entire shared `HandshakeCore` — sequencing over the public `HandshakeState` cursor (the RFC 8446 Appendix A.1 client states, plus an implementation `failed` terminal), the ServerHello/HRR and encrypted-flight transitions — with its ephemeral ECDHE methods in `key_exchange.v` and its derived-secret holders and lifecycle in `key_schedule.v` — and owns the key ratchet behind the `pub` seam; facade-exclusive methods live on the facades, never promoted from it — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. Facade choice at construction fixes the transport (§1.5); secret-hygiene timing is in §2.1 and the source preambles. |
-| `tls` | `record.v`, `record_protection.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `alert_record` wrapper, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side helpers (`alert_record`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
+| `tls` | `record.v`, `record_protection.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `Record` frame, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side framing helpers (`new_record`, `change_cipher_spec`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
 | `tls` | `conn.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, the caller-facing `Config`/`default_config()`, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `TLSProtection` installation from `record_traffic_keys()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits). |
 | `tls.quic` | `engine.v`, `config.v`, `packet.v`, `packet_parse.v`, `protection.v`, `initial_keys.v`, `frame.v`, `varint.v`, `cid.v`, `reasm.v`, `transport_params.v` | The QUIC client engine (RFC 9000/9001): the eight-step loop driving `tls.handshake` through the recordless `QuicHandshake` facade, long/short header (de)serialization and sample-based packet + header protection, Initial-key derivation from the original DCID, CRYPTO-stream reassembly, varints, frames, and the `original_destination_connection_id`-guarded transport parameters. Construction and the protection layers never import `tls`; see [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). |
 | `tls.fakeserver` | `server.v`, `fixtures.v`, `keys.v` | Test-only adaptive TLS 1.3 server flight generator: builds a spec-conformant server response — full flight or HelloRetryRequest — from the client's actual ClientHello so the end-to-end tests can drive the real client byte by byte. Ships no library API. |
@@ -247,7 +247,7 @@ new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshake
   each separately; traffic-key/secret access accepts handshake or application.
   QUIC Initial packet keys derive from the destination connection ID and are
   not part of this TLS secret API.
-- **Keys stay adapter-owned.** `TLSHandshake` caches record `TrafficKeys`
+- **Keys stay adapter-owned.** `TLSHandshake` caches its flat record-key fields
   and implements the TLS KeyUpdate derivation. `QuicHandshake` exposes TLS traffic
   secrets for RFC 9001 packet-key derivation; the QUIC engine owns packet keys
   and QUIC key updates.
@@ -357,12 +357,10 @@ pub struct Conn {}
 A TLS 1.3 client connection over TCP. `@[noinit]` prevents constructing one
 without `dial()` supplying every field.
 
-**Accessible fields** (set at dial time, read-only by contract):
-
-| Field | Type | Meaning |
-|---|---|---|
-| `server_name` | `string` | SNI value sent and the name the certificate was checked against |
-| `negotiated_alpn` | `string` | The server's ALPN pick — always one of `hsk_options.alpn`, or `''` if none |
+All `Conn` fields are module-private. The only connection identity surfaced to a
+caller is the negotiated ALPN protocol, read through the `negotiated_alpn()`
+accessor below; the SNI name and the verified host stay internal (a caller
+already holds both in its own `Config`).
 
 #### `read`
 

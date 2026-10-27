@@ -494,27 +494,56 @@ fn (mut e Conn) install_exported_keys() ! {
 	// Readiness comes from the core's secret-phase query, not from decoding
 	// HandshakeState: a phase is true exactly while both directions' traffic secrets
 	// exist, so a .failed handshake (schedule wiped) never reaches these expands with
-	// zeroized secrets. The adapter keeps its own install-once flags.
+	// live secrets. The adapter keeps its own install-once flags.
 	phases := e.hs.available_secret_phases()
 	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none && phases.handshake {
-		ck, sk := e.hs.peer_traffic_secrets(.handshake)!
-		suite := e.hs.negotiated_cipher_suite()
-		chash := handshake.suite_hash_algo(suite)
-		klen := handshake.suite_key_len(suite)
-		client_keys := expand_direction(chash, ck, klen)!
-		server_keys := expand_direction(chash, sk, klen)!
-		e.handshake_tx = new_protection(client_keys, suite)!
-		e.handshake_rx = new_protection(server_keys, suite)!
+		e.install_level_protection(.handshake)!
 	}
 	if phases.application && e.app_tx == none && e.app_rx == none {
-		ck, sk := e.hs.peer_traffic_secrets(.application)!
-		suite := e.hs.negotiated_cipher_suite()
-		chash := handshake.suite_hash_algo(suite)
-		klen := handshake.suite_key_len(suite)
-		client_keys := expand_direction(chash, ck, klen)!
-		server_keys := expand_direction(chash, sk, klen)!
+		e.install_level_protection(.application)!
+	}
+}
+
+// install_level_protection expands one level's exported traffic secrets into that
+// level's packet protection (RFC 9001 §5.1). The exported secrets and the derived
+// packet keys are dead once new_protection has cloned what it needs into its state and
+// the AEAD backend has copied the key, so defer scrubs every local copy on all exit
+// paths (§7.5) — zeroing these inputs cannot disturb the live protection state.
+fn (mut e Conn) install_level_protection(level handshake.EncryptionLevel) ! {
+	mut ck, mut sk := e.hs.peer_traffic_secrets(level)!
+	defer {
+		zero_bytes(mut ck)
+		zero_bytes(mut sk)
+	}
+	suite := e.hs.negotiated_cipher_suite()
+	chash := handshake.suite_hash_algo(suite)
+	klen := handshake.suite_key_len(suite)
+	mut client_keys := expand_direction(chash, ck, klen)!
+	mut server_keys := expand_direction(chash, sk, klen)!
+	defer {
+		zero_bytes(mut client_keys.key)
+		zero_bytes(mut client_keys.iv)
+		zero_bytes(mut client_keys.hp)
+		zero_bytes(mut server_keys.key)
+		zero_bytes(mut server_keys.iv)
+		zero_bytes(mut server_keys.hp)
+	}
+	if level == .handshake {
+		e.handshake_tx = new_protection(client_keys, suite)!
+		e.handshake_rx = new_protection(server_keys, suite)!
+	} else {
 		e.app_tx = new_protection(client_keys, suite)!
 		e.app_rx = new_protection(server_keys, suite)!
+	}
+}
+
+// zero_bytes overwrites a buffer in place, the §7.5 scrub for dead QUIC key material
+// that never reaches a tracked protection state. Mirrors the tls adapter's helper of
+// the same name; the modules stay independent (tls.handshake cannot import tls.quic).
+@[direct_array_access]
+fn zero_bytes(mut buf []u8) {
+	for i in 0 .. buf.len {
+		buf[i] = 0
 	}
 }
 

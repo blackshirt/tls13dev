@@ -14,8 +14,6 @@ import tls.handshake
 import tls.pki
 import tls.wire
 
-//  Tunable limits
-
 // max_stored_session_tickets bounds the NewSessionTicket backlog kept on the
 // Conn; resumption is unimplemented, so the queue is only diagnostic
 // (RFC 8446 §4.6.1).
@@ -69,8 +67,6 @@ const max_tolerated_records_per_read = 100
 // record packs ~3300 eight-byte KeyUpdate or ticket bodies, each costing a
 // rekey (plus a KeyUpdate response write), so the bound fires before that work.
 const max_post_handshake_messages_per_record = 1000
-
-//  Public types
 
 // Conn is a TLS 1.3 client connection over TCP, built only by dial(). read() and
 // write() take separate mutexes; the lock order is always rlock → wlock.
@@ -173,8 +169,6 @@ pub:
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }
-
-//  Public API
 
 // default_config builds a Config for the given hostname that trusts the system
 // root store (root_cas stays none, so dial loads it) and keeps verification on.
@@ -435,8 +429,6 @@ pub fn (c Conn) negotiated_alpn() string {
 	return c.negotiated_alpn
 }
 
-//  Handshake driving
-
 // do_handshake drives the full client flight over TCP: frame the ClientHello
 // (+dummy CCS), then feed records into the core until it reports .connected (§5.1).
 fn (mut c Conn) do_handshake() ! {
@@ -606,28 +598,6 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	}
 }
 
-//  Record protection state
-
-// tls_protection_from_keys instantiates one direction's record protection from
-// the core's derived key and IV bytes; sequence numbers restart at 0 per generation (§5.3).
-fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
-	aead := handshake.new_aead_for_suite(suite, key)!
-	return new_tls_protection(aead, iv)!
-}
-
-// decrypt_failure_alert maps a decrypt_record error to the fatal alert the record
-// layer must surface: rekey exhaustion is record_overflow, a failed tag is
-// bad_record_mac, anything else is unexpected_message (RFC 8446 §5.5/§6).
-fn decrypt_failure_alert(msg string) handshake.AlertDescription {
-	if msg.contains('sequence limit') {
-		return .record_overflow
-	}
-	if msg.contains('AEAD decryption failed') {
-		return .bad_record_mac
-	}
-	return .unexpected_message
-}
-
 // install_ciphers builds both protection states for one key generation from the
 // core's record_traffic_keys(level); called once after the ServerHello is fed
 // (.handshake) and once at .connected (.application). Initial keys are refused:
@@ -636,7 +606,21 @@ fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
 	if level == .initial {
 		return error('tls: no record protection exists for the initial level')
 	}
-	ck, civ, sk, siv := c.hs.record_traffic_keys(level)!
+	mut ck := []u8{}
+	mut civ := []u8{}
+	mut sk := []u8{}
+	mut siv := []u8{}
+	// The facade hands independent copies; the AEAD backend keeps its own key and the
+	// protection state clones its IV, so these locals are dead once installed. Defer-scrub
+	// every copy on all exit paths (§7.5); zeroing the caller's copies cannot disturb the
+	// live cipher because the backend and protection state hold their own copies.
+	defer {
+		zero_bytes(mut ck)
+		zero_bytes(mut civ)
+		zero_bytes(mut sk)
+		zero_bytes(mut siv)
+	}
+	ck, civ, sk, siv = c.hs.record_traffic_keys(level)!
 	suite := c.hs.negotiated_cipher_suite()
 	if level == .handshake {
 		c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
@@ -653,7 +637,15 @@ fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
 // update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
 // restart at 0 per generation (§5.3).
 fn (mut c Conn) rekey_cipher(is_server bool) ! {
-	ck, civ, sk, siv := c.hs.record_traffic_keys(.application)!
+	mut ck, mut civ, mut sk, mut siv := c.hs.record_traffic_keys(.application)!
+	// Scrub every copy on all exit paths (§7.5): only the selected leg is installed, but
+	// both pairs are dead here and the AEAD backend/protection state own their copies.
+	defer {
+		zero_bytes(mut ck)
+		zero_bytes(mut civ)
+		zero_bytes(mut sk)
+		zero_bytes(mut siv)
+	}
 	suite := c.hs.negotiated_cipher_suite()
 	if is_server {
 		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
@@ -661,8 +653,6 @@ fn (mut c Conn) rekey_cipher(is_server bool) ! {
 		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
 	}
 }
-
-//  Read path internals
 
 // read_raw_record blocks until one complete TLS record (header + payload) is
 // buffered, then parses it in place off recv_buf; TCP may split or coalesce records.
@@ -856,8 +846,6 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	}
 }
 
-//  Write path internals
-
 // write_records serializes records into one buffer and writes the full batch,
 // continuing after short writes. It returns only after all bytes are sent or an
 // error occurs, so callers do not need a partial byte count (RFC 8446 §5).
@@ -960,8 +948,6 @@ fn (mut c Conn) send_key_update_response() ! {
 	}
 	c.send_key_update_record_locked()!
 }
-
-//  Failure & teardown
 
 // abort_connection sends a best-effort fatal alert, destroys connection secrets,
 // closes the socket, and makes the failure sticky for subsequent reads.
@@ -1075,17 +1061,6 @@ fn (mut c Conn) send_close_notify() {
 	c.write_records([enc]) or {}
 }
 
-//  Buffer hygiene
-
-// zero_bytes wipes a buffer in place before it is dropped or reused, so freed
-// memory retains no plaintext (RFC 8446 §7.5 spirit); one implementation for
-// every staged-bytes scrub below.
-fn zero_bytes(mut buf []u8) {
-	for i in 0 .. buf.len {
-		buf[i] = 0
-	}
-}
-
 // clear_app_buf zeroes then drops the staged-but-undelivered application
 // plaintext, so freed buffer memory never retains decrypted bytes (§7.5 spirit).
 fn (mut c Conn) clear_app_buf() {
@@ -1101,7 +1076,37 @@ fn (mut c Conn) clear_post_hsk_buf() {
 	c.post_hsk_buf = []u8{}
 }
 
-//  Utilities
+// Helpers (utility)
+
+// tls_protection_from_keys instantiates one direction's record protection from
+// the core's derived key and IV bytes; sequence numbers restart at 0 per generation (§5.3).
+fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
+	aead := handshake.new_aead_for_suite(suite, key)!
+	return new_tls_protection(aead, iv)!
+}
+
+// decrypt_failure_alert maps a decrypt_record error to the fatal alert the record
+// layer must surface: rekey exhaustion is record_overflow, a failed tag is
+// bad_record_mac, anything else is unexpected_message (RFC 8446 §5.5/§6).
+fn decrypt_failure_alert(msg string) handshake.AlertDescription {
+	if msg.contains('sequence limit') {
+		return .record_overflow
+	}
+	if msg.contains('AEAD decryption failed') {
+		return .bad_record_mac
+	}
+	return .unexpected_message
+}
+
+// zero_bytes wipes a buffer in place before it is dropped or reused, so freed
+// memory retains no plaintext (RFC 8446 §7.5 spirit); one implementation for
+// every staged-bytes scrub below.
+@[direct_array_access]
+fn zero_bytes(mut buf []u8) {
+	for i in 0 .. buf.len {
+		buf[i] = 0
+	}
+}
 
 // mono_ms is the module's monotonic millisecond clock, read from
 // time.sys_mono_now() (CLOCK_MONOTONIC, nanoseconds ÷ 1e6 per millisecond): an NTP

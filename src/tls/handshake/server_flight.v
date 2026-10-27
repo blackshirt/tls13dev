@@ -14,18 +14,6 @@ mut:
 	signature []u8            // raw signature bytes over the transcript-derived content
 }
 
-// signature_scheme_from_u16 decodes a 2-byte SignatureScheme code against
-// supported_signature_schemes (RFC 8446 §4.2.3) — the same list the offer and
-// configuration gates use.
-fn signature_scheme_from_u16(raw u16) !SignatureScheme {
-	for s in supported_signature_schemes {
-		if u16(s) == raw {
-			return s
-		}
-	}
-	return error('handshake: unsupported signature scheme 0x${raw:04x}')
-}
-
 // parse_certificate_message decodes the Certificate message body (RFC 8446 §4.4.2)
 // and returns the DER-encoded chain; pki.parse_certificate decodes a single certificate.
 @[direct_array_access]

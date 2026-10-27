@@ -6,18 +6,6 @@ module handshake
 
 import tls.wire
 
-// cipher_suite_from_u16 decodes a 2-byte cipher suite code against
-// supported_cipher_suites (RFC 8446 §B.4), the same list the offer and
-// configuration gates use.
-fn cipher_suite_from_u16(raw u16) !CipherSuite {
-	for cs in supported_cipher_suites {
-		if u16(cs) == raw {
-			return cs
-		}
-	}
-	return error('handshake: unsupported cipher suite 0x${raw:04x}')
-}
-
 // hello_retry_request_random is the HRR sentinel random (RFC 8446 §4.1.3); an HRR is
 // a ServerHello, so only this fixed value tells them apart.
 const hello_retry_request_random = [u8(0xcf), 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d,
@@ -43,17 +31,6 @@ mut:
 	has_key_share bool
 	// cookie holds the cookie value from a HelloRetryRequest, empty otherwise.
 	cookie []u8
-}
-
-// named_group_from_u16 converts the 16-bit group identifier against
-// supported_named_groups — the same list the offer and configuration gates use.
-fn named_group_from_u16(raw u16) !NamedGroup {
-	for g in supported_named_groups {
-		if u16(g) == raw {
-			return g
-		}
-	}
-	return error('handshake: unsupported group 0x${raw:04x}')
 }
 
 // validate performs the ServerHello/HelloRetryRequest checks independent of the message

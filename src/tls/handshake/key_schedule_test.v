@@ -74,13 +74,15 @@ fn test_rfc8448_section3_key_schedule() ! {
 	assert hex.encode(server_hs_secret) == rfc8448_server_hs_traffic
 
 	// 5. Verify Handshake Keys & IVs
-	client_hs_keys := derive_traffic_keys(hash, client_hs_secret, 16, 12)!
-	assert hex.encode(client_hs_keys.key) == 'dbfaa693d1762c5b666af5d950258d01'
-	assert hex.encode(client_hs_keys.iv) == '5bd3c71b836e0b76bb73265f'
+	client_hs_key := derive_traffic_key(hash, client_hs_secret, 16)!
+	client_hs_iv := derive_traffic_iv(hash, client_hs_secret, 12)!
+	assert hex.encode(client_hs_key) == 'dbfaa693d1762c5b666af5d950258d01'
+	assert hex.encode(client_hs_iv) == '5bd3c71b836e0b76bb73265f'
 
-	server_hs_keys := derive_traffic_keys(hash, server_hs_secret, 16, 12)!
-	assert hex.encode(server_hs_keys.key) == '3fce516009c21727d0f2e4e86ee403bc'
-	assert hex.encode(server_hs_keys.iv) == '5d313eb2671276ee13000b30'
+	server_hs_key := derive_traffic_key(hash, server_hs_secret, 16)!
+	server_hs_iv := derive_traffic_iv(hash, server_hs_secret, 12)!
+	assert hex.encode(server_hs_key) == '3fce516009c21727d0f2e4e86ee403bc'
+	assert hex.encode(server_hs_iv) == '5d313eb2671276ee13000b30'
 
 	// 6. Verify Master Secret
 	derived_hs := derive_secret(hash, handshake_secret, 'derived', empty_transcript_hash(hash))!
@@ -98,31 +100,38 @@ fn test_rfc8448_section3_key_schedule() ! {
 	assert hex.encode(server_app_secret) == rfc8448_server_ap_traffic_0
 
 	// 8. Verify Application Keys & IVs
-	client_app_keys := derive_traffic_keys(hash, client_app_secret, 16, 12)!
-	assert hex.encode(client_app_keys.key) == '17422dda596ed5d9acd890e3c63f5051'
-	assert hex.encode(client_app_keys.iv) == '5b78923dee08579033e523d9'
+	client_app_key := derive_traffic_key(hash, client_app_secret, 16)!
+	client_app_iv := derive_traffic_iv(hash, client_app_secret, 12)!
+	assert hex.encode(client_app_key) == '17422dda596ed5d9acd890e3c63f5051'
+	assert hex.encode(client_app_iv) == '5b78923dee08579033e523d9'
 
-	server_app_keys := derive_traffic_keys(hash, server_app_secret, 16, 12)!
-	assert hex.encode(server_app_keys.key) == '9f02283b6c9c07efc26bb9f2ac92e356'
-	assert hex.encode(server_app_keys.iv) == 'cf782b88dd83549aadf1e984'
+	server_app_key := derive_traffic_key(hash, server_app_secret, 16)!
+	server_app_iv := derive_traffic_iv(hash, server_app_secret, 12)!
+	assert hex.encode(server_app_key) == '9f02283b6c9c07efc26bb9f2ac92e356'
+	assert hex.encode(server_app_iv) == 'cf782b88dd83549aadf1e984'
 }
 
-// test_rfc8448_composite_phase_helpers pins derive_hs_secrets and derive_app_secrets
-// to the same RFC 8448 chain after their in-place intermediate wipes: a wipe that
-// aliased an input or an output would break these known answers.
+// test_rfc8448_composite_phase_helpers pins the split handshake/master derivers to the
+// same RFC 8448 chain after their in-place intermediate wipes: a wipe that aliased an
+// input or an output would break these known answers.
 fn test_rfc8448_composite_phase_helpers() ! {
 	hash := HashAlgorithm.sha256
 	ecdh_shared := hex.decode(rfc8448_ecdhe_shared_secret)!
 	transcript_ch_sh := hex.decode(rfc8448_transcript_hash_ch_sh)!
-	hs := derive_hs_secrets(hash, ecdh_shared, transcript_ch_sh)!
-	assert hex.encode(hs.handshake_secret) == rfc8448_handshake_secret
-	assert hex.encode(hs.client_traffic) == rfc8448_client_hs_traffic
-	assert hex.encode(hs.server_traffic) == rfc8448_server_hs_traffic
+	handshake_secret := derive_handshake_secret(hash, ecdh_shared)!
+	assert hex.encode(handshake_secret) == rfc8448_handshake_secret
+	hs_c := derive_client_hs_secret(hash, handshake_secret, transcript_ch_sh)!
+	hs_s := derive_server_hs_secret(hash, handshake_secret, transcript_ch_sh)!
+	assert hex.encode(hs_c) == rfc8448_client_hs_traffic
+	assert hex.encode(hs_s) == rfc8448_server_hs_traffic
 
 	transcript_ch_sfin := hex.decode(rfc8448_transcript_hash_ch_sfin)!
-	ap := derive_app_secrets(hash, hs.handshake_secret, transcript_ch_sfin)!
-	assert hex.encode(ap.client_traffic) == rfc8448_client_ap_traffic_0
-	assert hex.encode(ap.server_traffic) == rfc8448_server_ap_traffic_0
+	mut master := derive_master_secret(hash, handshake_secret)!
+	ap_c := derive_client_app_secret(hash, master, transcript_ch_sfin)!
+	ap_s := derive_server_app_secret(hash, master, transcript_ch_sfin)!
+	wipe_secret(mut master)
+	assert hex.encode(ap_c) == rfc8448_client_ap_traffic_0
+	assert hex.encode(ap_s) == rfc8448_server_ap_traffic_0
 }
 
 // test_hkdf_expand_rejects_nonpositive_length checks the fail-closed guard: a
@@ -135,15 +144,19 @@ fn test_hkdf_expand_rejects_nonpositive_length() ! {
 	assert false, 'a zero-length HKDF-Expand must fail closed'
 }
 
-// test_derive_record_key_pair pins the shared per-level expansion to the RFC 8448 §3
-// handshake keys: the pair must equal the two derive_traffic_keys calls it replaced.
-fn test_derive_record_key_pair() ! {
+// test_record_key_expansion pins the per-level client/server record-key expansion
+// to the RFC 8448 §3 handshake keys: the derive_traffic_key and derive_traffic_iv
+// calls that sync_keys_level now runs inline must reproduce these known answers.
+fn test_record_key_expansion() ! {
 	hash := HashAlgorithm.sha256
 	client_secret := hex.decode(rfc8448_client_hs_traffic)!
 	server_secret := hex.decode(rfc8448_server_hs_traffic)!
-	ck, sk := derive_record_key_pair(hash, 16, client_secret, server_secret)!
-	assert hex.encode(ck.key) == 'dbfaa693d1762c5b666af5d950258d01'
-	assert hex.encode(ck.iv) == '5bd3c71b836e0b76bb73265f'
-	assert hex.encode(sk.key) == '3fce516009c21727d0f2e4e86ee403bc'
-	assert hex.encode(sk.iv) == '5d313eb2671276ee13000b30'
+	ck_key := derive_traffic_key(hash, client_secret, 16)!
+	ck_iv := derive_traffic_iv(hash, client_secret, 12)!
+	sk_key := derive_traffic_key(hash, server_secret, 16)!
+	sk_iv := derive_traffic_iv(hash, server_secret, 12)!
+	assert hex.encode(ck_key) == 'dbfaa693d1762c5b666af5d950258d01'
+	assert hex.encode(ck_iv) == '5bd3c71b836e0b76bb73265f'
+	assert hex.encode(sk_key) == '3fce516009c21727d0f2e4e86ee403bc'
+	assert hex.encode(sk_iv) == '5d313eb2671276ee13000b30'
 }

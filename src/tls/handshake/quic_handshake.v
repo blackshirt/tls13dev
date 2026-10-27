@@ -3,7 +3,7 @@
 // QuicHandshake is the QUIC adapter facade over shared TLS handshake
 // semantics. QUIC derives packet protection from the exported traffic secrets,
 // so the raw-secret accessor peer_traffic_secrets() lives here: the record
-// facade caches derived TrafficKeys and has no caller for it.
+// facade caches flat record-key fields instead and has no caller for it.
 module handshake
 
 // QuicHandshake exposes only operations needed by a QUIC adapter.
@@ -22,21 +22,33 @@ pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHan
 
 // peer_traffic_secrets returns copies of the client and server traffic secrets
 // for one encryption level; the initial level has no TLS traffic secrets. QUIC
-// seam: the engine expands the pair into RFC 9001 §5.1 packet keys itself, and
-// the TLS record path never reads raw secrets — TLSHandshake serves
-// record_traffic_keys() from its cached TrafficKeys instead.
+// seam: the engine expands the two secrets into RFC 9001 §5.1 packet keys
+// itself, and the TLS record path never reads raw secrets — TLSHandshake serves
+// record_traffic_keys() from its cached flat key fields instead.
 pub fn (h &QuicHandshake) peer_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
 	if level == .initial {
 		return error('handshake: initial level has no traffic secrets')
 	}
-	secrets := h.secrets.pair(level)
-	if !secrets.available() {
+	mut c := []u8{}
+	mut s := []u8{}
+	match level {
+		.initial {}
+		.handshake {
+			c = h.c_hsk_tsec
+			s = h.s_hsk_tsec
+		}
+		.application {
+			c = h.c_app_tsec
+			s = h.s_app_tsec
+		}
+	}
+	if c.len == 0 || s.len == 0 {
 		if level == .handshake {
 			return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
 		}
 		return error('handshake: application traffic secrets unavailable before the server Finished')
 	}
-	return secrets.client.clone(), secrets.server.clone()
+	return c.clone(), s.clone()
 }
 
 // peer_transport_parameters returns the raw bytes of the server's

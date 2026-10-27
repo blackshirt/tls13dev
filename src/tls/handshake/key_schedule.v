@@ -2,10 +2,12 @@
 //
 // key_schedule.v runs the RFC 8446 §7.1 HKDF-Extract/Expand ladder over the
 // (EC)DHE and traffic-secret stages, deriving every handshake and application key.
-// The phase-stage derivations (derive_hs_secrets, derive_app_secrets) that
-// state_machine.v sequences live here too, beside the ladder primitives they call.
-// It also owns the retained derived-secret holders (TrafficSecretPair, PhaseSecrets,
-// SecretPhases) and the §7.5 zeroization lifecycle methods declared on HandshakeCore.
+// The phase-stage derivations (derive_handshake_secret, derive_master_secret and
+// the per-direction traffic-secret derivers) that state_machine.v sequences live
+// here too, beside the ladder primitives they call.
+// It also owns the SecretPhases readiness type and the §7.5 zeroization lifecycle
+// methods declared on HandshakeCore; the traffic secrets they guard are flat []u8
+// fields on the core itself (c_hsk_tsec/s_hsk_tsec, c_app_tsec/s_app_tsec).
 module handshake
 
 import crypto.hmac
@@ -130,64 +132,53 @@ fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 	return hash.compute_hash([]u8{})
 }
 
-// TrafficSecrets groups one key-schedule stage's output; the handshake phase fills all
-// three, the application phase leaves handshake_secret empty.
-struct TrafficSecrets {
-mut:
-	handshake_secret []u8
-	client_traffic   []u8
-	server_traffic   []u8
-}
-
-// derive_hs_secrets runs the §7.1 handshake phase: the zero-PSK Early Secret, the
-// Handshake Secret mixing in the ECDHE shared secret, and the handshake traffic secrets.
-fn derive_hs_secrets(hash_algo HashAlgorithm, shared_secret []u8, th_ch_sh []u8) !TrafficSecrets {
+// derive_handshake_secret runs the §7.1 Early->Handshake ladder: the zero-PSK Early
+// Secret, then the Handshake Secret mixing in the ECDHE shared secret. The early chain
+// is dead once the Handshake extract consumed it (§7.5), so its locals zeroize here.
+fn derive_handshake_secret(hash_algo HashAlgorithm, shared_secret []u8) ![]u8 {
 	// Early Secret = HKDF-Extract(0, 0); without a PSK the IKM is empty but is still mixed in.
 	mut early_secret := hkdf_extract(hash_algo, []u8{}, []u8{len: hash_algo.hash_len()})
 	mut derived_early := derive_secret(hash_algo, early_secret, 'derived', empty_transcript_hash(hash_algo))!
-	// §7.5: the early chain is dead once the Handshake extract consumed it — these
-	// locals never reach the core's tracked secrets, so they zeroize here.
 	wipe_secret(mut early_secret)
 	// Handshake Secret = HKDF-Extract(Derive-Secret(Early, "derived"), ECDHE)
 	handshake_secret := hkdf_extract(hash_algo, derived_early, shared_secret)
 	wipe_secret(mut derived_early)
-
-	client_hs := derive_secret(hash_algo, handshake_secret, 'c hs traffic', th_ch_sh)!
-	server_hs := derive_secret(hash_algo, handshake_secret, 's hs traffic', th_ch_sh)!
-
-	return TrafficSecrets{
-		handshake_secret: handshake_secret
-		client_traffic:   client_hs
-		server_traffic:   server_hs
-	}
+	return handshake_secret
 }
 
-// derive_app_secrets runs the §7.1 application phase from the Handshake Secret: the
-// Master Secret, then the client/server application traffic secrets (KeyUpdate updates them, §7.2).
-fn derive_app_secrets(hash_algo HashAlgorithm, handshake_secret []u8, th_sfin []u8) !TrafficSecrets {
+// derive_client_hs_secret expands the client handshake traffic secret (RFC 8446
+// §7.1, "c hs traffic" label) from the Handshake Secret over the ClientHello..ServerHello transcript.
+fn derive_client_hs_secret(hash_algo HashAlgorithm, handshake_secret []u8, th_ch_sh []u8) ![]u8 {
+	return derive_secret(hash_algo, handshake_secret, 'c hs traffic', th_ch_sh)!
+}
+
+// derive_server_hs_secret expands the server handshake traffic secret (RFC 8446
+// §7.1, "s hs traffic" label) from the Handshake Secret over the same transcript.
+fn derive_server_hs_secret(hash_algo HashAlgorithm, handshake_secret []u8, th_ch_sh []u8) ![]u8 {
+	return derive_secret(hash_algo, handshake_secret, 's hs traffic', th_ch_sh)!
+}
+
+// derive_master_secret advances the §7.1 Handshake->Master ladder from the Handshake
+// Secret: the "derived" salt then a zero-PSK extract. The derived_hs intermediate is
+// wiped here (§7.5); the returned Master Secret is zeroized by the caller after both
+// application traffic secrets are expanded, since it is never stored.
+fn derive_master_secret(hash_algo HashAlgorithm, handshake_secret []u8) ![]u8 {
 	mut derived_hs := derive_secret(hash_algo, handshake_secret, 'derived', empty_transcript_hash(hash_algo))!
-	mut master_secret := hkdf_extract(hash_algo, derived_hs, []u8{len: hash_algo.hash_len()})
+	master_secret := hkdf_extract(hash_algo, derived_hs, []u8{len: hash_algo.hash_len()})
 	wipe_secret(mut derived_hs)
-
-	client_ap := derive_secret(hash_algo, master_secret, 'c ap traffic', th_sfin)!
-	server_ap := derive_secret(hash_algo, master_secret, 's ap traffic', th_sfin)!
-	// §7.1/§7.5: the Master Secret is never stored — KeyUpdate (§7.2) chains from the
-	// traffic secrets alone — so it dies with this call.
-	wipe_secret(mut master_secret)
-
-	return TrafficSecrets{
-		client_traffic: client_ap
-		server_traffic: server_ap
-	}
+	return master_secret
 }
 
-// TrafficKeys holds the derived AEAD key and IV for one traffic direction at one
-// encryption level. It is module-private: the record accessor hands the tls layer
-// the key and IV as plain []u8, so the type never crosses the module boundary.
-struct TrafficKeys {
-mut:
-	key []u8 // AEAD key, suite-length bytes (16 for AES-128-GCM, 32 for the others)
-	iv  []u8 // 12-byte nonce base; per-record nonces XOR in the sequence number
+// derive_client_app_secret expands the client application traffic secret (RFC 8446
+// §7.1, "c ap traffic" label) from the Master Secret; KeyUpdate chains from it (§7.2).
+fn derive_client_app_secret(hash_algo HashAlgorithm, master_secret []u8, th_sfin []u8) ![]u8 {
+	return derive_secret(hash_algo, master_secret, 'c ap traffic', th_sfin)!
+}
+
+// derive_server_app_secret expands the server application traffic secret (RFC 8446
+// §7.1, "s ap traffic" label) from the Master Secret; KeyUpdate chains from it (§7.2).
+fn derive_server_app_secret(hash_algo HashAlgorithm, master_secret []u8, th_sfin []u8) ![]u8 {
+	return derive_secret(hash_algo, master_secret, 's ap traffic', th_sfin)!
 }
 
 // wipe_secret overwrites a secret buffer before releasing its contents. The
@@ -201,29 +192,18 @@ fn wipe_secret(mut secret []u8) {
 	secret = []u8{}
 }
 
-// wipe_traffic_keys overwrites and clears the key and IV buffers. As with
-// wipe_secret, the zeroing loops are what matters; the final reset just leaves the
-// local handle empty — every caller overwrites the stored pair immediately.
-fn wipe_traffic_keys(mut keys TrafficKeys) {
-	for i in 0 .. keys.key.len {
-		keys.key[i] = 0
-	}
-	for i in 0 .. keys.iv.len {
-		keys.iv[i] = 0
-	}
-	keys = TrafficKeys{}
+// derive_traffic_key expands a traffic secret into the AEAD key
+// (RFC 8446 §7.1, "key" label).
+@[direct_array_access]
+fn derive_traffic_key(hash HashAlgorithm, secret []u8, key_len int) ![]u8 {
+	return hkdf_expand_label(hash, secret, 'key', []u8{}, key_len)!
 }
 
-// derive_traffic_keys expands a traffic secret into an AEAD key and IV (RFC 8446
-// §7.1, "key"/"iv" labels); the IV is the static nonce base the adapter consumes.
+// derive_traffic_iv expands a traffic secret into the static nonce base the
+// adapter consumes (RFC 8446 §7.1, "iv" label).
 @[direct_array_access]
-fn derive_traffic_keys(hash HashAlgorithm, secret []u8, key_len int, iv_len int) !TrafficKeys {
-	key := hkdf_expand_label(hash, secret, 'key', []u8{}, key_len)!
-	iv := hkdf_expand_label(hash, secret, 'iv', []u8{}, iv_len)!
-	return TrafficKeys{
-		key: key
-		iv:  iv
-	}
+fn derive_traffic_iv(hash HashAlgorithm, secret []u8, iv_len int) ![]u8 {
+	return hkdf_expand_label(hash, secret, 'iv', []u8{}, iv_len)!
 }
 
 // derive_finished_key computes the finished_key = HKDF-Expand-Label(BaseKey, "finished",
@@ -245,57 +225,6 @@ fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_ha
 	return hash.compute_hmac(finished_key, transcript_hash)
 }
 
-// TrafficSecretPair holds one traffic phase's client and server secrets.
-struct TrafficSecretPair {
-mut:
-	client []u8
-	server []u8
-}
-
-// available reports whether both directions' secrets are present.
-fn (p &TrafficSecretPair) available() bool {
-	return p.client.len > 0 && p.server.len > 0
-}
-
-// wipe zeroes both directions and drops their handles.
-fn (mut p TrafficSecretPair) wipe() {
-	wipe_secret(mut p.client)
-	wipe_secret(mut p.server)
-}
-
-// PhaseSecrets groups the handshake and application traffic-secret pairs.
-struct PhaseSecrets {
-mut:
-	handshake   TrafficSecretPair
-	application TrafficSecretPair
-}
-
-// pair selects one phase's traffic-secret pair; the initial level has none.
-fn (s &PhaseSecrets) pair(level EncryptionLevel) TrafficSecretPair {
-	return match level {
-		.initial { TrafficSecretPair{} }
-		.handshake { s.handshake }
-		.application { s.application }
-	}
-}
-
-// wipe zeroes one phase's traffic-secret pair; the initial level has none.
-fn (mut s PhaseSecrets) wipe(level EncryptionLevel) {
-	match level {
-		.initial {}
-		.handshake { s.handshake.wipe() }
-		.application { s.application.wipe() }
-	}
-}
-
-// available reports which phase pairs currently hold both directions.
-fn (s &PhaseSecrets) available() SecretPhases {
-	return SecretPhases{
-		handshake:   s.handshake.available()
-		application: s.application.available()
-	}
-}
-
 // SecretPhases reports which traffic-secret phases the core currently holds
 // (derived, not yet zeroized, both directions present). Transport-neutral: it lets
 // adapters install record or packet keys when the material actually exists instead
@@ -308,7 +237,10 @@ pub:
 
 // available_secret_phases reports the current key-material readiness.
 pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
-	return h.secrets.available()
+	return SecretPhases{
+		handshake:   h.c_hsk_tsec.len > 0 && h.s_hsk_tsec.len > 0
+		application: h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
+	}
 }
 
 // wipe_traffic_secrets zeroes the client and server traffic secrets for one
@@ -316,7 +248,17 @@ pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 // QUIC-side peer_traffic_secrets() accessor (quic_handshake.v) so reads and
 // wipes share the same phase vocabulary.
 fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
-	h.secrets.wipe(level)
+	match level {
+		.initial {}
+		.handshake {
+			wipe_secret(mut h.c_hsk_tsec)
+			wipe_secret(mut h.s_hsk_tsec)
+		}
+		.application {
+			wipe_secret(mut h.c_app_tsec)
+			wipe_secret(mut h.s_app_tsec)
+		}
+	}
 }
 
 // wipe_all_secrets zeroes the key-schedule intermediate and every traffic secret.
