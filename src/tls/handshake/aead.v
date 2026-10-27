@@ -36,14 +36,19 @@ pub fn suite_key_len(suite CipherSuite) int {
 }
 
 // new_aead_for_suite constructs the AEAD cipher for the negotiated suite; the 12-byte
-// nonce matches TLS 1.3 (RFC 8446 §5.3 / RFC 8439 §2.8).
+// nonce matches TLS 1.3 (RFC 8446 §5.3 / RFC 8439 §2.8). It takes ownership of a
+// distinct key: AES-GCM expands the key into its own round schedule, and ChaCha20-
+// Poly1305 stores the slice it is handed, so that leg clones first. The callers in the
+// record layer scrub their key copy once installed (§7.5), which would otherwise zero
+// the shared buffer and silently corrupt every later ChaCha record (a tag mismatch that
+// AES never shows). Cloning here keeps that scrub from reaching the live cipher.
 pub fn new_aead_for_suite(suite CipherSuite, key []u8) !cipher.AEAD {
 	return match suite {
 		.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384 {
 			aes.new_aes_gcm(key)!
 		}
 		.tls_chacha20_poly1305_sha256 {
-			*chacha20poly1305.new(key, chacha20poly1305.nonce_size, chacha20.Options{})!
+			*chacha20poly1305.new(key.clone(), chacha20poly1305.nonce_size, chacha20.Options{})!
 		}
 	}
 }

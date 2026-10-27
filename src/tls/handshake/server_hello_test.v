@@ -146,3 +146,25 @@ fn test_server_hello_rejects_oversized_hrr_cookie() ! {
 	}
 	assert rejected, 'an oversized HRR cookie must be rejected'
 }
+
+// test_server_hello_reports_missing_supported_versions distinguishes the two
+// version failures: an absent mandatory extension (§4.2.1) is worded as a
+// missing extension, not as a negotiated 0x0000 the peer never sent, while a
+// present-but-wrong version keeps the explicit wrong-value wording.
+fn test_server_hello_reports_missing_supported_versions() ! {
+	mut missing := false
+	parse_server_hello(sh_body([]u8{})!) or { // no extensions at all
+		assert err.msg().contains('missing required supported_versions')
+		missing = true
+	}
+	assert missing, 'an absent supported_versions must be worded as a missing extension'
+
+	mut wrong := false
+	bad_exts := ext_block(u16(ExtensionType.supported_versions), [u8(0x03), 0x03])! // TLS 1.2 offer
+	parse_server_hello(sh_body(bad_exts)!) or {
+		assert err.msg().contains('negotiated version must be 0x0304')
+		assert err.msg().contains('0x0303')
+		wrong = true
+	}
+	assert wrong, 'a present-but-wrong version must keep the wrong-value wording'
+}

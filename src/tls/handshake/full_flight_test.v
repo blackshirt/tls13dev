@@ -305,3 +305,32 @@ fn test_default_failure_alert_is_internal_error() ! {
 	_ := h.create_client_hello()!
 	assert h.failure_alert() == .internal_error
 }
+
+// test_connected_destroys_handshake_secret_keeps_app_secrets locks the §7.5 retention
+// ordering the split depends on end-to-end: the Master Secret is derived from the
+// retained Handshake Secret (so the per-direction app derivers still get it), the
+// caller-side master_secret wipe runs, and the Handshake Secret intermediate is
+// destroyed at .connected while the application traffic secrets it fed stay live.
+fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
+	mut srv := fakeserver.new_server()!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
+	assert produced.len == 1
+	srv.handle_client_finished(produced[0].msg)!
+	assert h.state() == .connected
+
+	// The key-schedule intermediate is gone (wipe_key_schedule_secrets), proving the
+	// Master Secret was derived from the retained Handshake Secret before destruction.
+	assert h.handshake_secret.len == 0
+	// The application traffic secrets the split derivers produced from the caller-owned
+	// Master Secret survive, and readiness reports them.
+	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
+	assert h.available_secret_phases().application
+	// The split key/iv derivers populated the record cache the transport consumes.
+	ck, civ, sk, siv := h.record_traffic_keys(.application)!
+	assert ck.len == 16 && civ.len == 12 && sk.len == 16 && siv.len == 12
+}

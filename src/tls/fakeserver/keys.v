@@ -2,8 +2,10 @@
 //
 // keys.v is the fakeserver's private copy of the RFC 8446 §7.1 key-schedule
 // primitives (HKDF-Extract/Expand/Expand-Label, Derive-Secret, traffic keys,
-// Finished verify_data), pinned to SHA-256 / TLS_AES_128_GCM_SHA256. It does NOT
-// import tls.handshake: that would form an import cycle with the handshake tests.
+// Finished verify_data), pinned to SHA-256 — the hash TLS_AES_128_GCM_SHA256 and
+// TLS_CHACHA20_POLY1305_SHA256 share, differing only in the AEAD key length that
+// traffic_keys takes per suite. It does NOT import tls.handshake: that would form
+// an import cycle with the handshake tests.
 module fakeserver
 
 import crypto.hmac
@@ -12,8 +14,9 @@ import crypto.sha256
 // hash_len is the SHA-256 digest size; the suite pins the hash (RFC 8446 §9.1).
 const hash_len = 32
 
-// key_len / iv_len are the TLS_AES_128_GCM_SHA256 traffic-key sizes (RFC 8446 §7.1).
-const key_len = 16
+// iv_len is the 12-byte AEAD nonce base every suite the fakeserver can select
+// shares (RFC 8446 §7.1). The AEAD key length is suite-dependent, so traffic_keys
+// takes it explicitly instead of pinning a single value here.
 const iv_len = 12
 
 // hmac_block_size is the SHA-256 HMAC block size (RFC 2104).
@@ -93,9 +96,10 @@ fn finished_verify_data(base_key []u8, transcript_hash []u8) ![]u8 {
 }
 
 // traffic_keys expands a traffic secret into the AEAD key and 12-byte IV for
-// one direction (RFC 8446 §7.1 "key" / "iv" labels).
-fn traffic_keys(secret []u8) !([]u8, []u8) {
-	key := hkdf_expand_label(secret, 'key', []u8{}, key_len)!
+// one direction (RFC 8446 §7.1 "key" / "iv" labels); klen is the selected suite's
+// key length (16 for AES-128-GCM, 32 for ChaCha20-Poly1305), both on SHA-256.
+fn traffic_keys(secret []u8, klen int) !([]u8, []u8) {
+	key := hkdf_expand_label(secret, 'key', []u8{}, klen)!
 	iv := hkdf_expand_label(secret, 'iv', []u8{}, iv_len)!
 	return key, iv
 }

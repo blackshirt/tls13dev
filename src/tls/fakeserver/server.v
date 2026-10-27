@@ -3,7 +3,9 @@
 // server.v is a minimal, adaptive TLS 1.3 server flight generator for tests:
 // it parses the client's real ClientHello and emits a byte-correct ServerHello
 // plus encrypted flight (RFC 8446 §7.1), so a record handshaker can be driven
-// to .connected without a socket. Scope: TLS_AES_128_GCM_SHA256 only.
+// to .connected without a socket. Scope: the SHA-256 suites TLS_AES_128_GCM_SHA256
+// (the default) and TLS_CHACHA20_POLY1305_SHA256, chosen per instance via
+// Config.cipher_suite.
 module fakeserver
 
 import crypto.ecdsa
@@ -36,8 +38,10 @@ const ext_quic_transport_parameters = u16(57)
 const group_secp256r1 = u16(0x0017)
 const group_x25519 = u16(0x001d)
 
-// The only cipher suite the fakeserver implements (RFC 8446 §B.4): SHA-256, 16-byte key, 12-byte IV.
+// The cipher suites the fakeserver can select (RFC 8446 §B.4), both SHA-256 with a
+// 12-byte IV; AES-128-GCM keys are 16 bytes, ChaCha20-Poly1305 keys 32.
 const suite_tls_aes_128_gcm_sha256 = u16(0x1301)
+const suite_tls_chacha20_poly1305_sha256 = u16(0x1303)
 
 // TLS 1.3's real version, hidden behind legacy 0x0303 on the wire (§4.2.1).
 const tls13_version = u16(0x0304)
@@ -81,6 +85,11 @@ pub struct Config {
 pub:
 	// alpn is the server's preference-ordered protocol list (RFC 7301 §3.1).
 	alpn []string = []string{}
+	// cipher_suite is the suite the server selects from the client's offer. It defaults
+	// to TLS_AES_128_GCM_SHA256 so every existing test keeps its current flight; setting
+	// TLS_CHACHA20_POLY1305_SHA256 drives the record layer's §7.5 key-ownership path
+	// end to end (the suite where a caller-side key scrub used to corrupt the live AEAD).
+	cipher_suite u16 = suite_tls_aes_128_gcm_sha256
 	// hrr requests a HelloRetryRequest round trip before the real flight.
 	hrr HrrMode = .none
 	// bad_finished flips the last byte of the server Finished verify_data so the
@@ -201,8 +210,8 @@ pub fn (mut s Server) handle_client_hello(msg []u8) !Flight {
 	if !ch.versions.contains(tls13_version) {
 		return error('fakeserver: ClientHello did not offer TLS 1.3')
 	}
-	if !ch.suites.contains(suite_tls_aes_128_gcm_sha256) {
-		return error('fakeserver: ClientHello did not offer TLS_AES_128_GCM_SHA256')
+	if !ch.suites.contains(s.cfg.cipher_suite) {
+		return error('fakeserver: ClientHello did not offer the configured cipher suite 0x${s.cfg.cipher_suite:04x}')
 	}
 	if ch.share_group == 0 || ch.share.len == 0 {
 		return error('fakeserver: ClientHello carried no key_share entry')
@@ -244,7 +253,7 @@ fn (mut s Server) send_hello_retry_request(ch ClientHello, ch1_msg []u8) !Flight
 	} else {
 		cookie = hrr_cookie.clone()
 	}
-	hrr := build_hrr(s.session_id, req_group, cookie)!
+	hrr := build_hrr(s.session_id, s.cfg.cipher_suite, req_group, cookie)!
 	s.transcript.apply_hello_retry_request(ch1_msg, hrr)
 	s.hrr_requested_group = req_group
 	s.hrr_cookie_sent = cookie.clone()
@@ -278,7 +287,7 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	s.shared_secret = shared
 	s.share_group = ch.share_group
 
-	sh := build_server_hello(s.session_id, ch.share_group, server_share)!
+	sh := build_server_hello(s.session_id, s.cfg.cipher_suite, ch.share_group, server_share)!
 	// Transcript now covers ClientHello2 (or 1) and ServerHello (th_ch_sh, §7.1).
 	s.transcript.append(ch_msg)
 	s.transcript.append(sh)
@@ -443,13 +452,19 @@ fn (mut s Server) derive_application_secrets() ! {
 	s.server_app_traffic = derive_secret(master_secret, 's ap traffic', th)!
 }
 
+// aead_key_len is the selected suite's AEAD key length (RFC 8446 §7.1): 32 bytes for
+// ChaCha20-Poly1305, otherwise the AES-128-GCM default of 16.
+fn (s &Server) aead_key_len() int {
+	return if s.cfg.cipher_suite == suite_tls_chacha20_poly1305_sha256 { 32 } else { 16 }
+}
+
 // server_handshake_keys returns the server-direction handshake key and IV, so the
 // test transport can encrypt the flight records.
 pub fn (s &Server) server_handshake_keys() !([]u8, []u8) {
 	if s.server_hsk_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
 	}
-	return traffic_keys(s.server_hsk_traffic)
+	return traffic_keys(s.server_hsk_traffic, s.aead_key_len())
 }
 
 // client_handshake_keys returns the client-direction handshake key and IV, so the
@@ -458,7 +473,7 @@ pub fn (s &Server) client_handshake_keys() !([]u8, []u8) {
 	if s.client_hsk_traffic.len == 0 {
 		return error('fakeserver: handshake secrets not derived yet (ServerHello not built)')
 	}
-	return traffic_keys(s.client_hsk_traffic)
+	return traffic_keys(s.client_hsk_traffic, s.aead_key_len())
 }
 
 // server_handshake_secret returns the raw §7.1 server handshake traffic secret,
@@ -485,7 +500,7 @@ pub fn (s &Server) server_app_keys() !([]u8, []u8) {
 	if s.server_app_traffic.len == 0 {
 		return error('fakeserver: application secrets not derived yet (server Finished not built)')
 	}
-	return traffic_keys(s.server_app_traffic)
+	return traffic_keys(s.server_app_traffic, s.aead_key_len())
 }
 
 // server_app_secret returns the raw §7.1 server application traffic secret, for a
@@ -687,15 +702,15 @@ fn server_ecdhe(group u16, client_share []u8) !([]u8, []u8) {
 }
 
 // build_server_hello emits a TLS 1.3 ServerHello echoing the session id and
-// selecting the fixed suite and group (RFC 8446 §4.1.3).
-fn build_server_hello(session_id []u8, share_group u16, server_share []u8) ![]u8 {
+// selecting the negotiated suite and group (RFC 8446 §4.1.3).
+fn build_server_hello(session_id []u8, suite u16, share_group u16, server_share []u8) ![]u8 {
 	mut body := wire.new_writer(128)
 	body.write_u16(0x0303) // legacy_version (§4.1.3)
 	body.write_bytes(rand.bytes(32) or {
 		return error('fakeserver: ServerHello random generation failed (${err.msg()})')
 	})
 	body.write_vector_u8(session_id)! // legacy_session_id_echo
-	body.write_u16(suite_tls_aes_128_gcm_sha256)
+	body.write_u16(suite)
 	body.write_u8(0x00) // legacy_compression_method
 
 	mut ext := wire.new_writer(64)
@@ -715,12 +730,12 @@ fn build_server_hello(session_id []u8, share_group u16, server_share []u8) ![]u8
 
 // build_hrr emits a HelloRetryRequest: a ServerHello whose random is the fixed
 // §4.1.3 sentinel, carrying a selected_group or a cookie.
-fn build_hrr(session_id []u8, req_group u16, cookie []u8) ![]u8 {
+fn build_hrr(session_id []u8, suite u16, req_group u16, cookie []u8) ![]u8 {
 	mut body := wire.new_writer(128)
 	body.write_u16(0x0303)
 	body.write_bytes(hrr_random.clone())
 	body.write_vector_u8(session_id)!
-	body.write_u16(suite_tls_aes_128_gcm_sha256)
+	body.write_u16(suite)
 	body.write_u8(0x00)
 
 	mut ext := wire.new_writer(64)

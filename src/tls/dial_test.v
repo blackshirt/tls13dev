@@ -112,6 +112,13 @@ fn full_handshake_script(mut c net.TcpConn) ! {
 	run_full_handshake(mut c, false, false, []u8{})!
 }
 
+// chacha_handshake_script is the full flight under TLS_CHACHA20_POLY1305_SHA256 —
+// the software-preferred suite every AES-only test never reached, so it drives the
+// record layer's install/rekey §7.5 key-ownership path end to end.
+fn chacha_handshake_script(mut c net.TcpConn) ! {
+	run_flight(mut c, handshake.CipherSuite.tls_chacha20_poly1305_sha256, false, false, []u8{})!
+}
+
 // split_ticket_script is run_full_handshake with the NewSessionTicket fragmented.
 fn split_ticket_script(mut c net.TcpConn) ! {
 	run_full_handshake(mut c, true, false, []u8{})!
@@ -137,12 +144,21 @@ fn silent_peer_script(mut c net.TcpConn) ! {
 	c.close() or {}
 }
 
-// run_full_handshake drives the whole server flight; split_ticket fragments the
-// ticket across two app-key records, coalesce_ticket instead rides it behind the
-// server Finished in one handshake-key record (§4.6.1), and extra_post_msg (when
-// non-empty) is appended as one coalesced handshake record under the server
-// application keys, after the app data.
+// run_full_handshake drives the whole server flight under TLS_AES_128_GCM_SHA256,
+// the AEAD the majority of these tests assert; it delegates to run_flight, which
+// also lets a caller select TLS_CHACHA20_POLY1305_SHA256.
 fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8) ! {
+	run_flight(mut c, handshake.CipherSuite.tls_aes_128_gcm_sha256, split_ticket, coalesce_ticket, extra_post_msg)!
+}
+
+// run_flight drives the whole server flight under the given cipher suite; split_ticket
+// fragments the ticket across two app-key records, coalesce_ticket instead rides it
+// behind the server Finished in one handshake-key record (§4.6.1), and extra_post_msg
+// (when non-empty) is appended as one coalesced handshake record under the server
+// application keys, after the app data. The suite selects both the fakeserver's
+// ServerHello choice and the transport's AEAD, so a TLS_CHACHA20_POLY1305_SHA256 run
+// exercises the record layer's §7.5 key-ownership path end to end.
+fn run_flight(mut c net.TcpConn, suite handshake.CipherSuite, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8) ! {
 	ch_rec := scripted_read_record(mut c)!
 	if ch_rec.content_type != .handshake {
 		return error('expected a handshake record first, got ${ch_rec.content_type}')
@@ -152,7 +168,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool
 		return error('expected the client dummy CCS second, got ${ccs_rec.content_type}')
 	}
 
-	mut srv := fakeserver.new_server(alpn: ['h2', 'http/1.1']) or {
+	mut srv := fakeserver.new_server(alpn: ['h2', 'http/1.1'], cipher_suite: u16(suite)) or {
 		return error('fakeserver: ${err.msg()}')
 	}
 	fl := srv.handle_client_hello(ch_rec.payload) or {
@@ -169,7 +185,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool
 
 	// The rest of the flight, one encrypted record per message, under the server handshake keys.
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
-	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	aead := handshake.new_aead_for_suite(suite, skey) or { return err }
 	mut senc := new_tls_protection(aead, siv)!
 	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
 	for i, m in fl.rest {
@@ -184,7 +200,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool
 	// The client's Finished arrives encrypted under the client handshake keys.
 	cfin_rec := scripted_read_record(mut c)!
 	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
-	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	caead := handshake.new_aead_for_suite(suite, ckey) or { return err }
 	mut cdec := new_tls_protection(caead, civ)!
 	dec := cdec.decrypt_record(cfin_rec)!
 	if dec.content_type != .handshake {
@@ -194,7 +210,7 @@ fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool
 
 	// Post-handshake: a NewSessionTicket and one application record under the server application keys.
 	akey, aiv := srv.server_app_keys() or { return error('fakeserver keys: ${err.msg()}') }
-	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
+	aaead := handshake.new_aead_for_suite(suite, akey) or { return err }
 	mut aenc := new_tls_protection(aaead, aiv)!
 	if !coalesce_ticket {
 		if split_ticket {
@@ -240,6 +256,37 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 	assert conn.session_tickets.len == 1
 	assert conn.session_tickets[0].lifetime() == 3600
 	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
+
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// test_dial_chacha20_end_to_end negotiates TLS_CHACHA20_POLY1305_SHA256 alone and
+// completes the full handshake plus one application read over it. This is the
+// regression guard for the §7.5 key-ownership bug: install_ciphers scrubs its local
+// key copy after building the ChaCha cipher, which used to zero the AEAD's aliased
+// key and fail every record with an 'unmatching tag' that no AES suite exhibits and
+// that AES-only tests could never surface. Offering ChaCha exclusively means merely
+// reaching connected proves the flight decrypted under ChaCha handshake keys.
+fn test_dial_chacha20_end_to_end() ! {
+	addr, res_ch := start_scripted_server(chacha_handshake_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		hsk_options: handshake.HandshakeOptions{
+			cipher_suites: [handshake.CipherSuite.tls_chacha20_poly1305_sha256]
+		}
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)! // drains the ticket, then the ChaCha app record
+	assert buf[..n] == 'hello from fakeserver'.bytes()
 
 	conn.close() or {}
 	res := <-res_ch
@@ -331,6 +378,111 @@ fn test_dial_rejects_consecutive_key_update() ! {
 		return
 	}
 	assert false, 'two KeyUpdate messages in a row must be terminal'
+}
+
+// key_update_rekey_script is the standard flight, then one peer-initiated
+// KeyUpdate(update_not_requested) followed by a tail record under the NEXT
+// server application key generation (§4.6.3/§7.2): the tail must open only
+// after the client has rekeyed its read leg.
+fn key_update_rekey_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)! // client dummy CCS
+
+	mut srv := fakeserver.new_server() or {
+		return error('fakeserver: ${err.msg()}')
+	}
+	fl := srv.handle_client_hello(ch_rec.payload) or {
+		return error('fakeserver CH: ${err.msg()}')
+	}
+	c.write(new_record(.handshake, fl.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	saead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	mut senc := new_tls_protection(saead, siv)!
+	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
+	for m in fl.rest {
+		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
+	}
+
+	cfin_rec := scripted_read_record(mut c)!
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_tls_protection(caead, civ)!
+	dec := cdec.decrypt_record(cfin_rec)!
+	srv.handle_client_finished(dec.plaintext) or { return error('fakeserver Finished: ${err.msg()}') }
+
+	akey, aiv := srv.server_app_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
+	mut aenc := new_tls_protection(aaead, aiv)!
+	c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+	c.write(aenc.encrypt_record(.application_data, 'hello from fakeserver'.bytes())!.serialize()) or {
+		return err
+	}
+
+	// §7.2 KeyUpdate chain: traffic upd(secret), then the "key"/"iv" labels, the
+	// same derivations the client's core performs when it takes the update.
+	c.write(aenc.encrypt_record(.handshake, handshake.build_key_update(false))!.serialize()) or {
+		return err
+	}
+	hash := handshake.suite_hash_algo(.tls_aes_128_gcm_sha256)
+	next_secret := handshake.hkdf_expand_label(hash, srv.server_app_secret()!, 'traffic upd', []u8{}, hash.hash_len())!
+	next_key := handshake.hkdf_expand_label(hash, next_secret, 'key', []u8{}, handshake.suite_key_len(.tls_aes_128_gcm_sha256))!
+	next_iv := handshake.hkdf_expand_label(hash, next_secret, 'iv', []u8{}, 12)!
+	mut next_enc := new_tls_protection(handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, next_key)!, next_iv)!
+	c.write(next_enc.encrypt_record(.application_data, 'rekeyed tail'.bytes())!.serialize()) or {
+		return err
+	}
+}
+
+// test_dial_key_update_rekeys_and_wipes_superseded_protection proves the §7.5
+// wipe of the replaced generation end to end: after a peer KeyUpdate, the read
+// cipher's old nonce base must be zeroed in place (an alias taken before the
+// rekey reads back all-zero), and the tail record must open only under the
+// next key generation.
+fn test_dial_key_update_rekeys_and_wipes_superseded_protection() ! {
+	addr, res_ch := start_scripted_server(key_update_rekey_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)! // drains the ticket, then the app record
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+
+	// Alias the live read cipher's nonce base before the rekey: V arrays share one
+	// underlying buffer, so `unsafe` here (the compiler's sanctioned opt-out from the
+	// `.clone()` guard) keeps a genuine alias rather than a copy. rekey_cipher's wipe then
+	// zeroes this same buffer in place, which the alias observes; a `.clone()` would instead
+	// snapshot the pre-rekey nonzero bytes and defeat the assertion below.
+	mut old_iv := unsafe { conn.server_app_cipher.iv }
+	assert old_iv.len == 12 && old_iv[0] != 0
+
+	mut tail := []u8{len: 32}
+	m := conn.read(mut tail)! // this read takes the KeyUpdate and rekeys
+	assert tail[..m] == 'rekeyed tail'.bytes()
+
+	mut nonzero := false
+	for b in old_iv {
+		if b != 0 {
+			nonzero = true
+		}
+	}
+	assert !nonzero, 'the superseded read cipher must leave its nonce base zeroed (§7.5)'
+	assert conn.server_app_cipher.iv.len == 12 // the new generation is live
+
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
 }
 
 // test_dial_rejects_oversized_client_hello checks the §5.1 single-record rule
@@ -808,6 +960,127 @@ fn test_dial_answers_certificate_request_with_empty_certificate() ! {
 	)!
 	assert conn.negotiated_alpn() == ''
 	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// ---- Truncation and clean-shutdown defenses (RFC 8446 §6.1) ----
+
+// close_notify_script is the standard flight, then one application record followed by an
+// encrypted close_notify under the server application keys — the clean-shutdown signal a
+// well-behaved peer sends before closing (RFC 8446 §6.1).
+fn close_notify_script(mut c net.TcpConn) ! {
+	ch_rec := scripted_read_record(mut c)!
+	if ch_rec.content_type != .handshake {
+		return error('expected a handshake record first, got ${ch_rec.content_type}')
+	}
+	_ := scripted_read_record(mut c)! // client dummy CCS
+
+	mut srv := fakeserver.new_server() or {
+		return error('fakeserver: ${err.msg()}')
+	}
+	fl := srv.handle_client_hello(ch_rec.payload) or { return error('fakeserver CH: ${err.msg()}') }
+	c.write(new_record(.handshake, fl.server_hello).serialize()) or { return err }
+	c.write(change_cipher_spec().serialize()) or { return err }
+
+	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	saead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
+	mut senc := new_tls_protection(saead, siv)!
+	nst := srv.new_session_ticket() or { return error('fakeserver NST: ${err.msg()}') }
+	for m in fl.rest {
+		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
+	}
+
+	cfin_rec := scripted_read_record(mut c)!
+	ckey, civ := srv.client_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	caead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, ckey) or { return err }
+	mut cdec := new_tls_protection(caead, civ)!
+	dec := cdec.decrypt_record(cfin_rec)!
+	srv.handle_client_finished(dec.plaintext) or { return error('fakeserver Finished: ${err.msg()}') }
+
+	akey, aiv := srv.server_app_keys() or { return error('fakeserver keys: ${err.msg()}') }
+	aaead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, akey) or { return err }
+	mut aenc := new_tls_protection(aaead, aiv)!
+	c.write(aenc.encrypt_record(.handshake, nst)!.serialize()) or { return err }
+	c.write(aenc.encrypt_record(.application_data, 'hello from fakeserver'.bytes())!.serialize()) or {
+		return err
+	}
+	// Encrypted close_notify under the server application keys, inner type alert (§6.1).
+	notify := handshake.new_alert(.close_notify)
+	c.write(aenc.encrypt_record(.alert, notify.encode())!.serialize()) or { return err }
+}
+
+// test_dial_clean_close_notify_returns_zero proves the §6.1 clean-shutdown path end to end:
+// after delivering app data, an encrypted close_notify makes read() return 0 — and it stays 0
+// on the next read, never flipping to an error, so a graceful peer is distinguishable from a
+// truncating one.
+fn test_dial_clean_close_notify_returns_zero() ! {
+	addr, res_ch := start_scripted_server(close_notify_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)! // drains the ticket, then the app record
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+
+	// The encrypted close_notify surfaces as a clean EOF (0).
+	mut b2 := []u8{len: 64}
+	assert conn.read(mut b2)! == 0
+	// It stays 0 (a sticky clean close), never an error (§6.1).
+	assert conn.read(mut b2)! == 0
+
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// test_dial_truncation_without_close_notify_is_sticky proves the RFC 8446 §6.1 truncation
+// defense end to end: a peer that delivers one application record and then closes the TCP
+// connection WITHOUT a close_notify must leave the client with a sticky error, re-reported on
+// every later read — never a silent clean EOF (0).
+fn test_dial_truncation_without_close_notify_is_sticky() ! {
+	// full_handshake_script delivers app data and then the worker closes the socket with no
+	// close_notify: exactly the abrupt-FIN truncation vector §6.1 defends against.
+	addr, res_ch := start_scripted_server(full_handshake_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)! // drains the ticket, then the app record
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+
+	// The abrupt close (no close_notify) must surface as an error, not 0.
+	mut truncated := false
+	mut sticky := ''
+	conn.read(mut buf) or {
+		assert err.msg().contains('connection closed')
+		sticky = conn.fatal_error
+		assert sticky == err.msg()
+		truncated = true
+	}
+	assert truncated, 'an abrupt close without close_notify must not read as a clean EOF'
+
+	// And it must stay sticky on the next read — never reduce to a silent 0 (§6.1).
+	mut re_reported := false
+	conn.read(mut buf) or {
+		assert err.msg() == sticky
+		re_reported = true
+	}
+	assert re_reported, 'truncation must remain a sticky error across reads'
 	res := <-res_ch
 	assert res == 'OK'
 }

@@ -78,6 +78,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 
 	ext_bytes := r.read_vector_u16()!
 
+	mut got_version := false
 	mut selected_version := u16(0)
 	mut server_share := KeyShareEntry{}
 	mut has_key_share := false
@@ -92,6 +93,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 			u16(ExtensionType.supported_versions) {
 				// A bare u16 version here, not a length-prefixed vector as in ClientHello (§4.2.1).
 				selected_version = data_r.read_u16()!
+				got_version = true
 				if data_r.remaining() != 0 {
 					return error('handshake: trailing bytes in supported_versions extension')
 				}
@@ -146,6 +148,12 @@ fn parse_server_hello(body []u8) !ServerHello {
 	}
 
 	// The negotiated version MUST be confirmed via supported_versions = 0x0304.
+	// Distinguish the two failures: an absent mandatory extension is a missing
+	// extension (§4.2.1/§4.1.3), not a wrong version — reporting 0x0000 would
+	// blame a version the peer never sent.
+	if !got_version {
+		return error('handshake: ServerHello missing required supported_versions extension (missing_extension)')
+	}
 	if selected_version != 0x0304 {
 		return error('handshake: ServerHello negotiated version must be 0x0304 (TLS 1.3), got 0x${selected_version:04x}')
 	}

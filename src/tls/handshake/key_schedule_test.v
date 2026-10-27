@@ -160,3 +160,106 @@ fn test_record_key_expansion() ! {
 	assert hex.encode(sk_key) == '3fce516009c21727d0f2e4e86ee403bc'
 	assert hex.encode(sk_iv) == '5d313eb2671276ee13000b30'
 }
+
+// test_derivers_leave_input_secret_untouched guards the split's moved ownership: each
+// deriver must read its secret argument without mutating or wiping it, because the
+// caller keeps that buffer alive (handshake_secret is stored and reused for the Master
+// Secret; master_secret is zeroized by the caller, not by the app derivers). A split
+// helper that wiped its input would silently destroy the secret the next stage needs.
+fn test_derivers_leave_input_secret_untouched() ! {
+	hash := HashAlgorithm.sha256
+	shared_secret := hex.decode(rfc8448_ecdhe_shared_secret)!
+	handshake_secret := hex.decode(rfc8448_handshake_secret)!
+	master_secret := hex.decode(rfc8448_master_secret)!
+	th_ch_sh := hex.decode(rfc8448_transcript_hash_ch_sh)!
+	th_sfin := hex.decode(rfc8448_transcript_hash_ch_sfin)!
+	client_hs_traffic := hex.decode(rfc8448_client_hs_traffic)!
+
+	shared_before := shared_secret.clone()
+	_ = derive_handshake_secret(hash, shared_secret)!
+	assert shared_secret == shared_before
+
+	hs_before := handshake_secret.clone()
+	_ = derive_client_hs_secret(hash, handshake_secret, th_ch_sh)!
+	_ = derive_server_hs_secret(hash, handshake_secret, th_ch_sh)!
+	_ = derive_master_secret(hash, handshake_secret)!
+	assert handshake_secret == hs_before
+
+	master_before := master_secret.clone()
+	_ = derive_client_app_secret(hash, master_secret, th_sfin)!
+	_ = derive_server_app_secret(hash, master_secret, th_sfin)!
+	assert master_secret == master_before
+
+	tsec_before := client_hs_traffic.clone()
+	_ = derive_traffic_key(hash, client_hs_traffic, 16)!
+	_ = derive_traffic_iv(hash, client_hs_traffic, 12)!
+	assert client_hs_traffic == tsec_before
+}
+
+// test_derivers_deterministic_and_distinct pins the properties the label-preserving
+// split must retain: the same inputs expand to the same bytes, the client and server
+// directions stay distinct (separate labels survived the split), and the key and iv
+// derivers produce different material of exactly the requested lengths.
+fn test_derivers_deterministic_and_distinct() ! {
+	hash := HashAlgorithm.sha256
+	handshake_secret := hex.decode(rfc8448_handshake_secret)!
+	master_secret := hex.decode(rfc8448_master_secret)!
+	th_ch_sh := hex.decode(rfc8448_transcript_hash_ch_sh)!
+	th_sfin := hex.decode(rfc8448_transcript_hash_ch_sfin)!
+	client_hs_traffic := hex.decode(rfc8448_client_hs_traffic)!
+
+	first := derive_client_hs_secret(hash, handshake_secret, th_ch_sh)!
+	second := derive_client_hs_secret(hash, handshake_secret, th_ch_sh)!
+	assert first == second
+
+	hs_c := derive_client_hs_secret(hash, handshake_secret, th_ch_sh)!
+	hs_s := derive_server_hs_secret(hash, handshake_secret, th_ch_sh)!
+	assert hs_c != hs_s
+
+	ap_c := derive_client_app_secret(hash, master_secret, th_sfin)!
+	ap_s := derive_server_app_secret(hash, master_secret, th_sfin)!
+	assert ap_c != ap_s
+
+	key := derive_traffic_key(hash, client_hs_traffic, 16)!
+	iv := derive_traffic_iv(hash, client_hs_traffic, 12)!
+	assert key.len == 16
+	assert iv.len == 12
+	assert key != iv
+}
+
+// test_derived_buffers_are_independent_of_intermediates checks that two expansions off
+// the same secret return separate allocations. If a split deriver handed back a buffer
+// aliased to a wiped intermediate, a later expansion (or the caller's input wipe) would
+// clobber an already-returned secret.
+fn test_derived_buffers_are_independent_of_intermediates() ! {
+	hash := HashAlgorithm.sha256
+	handshake_secret := hex.decode(rfc8448_handshake_secret)!
+	th_ch_sh := hex.decode(rfc8448_transcript_hash_ch_sh)!
+	hs_c := derive_client_hs_secret(hash, handshake_secret, th_ch_sh)!
+	hs_s := derive_server_hs_secret(hash, handshake_secret, th_ch_sh)!
+	assert unsafe { voidptr(&hs_c[0]) } != unsafe { voidptr(&hs_s[0]) }
+}
+
+// test_sha384_split_chain_matches_primitives proves the composite phase helpers are
+// byte-identical to their primitive HKDF decomposition at the SHA-384 digest, without
+// needing external vectors. This exercises the hash_len()==48 block loop the SHA-256
+// KATs never reach, so a length or digest-size regression in the split surfaces here.
+fn test_sha384_split_chain_matches_primitives() ! {
+	hash := HashAlgorithm.sha384
+	shared_secret := []u8{len: 48, init: 0x5a}
+
+	// Handshake Secret: Early(zero-PSK) -> "derived" -> HKDF-Extract(shared secret).
+	early := hkdf_extract(hash, []u8{}, []u8{len: 48})
+	derived_early := derive_secret(hash, early, 'derived', empty_transcript_hash(hash))!
+	manual_hs := hkdf_extract(hash, derived_early, shared_secret)
+	split_hs := derive_handshake_secret(hash, shared_secret)!
+	assert split_hs == manual_hs
+	assert split_hs.len == 48
+
+	// Master Secret: Handshake -> "derived" -> zero-PSK extract.
+	derived_hs := derive_secret(hash, manual_hs, 'derived', empty_transcript_hash(hash))!
+	manual_master := hkdf_extract(hash, derived_hs, []u8{len: 48})
+	split_master := derive_master_secret(hash, manual_hs)!
+	assert split_master == manual_master
+	assert split_master.len == 48
+}

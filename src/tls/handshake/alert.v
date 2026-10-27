@@ -86,6 +86,10 @@ pub fn (d AlertDescription) quic_connection_error() u32 {
 
 // new_alert builds an alert with the given description; RFC 8446 §6 makes every alert
 // except close_notify fatal, so close_notify is the only warning-level description.
+// Sending close_notify at warning level is deliberate interoperability heritage
+// (matching Go crypto/tls); §6 also permits a fatal-level close_notify, so a
+// receiver must accept the description under both levelings and gate only on
+// non-close_notify warnings.
 pub fn new_alert(description AlertDescription) Alert {
 	return Alert{
 		level:       if description == .close_notify { .warning } else { .fatal }
