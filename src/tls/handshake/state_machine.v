@@ -20,15 +20,22 @@ import tls.pki
 // HandshakeState tracks client progress; the wait_* order mirrors the fixed
 // post-ServerHello flight (RFC 8446 §1/§4.1), each handler asserting its state.
 pub enum HandshakeState {
-	start                     // nothing sent yet; create_client_hello moves us out of here
-	wait_server_hello         // ClientHello sent; awaiting ServerHello or HelloRetryRequest
-	wait_encrypted_extensions // ServerHello accepted and handshake keys installed
-	wait_certificate_request  // EncryptedExtensions accepted; a CertificateRequest may follow before the Certificate (§4.3.2/§4.4.1)
-	wait_certificate          // EncryptedExtensions accepted (ALPN/SNI checks done); awaiting the server Certificate
-	wait_certificate_verify   // server chain parsed and hostname/chain validated
-	wait_server_finished      // CertificateVerify verified against the leaf key
-	connected                 // server Finished verified; application data may flow
-	failed                    // terminal error; no further handshake messages are accepted
+	start              // nothing sent yet; create_client_hello moves us out of here
+	wait_server_hello  // ClientHello sent; awaiting ServerHello or HelloRetryRequest
+	wait_server_flight // ServerHello accepted; the encrypted server flight is in progress
+	connected          // server Finished verified; application data may flow
+	failed             // terminal error; no further handshake messages are accepted
+}
+
+// ServerFlightStep is the expected position inside the encrypted server flight.
+// It is the single ordering cursor; HandshakeState only reports coarse progress.
+enum ServerFlightStep {
+	encrypted_extensions
+	certificate_request_or_certificate
+	certificate
+	certificate_verify
+	finished
+	complete
 }
 
 // HandshakeMessage is one outbound handshake message, unframed: level tags its
@@ -94,16 +101,57 @@ pub mut:
 	quic_transport_params []u8
 }
 
+// with_validator returns a copy of the options with the given validator, preserving
+// every other setting. Adapters use it to resolve trust configuration before handing
+// the options to a constructor without copying fields by hand.
+pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOptions {
+	return HandshakeOptions{
+		alpn:                  o.alpn.clone()
+		validator:             validator
+		key_share_group:       o.key_share_group
+		supported_groups:      o.supported_groups.clone()
+		cipher_suites:         o.cipher_suites.clone()
+		signature_algorithms:  o.signature_algorithms.clone()
+		legacy_session_id:     o.legacy_session_id.clone()
+		random:                o.random.clone()
+		quic_transport_params: o.quic_transport_params
+	}
+}
+
+// TrafficSecretPair holds one traffic phase's client and server secrets.
+struct TrafficSecretPair {
+mut:
+	client []u8
+	server []u8
+}
+
+// available reports whether both directions' secrets are present.
+fn (p &TrafficSecretPair) available() bool {
+	return p.client.len > 0 && p.server.len > 0
+}
+
+// wipe zeroes both directions and drops their handles.
+fn (mut p TrafficSecretPair) wipe() {
+	wipe_secret(mut p.client)
+	wipe_secret(mut p.server)
+}
+
+// PhaseSecrets groups the handshake and application traffic-secret pairs.
+struct PhaseSecrets {
+mut:
+	handshake   TrafficSecretPair
+	application TrafficSecretPair
+}
+
 // HandshakeCore owns shared TLS 1.3 handshake state and behavior.
 @[noinit]
 struct HandshakeCore {
 mut:
 	// ClientHello settings and key exchange state.
-	config        ClientHelloConfig // settings used to build or retry the ClientHello
-	ecdhe_group   NamedGroup        // key exchange group used for the shared secret
-	priv_x25519   &curve25519.PrivateKey = unsafe { nil } // client's X25519 private key, if used
-	priv_p256     ?ecdsa.PrivateKey // client's P-256 private key, if used
-	client_hello1 []u8              // first ClientHello, kept in case the server requests a retry
+	config      ClientHelloConfig // settings used to build or retry the ClientHello
+	ecdhe_group NamedGroup        // key exchange group used for the shared secret
+	priv_x25519 &curve25519.PrivateKey = unsafe { nil } // client's X25519 private key, if used
+	priv_p256   ?ecdsa.PrivateKey // client's P-256 private key, if used
 
 	// Transcript and negotiated cipher suite.
 	transcript   Transcript    // hash of handshake messages exchanged so far
@@ -112,34 +160,97 @@ mut:
 	key_len      int           // encryption key length for the selected cipher suite
 	quic_params  ?[]u8         // server transport parameters received in EncryptedExtensions, kept as opaque bytes for the QUIC adapter
 
-	// Traffic secrets used to protect handshake and application data.
-	handshake_secret   []u8 // secret used to derive handshake traffic keys
-	client_hsk_traffic []u8 // key material for client handshake messages
-	server_hsk_traffic []u8 // key material for server handshake messages
-	client_app_traffic []u8 // key material for client application data
-	server_app_traffic []u8 // key material for server application data
+	// Key-schedule material used to protect handshake and application data.
+	handshake_secret []u8 // secret used to derive handshake traffic keys
+	secrets          PhaseSecrets
 
-	// Incoming handshake bytes that do not yet form a complete message.
-	init_buf []u8 // initial-level bytes not yet forming a complete message
-	hsk_buf  []u8 // handshake-level bytes not yet forming a complete message
+	// Incoming handshake bytes that do not yet form complete messages.
+	buffers ReassemblyBuffers
 
 	// Peer certificate validation and client certificate response state.
-	validator       pki.Validator     // checks the server's certificate and hostname
-	server_certs    []pki.Certificate // certificates received from the server, leaf first
-	request_context []u8              // context to include in the client's certificate response
+	validator    pki.Validator     // checks the server's certificate and hostname
+	server_certs []pki.Certificate // certificates received from the server, leaf first
 
 	// Handshake retry and outcome.
-	hrr_received     bool           // whether the server has requested a ClientHello retry
-	hrr_cipher_suite ?CipherSuite   // cipher suite chosen in the retry request, if any
-	state            HandshakeState // current stage of the handshake
-	negotiated_alpn  string         // protocol chosen by the server, or empty if none
+	hrr_cipher_suite ?CipherSuite     // suite from the retry request; presence marks a retry
+	state            HandshakeState   // current stage of the handshake
+	flight_step      ServerFlightStep // expected message within the encrypted server flight
+	negotiated_alpn  string           // protocol chosen by the server, or empty if none
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
+}
+
+// secret_pair selects one phase's traffic-secret pair; the initial level has none.
+fn (h &HandshakeCore) secret_pair(level EncryptionLevel) TrafficSecretPair {
+	return match level {
+		.initial { TrafficSecretPair{} }
+		.handshake { h.secrets.handshake }
+		.application { h.secrets.application }
+	}
 }
 
 // reassembly_buf_cap is the initial per-level reassembly allocation; the hard bound
 // a hostile peer must never exceed is enforced inline in receive_msgs_at_level
 // against max_handshake_message_len.
 const reassembly_buf_cap = 4096
+
+// ReassemblyBuffers holds the initial- and handshake-level byte streams that do
+// not yet form complete messages. Application-level bytes never reach the core.
+struct ReassemblyBuffers {
+mut:
+	initial   []u8
+	handshake []u8
+}
+
+// new_reassembly_buffers allocates both level buffers with the standard capacity.
+fn new_reassembly_buffers() ReassemblyBuffers {
+	return ReassemblyBuffers{
+		initial:   []u8{cap: reassembly_buf_cap}
+		handshake: []u8{cap: reassembly_buf_cap}
+	}
+}
+
+// len reports the unconsumed byte count at one level.
+fn (b &ReassemblyBuffers) len(level EncryptionLevel) int {
+	return match level {
+		.initial { b.initial.len }
+		.handshake { b.handshake.len }
+		.application { 0 }
+	}
+}
+
+// append adds bytes to one level's reassembly buffer.
+fn (mut b ReassemblyBuffers) append(level EncryptionLevel, bytes []u8) {
+	match level {
+		.initial { b.initial << bytes }
+		.handshake { b.handshake << bytes }
+		.application {}
+	}
+}
+
+// next_message extracts one complete framed message from one level's buffer.
+fn (mut b ReassemblyBuffers) next_message(level EncryptionLevel) ![]u8 {
+	match level {
+		.initial { return next_recordless_message(mut b.initial) }
+		.handshake { return next_recordless_message(mut b.handshake) }
+		.application { return []u8{} }
+	}
+}
+
+// take_handshake zeroes and removes the handshake-level buffer, returning its bytes.
+fn (mut b ReassemblyBuffers) take_handshake() []u8 {
+	taken := b.handshake.clone()
+	for i in 0 .. b.handshake.len {
+		b.handshake[i] = 0
+	}
+	b.handshake = []u8{}
+	return taken
+}
+
+// clear_all drops both level buffers on terminal failure.
+fn (mut b ReassemblyBuffers) clear_all() {
+	b.initial = []u8{}
+	b.handshake = []u8{}
+}
 
 //  Construction
 
@@ -163,8 +274,9 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	}
 
 	mut core := HandshakeCore{
-		state:      .start
-		config:     ClientHelloConfig{
+		state:       .start
+		flight_step: .encrypted_extensions
+		config:      ClientHelloConfig{
 			server_name:           server_name
 			alpn:                  options.alpn.clone()
 			session_id:            session_id
@@ -179,12 +291,11 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 				none
 			}
 		}
-		transcript: new_transcript(.sha256)
-		hash_algo:  .sha256
-		key_len:    16
-		validator:  validator
-		init_buf:   []u8{cap: reassembly_buf_cap}
-		hsk_buf:    []u8{cap: reassembly_buf_cap}
+		transcript:  new_transcript(.sha256)
+		hash_algo:   .sha256
+		key_len:     16
+		validator:   validator
+		buffers:     new_reassembly_buffers()
 	}
 	core.generate_key_share(options.key_share_group)!
 	core.config.client_share = KeyShareEntry{
@@ -231,8 +342,8 @@ pub:
 // available_secret_phases reports the current key-material readiness.
 pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	return SecretPhases{
-		handshake:   h.client_hsk_traffic.len > 0 && h.server_hsk_traffic.len > 0
-		application: h.client_app_traffic.len > 0 && h.server_app_traffic.len > 0
+		handshake:   h.secrets.handshake.available()
+		application: h.secrets.application.available()
 	}
 }
 
@@ -249,11 +360,17 @@ fn (mut h HandshakeCore) classify_failure(alert AlertDescription, message string
 	return error(message)
 }
 
+// fail_with classifies a propagated error without each call site repeating the
+// err.msg() unwrap.
+fn (mut h HandshakeCore) fail_with(alert AlertDescription, err IError) IError {
+	return h.classify_failure(alert, err.msg())
+}
+
 // update_transcript appends one message to the running transcript, converting the
 // total-size bound into the alert-classified failure the state machine reports.
 fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 	h.transcript.update(msg) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 }
 
@@ -269,7 +386,6 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 		return error('handshake: create_client_hello() only runs once (state: ${h.state}); the retry ClientHello is produced by receive_msgs_at_level() during HelloRetryRequest handling')
 	}
 	_, full_client_hello := build_client_hello(h.config)!
-	h.client_hello1 = full_client_hello.clone()
 	h.update_transcript(full_client_hello)!
 
 	h.state = .wait_server_hello
@@ -296,9 +412,7 @@ pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes 
 			return h.append_and_drain(level, bytes)
 		}
 		.handshake {
-			if h.state != .wait_encrypted_extensions && h.state != .wait_certificate_request
-				&& h.state != .wait_certificate && h.state != .wait_certificate_verify
-				&& h.state != .wait_server_finished {
+			if h.state != .wait_server_flight {
 				return error('handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state})')
 			}
 			return h.append_and_drain(level, bytes)
@@ -318,35 +432,19 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 	mut offset := 0
 	limit := handshake_header_len + max_handshake_message_len
 	for {
-		buffer_len := if level == .initial {
-			h.init_buf.len
-		} else {
-			h.hsk_buf.len
-		}
-		available := limit - buffer_len
+		available := limit - h.buffers.len(level)
 		if offset < bytes.len && available == 0 {
 			alert := if level == .initial { 'initial-level' } else { 'handshake-level' }
 			return h.classify_failure(.decode_error, 'handshake: ${alert} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 		}
 		take := if bytes.len - offset > available { available } else { bytes.len - offset }
 		if take > 0 {
-			if level == .initial {
-				h.init_buf << bytes[offset..offset + take]
-			} else {
-				h.hsk_buf << bytes[offset..offset + take]
-			}
+			h.buffers.append(level, bytes[offset..offset + take])
 			offset += take
 		}
-		messages := if level == .initial {
-			h.drain_initial() or {
-				h.fail_and_zeroize_secrets()
-				return err
-			}
-		} else {
-			h.drain_handshake() or {
-				h.fail_and_zeroize_secrets()
-				return err
-			}
+		messages := h.drain(level) or {
+			h.fail_and_zeroize_secrets()
+			return err
 		}
 		out << messages
 		if offset == bytes.len {
@@ -356,46 +454,64 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 	return out
 }
 
-// drain_initial consumes the complete ServerHello/HelloRetryRequest from the
-// initial-level buffer; framing-boundary checks remain adapter policy.
-fn (mut h HandshakeCore) drain_initial() ![]HandshakeMessage {
+// should_drain reports whether the level's buffer can still yield messages for
+// the current state.
+fn (h &HandshakeCore) should_drain(level EncryptionLevel) bool {
+	return match level {
+		.initial { h.state == .wait_server_hello }
+		.handshake { h.state == .wait_server_flight }
+		.application { false }
+	}
+}
+
+// drain consumes every complete message one level's buffer currently holds.
+// Framing-boundary checks remain adapter policy.
+fn (mut h HandshakeCore) drain(level EncryptionLevel) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
-	for h.state == .wait_server_hello {
-		msg := next_recordless_message(mut h.init_buf) or {
-			return h.classify_failure(.decode_error, err.msg())
+	for h.should_drain(level) {
+		msg := h.buffers.next_message(level) or {
+			return h.fail_with(.decode_error, err)
 		}
 		if msg.len == 0 {
 			break // header or body still incomplete
 		}
-		out_msgs := h.handle_server_hello_message(msg) or {
-			return err // classified inside the ServerHello handler
+		out_msgs := if level == .initial {
+			h.handle_server_hello_message(msg) or { return err }
+		} else {
+			h.handle_handshake_message(msg) or { return err }
 		}
 		out << out_msgs
-		if h.state != .wait_server_hello {
-			break // ServerHello consumed (or failed); an HRR rearms the wait
-		}
 	}
 	return out
 }
 
-// drain_handshake consumes the encrypted flight — EE, optional CertificateRequest,
-// Certificate, CertificateVerify, and Finished — until the buffer runs dry
-// or the handshake ends.
-fn (mut h HandshakeCore) drain_handshake() ![]HandshakeMessage {
-	mut out := []HandshakeMessage{}
-	for h.state != .connected && h.state != .failed {
-		msg := next_recordless_message(mut h.hsk_buf) or {
-			return h.classify_failure(.decode_error, err.msg())
+// accepts_handshake_message is the single ordering check for the encrypted
+// flight: it names the message types legal in the current state, so each handler
+// only parses and transitions.
+fn (h &HandshakeCore) accepts_handshake_message(msg_type HandshakeType) bool {
+	return match h.flight_step {
+		.encrypted_extensions { msg_type == .encrypted_extensions }
+		.certificate_request_or_certificate {
+			msg_type == .certificate_request || msg_type == .certificate
 		}
-		if msg.len == 0 {
-			break
-		}
-		out_msgs := h.handle_handshake_message(msg) or {
-			return err // classified inside the encrypted-flight handlers
-		}
-		out << out_msgs
+		.certificate { msg_type == .certificate }
+		.certificate_verify { msg_type == .certificate_verify }
+		.finished { msg_type == .finished }
+		.complete { false }
 	}
-	return out
+}
+
+// unexpected_handshake_message preserves the per-message wording adapters and
+// tests rely on when ordering rejects a message.
+fn unexpected_handshake_message(msg_type HandshakeType) string {
+	return match msg_type {
+		.encrypted_extensions { 'handshake: unexpected EncryptedExtensions' }
+		.certificate_request { 'handshake: unexpected CertificateRequest' }
+		.certificate { 'handshake: unexpected Certificate' }
+		.certificate_verify { 'handshake: unexpected CertificateVerify' }
+		.finished { 'handshake: unexpected Finished message' }
+		else { 'handshake: unexpected handshake message ${msg_type}' }
+	}
 }
 
 // handle_handshake_message processes one complete encrypted-flight message:
@@ -404,7 +520,10 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 	// The message is complete by construction (reassembly framed it by its own
 	// header), so peel type/length and split the body off.
 	msg_type, body := split_handshake_message(full_msg) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
+	}
+	if !h.accepts_handshake_message(msg_type) {
+		return h.classify_failure(.unexpected_message, unexpected_handshake_message(msg_type))
 	}
 
 	match msg_type {
@@ -414,7 +533,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 		.certificate_verify { return h.handle_certificate_verify(full_msg, body) }
 		.finished { return h.handle_finished(full_msg, body) }
 		else {
-			return h.classify_failure(.unexpected_message, 'handshake: unexpected handshake message ${msg_type}')
+			return h.classify_failure(.unexpected_message, unexpected_handshake_message(msg_type))
 		}
 	}
 }
@@ -557,7 +676,7 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 
 	// Peel the 4-byte handshake header (type || 3-byte length) to bound the body (§4).
 	msg_type, body := split_handshake_message(sh_msg) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	if msg_type != .server_hello {
 		// HelloRetryRequest reuses the ServerHello type value (2) and is told apart
@@ -568,7 +687,7 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	// method one complete handshake message.
 	// §4.1.3 field decode plus the §4.2 extension allowlist.
 	sh := parse_server_hello(body) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	// Re-frame header + body so the transcript covers the exact wire layout.
 	full_sh_msg := wrap_handshake_message(.server_hello, body)
@@ -579,7 +698,7 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 
 	// Normal ServerHello: validate echoed fields and that a key share was selected
 	// for our group; (EC)DHE cannot proceed without one.
-	sh.validate(&h.config) or { return h.classify_failure(.illegal_parameter, err.msg()) }
+	sh.validate(&h.config) or { return h.fail_with(.illegal_parameter, err) }
 	// §4.1.4: after a HelloRetryRequest the ServerHello suite must match the HRR's.
 	if hrr_suite := h.hrr_cipher_suite {
 		if hrr_suite != sh.cipher_suite {
@@ -609,10 +728,13 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	th_ch_sh := h.transcript.current_hash()
 	hs := derive_hs_secrets(h.hash_algo, shared_secret, th_ch_sh)!
 	h.handshake_secret = hs.handshake_secret
-	h.client_hsk_traffic = hs.client_traffic
-	h.server_hsk_traffic = hs.server_traffic
+	h.secrets.handshake = TrafficSecretPair{
+		client: hs.client_traffic
+		server: hs.server_traffic
+	}
 
-	h.state = .wait_encrypted_extensions
+	h.state = .wait_server_flight
+	h.flight_step = .encrypted_extensions
 	return []HandshakeMessage{}
 }
 
@@ -621,8 +743,8 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg []u8) ![]HandshakeMessage {
 	// §4.1.4: validate shared fields, reject a second HelloRetryRequest, and
 	// require that the request actually changes something.
-	sh.validate(&h.config) or { return h.classify_failure(.illegal_parameter, err.msg()) }
-	if h.hrr_received {
+	sh.validate(&h.config) or { return h.fail_with(.illegal_parameter, err) }
+	if h.hrr_cipher_suite != none {
 		return h.classify_failure(.unexpected_message, 'handshake: received second HelloRetryRequest (unexpected_message)')
 	}
 
@@ -639,12 +761,12 @@ fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg 
 		}
 	}
 
-	h.hrr_received = true
-	// §4.1.4: the final ServerHello must reuse this cipher suite.
+	// §4.1.4: the final ServerHello must reuse this cipher suite; presence also
+	// marks that a retry has already been accepted.
 	h.hrr_cipher_suite = sh.cipher_suite
 	// §4.4.1: the message_hash uses the HRR suite's hash, so switch before applying the HRR.
 	h.set_hash_algo(suite_hash_algo(sh.cipher_suite))
-	h.transcript.apply_hello_retry_request(h.client_hello1, full_sh_msg)
+	h.transcript.apply_hello_retry_request(full_sh_msg)
 
 	return h.build_second_client_hello(sh.has_key_share, sh.server_share.group, sh.cookie)!
 }
@@ -691,12 +813,9 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 
 // handle_encrypted_extensions records ALPN and QUIC transport parameters.
 fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) ![]HandshakeMessage {
-	if h.state != .wait_encrypted_extensions {
-		return h.classify_failure(.unexpected_message, 'handshake: unexpected EncryptedExtensions')
-	}
 	alpn, transport_parameters := parse_encrypted_extensions_for_transport(body,
 		h.config.is_quic) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	// RFC 7301 §3.1: the server must pick from the offered list; an unoffered value
 	// could steer the application protocol below us. `in` is exact element
@@ -708,7 +827,7 @@ fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) !
 	h.negotiated_alpn = alpn
 	h.quic_params = transport_parameters
 	h.update_transcript(full_msg)!
-	h.state = .wait_certificate_request
+	h.flight_step = .certificate_request_or_certificate
 	return []HandshakeMessage{}
 }
 
@@ -716,19 +835,15 @@ fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) !
 fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![]HandshakeMessage {
 	// §4.3.2: the server wants client authentication; this client holds no
 	// credential and acknowledges with an empty Certificate (§4.4.2).
-	if h.state != .wait_certificate_request {
-		return h.classify_failure(.unexpected_message, 'handshake: unexpected CertificateRequest')
-	}
 	req := parse_certificate_request(body) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	h.update_transcript(full_msg)!
-	h.request_context = req.request_context
-	h.state = .wait_certificate
+	h.flight_step = .certificate
 
 	// The empty Certificate-response (§4.4.2) enters the transcript BEFORE the
 	// server's flight is verified, so the server Finished covers our response.
-	response := build_empty_certificate(h.request_context)
+	response := build_empty_certificate(req.request_context)
 	h.update_transcript(response)!
 	return [new_handshake_message(.handshake, response)!]
 }
@@ -736,36 +851,30 @@ fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![
 // handle_certificate parses and validates the server certificate chain.
 fn (mut h HandshakeCore) handle_certificate(full_msg []u8, body []u8) ![]HandshakeMessage {
 	// §4.4.1: the server Certificate follows EncryptedExtensions directly, or a
-	// CertificateRequest may sit before it; accept both orders.
-	if h.state != .wait_certificate_request && h.state != .wait_certificate {
-		return h.classify_failure(.unexpected_message, 'handshake: unexpected Certificate')
-	}
+	// CertificateRequest may sit before it; accepts_handshake_message allows both.
 	cert_ders := parse_certificate_message(body) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	h.update_transcript(full_msg)!
 
 	h.server_certs = []pki.Certificate{}
 	for der in cert_ders {
 		cert := pki.parse_certificate(der) or {
-			return h.classify_failure(.decode_error, err.msg())
+			return h.fail_with(.decode_error, err)
 		}
 		h.server_certs << cert
 	}
 	h.validator.verify_certificate_chain(h.server_certs, h.config.server_name) or {
-		return h.classify_failure(.bad_certificate, err.msg())
+		return h.fail_with(.bad_certificate, err)
 	}
-	h.state = .wait_certificate_verify
+	h.flight_step = .certificate_verify
 	return []HandshakeMessage{}
 }
 
 // handle_certificate_verify checks the server's signature over the transcript.
 fn (mut h HandshakeCore) handle_certificate_verify(full_msg []u8, body []u8) ![]HandshakeMessage {
-	if h.state != .wait_certificate_verify {
-		return h.classify_failure(.unexpected_message, 'handshake: unexpected CertificateVerify')
-	}
 	cv := parse_certificate_verify(body) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	signed_content := certificate_verify_signed_content(h.transcript.current_hash())
 	h.update_transcript(full_msg)!
@@ -774,24 +883,22 @@ fn (mut h HandshakeCore) handle_certificate_verify(full_msg []u8, body []u8) ![]
 		return h.classify_failure(.decode_error, 'handshake: missing server certificate for verification')
 	}
 	verify_certificate_verify(leaf_key(h.server_certs[0]), cv, signed_content) or {
-		return h.classify_failure(.decrypt_error, err.msg())
+		return h.fail_with(.decrypt_error, err)
 	}
-	h.state = .wait_server_finished
+	h.flight_step = .finished
 	return []HandshakeMessage{}
 }
 
 // handle_finished verifies the server Finished and emits the client Finished.
 fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeMessage {
-	if h.state != .wait_server_finished {
-		return h.classify_failure(.unexpected_message, 'handshake: unexpected Finished message')
-	}
 	// Verify the server Finished over the transcript up to but excluding this message.
 	server_verify_data := parse_finished(body, h.hash_algo.hash_len()) or {
-		return h.classify_failure(.decode_error, err.msg())
+		return h.fail_with(.decode_error, err)
 	}
 	th_before_sfin := h.transcript.current_hash()
 
-	expected_verify_data := compute_finished_verify_data(h.hash_algo, h.server_hsk_traffic, th_before_sfin)!
+	expected_verify_data := compute_finished_verify_data(h.hash_algo, h.secrets.handshake.server,
+		th_before_sfin)!
 	// Constant-time compare: verify_data is a MAC over the transcript, and a naive
 	// compare would leak a byte-by-byte Finished forgery.
 	if subtle.constant_time_compare(server_verify_data, expected_verify_data) != 1 {
@@ -803,25 +910,29 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// application traffic secrets bound to the transcript including server Finished.
 	th_sfin := h.transcript.current_hash()
 	ap := derive_app_secrets(h.hash_algo, h.handshake_secret, th_sfin)!
-	h.client_app_traffic = ap.client_traffic
-	h.server_app_traffic = ap.server_traffic
+	h.secrets.application = TrafficSecretPair{
+		client: ap.client_traffic
+		server: ap.server_traffic
+	}
 
 	// The client Finished uses the handshake traffic secret over the transcript now
 	// including server Finished, sent under the (still active) handshake keys.
-	client_verify_data := compute_finished_verify_data(h.hash_algo, h.client_hsk_traffic, th_sfin)!
+	client_verify_data := compute_finished_verify_data(h.hash_algo, h.secrets.handshake.client,
+		th_sfin)!
 	client_fin_msg := build_finished(client_verify_data)
 	h.update_transcript(client_fin_msg)!
 
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
 	// adapter's take_buffered_handshake_bytes. Any other leader is flight garbage.
-	if h.hsk_buf.len > 0 {
-		leading := h.hsk_buf[0]
+	if h.buffers.handshake.len > 0 {
+		leading := h.buffers.handshake[0]
 		if leading != u8(4) && leading != u8(24) {
 			return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
 		}
 	}
 
+	h.flight_step = .complete
 	h.state = .connected
 	// Forward-secrecy cleanup: every ephemeral/handshake secret consumed to reach
 	// this point is now dead (RFC 8446 §7.5 / §1.3.1).
@@ -839,14 +950,8 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 // wipes share the same phase vocabulary.
 fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
 	match level {
-		.handshake {
-			wipe_secret(mut h.client_hsk_traffic)
-			wipe_secret(mut h.server_hsk_traffic)
-		}
-		.application {
-			wipe_secret(mut h.client_app_traffic)
-			wipe_secret(mut h.server_app_traffic)
-		}
+		.handshake { h.secrets.handshake.wipe() }
+		.application { h.secrets.application.wipe() }
 		.initial {}
 	}
 }
@@ -889,8 +994,7 @@ fn (mut h HandshakeCore) release_ephemeral_keys() {
 // in .failed (RFC 8446 §1.3.1/§7.5).
 pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_all_secrets()
-	h.init_buf = []u8{}
-	h.hsk_buf = []u8{}
+	h.buffers.clear_all()
 	h.release_ephemeral_keys()
 	h.state = .failed
 }

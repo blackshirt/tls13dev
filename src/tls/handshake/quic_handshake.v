@@ -26,23 +26,17 @@ pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHan
 // the TLS record path never reads raw secrets — TLSHandshake serves
 // record_traffic_keys() from its cached TrafficKeys instead.
 pub fn (h &QuicHandshake) peer_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
-	match level {
-		.initial {
-			return error('handshake: initial level has no traffic secrets')
-		}
-		.handshake {
-			if h.client_hsk_traffic.len == 0 || h.server_hsk_traffic.len == 0 {
-				return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
-			}
-			return h.client_hsk_traffic.clone(), h.server_hsk_traffic.clone()
-		}
-		.application {
-			if h.client_app_traffic.len == 0 || h.server_app_traffic.len == 0 {
-				return error('handshake: application traffic secrets unavailable before the server Finished')
-			}
-			return h.client_app_traffic.clone(), h.server_app_traffic.clone()
-		}
+	if level == .initial {
+		return error('handshake: initial level has no traffic secrets')
 	}
+	secrets := h.secret_pair(level)
+	if !secrets.available() {
+		if level == .handshake {
+			return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
+		}
+		return error('handshake: application traffic secrets unavailable before the server Finished')
+	}
+	return secrets.client.clone(), secrets.server.clone()
 }
 
 // peer_transport_parameters returns the raw bytes of the server's
@@ -61,5 +55,5 @@ pub fn (h &QuicHandshake) peer_transport_parameters() ?[]u8 {
 // different destination connection ID, and Initial protection is a function of
 // that ID, so the adapter's Initial keys go stale here (RFC 9001 §5.5).
 pub fn (h &QuicHandshake) hello_retry_request_received() bool {
-	return h.hrr_received
+	return h.hrr_cipher_suite != none
 }

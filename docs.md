@@ -319,7 +319,7 @@ Behavior and guarantees:
 - <span style="color:#2ea44f">**Forward secrecy of retained secrets**</span> — the
   handshake secret and ephemeral X25519 / P-256 private keys are released when
   the state machine reaches `.connected`. Handshake traffic secrets remain
-  until `zeroize_handshake_traffic_secrets()` because QUIC may still need them;
+  until `zeroize_traffic_secrets(.handshake)` because QUIC may still need them;
   application traffic secrets are released at `close()` or on a fatal alert.
   The §7.1 derivations also zeroize their own in-function intermediates — the
   Early and Master secrets, the `derived` seeds, every HKDF-Expand round input,

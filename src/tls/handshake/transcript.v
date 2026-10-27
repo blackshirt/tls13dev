@@ -48,9 +48,10 @@ fn (t &Transcript) current_hash() []u8 {
 }
 
 // apply_hello_retry_request replaces ClientHello1 with the synthetic message_hash
-// (RFC 8446 §4.4.1), restarting the transcript from [message_hash, HRR].
-fn (mut t Transcript) apply_hello_retry_request(client_hello1 []u8, hello_retry_request []u8) {
-	ch1_hash := t.hash_algo.compute_hash(client_hello1)
+// (RFC 8446 §4.4.1), restarting the transcript from [message_hash, HRR]. The
+// transcript holds only ClientHello1 at this point, so it supplies the hash input.
+fn (mut t Transcript) apply_hello_retry_request(hello_retry_request []u8) {
+	ch1_hash := t.hash_algo.compute_hash(t.messages)
 	hash_len := t.hash_algo.hash_len()
 
 	mut synthetic_msg := []u8{cap: 4 + hash_len}

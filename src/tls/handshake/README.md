@@ -69,11 +69,20 @@ Each `*_test.v` sits beside its source.
   (secret material under §7.5 lifecycle rules), `destroy_*` (whole-adapter teardown).
 - **Atomic failure classification.** The private `classify_failure(alert, message)` pins the alert
   `failure_alert()` will surface, zeroizes secrets, and returns the error — a peer-triggered decode
-  error always both tears down and reports the RFC-correct alert, never a stale default.
+  error always both tears down and reports the RFC-correct alert, never a stale default. `fail_with()`
+  is the `err.msg()`-unwrapping shorthand used by parse sites.
+- **Grouped phase material.** Handshake and application secrets are stored as client/server
+  `TrafficSecretPair`s inside `PhaseSecrets`; the TLS facade caches matching `TrafficKeyPair`s. Both
+  level buffers live in `ReassemblyBuffers`. Grouping keeps each level's two directions, and each
+  core's reassembly state, from being cleared or advanced independently.
+- **Coarse state, one ordering cursor.** `HandshakeState` reports `start`, `wait_server_hello`,
+  `wait_server_flight`, `connected`, or `failed`. A private `ServerFlightStep` cursor enforces the
+  encrypted-flight order — EncryptedExtensions, optional CertificateRequest, Certificate,
+  CertificateVerify, Finished — in `accepts_handshake_message()`, so handlers only parse and advance.
 - **Key-material readiness** is queried via `available_secret_phases()` rather than inferred from
   `state()`, so a `.failed` handshake (schedule wiped) never presents stale readiness.
 - **Phase-checked input.** `receive_msgs_at_level()` accepts initial-level input only while awaiting
-  ServerHello and handshake-level input only after it and before Finished; out-of-phase calls are
+  ServerHello and handshake-level input only during `wait_server_flight`; out-of-phase calls are
   rejected without consuming input or discarding usable keys.
 - **Transcript bound.** `transcript.v` caps the running transcript (`max_transcript_len`) so a peer
   cannot grow the buffer indefinitely with legal-size records that never complete the flight.

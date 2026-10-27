@@ -37,6 +37,11 @@ hs.fail_and_zeroize_secrets()
 hs.zeroize_traffic_secrets(.application)!
 ```
 
+`state()` reports coarse progress as one of `start`, `wait_server_hello`,
+`wait_server_flight`, `connected`, or `failed`. Encrypted-flight message
+ordering is a private implementation cursor, not a public state value, and
+adapters should poll only the coarse states plus `available_secret_phases()`.
+
 `fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
 secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
 wipes its cached record keys during failure cleanup. `zeroize_traffic_secrets(level)`

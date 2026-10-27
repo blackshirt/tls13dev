@@ -6,17 +6,40 @@
 // here — none of them has a QUIC caller, so none belongs to the core.
 module handshake
 
+// TrafficKeyPair holds one traffic phase's cached client and server record keys.
+struct TrafficKeyPair {
+mut:
+	client TrafficKeys
+	server TrafficKeys
+}
+
+// available reports whether both directions' keys are present.
+fn (p &TrafficKeyPair) available() bool {
+	return p.client.key.len > 0 && p.server.key.len > 0
+}
+
+// wipe zeroes both directions' cached keys.
+fn (mut p TrafficKeyPair) wipe() {
+	wipe_traffic_keys(mut p.client)
+	wipe_traffic_keys(mut p.server)
+}
+
 // TLSHandshake exposes only operations needed by the TLS record layer.
-// The four record-key fields are ordered protocol-first to mirror the core's
-// client/server_*_traffic secret names.
 @[noinit]
 pub struct TLSHandshake {
 	HandshakeCore
 mut:
-	client_hsk_keys TrafficKeys // Cached record keys for the client at the handshake level.
-	server_hsk_keys TrafficKeys // Cached record keys for the server at the handshake level.
-	client_app_keys TrafficKeys // Cached record keys for the client at the application level.
-	server_app_keys TrafficKeys // Cached record keys for the server at the application level.
+	hsk_keys TrafficKeyPair // Cached record keys at the handshake level.
+	app_keys TrafficKeyPair // Cached record keys at the application level.
+}
+
+// key_pair selects one phase's cached record-key pair; the initial level has none.
+fn (h &TLSHandshake) key_pair(level EncryptionLevel) TrafficKeyPair {
+	return match level {
+		.initial { TrafficKeyPair{} }
+		.handshake { h.hsk_keys }
+		.application { h.app_keys }
+	}
 }
 
 //  Public API: construction and dispatch driver
@@ -51,23 +74,14 @@ pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes [
 // TLS messages were consumed. Record-path scope: only the TLS adapter enforces
 // the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO stream.
 pub fn (h &TLSHandshake) unconsumed_bytes(level EncryptionLevel) int {
-	return match level {
-		.initial { h.init_buf.len }
-		.handshake { h.hsk_buf.len }
-		.application { 0 }
-	}
+	return h.buffers.len(level)
 }
 
 // take_buffered_handshake_bytes moves whatever the core's drain left buffered at
 // .connected (legal only per RFC 8446 §4.6.1 coalescing) to the record adapter,
 // zeroizing the core's copy (§7.5).
 pub fn (mut h TLSHandshake) take_buffered_handshake_bytes() []u8 {
-	taken := h.hsk_buf.clone()
-	for i in 0 .. h.hsk_buf.len {
-		h.hsk_buf[i] = 0
-	}
-	h.hsk_buf = []u8{}
-	return taken
+	return h.buffers.take_handshake()
 }
 
 // record_traffic_keys returns independent copies of the cached client/server
@@ -75,23 +89,17 @@ pub fn (mut h TLSHandshake) take_buffered_handshake_bytes() []u8 {
 // (client_key, client_iv, server_key, server_iv). TrafficKeys stays a module-internal
 // type: the tls record layer receives plain []u8 instead of a named key handle.
 pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !([]u8, []u8, []u8, []u8) {
-	match level {
-		.initial {
-			return error('handshake: initial level has no traffic keys')
-		}
-		.handshake {
-			if h.client_hsk_keys.key.len == 0 || h.server_hsk_keys.key.len == 0 {
-				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
-			}
-			return h.client_hsk_keys.key.clone(), h.client_hsk_keys.iv.clone(), h.server_hsk_keys.key.clone(), h.server_hsk_keys.iv.clone()
-		}
-		.application {
-			if h.client_app_keys.key.len == 0 || h.server_app_keys.key.len == 0 {
-				return error('handshake: application traffic keys unavailable before the server Finished')
-			}
-			return h.client_app_keys.key.clone(), h.client_app_keys.iv.clone(), h.server_app_keys.key.clone(), h.server_app_keys.iv.clone()
-		}
+	if level == .initial {
+		return error('handshake: initial level has no traffic keys')
 	}
+	keys := h.key_pair(level)
+	if !keys.available() {
+		if level == .handshake {
+			return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
+		}
+		return error('handshake: application traffic keys unavailable before the server Finished')
+	}
+	return keys.client.key.clone(), keys.client.iv.clone(), keys.server.key.clone(), keys.server.iv.clone()
 }
 
 // update_traffic_keys updates one direction's application traffic keys around a
@@ -106,9 +114,9 @@ pub fn (mut h TLSHandshake) update_traffic_keys(is_server bool) ! {
 		return error('handshake: cannot update ${side} application traffic keys before the handshake is connected (state: ${h.state()})')
 	}
 	secret := if is_server {
-		h.server_app_traffic
+		h.secrets.application.server
 	} else {
-		h.client_app_traffic
+		h.secrets.application.client
 	}
 	if secret.len == 0 {
 		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_traffic_secrets(.application))')
@@ -118,15 +126,15 @@ pub fn (mut h TLSHandshake) update_traffic_keys(is_server bool) ! {
 		return err
 	}
 	if is_server {
-		wipe_secret(mut h.server_app_traffic)
-		h.server_app_traffic = new_secret
-		wipe_traffic_keys(mut h.server_app_keys)
-		h.server_app_keys = next
+		wipe_secret(mut h.secrets.application.server)
+		h.secrets.application.server = new_secret
+		wipe_traffic_keys(mut h.app_keys.server)
+		h.app_keys.server = next
 	} else {
-		wipe_secret(mut h.client_app_traffic)
-		h.client_app_traffic = new_secret
-		wipe_traffic_keys(mut h.client_app_keys)
-		h.client_app_keys = next
+		wipe_secret(mut h.secrets.application.client)
+		h.secrets.application.client = new_secret
+		wipe_traffic_keys(mut h.app_keys.client)
+		h.app_keys.client = next
 	}
 }
 
@@ -170,20 +178,25 @@ fn derive_record_key_pair(hash_algo HashAlgorithm, key_len int, client_secret []
 }
 
 // sync_record_keys derives and caches record keys when the core exposes
-// corresponding handshake or application traffic secrets. The client key of each
-// level doubles as the derived-once marker, so each level expands exactly once.
-// Each level's pair is derived atomically via derive_record_key_pair before either
-// field is written.
+// corresponding handshake or application traffic secrets. A complete pair marks
+// a level as derived, so each level expands exactly once. Each level's pair is
+// derived atomically via derive_record_key_pair before either direction is written.
 fn (mut h TLSHandshake) sync_record_keys() ! {
-	if h.client_hsk_keys.key.len == 0 && h.client_hsk_traffic.len > 0 {
-		ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, h.client_hsk_traffic, h.server_hsk_traffic)!
-		h.client_hsk_keys = ck
-		h.server_hsk_keys = sk
+	if !h.hsk_keys.available() && h.secrets.handshake.available() {
+		ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, h.secrets.handshake.client,
+			h.secrets.handshake.server)!
+		h.hsk_keys = TrafficKeyPair{
+			client: ck
+			server: sk
+		}
 	}
-	if h.client_app_keys.key.len == 0 && h.client_app_traffic.len > 0 {
-		ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, h.client_app_traffic, h.server_app_traffic)!
-		h.client_app_keys = ck
-		h.server_app_keys = sk
+	if !h.app_keys.available() && h.secrets.application.available() {
+		ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, h.secrets.application.client,
+			h.secrets.application.server)!
+		h.app_keys = TrafficKeyPair{
+			client: ck
+			server: sk
+		}
 	}
 }
 
@@ -192,14 +205,8 @@ fn (mut h TLSHandshake) sync_record_keys() ! {
 fn (mut h TLSHandshake) wipe_record_keys_at(level EncryptionLevel) {
 	match level {
 		.initial {}
-		.handshake {
-			wipe_traffic_keys(mut h.client_hsk_keys)
-			wipe_traffic_keys(mut h.server_hsk_keys)
-		}
-		.application {
-			wipe_traffic_keys(mut h.client_app_keys)
-			wipe_traffic_keys(mut h.server_app_keys)
-		}
+		.handshake { h.hsk_keys.wipe() }
+		.application { h.app_keys.wipe() }
 	}
 }
 

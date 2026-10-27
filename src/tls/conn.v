@@ -238,16 +238,7 @@ pub fn dial(address string, config Config) !&Conn {
 	if config.min_rsa_bits > 0 {
 		validator.set_min_rsa_bits(config.min_rsa_bits)
 	}
-	options := handshake.HandshakeOptions{
-		alpn:                 handshake_options.alpn.clone()
-		validator:            validator
-		key_share_group:      handshake_options.key_share_group
-		supported_groups:     handshake_options.supported_groups.clone()
-		cipher_suites:        handshake_options.cipher_suites.clone()
-		signature_algorithms: handshake_options.signature_algorithms.clone()
-		legacy_session_id:    handshake_options.legacy_session_id.clone()
-		random:               handshake_options.random.clone()
-	}
+	options := handshake_options.with_validator(validator)
 
 	mut hs := handshake.new_tls_handshake(server_name, options) or {
 		sock.close() or {}

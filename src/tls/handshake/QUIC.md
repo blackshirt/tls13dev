@@ -93,37 +93,35 @@ the adapter intact and are ignored there.
 
 ## 2. The handshake the core performs
 
-The core is a **client** state machine. One successful run walks these states
-(`HandshakeState`), which mirror the fixed post-ServerHello order of RFC 8446
-§4.1:
+The core is a **client** state machine. Its public `HandshakeState` reports
+coarse progress, while a private `ServerFlightStep` cursor enforces the fixed
+post-ServerHello order of RFC 8446 §4.1:
 
 ```
 start
   └─ create_client_hello() ─▶ wait_server_hello
         │  ServerHello (or HelloRetryRequest → re-send ClientHello, back to wait_server_hello)
         ▼
-  wait_encrypted_extensions
+  wait_server_flight            (private cursor: EncryptedExtensions)
         │  EncryptedExtensions   (ALPN/SNI checks happen here)
-        ▼
-  wait_certificate_request      (optional: a CertificateRequest may precede the Certificate, §4.3.2)
-        │  CertificateRequest (client answers with an empty Certificate, §4.4.2)
-        ▼
-  wait_certificate
-        │  Certificate            (chain parsed + validated against the injected pki.Validator)
-        ▼
-  wait_certificate_verify
-        │  CertificateVerify      (server signature over the §4.4.3 content)
-        ▼
-  wait_server_finished
-        │  Finished               (transcript-bound verify_data)
+        │                        (cursor: CertificateRequest or Certificate)
+        │  CertificateRequest?   (optional, §4.3.2; client answers with an empty Certificate, §4.4.2)
+        │  Certificate           (chain parsed + validated against the injected pki.Validator)
+        │  CertificateVerify     (server signature over the §4.4.3 content)
+        │  Finished              (transcript-bound verify_data)
         ▼
   connected                     (client Finished emitted; application secrets live)
 ```
 
-`failed` is terminal: once reached, `receive_msgs_at_level()` refuses further input. A protocol
-violation moves the machine to `failed` and wipes all derived material (see
-`fail_and_zeroize_secrets()` in [CONTRACT.md](./CONTRACT.md)). The public accessors `state()`, `negotiated_alpn()`, and
-`negotiated_cipher_suite()` let an adapter poll progress and outcome.
+The cursor rejects an out-of-order encrypted-flight message and advances only
+as each message is handled; `state()` deliberately stays coarse, so adapters
+poll `wait_server_hello`, `connected`, or `failed` rather than internal
+per-message steps. `failed` is terminal: once reached,
+`receive_msgs_at_level()` refuses further input. A protocol violation moves the
+machine to `failed` and wipes all derived material (see
+`fail_and_zeroize_secrets()` in [CONTRACT.md](./CONTRACT.md)). The public
+accessors `state()`, `negotiated_alpn()`, and `negotiated_cipher_suite()` let an
+adapter poll progress and outcome.
 
 ### The ClientHello and HelloRetryRequest
 

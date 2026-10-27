@@ -27,7 +27,7 @@ fn expect_no_handshake_keys(h &TLSHandshake) bool {
 // expect_no_exported_handshake_secrets reports whether the handshake traffic
 // secrets are gone — the expected state once they were wiped.
 fn expect_no_exported_handshake_secrets(h &TLSHandshake) bool {
-	return h.client_hsk_traffic.len == 0 && h.server_hsk_traffic.len == 0
+	return h.secrets.handshake.client.len == 0 && h.secrets.handshake.server.len == 0
 }
 
 // assert_handshake_material_destroyed checks the failure-path contract: after a
@@ -65,7 +65,8 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
 	assert produced.len == 1
 	assert produced[0].level == .handshake
-	assert h.state() == .wait_certificate
+	assert h.state() == .wait_server_flight
+	assert h.flight_step == .certificate
 
 	// The server validates the echo and returns the deferred Cert/CV/Fin tail.
 	tail := srv.handle_client_certificate(produced[0].msg)!
@@ -93,7 +94,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// Plaintext ServerHello on the Initial level; nothing outbound yet.
 	out := h.receive_msgs_at_level(.initial, fl.server_hello)!
 	assert out.len == 0
-	assert h.state() == .wait_encrypted_extensions
+	assert h.state() == .wait_server_flight
 
 	// The encrypted flight, one byte at a time, across every reassembly boundary.
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
@@ -143,7 +144,7 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 	assert !fl2.is_hrr
 	out2 := h.receive_msgs_at_level(.initial, fl2.server_hello)!
 	assert out2.len == 0
-	assert h.state() == .wait_encrypted_extensions
+	assert h.state() == .wait_server_flight
 
 	produced := h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1
