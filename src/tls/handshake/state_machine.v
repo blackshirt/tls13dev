@@ -143,6 +143,32 @@ mut:
 	application TrafficSecretPair
 }
 
+// pair selects one phase's traffic-secret pair; the initial level has none.
+fn (s &PhaseSecrets) pair(level EncryptionLevel) TrafficSecretPair {
+	return match level {
+		.initial { TrafficSecretPair{} }
+		.handshake { s.handshake }
+		.application { s.application }
+	}
+}
+
+// wipe zeroes one phase's traffic-secret pair; the initial level has none.
+fn (mut s PhaseSecrets) wipe(level EncryptionLevel) {
+	match level {
+		.initial {}
+		.handshake { s.handshake.wipe() }
+		.application { s.application.wipe() }
+	}
+}
+
+// available reports which phase pairs currently hold both directions.
+fn (s &PhaseSecrets) available() SecretPhases {
+	return SecretPhases{
+		handshake:   s.handshake.available()
+		application: s.application.available()
+	}
+}
+
 // HandshakeCore owns shared TLS 1.3 handshake state and behavior.
 @[noinit]
 struct HandshakeCore {
@@ -177,15 +203,6 @@ mut:
 	flight_step      ServerFlightStep // expected message within the encrypted server flight
 	negotiated_alpn  string           // protocol chosen by the server, or empty if none
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
-}
-
-// secret_pair selects one phase's traffic-secret pair; the initial level has none.
-fn (h &HandshakeCore) secret_pair(level EncryptionLevel) TrafficSecretPair {
-	return match level {
-		.initial { TrafficSecretPair{} }
-		.handshake { h.secrets.handshake }
-		.application { h.secrets.application }
-	}
 }
 
 // reassembly_buf_cap is the initial per-level reassembly allocation; the hard bound
@@ -225,6 +242,14 @@ fn (mut b ReassemblyBuffers) append(level EncryptionLevel, bytes []u8) {
 		.handshake { b.handshake << bytes }
 		.application {}
 	}
+}
+
+// handshake_leader returns the first buffered handshake-level byte, if any.
+fn (b &ReassemblyBuffers) handshake_leader() ?u8 {
+	if b.handshake.len == 0 {
+		return none
+	}
+	return b.handshake[0]
 }
 
 // next_message extracts one complete framed message from one level's buffer.
@@ -341,10 +366,7 @@ pub:
 
 // available_secret_phases reports the current key-material readiness.
 pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
-	return SecretPhases{
-		handshake:   h.secrets.handshake.available()
-		application: h.secrets.application.available()
-	}
+	return h.secrets.available()
 }
 
 //  Terminal-failure and transcript primitives
@@ -925,8 +947,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
 	// adapter's take_buffered_handshake_bytes. Any other leader is flight garbage.
-	if h.buffers.handshake.len > 0 {
-		leading := h.buffers.handshake[0]
+	if leading := h.buffers.handshake_leader() {
 		if leading != u8(4) && leading != u8(24) {
 			return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
 		}
@@ -949,11 +970,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 // QUIC-side peer_traffic_secrets() accessor (quic_handshake.v) so reads and
 // wipes share the same phase vocabulary.
 fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
-	match level {
-		.handshake { h.secrets.handshake.wipe() }
-		.application { h.secrets.application.wipe() }
-		.initial {}
-	}
+	h.secrets.wipe(level)
 }
 
 // wipe_all_secrets zeroes the key-schedule intermediate and every traffic secret.

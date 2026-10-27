@@ -29,7 +29,7 @@ pub fn (h &QuicHandshake) peer_traffic_secrets(level EncryptionLevel) !([]u8, []
 	if level == .initial {
 		return error('handshake: initial level has no traffic secrets')
 	}
-	secrets := h.secret_pair(level)
+	secrets := h.secrets.pair(level)
 	if !secrets.available() {
 		if level == .handshake {
 			return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
