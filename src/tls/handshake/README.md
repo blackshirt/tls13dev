@@ -12,8 +12,10 @@ through in [`QUIC.md`](./QUIC.md).
 
 ## One core, two facades
 
-There is a single private `HandshakeCore` holding the shared TLS semantics, promoted through two
-public transport facades:
+There is a single private `HandshakeCore` holding the shared TLS semantics. All its methods are
+module-private, so nothing reaches callers through embedded promotion;
+each of the two public transport facades re-exports only what its adapter uses, as a curated set of
+`pub` forwarders over the core:
 
 - **`TLSHandshake`** (`new_tls_handshake(server_name, options)`) — the record adapter for
   TLS-over-TCP. Also derives and owns the cached TLS record keys and implements the TLS KeyUpdate
@@ -23,7 +25,7 @@ public transport facades:
   reassembly live in the QUIC engine, not here.
 
 A caller picks its transport at construction; there is no runtime mode flag and no wrong-transport
-call that only fails at runtime. QUIC-only methods (record boundary, TLS KeyUpdate) are simply
+call that only fails at runtime. TLS-specific methods (record boundary, TLS KeyUpdate) are simply
 absent from `QuicHandshake`.
 
 ```v
@@ -46,8 +48,9 @@ state_machine.v       the whole shared HandshakeCore: states, EncryptionLevel,
                       ServerHello/HRR transition, encrypted flight
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
-tls_handshake.v       TLS record facade: cached record keys, KeyUpdate, reassembly hooks
-quic_handshake.v      QUIC facade: peer_traffic_secrets, peer transport params
+tls_handshake.v       TLS record facade: curated core forwarders, cached record keys, KeyUpdate,
+                      reassembly hooks
+quic_handshake.v      QUIC facade: curated core forwarders, peer_traffic_secrets, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished

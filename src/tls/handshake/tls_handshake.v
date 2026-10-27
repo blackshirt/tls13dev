@@ -32,6 +32,42 @@ pub fn new_tls_handshake(server_name string, options HandshakeOptions) !TLSHands
 	}
 }
 
+// Curated forwarders. HandshakeCore is an internal type and all its methods are
+// module-private, so nothing reaches outside tls.handshake through embedded-field
+// promotion; the tls record layer sees only these entry points, each delegating
+// to the core by an explicit qualified call (never h.X(), which would resolve
+// back to the forwarder and recurse).
+
+// state reports the handshake position; the record adapter polls it (§A.1).
+pub fn (h &TLSHandshake) state() HandshakeState {
+	return h.HandshakeCore.state()
+}
+
+// negotiated_alpn returns the ALPN protocol the server picked ('' when none).
+pub fn (h &TLSHandshake) negotiated_alpn() string {
+	return h.HandshakeCore.negotiated_alpn()
+}
+
+// negotiated_cipher_suite reports the suite selected by the server in ServerHello.
+pub fn (h &TLSHandshake) negotiated_cipher_suite() CipherSuite {
+	return h.HandshakeCore.negotiated_cipher_suite()
+}
+
+// failure_alert returns the alert the adapter surfaces when the handshake dies (§6).
+pub fn (h &TLSHandshake) failure_alert() AlertDescription {
+	return h.HandshakeCore.failure_alert()
+}
+
+// available_secret_phases reports which traffic-secret phases the core holds.
+pub fn (h &TLSHandshake) available_secret_phases() SecretPhases {
+	return h.HandshakeCore.available_secret_phases()
+}
+
+// create_client_hello generates the initial ClientHello bytes (RFC 8446 App. D.4).
+pub fn (mut h TLSHandshake) create_client_hello() ![]u8 {
+	return h.HandshakeCore.create_client_hello()!
+}
+
 // receive_msgs_at_level feeds TLS handshake bytes at one encryption level and returns
 // any complete outbound handshake messages triggered by the input.
 pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {

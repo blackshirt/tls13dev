@@ -236,7 +236,7 @@ pub:
 }
 
 // available_secret_phases reports the current key-material readiness.
-pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
+fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	return SecretPhases{
 		handshake:   h.c_hsk_tsec.len > 0 && h.s_hsk_tsec.len > 0
 		application: h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
@@ -272,7 +272,7 @@ fn (mut h HandshakeCore) wipe_all_secrets() {
 // encryption level (and, on the record facade, that level's cached record keys)
 // once the adapter no longer needs them; it is valid only after .connected, and
 // the initial level — which has no TLS traffic secrets — is refused (RFC 8446 §7.5).
-pub fn (mut h HandshakeCore) zeroize_traffic_secrets(level EncryptionLevel) ! {
+fn (mut h HandshakeCore) zeroize_traffic_secrets(level EncryptionLevel) ! {
 	match level {
 		.initial {
 			return error('handshake: initial level has no traffic secrets to zeroize')
@@ -297,7 +297,7 @@ fn (mut h HandshakeCore) release_ephemeral_keys() {
 
 // fail_and_zeroize_secrets wipes derived secrets and parks the state machine
 // in .failed (RFC 8446 §1.3.1/§7.5).
-pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
+fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_all_secrets()
 	h.buffers.clear_all()
 	h.release_ephemeral_keys()

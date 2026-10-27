@@ -219,7 +219,7 @@ building a QUIC adapter. The API contract is documented in
 [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md).
 
 ```v
-// shared handshake driving
+// shared handshake driving (surfaced as curated `pub` forwarders on both facades)
 // HandshakeOptions fields may be passed as optional named arguments.
 new_tls_handshake(server_name string, options HandshakeOptions) !TLSHandshake
 new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshake

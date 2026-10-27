@@ -9,9 +9,11 @@ semantics and two public facades for its transport adapters:
 The facades contain the shared core but expose different transport-specific
 operations. A caller chooses its transport at construction, and does not need a
 runtime mode flag or a wrong-transport call that fails at runtime.
-Shared public core methods are promoted through the embedded core instead of
-being duplicated as forwarding methods on each facade. Facade methods remain
-where they add transport-specific behavior or expose transport-only operations.
+The shared core is a private type with module-private methods, so nothing leaks
+through embedded promotion; each facade re-exports only what its adapter calls,
+as curated `pub` forwarders over the core. A facade still defines a method
+itself where it adds transport-specific behavior or exposes a transport-only
+operation.
 
 The implementation is split by ownership:
 
@@ -153,8 +155,9 @@ calls `zeroize_traffic_secrets(.handshake)` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.
 `peer_transport_parameters()` returns the server's opaque extension bytes once
 received, and `hello_retry_request_received()` reports whether a retry occurred.
-Application teardown calls the same inherited `zeroize_traffic_secrets(.application)`;
-both levels come from the shared core rather than a QUIC-facade declaration.
+Application teardown calls `zeroize_traffic_secrets(.application)`, a `pub`
+forwarder on the `QuicHandshake` facade over the shared core — each level is
+reached through the facade's curated forwarders, never embedded promotion.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 are absent from `QuicHandshake`, rather than present as runtime-rejected calls.

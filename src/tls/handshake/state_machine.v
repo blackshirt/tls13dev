@@ -1,7 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
 // state_machine.v owns the entire transport-neutral handshake core shared by
-// both adapters: client state, public accessors, reassembly and dispatch, the
+// both adapters: client state, core accessors, reassembly and dispatch, the
 // facade-shared HandshakeOptions, the ServerHello/HelloRetryRequest transition,
 // and encrypted-flight processing.
 // Ephemeral ECDHE lives in key_exchange.v and the derived-secret holders with
@@ -279,8 +279,10 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 
 // state reports the client's position in the RFC 8446 Appendix A.1 handshake
 // state machine; adapters poll it to know when the handshake completed and which
-// messages are still legal on the wire.
-pub fn (h &HandshakeCore) state() HandshakeState {
+// messages are still legal on the wire. Module-private like every HandshakeCore
+// method: callers reach it only through each facade's curated pub forwarder,
+// never through embedded-field promotion.
+fn (h &HandshakeCore) state() HandshakeState {
 	return h.state
 }
 
@@ -294,18 +296,18 @@ fn (h &HandshakeCore) in_flight() bool {
 }
 
 // negotiated_alpn returns the ALPN protocol the server picked ('' when none).
-pub fn (h &HandshakeCore) negotiated_alpn() string {
+fn (h &HandshakeCore) negotiated_alpn() string {
 	return h.negotiated_alpn
 }
 
 // negotiated_cipher_suite reports the suite selected by the server in ServerHello.
-pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
+fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 	return h.cipher_suite
 }
 
 // failure_alert returns the alert description an adapter should surface when
 // this handshake dies (RFC 8446 §6).
-pub fn (h &HandshakeCore) failure_alert() AlertDescription {
+fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
 
@@ -336,7 +338,7 @@ fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 
 // create_client_hello generates the initial ClientHello, advances to
 // .wait_sh and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
-pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
+fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	// A second call would replay the first ClientHello into the transcript and
 	// corrupt every later hash; the retry ClientHello has its own path via
 	// receive_msgs_at_level().
@@ -355,7 +357,7 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 // Initial-level input is accepted only while awaiting ServerHello; handshake-level
 // input is accepted only between ServerHello and Finished. Phase misuse is rejected
 // without consuming bytes or changing state.
-pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == HandshakeState.start {
 		return error('handshake: receive_msgs_at_level() before create_client_hello() — no ClientHello has been sent yet')
 	}
