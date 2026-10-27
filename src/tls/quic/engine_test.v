@@ -355,7 +355,7 @@ fn test_engine_completes_quic_handshake() ! {
 	start := eng.start()!
 	assert start.len >= min_client_initial_datagram_len, 'client Initial datagram must be padded to 1200 bytes'
 	assert first_byte_long(start[0])
-	assert eng.state() == .wait_server_hello
+	assert eng.state() == .wait_sh
 
 	// The ferry server needs the client's original DCID to derive Initial keys;
 	// the engine exposes it for the test.
@@ -397,7 +397,7 @@ fn test_engine_initial_keys_match_appendix_a() ! {
 	start := eng.start()!
 	assert start.len >= min_client_initial_datagram_len
 	assert first_byte_long(start[0])
-	assert eng.state() == .wait_server_hello
+	assert eng.state() == .wait_sh
 }
 
 fn test_engine_handshake_with_asymmetric_cids() ! {
@@ -482,7 +482,7 @@ fn test_engine_hello_retry_request_reassembles_retry_at_correct_offset() ! {
 	// onto the same Initial stream; receive() flushes pending CRYPTO bytes itself.
 	retry := eng.receive(hrr)!
 	assert retry.len > 0
-	assert eng.state() == .wait_server_hello, 'after an HRR the client rearms to await the real ServerHello'
+	assert eng.state() == .wait_sh, 'after an HRR the client rearms to await the real ServerHello'
 	// The engine re-keyed from the DCID it adopted off the HelloRetryRequest header,
 	// which is what makes the ferry's fresh keys able to open `retry` at all.
 	assert eng.initial_rekeyed, 'the engine must re-derive Initial keys before sealing the retry ClientHello'

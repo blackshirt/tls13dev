@@ -43,14 +43,17 @@ CA bundle.
 ```
 state_machine.v       the whole shared HandshakeCore: states, EncryptionLevel,
                       HandshakeOptions, create_client_hello, receive_msgs_at_level,
-                      ServerHello/HRR transition, encrypted flight, ECDHE, secrets
+                      ServerHello/HRR transition, encrypted flight
+key_exchange.v        the core's ECDHE methods: key share, public share,
+                      peer-share validation and secret derivation
 tls_handshake.v       TLS record facade: cached TrafficKeys, KeyUpdate, reassembly hooks
 quic_handshake.v      QUIC facade: peer_traffic_secrets, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
 certificate_verify.v  verify the §4.4.3 CertificateVerify (pure, no state change)
-key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations
+key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations,
+                      the retained secret holders and their §7.5 lifecycle
 transcript.v          running transcript the schedule and CertificateVerify hash over
 messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + header
 aead.v                cipher-suite → AEAD/hash helpers
@@ -75,15 +78,18 @@ Each `*_test.v` sits beside its source.
   `TrafficSecretPair`s inside `PhaseSecrets`; the TLS facade caches matching `TrafficKeyPair`s. Both
   level buffers live in `ReassemblyBuffers`. Grouping keeps each level's two directions, and each
   core's reassembly state, from being cleared or advanced independently.
-- **Coarse state, one ordering cursor.** `HandshakeState` reports `start`, `wait_server_hello`,
-  `wait_server_flight`, `connected`, or `failed`. A private `ServerFlightStep` cursor enforces the
-  encrypted-flight order — EncryptedExtensions, optional CertificateRequest, Certificate,
-  CertificateVerify, Finished — in `accepts_handshake_message()`, so handlers only parse and advance.
+- **One state machine.** `HandshakeState` is the single public enum, mirroring the client
+  states of RFC 8446 Appendix A.1 (`start`, `wait_sh`, `wait_ee`, `wait_cert_cr`, `wait_cert`,
+  `wait_cv`, `wait_finished`, `connected`, plus an implementation `failed`). It is itself the
+  ordering cursor: `accepts_handshake_message()` gates the encrypted flight — EncryptedExtensions,
+  optional CertificateRequest, Certificate, CertificateVerify, Finished — so handlers only parse and
+  transition, and `state()` returns the cursor directly.
 - **Key-material readiness** is queried via `available_secret_phases()` rather than inferred from
   `state()`, so a `.failed` handshake (schedule wiped) never presents stale readiness.
-- **Phase-checked input.** `receive_msgs_at_level()` accepts initial-level input only while awaiting
-  ServerHello and handshake-level input only during `wait_server_flight`; out-of-phase calls are
-  rejected without consuming input or discarding usable keys.
+- **Phase-checked input.** `receive_msgs_at_level()` accepts initial-level input only in
+  `wait_sh` and handshake-level input only while the flight is in progress (`wait_ee` through
+  `wait_finished`); out-of-phase calls are rejected without consuming input or discarding usable
+  keys.
 - **Transcript bound.** `transcript.v` caps the running transcript (`max_transcript_len`) so a peer
   cannot grow the buffer indefinitely with legal-size records that never complete the flight.
 

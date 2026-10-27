@@ -446,21 +446,13 @@ fn (mut c Conn) do_handshake() ! {
 	if ch.len > max_plaintext_record_len {
 		return c.abort_connection(.internal_error, 'tls: ClientHello exceeds one record (${ch.len} > ${max_plaintext_record_len} bytes)')
 	}
-	c.write_records([new_record(.handshake, ch), change_cipher_spec()])!
+	c.send_plaintext_flight(ch)!
 
 	mut ccs_seen := 0
 	mut flight_records := 0
 	for c.hs.state() != .connected {
 		// Cheap early check; the fill loop enforces the same deadline per read.
-		remaining_ms := c.deadline_ms - mono_ms()
-		if remaining_ms <= 0 {
-			return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
-		}
-		// Shrink the per-read timeout to the deadline left, so the read itself
-		// surfaces as the deadline error instead of racing a raw timeout.
-		if remaining_ms * i64(time.millisecond) < i64(c.sock_timeout) {
-			c.sock.set_read_timeout(remaining_ms * time.millisecond)
-		}
+		_ := c.handshake_read_budget()!
 		rec := c.read_raw_record()!
 		flight_records++
 		if flight_records > max_handshake_flight_records {
@@ -477,7 +469,7 @@ fn (mut c Conn) do_handshake() ! {
 			}
 			.alert {
 				// After ServerHello, RFC 8446 §6 requires alerts to be encrypted — reject a plaintext one.
-				if c.hs.state() != .wait_server_hello {
+				if c.hs.state() != .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: unencrypted alert after ServerHello (unexpected_message)')
 				}
 				peer_alert := handshake.parse_alert(rec.payload) or {
@@ -490,7 +482,7 @@ fn (mut c Conn) do_handshake() ! {
 			}
 			.handshake {
 				// Plaintext handshake records are legal only while the ServerHello is outstanding (§5.1/§6).
-				if c.hs.state() != .wait_server_hello {
+				if c.hs.state() != .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
 				msgs := c.hs.receive_msgs_at_level(.initial, rec.payload)!
@@ -498,7 +490,7 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.unconsumed_bytes(.initial) != 0 {
 					return c.classify_failure(.unexpected_message, 'tls: misframed ServerHello record: ${c.hs.unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
 				}
-				if msgs.len == 0 && c.hs.state() == .wait_server_hello {
+				if msgs.len == 0 && c.hs.state() == .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: incomplete ServerHello at record boundary (unexpected_message)')
 				}
 				if c.hs.available_secret_phases().handshake {
@@ -508,52 +500,11 @@ fn (mut c Conn) do_handshake() ! {
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
-					c.write_records([new_record(.handshake, m.msg()), change_cipher_spec()])!
+					c.send_plaintext_flight(m.msg())!
 				}
 			}
 			.application_data {
-				// Everything under the server's handshake keys has outer type application_data (RFC 8446 §5.1/§5.2).
-				if c.hs.state() == .start || c.hs.state() == .wait_server_hello {
-					return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
-				}
-				dec := c.server_hsk_cipher.decrypt_record(rec) or {
-					// Mirror the read() path: a record that will not open is a peer-caused
-					// integrity failure, so surface its specific alert, not internal_error.
-					return c.classify_failure(decrypt_failure_alert(err.msg()), err.msg())
-				}
-				// Inner-type routing is record-layer policy; the core has no ContentType concept.
-				match dec.content_type {
-					.handshake {
-						// §5.1: handshake content must carry message bytes; an empty inner
-						// payload advances no state and would only burn AEAD opens.
-						if dec.plaintext.len == 0 {
-							return c.classify_failure(.unexpected_message, 'tls: empty handshake record under handshake keys (unexpected_message)')
-						}
-						msgs := c.hs.receive_msgs_at_level(.handshake, dec.plaintext)!
-						for m in msgs {
-							// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
-							enc := c.client_hsk_cipher.encrypt_record(.handshake, m.msg())!
-							c.write_records([enc])!
-						}
-					}
-					.alert {
-						// RFC 8446 §6: the server may surface a fatal alert under the handshake keys.
-						peer_alert := handshake.parse_alert(dec.plaintext) or {
-							// A malformed encrypted alert body is a decode error, not the stale internal_error.
-							return c.classify_failure(.decode_error, 'tls: malformed encrypted alert (decode_error): ${err.msg()}')
-						}
-						if peer_alert.description == .close_notify {
-							c.peer_terminated = true
-							return error('tls: peer sent close_notify during handshake')
-						}
-						c.peer_terminated = true
-						return error('tls: received alert ${peer_alert.description} during handshake')
-					}
-					else {
-						// Only handshake and alert are legal here; anything else violates §5.6.
-						return c.classify_failure(.unexpected_message, 'tls: unexpected content type in handshake phase: ${dec.content_type}')
-					}
-				}
+				c.handle_flight_record(rec)!
 			}
 			else {
 				return c.classify_failure(.unexpected_message, 'tls: unexpected record type ${rec.content_type} during handshake')
@@ -585,6 +536,74 @@ fn validate_compat_ccs(payload []u8, seen int) !int {
 		return error('tls: malformed change_cipher_spec during handshake (must be the single byte 0x01)')
 	}
 	return total
+}
+
+// send_plaintext_flight emits one handshake flight — the initial or a retry
+// ClientHello — as a plaintext record followed by the dummy CCS (§5/App. D.4).
+fn (mut c Conn) send_plaintext_flight(msg []u8) ! {
+	c.write_records([new_record(.handshake, msg), change_cipher_spec()])!
+}
+
+// handshake_read_budget returns ms left before the dial deadline, failing with the
+// pinned unexpected_message alert when spent, and shrinks the socket read timeout
+// to the remainder when it is the tighter bound.
+fn (mut c Conn) handshake_read_budget() !i64 {
+	remaining_ms := c.deadline_ms - mono_ms()
+	if remaining_ms <= 0 {
+		return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
+	}
+	if remaining_ms * i64(time.millisecond) < i64(c.sock_timeout) {
+		c.sock.set_read_timeout(remaining_ms * time.millisecond)
+	}
+	return remaining_ms
+}
+
+// handle_flight_record decrypts one handshake-phase encrypted record and routes its
+// inner content type: handshake bytes feed the core and the client Finished travels
+// under the client handshake keys; alerts are terminal peer faults (§5.1/§6).
+fn (mut c Conn) handle_flight_record(rec Record) ! {
+	// Everything under the server's handshake keys has outer type application_data (RFC 8446 §5.1/§5.2).
+	if c.hs.state() == .start || c.hs.state() == .wait_sh {
+		return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
+	}
+	dec := c.server_hsk_cipher.decrypt_record(rec) or {
+		// Mirror the read() path: a record that will not open is a peer-caused
+		// integrity failure, so surface its specific alert, not internal_error.
+		return c.classify_failure(decrypt_failure_alert(err.msg()), err.msg())
+	}
+	// Inner-type routing is record-layer policy; the core has no ContentType concept.
+	match dec.content_type {
+		.handshake {
+			// §5.1: handshake content must carry message bytes; an empty inner
+			// payload advances no state and would only burn AEAD opens.
+			if dec.plaintext.len == 0 {
+				return c.classify_failure(.unexpected_message, 'tls: empty handshake record under handshake keys (unexpected_message)')
+			}
+			msgs := c.hs.receive_msgs_at_level(.handshake, dec.plaintext)!
+			for m in msgs {
+				// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
+				enc := c.client_hsk_cipher.encrypt_record(.handshake, m.msg())!
+				c.write_records([enc])!
+			}
+		}
+		.alert {
+			// RFC 8446 §6: the server may surface a fatal alert under the handshake keys.
+			peer_alert := handshake.parse_alert(dec.plaintext) or {
+				// A malformed encrypted alert body is a decode error, not the stale internal_error.
+				return c.classify_failure(.decode_error, 'tls: malformed encrypted alert (decode_error): ${err.msg()}')
+			}
+			if peer_alert.description == .close_notify {
+				c.peer_terminated = true
+				return error('tls: peer sent close_notify during handshake')
+			}
+			c.peer_terminated = true
+			return error('tls: received alert ${peer_alert.description} during handshake')
+		}
+		else {
+			// Only handshake and alert are legal here; anything else violates §5.6.
+			return c.classify_failure(.unexpected_message, 'tls: unexpected content type in handshake phase: ${dec.content_type}')
+		}
+	}
 }
 
 //  Record protection state
@@ -680,19 +699,10 @@ fn (mut c Conn) read_raw_record() !Record {
 		if c.sock == unsafe { nil } {
 			return error('tls: connection closed (no socket available to read further records)')
 		}
-		// The deadline must also bite inside an incomplete record: a slow-loris
-		// dribble never completes one, so this fill loop is where the stall lives.
-		// Cap each read at the time left; a read ending past it reports the deadline.
-		mut read_wait_ms := i64(c.sock_timeout) / i64(time.millisecond)
 		if c.deadline_ms != 0 {
-			remaining_ms := c.deadline_ms - mono_ms()
-			if remaining_ms <= 0 {
-				return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
-			}
-			if remaining_ms < read_wait_ms {
-				read_wait_ms = remaining_ms
-				c.sock.set_read_timeout(read_wait_ms * time.millisecond)
-			}
+			// The deadline must also bite inside an incomplete record: a slow-loris
+			// dribble never completes one, so this fill loop is where the stall lives.
+			c.handshake_read_budget()!
 		}
 		n := c.sock.read(mut c.sock_buf) or {
 			if c.deadline_ms != 0 && mono_ms() >= c.deadline_ms {

@@ -73,15 +73,6 @@ fn is_supported_group(g NamedGroup) bool {
 	return g in supported_named_groups
 }
 
-// expected_share_len is the §4.2.8.2 key_exchange size per group (x25519 32;
-// secp256r1 65 = 0x04||X||Y): one source for the peer gate and ClientHello builder.
-fn expected_share_len(g NamedGroup) int {
-	return match g {
-		.x25519 { 32 }
-		.secp256r1 { 65 }
-	}
-}
-
 // SignatureScheme defines cryptographic signature algorithms (RFC 8446 §4.2.3).
 pub enum SignatureScheme as u16 {
 	rsa_pkcs1_sha256       = 0x0401

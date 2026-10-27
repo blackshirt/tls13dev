@@ -65,8 +65,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
 	assert produced.len == 1
 	assert produced[0].level == .handshake
-	assert h.state() == .wait_server_flight
-	assert h.flight_step == .certificate
+	assert h.state() == .wait_cert
 
 	// The server validates the echo and returns the deferred Cert/CV/Fin tail.
 	tail := srv.handle_client_certificate(produced[0].msg)!
@@ -94,7 +93,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// Plaintext ServerHello on the Initial level; nothing outbound yet.
 	out := h.receive_msgs_at_level(.initial, fl.server_hello)!
 	assert out.len == 0
-	assert h.state() == .wait_server_flight
+	assert h.state() == .wait_ee
 
 	// The encrypted flight, one byte at a time, across every reassembly boundary.
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
@@ -138,13 +137,13 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 	out := h.receive_msgs_at_level(.initial, fl1.server_hello)!
 	assert out.len == 1
 	assert out[0].level == .initial
-	assert h.state() == .wait_server_hello
+	assert h.state() == .wait_sh
 
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
 	out2 := h.receive_msgs_at_level(.initial, fl2.server_hello)!
 	assert out2.len == 0
-	assert h.state() == .wait_server_flight
+	assert h.state() == .wait_ee
 
 	produced := h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1

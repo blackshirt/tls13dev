@@ -3,7 +3,9 @@
 // state_machine.v owns the entire transport-neutral handshake core shared by
 // both adapters: client state, public accessors, reassembly and dispatch, the
 // facade-shared HandshakeOptions, the ServerHello/HelloRetryRequest transition,
-// encrypted-flight processing, ephemeral ECDHE, and the secret lifecycle.
+// and encrypted-flight processing.
+// Ephemeral ECDHE lives in key_exchange.v and the derived-secret holders with
+// their lifecycle in key_schedule.v, both as methods on this core.
 // Transport-specific methods are defined on their
 // facade — tls_handshake.v and quic_handshake.v — never promoted from here.
 // Message codecs, the transcript, and the key schedule keep their own files.
@@ -12,30 +14,25 @@ module handshake
 import crypto.ecdsa
 import crypto.rand
 import crypto.subtle
-import x.crypto.curve25519
 import tls.pki
+import x.crypto.curve25519
 
 //  Types: state, messages, options, and the core state struct
 
-// HandshakeState tracks client progress; the wait_* order mirrors the fixed
-// post-ServerHello flight (RFC 8446 §1/§4.1), each handler asserting its state.
+// HandshakeState is the client handshake state machine, mirroring the client
+// states of RFC 8446 Appendix A.1 (the all-caps RFC names carry no formal meaning,
+// so they are rendered in snake_case here); `failed` is an implementation terminal
+// the RFC does not define.
 pub enum HandshakeState {
-	start              // nothing sent yet; create_client_hello moves us out of here
-	wait_server_hello  // ClientHello sent; awaiting ServerHello or HelloRetryRequest
-	wait_server_flight // ServerHello accepted; the encrypted server flight is in progress
-	connected          // server Finished verified; application data may flow
-	failed             // terminal error; no further handshake messages are accepted
-}
-
-// ServerFlightStep is the expected position inside the encrypted server flight.
-// It is the single ordering cursor; HandshakeState only reports coarse progress.
-enum ServerFlightStep {
-	encrypted_extensions
-	certificate_request_or_certificate
-	certificate
-	certificate_verify
-	finished
-	complete
+	start         // RFC START: nothing sent yet; create_client_hello moves us out of here
+	wait_sh       // RFC WAIT_SH: ClientHello sent; awaiting ServerHello or HelloRetryRequest
+	wait_ee       // RFC WAIT_EE: ServerHello accepted; awaiting EncryptedExtensions
+	wait_cert_cr  // RFC WAIT_CERT_CR: awaiting CertificateRequest or Certificate
+	wait_cert     // RFC WAIT_CERT: awaiting Certificate
+	wait_cv       // RFC WAIT_CV: awaiting CertificateVerify
+	wait_finished // RFC WAIT_FINISHED: awaiting Finished
+	connected     // RFC CONNECTED: server Finished verified; application data may flow
+	failed        // implementation terminal; no further handshake messages are accepted
 }
 
 // HandshakeMessage is one outbound handshake message, unframed: level tags its
@@ -118,57 +115,6 @@ pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOpt
 	}
 }
 
-// TrafficSecretPair holds one traffic phase's client and server secrets.
-struct TrafficSecretPair {
-mut:
-	client []u8
-	server []u8
-}
-
-// available reports whether both directions' secrets are present.
-fn (p &TrafficSecretPair) available() bool {
-	return p.client.len > 0 && p.server.len > 0
-}
-
-// wipe zeroes both directions and drops their handles.
-fn (mut p TrafficSecretPair) wipe() {
-	wipe_secret(mut p.client)
-	wipe_secret(mut p.server)
-}
-
-// PhaseSecrets groups the handshake and application traffic-secret pairs.
-struct PhaseSecrets {
-mut:
-	handshake   TrafficSecretPair
-	application TrafficSecretPair
-}
-
-// pair selects one phase's traffic-secret pair; the initial level has none.
-fn (s &PhaseSecrets) pair(level EncryptionLevel) TrafficSecretPair {
-	return match level {
-		.initial { TrafficSecretPair{} }
-		.handshake { s.handshake }
-		.application { s.application }
-	}
-}
-
-// wipe zeroes one phase's traffic-secret pair; the initial level has none.
-fn (mut s PhaseSecrets) wipe(level EncryptionLevel) {
-	match level {
-		.initial {}
-		.handshake { s.handshake.wipe() }
-		.application { s.application.wipe() }
-	}
-}
-
-// available reports which phase pairs currently hold both directions.
-fn (s &PhaseSecrets) available() SecretPhases {
-	return SecretPhases{
-		handshake:   s.handshake.available()
-		application: s.application.available()
-	}
-}
-
 // HandshakeCore owns shared TLS 1.3 handshake state and behavior.
 @[noinit]
 struct HandshakeCore {
@@ -198,10 +144,9 @@ mut:
 	server_certs []pki.Certificate // certificates received from the server, leaf first
 
 	// Handshake retry and outcome.
-	hrr_cipher_suite ?CipherSuite     // suite from the retry request; presence marks a retry
-	state            HandshakeState   // current stage of the handshake
-	flight_step      ServerFlightStep // expected message within the encrypted server flight
-	negotiated_alpn  string           // protocol chosen by the server, or empty if none
+	hrr_cipher_suite ?CipherSuite   // suite from the retry request; presence marks a retry
+	state            HandshakeState // position in the client state machine (RFC 8446 App. A.1)
+	negotiated_alpn  string         // protocol chosen by the server, or empty if none
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
 }
 
@@ -261,7 +206,7 @@ fn (mut b ReassemblyBuffers) next_message(level EncryptionLevel) ![]u8 {
 	}
 }
 
-// take_handshake zeroes and removes the handshake-level buffer, returning its bytes.
+// take_handshake clones, zeroes and removes the handshake-level buffer, returning its bytes.
 fn (mut b ReassemblyBuffers) take_handshake() []u8 {
 	taken := b.handshake.clone()
 	for i in 0 .. b.handshake.len {
@@ -277,8 +222,6 @@ fn (mut b ReassemblyBuffers) clear_all() {
 	b.handshake = []u8{}
 }
 
-//  Construction
-
 // new_handshake_core creates shared state from the server name and complete
 // handshake options, including ALPN and certificate validation.
 fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool) !HandshakeCore {
@@ -287,11 +230,13 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 		pki.default_validator()!
 	}
 	// Pin random/session id at construction so HRR reuses them byte-identically (§4.1.4).
+	// session_id.len has been checked in validate_handshake_options
 	session_id := if options.legacy_session_id.len > 0 {
 		options.legacy_session_id.clone()
 	} else {
 		rand.bytes(legacy_session_id_len)!
 	}
+	// random.len has been checked in validate_handshake_options
 	random := if options.random.len > 0 {
 		options.random.clone()
 	} else {
@@ -299,9 +244,8 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	}
 
 	mut core := HandshakeCore{
-		state:       .start
-		flight_step: .encrypted_extensions
-		config:      ClientHelloConfig{
+		state:      HandshakeState.start
+		config:     ClientHelloConfig{
 			server_name:           server_name
 			alpn:                  options.alpn.clone()
 			session_id:            session_id
@@ -316,11 +260,11 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 				none
 			}
 		}
-		transcript:  new_transcript(.sha256)
-		hash_algo:   .sha256
-		key_len:     16
-		validator:   validator
-		buffers:     new_reassembly_buffers()
+		transcript: new_transcript(.sha256)
+		hash_algo:  .sha256
+		key_len:    16
+		validator:  validator
+		buffers:    new_reassembly_buffers()
 	}
 	core.generate_key_share(options.key_share_group)!
 	core.config.client_share = KeyShareEntry{
@@ -330,12 +274,20 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	return core
 }
 
-//  Public accessors
-
-// state reports current handshake progress; adapters poll it to know
-// when the handshake completed and which messages are still legal on the wire.
+// state reports the client's position in the RFC 8446 Appendix A.1 handshake
+// state machine; adapters poll it to know when the handshake completed and which
+// messages are still legal on the wire.
 pub fn (h &HandshakeCore) state() HandshakeState {
 	return h.state
+}
+
+// in_flight reports whether the current state lies inside the encrypted server
+// flight, the window in which handshake-level bytes are legal.
+fn (h &HandshakeCore) in_flight() bool {
+	return match h.state {
+		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cv, .wait_finished { true }
+		else { false }
+	}
 }
 
 // negotiated_alpn returns the ALPN protocol the server picked ('' when none).
@@ -353,23 +305,6 @@ pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
-
-// SecretPhases reports which traffic-secret phases the core currently holds
-// (derived, not yet zeroized, both directions present). Transport-neutral: it lets
-// adapters install record or packet keys when the material actually exists instead
-// of re-deriving readiness from HandshakeState.
-pub struct SecretPhases {
-pub:
-	handshake   bool // client+server handshake traffic secrets available
-	application bool // client+server application traffic secrets available
-}
-
-// available_secret_phases reports the current key-material readiness.
-pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
-	return h.secrets.available()
-}
-
-//  Terminal-failure and transcript primitives
 
 // classify_failure is the single terminal-failure primitive for the core: it pins
 // the alert the adapter must surface, zeroes every derived secret, parks the
@@ -396,21 +331,19 @@ fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 	}
 }
 
-//  Reassembly and dispatch
-
 // create_client_hello generates the initial ClientHello, advances to
-// .wait_server_hello and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
+// .wait_sh and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
 pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	// A second call would replay the first ClientHello into the transcript and
 	// corrupt every later hash; the retry ClientHello has its own path via
 	// receive_msgs_at_level().
-	if h.state != .start {
-		return error('handshake: create_client_hello() only runs once (state: ${h.state}); the retry ClientHello is produced by receive_msgs_at_level() during HelloRetryRequest handling')
+	if h.state != HandshakeState.start {
+		return error('handshake: create_client_hello() only runs once (state: ${h.state()}); the retry ClientHello is produced by receive_msgs_at_level() during HelloRetryRequest handling')
 	}
 	_, full_client_hello := build_client_hello(h.config)!
 	h.update_transcript(full_client_hello)!
 
-	h.state = .wait_server_hello
+	h.state = .wait_sh
 	return full_client_hello
 }
 
@@ -420,29 +353,24 @@ pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 // input is accepted only between ServerHello and Finished. Phase misuse is rejected
 // without consuming bytes or changing state.
 pub fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
-	if h.state == .start {
+	if h.state == HandshakeState.start {
 		return error('handshake: receive_msgs_at_level() before create_client_hello() — no ClientHello has been sent yet')
 	}
-	if h.state == .failed {
+	if h.state == HandshakeState.failed {
 		return error('handshake: state machine has failed; receive_msgs_at_level() refuses further messages')
 	}
-	match level {
-		.initial {
-			if h.state != .wait_server_hello {
-				return error('handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state})')
-			}
-			return h.append_and_drain(level, bytes)
-		}
-		.handshake {
-			if h.state != .wait_server_flight {
-				return error('handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state})')
-			}
-			return h.append_and_drain(level, bytes)
-		}
-		.application {
-			return error('handshake: receive_msgs_at_level() does not accept application-level bytes')
-		}
+	if level == .application {
+		return error('handshake: receive_msgs_at_level() does not accept application-level bytes')
 	}
+	if !h.level_is_open(level) {
+		msg := if level == .handshake {
+			'handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state()})'
+		} else {
+			'handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state()})'
+		}
+		return error(msg)
+	}
+	return h.append_and_drain(level, bytes)
 }
 
 // append_and_drain bounds each append before allocating, while still allowing a
@@ -476,12 +404,12 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 	return out
 }
 
-// should_drain reports whether the level's buffer can still yield messages for
-// the current state.
-fn (h &HandshakeCore) should_drain(level EncryptionLevel) bool {
+// level_is_open reports whether one level's buffer is legal for the current state;
+// receive_msgs_at_level and drain() share it as the single phase-legality rule.
+fn (h &HandshakeCore) level_is_open(level EncryptionLevel) bool {
 	return match level {
-		.initial { h.state == .wait_server_hello }
-		.handshake { h.state == .wait_server_flight }
+		.initial { h.state == .wait_sh }
+		.handshake { h.in_flight() }
 		.application { false }
 	}
 }
@@ -490,7 +418,7 @@ fn (h &HandshakeCore) should_drain(level EncryptionLevel) bool {
 // Framing-boundary checks remain adapter policy.
 fn (mut h HandshakeCore) drain(level EncryptionLevel) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
-	for h.should_drain(level) {
+	for h.level_is_open(level) {
 		msg := h.buffers.next_message(level) or {
 			return h.fail_with(.decode_error, err)
 		}
@@ -511,15 +439,15 @@ fn (mut h HandshakeCore) drain(level EncryptionLevel) ![]HandshakeMessage {
 // flight: it names the message types legal in the current state, so each handler
 // only parses and transitions.
 fn (h &HandshakeCore) accepts_handshake_message(msg_type HandshakeType) bool {
-	return match h.flight_step {
-		.encrypted_extensions { msg_type == .encrypted_extensions }
-		.certificate_request_or_certificate {
+	return match h.state {
+		.wait_ee { msg_type == .encrypted_extensions }
+		.wait_cert_cr {
 			msg_type == .certificate_request || msg_type == .certificate
 		}
-		.certificate { msg_type == .certificate }
-		.certificate_verify { msg_type == .certificate_verify }
-		.finished { msg_type == .finished }
-		.complete { false }
+		.wait_cert { msg_type == .certificate }
+		.wait_cv { msg_type == .certificate_verify }
+		.wait_finished { msg_type == .finished }
+		else { false }
 	}
 }
 
@@ -560,140 +488,14 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 	}
 }
 
-//  Ephemeral ECDHE key exchange (RFC 8446 §4.2.8)
-
-// generate_key_share creates a fresh ephemeral private key for the requested group.
-fn (mut h HandshakeCore) generate_key_share(group NamedGroup) ! {
-	h.ecdhe_group = group
-	// Only the key for the selected group stays live.
-	h.priv_x25519 = unsafe { nil }
-	h.priv_p256 = none
-	match group {
-		.x25519 {
-			h.priv_x25519 = curve25519.PrivateKey.new()!
-		}
-		.secp256r1 {
-			h.priv_p256 = ecdsa.PrivateKey.new(nid: .prime256v1)!
-		}
-	}
-}
-
-// public_share_bytes serializes the public half of the current ephemeral key in
-// the wire form its group mandates (RFC 8446 §4.2.8.2).
-fn (mut h HandshakeCore) public_share_bytes() ![]u8 {
-	match h.ecdhe_group {
-		.x25519 {
-			pub_key := h.priv_x25519.public_key()!
-			return pub_key.bytes()!
-		}
-		.secp256r1 {
-			priv := h.priv_p256 or { return error('handshake: missing P-256 private key') }
-			pub_key := priv.public_key()!
-			return pub_key.uncompressed_bytes()!
-		}
-	}
-}
-
-// The three small-order X25519 shared-secret results of RFC 7748 §6.1, in the
-// little-endian wire encoding: the identity, u = 1, and u = p-1 = 2^255-20.
-const x25519_secret_zero = [u8(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-
-const x25519_secret_one = [u8(1), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-
-const x25519_secret_p_minus_1 = [u8(0xec), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
-
-// is_x25519_small_order reports whether a finished X25519 shared secret landed
-// in one of the three small-order results (RFC 7748 §6.1); reject all three.
-@[direct_array_access]
-fn is_x25519_small_order(secret []u8) bool {
-	if subtle.constant_time_compare(secret, x25519_secret_zero) == 1 {
-		return true
-	}
-	if subtle.constant_time_compare(secret, x25519_secret_one) == 1 {
-		return true
-	}
-	return subtle.constant_time_compare(secret, x25519_secret_p_minus_1) == 1
-}
-
-// compute_shared_secret performs the ECDHE exchange against the server's key
-// share, returning the raw shared secret that seeds the key schedule.
-fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8 {
-	// §4.2.8.2 fixes key_exchange size per group; gate it here so a wrong size
-	// yields a named protocol error.
-	expected_len := expected_share_len(server_share.group)
-	if server_share.key_exchange.len != expected_len {
-		return h.classify_failure(.illegal_parameter, 'handshake: ${server_share.group} key_share is ${server_share.key_exchange.len} bytes, expected ${expected_len}')
-	}
-	match server_share.group {
-		.x25519 {
-			if h.priv_x25519 == unsafe { nil } {
-				return error('handshake: missing X25519 private key')
-			}
-			// §4.2.8.2 & RFC 7748 §6.1: an all-zero peer u-coordinate would yield an
-			// all-zero secret; gate before the backend.
-			if subtle.constant_time_compare(server_share.key_exchange, []u8{len: 32, init: 0}) == 1 {
-				return h.classify_failure(.illegal_parameter, 'handshake: computed X25519 shared secret is all-zero value (illegal_parameter)')
-			}
-			// The backend runs its own low-order and zero-result checks, so a
-			// small-order contribution can fail inside the scalar multiplication and
-			// never reach the result comparison below. Classify every failure of this
-			// exchange as the peer's fault: RFC 8446 §4.2.8.2 makes a bad key_share
-			// illegal_parameter, and pinning it keeps the sent alert off internal_error.
-			secret := h.priv_x25519.x25519(server_share.key_exchange) or {
-				return h.classify_failure(.illegal_parameter, 'handshake: X25519 key_share is a small-order contribution (illegal_parameter)')
-			}
-			// Defense in depth: reject every small-order result, not just the all-zero one.
-			if is_x25519_small_order(secret) {
-				return h.classify_failure(.illegal_parameter, 'handshake: computed X25519 shared secret is a small-order value (illegal_parameter)')
-			}
-			return secret
-		}
-		.secp256r1 {
-			// Only the uncompressed encoding is legal in TLS 1.3 (§4.2.8.2); compressed shares start 0x02/0x03.
-			// A malformed share is the sender's fault, so it must pin the alert.
-			if server_share.key_exchange[0] != 0x04 {
-				return h.classify_failure(.illegal_parameter, 'handshake: P-256 key_share is not an uncompressed point (0x04 prefix)')
-			}
-			// 0x04 || 0^32 || 0^32 encodes the point at infinity: the exchange would
-			// contribute nothing to the secret. Reject the identity encoding itself,
-			// deterministically, instead of trusting the backend to refuse it.
-			if subtle.constant_time_compare(server_share.key_exchange[1..server_share.key_exchange.len],
-				[]u8{len: 64, init: 0}) == 1 {
-				return h.classify_failure(.illegal_parameter, 'handshake: P-256 key_share is the point at infinity (illegal_parameter)')
-			}
-			priv := h.priv_p256 or { return error('handshake: missing P-256 private key') }
-			// A point that does not decode is the sender's fault too, so pin the alert
-			// instead of letting a backend message surface as internal_error.
-			peer := ecdsa.PublicKey.from_uncompressed_bytes(server_share.key_exchange,
-				nid: .prime256v1
-			) or {
-				return h.classify_failure(.illegal_parameter, 'handshake: P-256 key_share is not a valid uncompressed point on the curve (illegal_parameter)')
-			}
-			secret := priv.derive_shared_secret(peer) or {
-				return h.classify_failure(.internal_error, 'handshake: P-256 ECDH operation failed')
-			}
-			if subtle.constant_time_compare(secret, []u8{len: secret.len, init: 0}) == 1 {
-				return h.classify_failure(.illegal_parameter, 'handshake: computed P-256 shared secret is all-zero value (illegal_parameter)')
-			}
-			return secret
-		}
-	}
-	// Unreachable: the match above is exhaustive over NamedGroup.
-	return error('handshake: unsupported key_share group ${server_share.group}')
-}
-
 //  ServerHello / HelloRetryRequest transition (RFC 8446 §4.1.3/§4.1.4)
 
 // handle_server_hello_message consumes one complete initial-level ServerHello
 // or HelloRetryRequest and returns the follow-up messages (RFC 8446 §4.1.3).
 fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMessage {
-	if h.state != .wait_server_hello {
+	if h.state != .wait_sh {
 		// Strict ordering: a ServerHello is only legal while we await it (§4.4.1).
-		return h.classify_failure(.unexpected_message, 'handshake: unexpected ServerHello in state ${h.state}')
+		return h.classify_failure(.unexpected_message, 'handshake: unexpected ServerHello in state ${h.state()}')
 	}
 
 	// Peel the 4-byte handshake header (type || 3-byte length) to bound the body (§4).
@@ -755,8 +557,7 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 		server: hs.server_traffic
 	}
 
-	h.state = .wait_server_flight
-	h.flight_step = .encrypted_extensions
+	h.state = .wait_ee
 	return []HandshakeMessage{}
 }
 
@@ -827,7 +628,7 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	// Finished MAC covers the retried flight (§4.4.1).
 	h.update_transcript(full_ch2)!
 
-	h.state = .wait_server_hello // rearm: the server now answers with the real ServerHello
+	h.state = .wait_sh // rearm: the server now answers with the real ServerHello
 	return [new_handshake_message(.initial, full_ch2)!]
 }
 
@@ -849,7 +650,7 @@ fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) !
 	h.negotiated_alpn = alpn
 	h.quic_params = transport_parameters
 	h.update_transcript(full_msg)!
-	h.flight_step = .certificate_request_or_certificate
+	h.state = .wait_cert_cr
 	return []HandshakeMessage{}
 }
 
@@ -861,7 +662,7 @@ fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![
 		return h.fail_with(.decode_error, err)
 	}
 	h.update_transcript(full_msg)!
-	h.flight_step = .certificate
+	h.state = .wait_cert
 
 	// The empty Certificate-response (§4.4.2) enters the transcript BEFORE the
 	// server's flight is verified, so the server Finished covers our response.
@@ -889,7 +690,7 @@ fn (mut h HandshakeCore) handle_certificate(full_msg []u8, body []u8) ![]Handsha
 	h.validator.verify_certificate_chain(h.server_certs, h.config.server_name) or {
 		return h.fail_with(.bad_certificate, err)
 	}
-	h.flight_step = .certificate_verify
+	h.state = .wait_cv
 	return []HandshakeMessage{}
 }
 
@@ -907,7 +708,7 @@ fn (mut h HandshakeCore) handle_certificate_verify(full_msg []u8, body []u8) ![]
 	verify_certificate_verify(leaf_key(h.server_certs[0]), cv, signed_content) or {
 		return h.fail_with(.decrypt_error, err)
 	}
-	h.flight_step = .finished
+	h.state = .wait_finished
 	return []HandshakeMessage{}
 }
 
@@ -953,74 +754,11 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 		}
 	}
 
-	h.flight_step = .complete
-	h.state = .connected
+	h.state = HandshakeState.connected
 	// Forward-secrecy cleanup: every ephemeral/handshake secret consumed to reach
 	// this point is now dead (RFC 8446 §7.5 / §1.3.1).
 	h.wipe_key_schedule_secrets()
 	// Hand the raw client Finished to the transport, which encrypts it under the
 	// still-active handshake keys.
 	return [new_handshake_message(.handshake, client_fin_msg)!]
-}
-
-//  Secret lifecycle: wiping and zeroization (RFC 8446 §1.3.1/§7.5)
-
-// wipe_traffic_secrets zeroes the client and server traffic secrets for one
-// encryption level; the initial level has no TLS traffic secrets. It mirrors the
-// QUIC-side peer_traffic_secrets() accessor (quic_handshake.v) so reads and
-// wipes share the same phase vocabulary.
-fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
-	h.secrets.wipe(level)
-}
-
-// wipe_all_secrets zeroes the key-schedule intermediate and every traffic secret.
-fn (mut h HandshakeCore) wipe_all_secrets() {
-	wipe_secret(mut h.handshake_secret)
-	h.wipe_traffic_secrets(.handshake)
-	h.wipe_traffic_secrets(.application)
-}
-
-// zeroize_traffic_secrets destroys the client and server traffic secrets for one
-// encryption level (and, on the record facade, that level's cached record keys)
-// once the adapter no longer needs them; it is valid only after .connected, and
-// the initial level — which has no TLS traffic secrets — is refused (RFC 8446 §7.5).
-pub fn (mut h HandshakeCore) zeroize_traffic_secrets(level EncryptionLevel) ! {
-	match level {
-		.initial {
-			return error('handshake: initial level has no traffic secrets to zeroize')
-		}
-		.handshake, .application {
-			if h.state != .connected {
-				return error('handshake: zeroize_traffic_secrets(${level}) is only valid once the handshake reaches .connected (state: ${h.state})')
-			}
-			h.wipe_traffic_secrets(level)
-		}
-	}
-}
-
-// release_ephemeral_keys drops both ephemeral ECDHE private halves. The vlib key
-// types expose no in-place wipe, so releasing the handles is the available
-// destruction; fail_and_zeroize_secrets() and wipe_key_schedule_secrets() must
-// release them identically (§7.5), so they share this single site.
-fn (mut h HandshakeCore) release_ephemeral_keys() {
-	h.priv_x25519 = unsafe { nil }
-	h.priv_p256 = none
-}
-
-// fail_and_zeroize_secrets wipes derived secrets and parks the state machine
-// in .failed (RFC 8446 §1.3.1/§7.5).
-pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
-	h.wipe_all_secrets()
-	h.buffers.clear_all()
-	h.release_ephemeral_keys()
-	h.state = .failed
-}
-
-// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
-// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
-// handshake traffic secrets.
-fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
-	wipe_secret(mut h.handshake_secret)
-	// Release the ephemeral private keys; compute_shared_secret, their only consumer, already ran.
-	h.release_ephemeral_keys()
 }

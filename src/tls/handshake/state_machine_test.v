@@ -123,7 +123,7 @@ fn test_unconsumed_bytes_levels_start_empty() ! {
 	assert h.unconsumed_bytes(.handshake) == 0
 	assert h.unconsumed_bytes(.initial) == 0
 	_ = h.create_client_hello()!
-	h.state = .wait_server_flight
+	h.state = .wait_ee
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
 	_ = h.receive_msgs_at_level(.handshake, [u8(2), 0x00])!
 	assert h.unconsumed_bytes(.handshake) == 2
@@ -142,8 +142,8 @@ fn test_record_and_quic_facades_share_handshake_state() ! {
 
 	_ = record.create_client_hello()!
 	_ = quic.create_client_hello()!
-	assert record.state() == .wait_server_hello
-	assert quic.state() == .wait_server_hello
+	assert record.state() == .wait_sh
+	assert quic.state() == .wait_sh
 }
 
 fn test_handshake_options_select_initial_key_share() ! {
@@ -371,13 +371,13 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	assert quic.HandshakeCore.buffers.initial.len == 1
 }
 
-// test_state_progression_to_wait_server_hello checks that the machine starts at
-// .start and moves to .wait_server_hello once the ClientHello is built.
-fn test_state_progression_to_wait_server_hello() ! {
+// test_state_progression_to_wait_sh checks that the machine starts at
+// .start and moves to .wait_sh once the ClientHello is built.
+fn test_state_progression_to_wait_sh() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	assert h.state() == .start
 	_ = h.create_client_hello()!
-	assert h.state() == .wait_server_hello
+	assert h.state() == .wait_sh
 }
 
 // test_feed_rejects_out_of_order_message checks that a Certificate arriving
@@ -389,7 +389,7 @@ fn test_feed_rejects_out_of_order_message() ! {
 	h.receive_msgs_at_level(.handshake, cert) or {
 		assert err.msg().contains('only expected after ServerHello')
 		assert h.unconsumed_bytes(.handshake) == 0
-		assert h.state() == .wait_server_hello
+		assert h.state() == .wait_sh
 		return
 	}
 	assert false
@@ -404,7 +404,7 @@ fn test_create_client_hello_only_runs_once() ! {
 	_ = h.create_client_hello()!
 	h.create_client_hello() or {
 		assert err.msg().contains('only runs once')
-		assert h.state == .wait_server_hello
+		assert h.state() == .wait_sh
 		return
 	}
 	assert false
@@ -416,7 +416,7 @@ fn test_feed_before_client_hello_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.receive_msgs_at_level(.initial, wrap_hsk(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('receive_msgs_at_level() before create_client_hello()')
-		assert h.state == .start
+		assert h.state() == .start
 		return
 	}
 	assert false
@@ -427,10 +427,10 @@ fn test_feed_before_client_hello_refused() ! {
 fn test_feed_initial_after_server_hello_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
-	h.state = .wait_server_flight
+	h.state = .wait_ee
 	h.receive_msgs_at_level(.initial, wrap_hsk(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('while awaiting ServerHello')
-		assert h.state == .wait_server_flight
+		assert h.state() == .wait_ee
 		return
 	}
 	assert false
@@ -444,7 +444,7 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	// A garbage ServerHello body fails to parse; the failure is terminal.
 	bad := wrap_hsk(.server_hello, []u8{len: 8, init: 0x01})
 	h.receive_msgs_at_level(.initial, bad) or {
-		assert h.state == .failed
+		assert h.state() == .failed
 		// No later receive_msgs_at_level() may make progress against a dead machine.
 		h.receive_msgs_at_level(.initial, bad) or {
 			assert err.msg().contains('state machine has failed')
@@ -466,10 +466,10 @@ fn test_class_a_failure_zeroizes_and_parks_failed() ! {
 	h.handshake_secret = [u8(9), 8, 7]
 	h.secrets.handshake.client = [u8(1), 2, 3]
 	h.secrets.handshake.server = [u8(4), 5, 6]
-	h.state = .wait_server_flight
+	h.state = .wait_ee
 	// Class A: a Certificate is illegal while EncryptedExtensions is awaited (unexpected_message).
 	h.receive_msgs_at_level(.handshake, wrap_hsk(.certificate, []u8{len: 4, init: 0x01})) or {
-		assert h.state == .failed
+		assert h.state() == .failed
 		assert h.handshake_secret.len == 0
 		assert h.secrets.handshake.client.len == 0
 		assert h.secrets.handshake.server.len == 0
@@ -487,11 +487,10 @@ fn test_class_b_parse_failure_zeroizes_and_reports_decode_error() ! {
 	_ = h.create_client_hello()!
 	h.handshake_secret = [u8(9), 8, 7]
 	h.secrets.handshake.client = [u8(1), 2, 3]
-	h.state = .wait_server_flight
-	h.flight_step = .certificate
+	h.state = .wait_cert
 	// Class B: a malformed Certificate body fails to decode while in the right state.
 	h.receive_msgs_at_level(.handshake, wrap_hsk(.certificate, []u8{len: 8, init: 0x01})) or {
-		assert h.state == .failed
+		assert h.state() == .failed
 		assert h.failure_alert() == .decode_error
 		assert h.handshake_secret.len == 0
 		assert h.secrets.handshake.client.len == 0
@@ -506,10 +505,9 @@ fn test_malformed_finished_reports_decode_error() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.secrets.handshake.server = [u8(1), 2, 3]
-	h.state = .wait_server_flight
-	h.flight_step = .finished
+	h.state = .wait_finished
 	h.receive_msgs_at_level(.handshake, wrap_hsk(.finished, []u8{len: 4, init: 0xab})) or {
-		assert h.state == .failed
+		assert h.state() == .failed
 		assert h.failure_alert() == .decode_error
 		return
 	}
@@ -521,10 +519,10 @@ fn test_malformed_finished_reports_decode_error() ! {
 fn test_feed_handshake_level_after_connected_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.receive_msgs_at_level(.handshake, wrap_hsk(.new_session_ticket, [u8(0)])) or {
 		assert err.msg().contains('only expected after ServerHello')
-		assert h.state == .connected
+		assert h.state() == .connected
 		assert h.unconsumed_bytes(.handshake) == 0
 		return
 	}
@@ -549,11 +547,11 @@ fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.keys.application.client = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
 	h.keys.application.server = TrafficKeys{ key: [u8(3)], iv: [u8(4)] }
-	h.state = .connected
+	h.state = HandshakeState.connected
 
 	h.receive_msgs_at_level(.initial, [u8(0)]) or {
 		assert err.msg().contains('only expected while awaiting ServerHello')
-		assert h.state == .connected
+		assert h.state() == .connected
 		assert h.keys.application.client.key.len == 1
 		assert h.keys.application.server.key.len == 1
 		return
@@ -568,7 +566,7 @@ fn test_zeroize_traffic_secrets_handshake() ! {
 	h.secrets.handshake.server = [u8(4), 5, 6]
 	h.keys.handshake.client = TrafficKeys{ key: [u8(7)], iv: [u8(8)] }
 	h.keys.handshake.server = TrafficKeys{ key: [u8(9)], iv: [u8(10)] }
-	h.state = .connected
+	h.state = HandshakeState.connected
 
 	h.zeroize_traffic_secrets(.handshake)!
 
@@ -602,7 +600,7 @@ fn test_zeroize_traffic_secrets_handshake_requires_connected_state() ! {
 // the application secrets and their cached keys (§7.5).
 fn test_zeroize_traffic_secrets_application_clears_and_refuses() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.secrets.application.client = [u8(11), 12]
 	h.secrets.application.server = [u8(13), 14]
 	h.keys.application.client = TrafficKeys{ key: [u8(1)], iv: [u8(2)] }
@@ -644,7 +642,7 @@ fn test_zeroize_traffic_secrets_application_refuses_before_connected() ! {
 // no TLS traffic secrets, is refused rather than silently accepted.
 fn test_zeroize_traffic_secrets_refuses_initial() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.zeroize_traffic_secrets(.initial) or {
 		assert err.msg().contains('initial level has no traffic secrets')
 		return
@@ -656,7 +654,7 @@ fn test_zeroize_traffic_secrets_refuses_initial() ! {
 // update refuses while the application traffic secrets are still empty.
 fn test_update_traffic_keys_refuse_missing_secrets() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.update_traffic_keys(true) or {
 		assert err.msg().contains('server application traffic secret')
 		h.update_traffic_keys(false) or {
@@ -700,7 +698,7 @@ fn test_update_traffic_keys_refuse_before_connected() ! {
 // derives the next secrets and rebuilds the cached keys (§7.2).
 fn test_update_traffic_keys_derives_next_keys() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.secrets.application.server = []u8{len: 32, init: 1}
 	h.secrets.application.client = []u8{len: 32, init: 2}
 	old_server := h.secrets.application.server.clone()
@@ -719,7 +717,7 @@ fn test_update_traffic_keys_derives_next_keys() ! {
 // after teardown is refused instead of resurrecting the secret.
 fn test_update_traffic_keys_refuses_after_zeroize() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.secrets.application.client = [u8(1), 2, 3]
 	h.keys.application.client = TrafficKeys{ key: [u8(4)], iv: [u8(5)] }
 	h.zeroize_traffic_secrets(.application)!
@@ -819,7 +817,7 @@ fn test_traffic_keys_returns_independent_copies() ! {
 // superseded generation is zeroed in place after the key update.
 fn test_update_traffic_keys_wipes_superseded_generation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = .connected
+	h.state = HandshakeState.connected
 	h.secrets.application.server = []u8{len: 32, init: 7}
 	h.keys.application.server = TrafficKeys{ key: [u8(9), 9, 9], iv: [u8(9)] }
 	// Aliases into the old generation, captured before the key update runs.

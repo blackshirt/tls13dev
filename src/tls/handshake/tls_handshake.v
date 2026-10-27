@@ -49,6 +49,12 @@ fn (mut k PhaseKeys) wipe(level EncryptionLevel) {
 	}
 }
 
+// wipe_all zeroes every cached record-key pair.
+fn (mut k PhaseKeys) wipe_all() {
+	k.handshake.wipe()
+	k.application.wipe()
+}
+
 // TLSHandshake exposes only operations needed by the TLS record layer.
 @[noinit]
 pub struct TLSHandshake {
@@ -192,27 +198,35 @@ fn derive_record_key_pair(hash_algo HashAlgorithm, key_len int, client_secret []
 	return ck, sk
 }
 
+// sync_keys_level expands one phase's traffic-secret pair into its cached record
+// keys exactly once; a complete pair or absent secrets both short-circuit (§7.1).
+// Each pair is derived atomically via derive_record_key_pair before either
+// direction is written.
+fn (mut h TLSHandshake) sync_keys_level(level EncryptionLevel) ! {
+	if h.keys.pair(level).available() {
+		return
+	}
+	secrets := h.secrets.pair(level)
+	if !secrets.available() {
+		return
+	}
+	ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, secrets.client, secrets.server)!
+	synced := TrafficKeyPair{
+		client: ck
+		server: sk
+	}
+	match level {
+		.handshake { h.keys.handshake = synced }
+		.application { h.keys.application = synced }
+		.initial {}
+	}
+}
+
 // sync_record_keys derives and caches record keys when the core exposes
-// corresponding handshake or application traffic secrets. A complete pair marks
-// a level as derived, so each level expands exactly once. Each level's pair is
-// derived atomically via derive_record_key_pair before either direction is written.
+// corresponding handshake or application traffic secrets.
 fn (mut h TLSHandshake) sync_record_keys() ! {
-	if !h.keys.handshake.available() && h.secrets.handshake.available() {
-		ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, h.secrets.handshake.client,
-			h.secrets.handshake.server)!
-		h.keys.handshake = TrafficKeyPair{
-			client: ck
-			server: sk
-		}
-	}
-	if !h.keys.application.available() && h.secrets.application.available() {
-		ck, sk := derive_record_key_pair(h.hash_algo, h.key_len, h.secrets.application.client,
-			h.secrets.application.server)!
-		h.keys.application = TrafficKeyPair{
-			client: ck
-			server: sk
-		}
-	}
+	h.sync_keys_level(.handshake)!
+	h.sync_keys_level(.application)!
 }
 
 // wipe_record_keys_at zeroes the cached client/server record keys for one level;
@@ -223,6 +237,5 @@ fn (mut h TLSHandshake) wipe_record_keys_at(level EncryptionLevel) {
 
 // wipe_record_keys clears all cached handshake and application record keys.
 fn (mut h TLSHandshake) wipe_record_keys() {
-	h.wipe_record_keys_at(.handshake)
-	h.wipe_record_keys_at(.application)
+	h.keys.wipe_all()
 }

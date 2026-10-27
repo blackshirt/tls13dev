@@ -27,8 +27,8 @@ The core was therefore split so that the carrier is always someone else's job:
 
 ```
    ┌──────────────────────────── tls.handshake (this module) ───────────────────────────┐
-   │  Shared core: state_machine.v (transitions, flight, ECDHE, secrets)           │
-   │  Key schedule: key_schedule.v                                                  │
+   │  Shared core: state_machine.v (transitions, flight) + key_exchange.v           │
+   │  Key schedule: key_schedule.v (holders + §7.5 lifecycle)                       │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
    │  Record facade: tls_handshake.v owns TLS TrafficKeys and the KeyUpdate path    │
@@ -93,30 +93,38 @@ the adapter intact and are ignored there.
 
 ## 2. The handshake the core performs
 
-The core is a **client** state machine. Its public `HandshakeState` reports
-coarse progress, while a private `ServerFlightStep` cursor enforces the fixed
-post-ServerHello order of RFC 8446 §4.1:
+The core is a **client** state machine. Its public `HandshakeState` is a single
+enum mirroring the client state machine of RFC 8446 Appendix A.1; it is itself the
+ordering cursor that enforces the fixed post-ServerHello order of §4.1:
 
 ```
 start
-  └─ create_client_hello() ─▶ wait_server_hello
-        │  ServerHello (or HelloRetryRequest → re-send ClientHello, back to wait_server_hello)
+  └─ create_client_hello() ─▶ wait_sh
+        │  ServerHello (or HelloRetryRequest → re-send ClientHello, back to wait_sh)
         ▼
-  wait_server_flight            (private cursor: EncryptedExtensions)
+  wait_ee                      (handshake keys installed)
         │  EncryptedExtensions   (ALPN/SNI checks happen here)
-        │                        (cursor: CertificateRequest or Certificate)
+        ▼
+  wait_cert_cr                 (CertificateRequest or Certificate)
         │  CertificateRequest?   (optional, §4.3.2; client answers with an empty Certificate, §4.4.2)
+        ▼
+  wait_cert                    (Certificate)
         │  Certificate           (chain parsed + validated against the injected pki.Validator)
+        ▼
+  wait_cv                      (CertificateVerify)
         │  CertificateVerify     (server signature over the §4.4.3 content)
+        ▼
+  wait_finished                (Finished)
         │  Finished              (transcript-bound verify_data)
         ▼
-  connected                     (client Finished emitted; application secrets live)
+  connected                    (client Finished emitted; application secrets live)
 ```
 
-The cursor rejects an out-of-order encrypted-flight message and advances only
-as each message is handled; `state()` deliberately stays coarse, so adapters
-poll `wait_server_hello`, `connected`, or `failed` rather than internal
-per-message steps. `failed` is terminal: once reached,
+`state()` reports the exact cursor position and rejects an out-of-order
+encrypted-flight message, advancing only as each message is handled; adapters may
+poll any of these states — `conn.v` keys its record routing on `wait_sh`,
+`connected`, and `failed` — while key-material readiness comes from
+`available_secret_phases()`. `failed` is terminal: once reached,
 `receive_msgs_at_level()` refuses further input. A protocol violation moves the
 machine to `failed` and wipes all derived material (see
 `fail_and_zeroize_secrets()` in [CONTRACT.md](./CONTRACT.md)). The public

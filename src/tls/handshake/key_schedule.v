@@ -4,6 +4,8 @@
 // (EC)DHE and traffic-secret stages, deriving every handshake and application key.
 // The phase-stage derivations (derive_hs_secrets, derive_app_secrets) that
 // state_machine.v sequences live here too, beside the ladder primitives they call.
+// It also owns the retained derived-secret holders (TrafficSecretPair, PhaseSecrets,
+// SecretPhases) and the §7.5 zeroization lifecycle methods declared on HandshakeCore.
 module handshake
 
 import crypto.hmac
@@ -241,4 +243,130 @@ fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_ha
 		wipe_secret(mut finished_key)
 	}
 	return hash.compute_hmac(finished_key, transcript_hash)
+}
+
+// TrafficSecretPair holds one traffic phase's client and server secrets.
+struct TrafficSecretPair {
+mut:
+	client []u8
+	server []u8
+}
+
+// available reports whether both directions' secrets are present.
+fn (p &TrafficSecretPair) available() bool {
+	return p.client.len > 0 && p.server.len > 0
+}
+
+// wipe zeroes both directions and drops their handles.
+fn (mut p TrafficSecretPair) wipe() {
+	wipe_secret(mut p.client)
+	wipe_secret(mut p.server)
+}
+
+// PhaseSecrets groups the handshake and application traffic-secret pairs.
+struct PhaseSecrets {
+mut:
+	handshake   TrafficSecretPair
+	application TrafficSecretPair
+}
+
+// pair selects one phase's traffic-secret pair; the initial level has none.
+fn (s &PhaseSecrets) pair(level EncryptionLevel) TrafficSecretPair {
+	return match level {
+		.initial { TrafficSecretPair{} }
+		.handshake { s.handshake }
+		.application { s.application }
+	}
+}
+
+// wipe zeroes one phase's traffic-secret pair; the initial level has none.
+fn (mut s PhaseSecrets) wipe(level EncryptionLevel) {
+	match level {
+		.initial {}
+		.handshake { s.handshake.wipe() }
+		.application { s.application.wipe() }
+	}
+}
+
+// available reports which phase pairs currently hold both directions.
+fn (s &PhaseSecrets) available() SecretPhases {
+	return SecretPhases{
+		handshake:   s.handshake.available()
+		application: s.application.available()
+	}
+}
+
+// SecretPhases reports which traffic-secret phases the core currently holds
+// (derived, not yet zeroized, both directions present). Transport-neutral: it lets
+// adapters install record or packet keys when the material actually exists instead
+// of re-deriving readiness from HandshakeState.
+pub struct SecretPhases {
+pub:
+	handshake   bool // client+server handshake traffic secrets available
+	application bool // client+server application traffic secrets available
+}
+
+// available_secret_phases reports the current key-material readiness.
+pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
+	return h.secrets.available()
+}
+
+// wipe_traffic_secrets zeroes the client and server traffic secrets for one
+// encryption level; the initial level has no TLS traffic secrets. It mirrors the
+// QUIC-side peer_traffic_secrets() accessor (quic_handshake.v) so reads and
+// wipes share the same phase vocabulary.
+fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
+	h.secrets.wipe(level)
+}
+
+// wipe_all_secrets zeroes the key-schedule intermediate and every traffic secret.
+fn (mut h HandshakeCore) wipe_all_secrets() {
+	wipe_secret(mut h.handshake_secret)
+	h.wipe_traffic_secrets(.handshake)
+	h.wipe_traffic_secrets(.application)
+}
+
+// zeroize_traffic_secrets destroys the client and server traffic secrets for one
+// encryption level (and, on the record facade, that level's cached record keys)
+// once the adapter no longer needs them; it is valid only after .connected, and
+// the initial level — which has no TLS traffic secrets — is refused (RFC 8446 §7.5).
+pub fn (mut h HandshakeCore) zeroize_traffic_secrets(level EncryptionLevel) ! {
+	match level {
+		.initial {
+			return error('handshake: initial level has no traffic secrets to zeroize')
+		}
+		.handshake, .application {
+			if h.state != HandshakeState.connected {
+				return error('handshake: zeroize_traffic_secrets(${level}) is only valid once the handshake reaches .connected (state: ${h.state()})')
+			}
+			h.wipe_traffic_secrets(level)
+		}
+	}
+}
+
+// release_ephemeral_keys drops both ephemeral ECDHE private halves. The vlib key
+// types expose no in-place wipe, so releasing the handles is the available
+// destruction; fail_and_zeroize_secrets() and wipe_key_schedule_secrets() must
+// release them identically (§7.5), so they share this single site.
+fn (mut h HandshakeCore) release_ephemeral_keys() {
+	h.priv_x25519 = unsafe { nil }
+	h.priv_p256 = none
+}
+
+// fail_and_zeroize_secrets wipes derived secrets and parks the state machine
+// in .failed (RFC 8446 §1.3.1/§7.5).
+pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
+	h.wipe_all_secrets()
+	h.buffers.clear_all()
+	h.release_ephemeral_keys()
+	h.state = HandshakeState.failed
+}
+
+// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
+// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
+// handshake traffic secrets.
+fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
+	wipe_secret(mut h.handshake_secret)
+	// Release the ephemeral private keys; compute_shared_secret, their only consumer, already ran.
+	h.release_ephemeral_keys()
 }

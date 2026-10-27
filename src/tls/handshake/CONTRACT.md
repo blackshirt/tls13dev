@@ -16,6 +16,12 @@ where they add transport-specific behavior or expose transport-only operations.
 The implementation is split by ownership:
 
 - [`state_machine.v`](./state_machine.v) contains the private shared core.
+- [`key_schedule.v`](./key_schedule.v) runs the §7.1 HKDF ladder and holds the
+  core's derived-secret holders (`TrafficSecretPair`, `PhaseSecrets`, `SecretPhases`)
+  with the §7.5 wiping and zeroization lifecycle methods.
+- [`key_exchange.v`](./key_exchange.v) implements the core's ephemeral ECDHE
+  methods: per-group key generation, the public share, and the peer-share
+  validation and secret derivation.
 - [`tls_handshake.v`](./tls_handshake.v) defines and implements the
   record facade and its cached TLS keys and the TLS KeyUpdate derivation.
 - [`quic_handshake.v`](./quic_handshake.v) defines and implements the QUIC
@@ -37,10 +43,13 @@ hs.fail_and_zeroize_secrets()
 hs.zeroize_traffic_secrets(.application)!
 ```
 
-`state()` reports coarse progress as one of `start`, `wait_server_hello`,
-`wait_server_flight`, `connected`, or `failed`. Encrypted-flight message
-ordering is a private implementation cursor, not a public state value, and
-adapters should poll only the coarse states plus `available_secret_phases()`.
+`state()` reports the client's position in a single `HandshakeState` enum that
+mirrors the client state machine of RFC 8446 Appendix A.1 (`start`, `wait_sh`,
+`wait_ee`, `wait_cert_cr`, `wait_cert`, `wait_cv`, `wait_finished`, `connected`,
+plus an implementation `failed`). Encrypted-flight ordering is enforced by that
+same public state; key-material readiness is still polled via
+`available_secret_phases()` rather than inferred from `state()`, so a `.failed`
+handshake never presents stale readiness.
 
 `fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
 secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
