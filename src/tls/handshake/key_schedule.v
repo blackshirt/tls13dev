@@ -243,11 +243,11 @@ fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	}
 }
 
-// wipe_traffic_secrets zeroes the client and server traffic secrets for one
+// wipe_traffic_secrets_at zeroes the client and server traffic secrets for one
 // encryption level; the initial level has no TLS traffic secrets. It mirrors the
-// QUIC-side peer_traffic_secrets() accessor (quic_handshake.v) so reads and
+// QUIC-side peer_traffic_secrets_at() accessor (quic_handshake.v) so reads and
 // wipes share the same phase vocabulary.
-fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
+fn (mut h HandshakeCore) wipe_traffic_secrets_at(level EncryptionLevel) {
 	match level {
 		.initial {}
 		.handshake {
@@ -264,24 +264,24 @@ fn (mut h HandshakeCore) wipe_traffic_secrets(level EncryptionLevel) {
 // wipe_all_secrets zeroes the key-schedule intermediate and every traffic secret.
 fn (mut h HandshakeCore) wipe_all_secrets() {
 	wipe_secret(mut h.handshake_secret)
-	h.wipe_traffic_secrets(.handshake)
-	h.wipe_traffic_secrets(.application)
+	h.wipe_traffic_secrets_at(.handshake)
+	h.wipe_traffic_secrets_at(.application)
 }
 
-// zeroize_traffic_secrets destroys the client and server traffic secrets for one
+// zeroize_traffic_secrets_at destroys the client and server traffic secrets for one
 // encryption level (and, on the record facade, that level's cached record keys)
 // once the adapter no longer needs them; it is valid only after .connected, and
 // the initial level — which has no TLS traffic secrets — is refused (RFC 8446 §7.5).
-fn (mut h HandshakeCore) zeroize_traffic_secrets(level EncryptionLevel) ! {
+fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	match level {
 		.initial {
 			return error('handshake: initial level has no traffic secrets to zeroize')
 		}
 		.handshake, .application {
 			if h.state != HandshakeState.connected {
-				return error('handshake: zeroize_traffic_secrets(${level}) is only valid once the handshake reaches .connected (state: ${h.state()})')
+				return error('handshake: zeroize_traffic_secrets_at(${level}) is only valid once the handshake reaches .connected (state: ${h.state()})')
 			}
-			h.wipe_traffic_secrets(level)
+			h.wipe_traffic_secrets_at(level)
 		}
 	}
 }

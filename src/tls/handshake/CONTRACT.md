@@ -42,7 +42,7 @@ alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
 alert := hs.failure_alert()
 hs.fail_and_zeroize_secrets()
-hs.zeroize_traffic_secrets(.application)!
+hs.zeroize_traffic_secrets_at(.application)!
 ```
 
 `state()` reports the client's position in a single `HandshakeState` enum that
@@ -55,7 +55,7 @@ handshake never presents stale readiness.
 
 `fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
 secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
-wipes its cached record keys during failure cleanup. `zeroize_traffic_secrets(level)`
+wipes its cached record keys during failure cleanup. `zeroize_traffic_secrets_at(level)`
 is a fallible teardown operation and is accepted only after `.connected`, so
 an out-of-phase call cannot discard traffic material needed to finish a handshake.
 Adapters call these lifecycle operations when aborting or tearing down; callers
@@ -78,7 +78,7 @@ the machine in `.failed`, and returns the `IError` to propagate. No call site ca
 produce one of those steps without the others, so a peer-triggered decode error both
 tears down and reports the RFC-correct alert (e.g. `decode_error` for a malformed
 message) rather than a stale default. Every handshake-level and ServerHello-path
-parse/framing failure routes through it; `append_and_drain()` keeps an
+parse/framing failure routes through it; `append_and_drain_at()` keeps an
 `or { fail_and_zeroize_secrets() }` safety net for any non-classified internal error
 (teardown is idempotent, so the belt-and-suspenders call is harmless). On the record
 facade this still triggers the cached-record-key wipe: `TLSHandshake.receive_msgs_at_level()`
@@ -124,7 +124,7 @@ readiness.
 
 `TLSHandshake` exposes operations needed by TLS over TCP:
 
-- `record_traffic_keys()` returns derived record keys.
+- `record_traffic_keys_at()` returns derived record keys.
 - `unconsumed_bytes()` lets the record adapter enforce the
   ServerHello record-boundary rule; it and `take_buffered_handshake_bytes()`
   are defined on the facade itself, called directly by `tls.Conn` (only the
@@ -138,7 +138,7 @@ readiness.
   (`true`, server keys, after receiving) and the write leg (`false`, client
   keys, before sending) — and is valid only after the handshake reaches
   `.connected`.
-- `zeroize_traffic_secrets(level)` destroys the traffic secrets for one
+- `zeroize_traffic_secrets_at(level)` destroys the traffic secrets for one
   encryption level once the adapter no longer needs them; valid only after
   `.connected`, and the record facade also wipes that level's cached record
   keys. `.handshake` is cleanup, not a handshake-confirmation signal; the
@@ -146,16 +146,16 @@ readiness.
 
 ## QUIC-only operations
 
-`QuicHandshake` defines `peer_traffic_secrets()` on the facade itself and
+`QuicHandshake` defines `peer_traffic_secrets_at()` on the facade itself and
 exposes raw traffic secrets instead of record keys: raw-secret export has no
 TLS caller — the record adapter keeps its cached-key surface
-(`record_traffic_keys()`) and never reads the secrets. The QUIC adapter expands
+(`record_traffic_keys_at()`) and never reads the secrets. The QUIC adapter expands
 these secrets with the RFC 9001 `quic key`, `quic iv`, and `quic hp` labels. It
-calls `zeroize_traffic_secrets(.handshake)` only when QUIC no longer needs the
+calls `zeroize_traffic_secrets_at(.handshake)` only when QUIC no longer needs the
 handshake keys, which may be after the handshake is confirmed.
 `peer_transport_parameters()` returns the server's opaque extension bytes once
 received, and `hello_retry_request_received()` reports whether a retry occurred.
-Application teardown calls `zeroize_traffic_secrets(.application)`, a `pub`
+Application teardown calls `zeroize_traffic_secrets_at(.application)`, a `pub`
 forwarder on the `QuicHandshake` facade over the shared core — each level is
 reached through the facade's curated forwarders, never embedded promotion.
 

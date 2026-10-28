@@ -46,7 +46,7 @@ fn test_encryption_level_rejects_unsupported_operation() ! {
 	}
 	assert rejected
 	rejected = false
-	record.record_traffic_keys(.initial) or {
+	record.record_traffic_keys_at(.initial) or {
 		assert err.msg().contains('initial level has no traffic keys')
 		rejected = true
 	}
@@ -56,7 +56,7 @@ fn test_encryption_level_rejects_unsupported_operation() ! {
 		validator: fixture_validator()
 	})!
 	rejected = false
-	quic.peer_traffic_secrets(.initial) or {
+	quic.peer_traffic_secrets_at(.initial) or {
 		assert err.msg().contains('initial level has no traffic secrets')
 		rejected = true
 	}
@@ -529,14 +529,14 @@ fn test_feed_handshake_level_after_connected_refused() ! {
 	assert false
 }
 
-// ---- traffic_keys / peer_traffic_secrets lifecycle (white-box) ----
+// ---- traffic_keys / peer_traffic_secrets_at lifecycle (white-box) ----
 
 // test_traffic_keys_unavailable_before_derivation checks that the accessors
 // refuse until the handshake derives keys.
 fn test_traffic_keys_unavailable_before_derivation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
-	_, _, _, _ := h.record_traffic_keys(.handshake) or {
+	_, _, _, _ := h.record_traffic_keys_at(.handshake) or {
 		return
 	}
 	assert false
@@ -572,14 +572,14 @@ fn test_zeroize_traffic_secrets_handshake() ! {
 	h.s_hsk_iv = [u8(10)]
 	h.HandshakeCore.state = HandshakeState.connected
 
-	h.zeroize_traffic_secrets(.handshake)!
+	h.zeroize_traffic_secrets_at(.handshake)!
 
 	assert h.c_hsk_tsec.len == 0
 	assert h.s_hsk_tsec.len == 0
 	assert h.c_hsk_key.len == 0
 	assert h.s_hsk_key.len == 0
 	// Handshake keys/secrets are gone: the record accessor now refuses.
-	_, _, _, _ := h.record_traffic_keys(.handshake) or {
+	_, _, _, _ := h.record_traffic_keys_at(.handshake) or {
 		return
 	}
 	assert false
@@ -592,7 +592,7 @@ fn test_zeroize_traffic_secrets_handshake_requires_connected_state() ! {
 	h.c_hsk_tsec = [u8(1), 2, 3]
 	h.c_hsk_key = [u8(7)]
 	h.c_hsk_iv = [u8(8)]
-	h.zeroize_traffic_secrets(.handshake) or {
+	h.zeroize_traffic_secrets_at(.handshake) or {
 		assert err.msg().contains('reaches .connected')
 		assert h.c_hsk_tsec.len == 3
 		assert h.c_hsk_key.len == 1
@@ -613,7 +613,7 @@ fn test_zeroize_traffic_secrets_application_clears_and_refuses() ! {
 	h.s_app_key = [u8(3)]
 	h.s_app_iv = [u8(4)]
 
-	h.zeroize_traffic_secrets(.application)!
+	h.zeroize_traffic_secrets_at(.application)!
 
 	assert h.c_app_tsec.len == 0
 	assert h.s_app_tsec.len == 0
@@ -621,7 +621,7 @@ fn test_zeroize_traffic_secrets_application_clears_and_refuses() ! {
 	assert h.c_app_key.len == 0
 	assert h.c_app_iv.len == 0
 	assert h.s_app_key.len == 0
-	_, _, _, _ := h.record_traffic_keys(.application) or {
+	_, _, _, _ := h.record_traffic_keys_at(.application) or {
 		return
 	}
 	assert false
@@ -636,7 +636,7 @@ fn test_zeroize_traffic_secrets_application_refuses_before_connected() ! {
 	h.c_app_key = [u8(1)]
 	h.c_app_iv = [u8(2)]
 
-	h.zeroize_traffic_secrets(.application) or {
+	h.zeroize_traffic_secrets_at(.application) or {
 		assert err.msg().contains('only valid once the handshake reaches .connected')
 		assert h.state() == .start
 		assert h.c_app_tsec == [u8(11), 12]
@@ -651,7 +651,7 @@ fn test_zeroize_traffic_secrets_application_refuses_before_connected() ! {
 fn test_zeroize_traffic_secrets_refuses_initial() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.HandshakeCore.state = HandshakeState.connected
-	h.zeroize_traffic_secrets(.initial) or {
+	h.zeroize_traffic_secrets_at(.initial) or {
 		assert err.msg().contains('initial level has no traffic secrets')
 		return
 	}
@@ -717,7 +717,7 @@ fn test_update_traffic_keys_derives_next_keys() ! {
 	assert h.c_app_tsec != old_client
 	assert h.s_app_tsec.len == 32
 	assert h.c_app_tsec.len == 32
-	key, _, _, _ := h.record_traffic_keys(.application)!
+	key, _, _, _ := h.record_traffic_keys_at(.application)!
 	assert key.len > 0
 }
 
@@ -729,9 +729,9 @@ fn test_update_traffic_keys_refuses_after_zeroize() ! {
 	h.c_app_tsec = [u8(1), 2, 3]
 	h.c_app_key = [u8(4)]
 	h.c_app_iv = [u8(5)]
-	h.zeroize_traffic_secrets(.application)!
+	h.zeroize_traffic_secrets_at(.application)!
 	h.update_traffic_keys(false) or {
-		assert err.msg().contains('destroyed by zeroize_traffic_secrets(.application)')
+		assert err.msg().contains('destroyed by zeroize_traffic_secrets_at(.application)')
 		return
 	}
 	assert false
@@ -816,7 +816,7 @@ fn test_traffic_keys_returns_independent_copies() ! {
 	h.c_hsk_iv = [u8(4), 5]
 	h.s_hsk_key = [u8(6), 7]
 	h.s_hsk_iv = [u8(8)]
-	ck, civ, sk, _ := h.record_traffic_keys(.handshake)!
+	ck, civ, sk, _ := h.record_traffic_keys_at(.handshake)!
 	assert unsafe { voidptr(&ck[0]) } != unsafe { voidptr(&h.c_hsk_key[0]) }
 	assert unsafe { voidptr(&civ[0]) } != unsafe { voidptr(&h.c_hsk_iv[0]) }
 	assert unsafe { voidptr(&sk[0]) } != unsafe { voidptr(&h.s_hsk_key[0]) }

@@ -17,8 +17,6 @@ import crypto.subtle
 import tls.pki
 import x.crypto.curve25519
 
-//  Types: state, messages, options, and the core state struct
-
 // HandshakeState is the client handshake state machine, mirroring the client
 // states of RFC 8446 Appendix A.1 (the all-caps RFC names carry no formal meaning,
 // so they are rendered in snake_case here); `failed` is an implementation terminal
@@ -375,14 +373,14 @@ fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8
 		}
 		return error(msg)
 	}
-	return h.append_and_drain(level, bytes)
+	return h.append_and_drain_at(level, bytes)
 }
 
-// append_and_drain bounds each append before allocating, while still allowing a
+// append_and_drain_at bounds each append before allocating, while still allowing a
 // transport to deliver multiple complete messages in one call. Inner failures
 // already tear down via classify_failure; the fail_and_zeroize_secrets() safety
 // nets below catch anything else — teardown is idempotent.
-fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+fn (mut h HandshakeCore) append_and_drain_at(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	mut offset := 0
 	limit := handshake_header_len + max_handshake_message_len
@@ -397,7 +395,7 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 			h.buffers.append(level, bytes[offset..offset + take])
 			offset += take
 		}
-		messages := h.drain(level) or {
+		messages := h.drain_at(level) or {
 			h.fail_and_zeroize_secrets()
 			return err
 		}
@@ -410,7 +408,7 @@ fn (mut h HandshakeCore) append_and_drain(level EncryptionLevel, bytes []u8) ![]
 }
 
 // level_is_open reports whether one level's buffer is legal for the current state;
-// receive_msgs_at_level and drain() share it as the single phase-legality rule.
+// receive_msgs_at_level and drain_at() share it as the single phase-legality rule.
 fn (h &HandshakeCore) level_is_open(level EncryptionLevel) bool {
 	return match level {
 		.initial { h.state == .wait_sh }
@@ -419,9 +417,9 @@ fn (h &HandshakeCore) level_is_open(level EncryptionLevel) bool {
 	}
 }
 
-// drain consumes every complete message one level's buffer currently holds.
+// drain_at consumes every complete message one level's buffer currently holds.
 // Framing-boundary checks remain adapter policy.
-fn (mut h HandshakeCore) drain(level EncryptionLevel) ![]HandshakeMessage {
+fn (mut h HandshakeCore) drain_at(level EncryptionLevel) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.level_is_open(level) {
 		msg := h.buffers.next_message(level) or {

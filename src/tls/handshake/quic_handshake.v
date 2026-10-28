@@ -2,7 +2,7 @@
 //
 // QuicHandshake is the QUIC adapter facade over shared TLS handshake
 // semantics. QUIC derives packet protection from the exported traffic secrets,
-// so the raw-secret accessor peer_traffic_secrets() lives here: the record
+// so the raw-secret accessor peer_traffic_secrets_at() lives here: the record
 // facade caches flat record-key fields instead and has no caller for it.
 module handshake
 
@@ -24,7 +24,7 @@ pub fn new_quic_handshake(server_name string, options HandshakeOptions) !QuicHan
 // module-private, so nothing reaches QUIC through embedded-field promotion; the
 // engine sees only these entry points, each delegating to the core by an
 // explicit qualified call (never h.X(), which would resolve back to the
-// forwarder and recurse). peer_traffic_secrets/peer_transport_parameters/
+// forwarder and recurse). peer_traffic_secrets_at/peer_transport_parameters/
 // hello_retry_request_received below stay QUIC-only seams.
 
 // state reports the handshake position; the engine polls it to know when the
@@ -65,9 +65,9 @@ pub fn (mut h QuicHandshake) receive_msgs_at_level(level EncryptionLevel, bytes 
 	return h.HandshakeCore.receive_msgs_at_level(level, bytes)!
 }
 
-// zeroize_traffic_secrets destroys one level's traffic secrets after use (§7.5).
-pub fn (mut h QuicHandshake) zeroize_traffic_secrets(level EncryptionLevel) ! {
-	h.HandshakeCore.zeroize_traffic_secrets(level)!
+// zeroize_traffic_secrets_at destroys one level's traffic secrets after use (§7.5).
+pub fn (mut h QuicHandshake) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
+	h.HandshakeCore.zeroize_traffic_secrets_at(level)!
 }
 
 // fail_and_zeroize_secrets wipes every secret and parks the machine in .failed (§7.5).
@@ -75,12 +75,12 @@ pub fn (mut h QuicHandshake) fail_and_zeroize_secrets() {
 	h.HandshakeCore.fail_and_zeroize_secrets()
 }
 
-// peer_traffic_secrets returns copies of the client and server traffic secrets
+// peer_traffic_secrets_at returns copies of the client and server traffic secrets
 // for one encryption level; the initial level has no TLS traffic secrets. QUIC
 // seam: the engine expands the two secrets into RFC 9001 §5.1 packet keys
 // itself, and the TLS record path never reads raw secrets — TLSHandshake serves
-// record_traffic_keys() from its cached flat key fields instead.
-pub fn (h &QuicHandshake) peer_traffic_secrets(level EncryptionLevel) !([]u8, []u8) {
+// record_traffic_keys_at() from its cached flat key fields instead.
+pub fn (h &QuicHandshake) peer_traffic_secrets_at(level EncryptionLevel) !([]u8, []u8) {
 	if level == .initial {
 		return error('handshake: initial level has no traffic secrets')
 	}
@@ -99,7 +99,7 @@ pub fn (h &QuicHandshake) peer_traffic_secrets(level EncryptionLevel) !([]u8, []
 	}
 	if c.len == 0 || s.len == 0 {
 		if level == .handshake {
-			return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
+			return error('handshake: handshake traffic secrets unavailable (available after ServerHello, dropped by zeroize_traffic_secrets_at(.handshake))')
 		}
 		return error('handshake: application traffic secrets unavailable before the server Finished')
 	}

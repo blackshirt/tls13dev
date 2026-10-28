@@ -36,8 +36,8 @@ The core was therefore split so that the carrier is always someone else's job:
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
-        │ receive_msgs_at_level                │ record_traffic_keys /                │ create_client_hello /
-        │                                      │ peer_traffic_secrets                 │ receive_msgs_at_level
+        │ receive_msgs_at_level                │ record_traffic_keys_at /              │ create_client_hello /
+        │                                      │ peer_traffic_secrets_at               │ receive_msgs_at_level
         │                                      │                                      │
    ┌────┴──────────────┐              ┌───────┴───────────┐               ┌─────────┴──────────┐
    │ tls TCP adapter   │              │ a QUIC engine     │               │ tests / other      │
@@ -186,11 +186,11 @@ RFC 9001 §5.1 expansions itself:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-`peer_traffic_secrets(level)` (defined on the `QuicHandshake` facade itself)
+`peer_traffic_secrets_at(level)` (defined on the `QuicHandshake` facade itself)
 hands out `(client, server)` clones of those secrets.
-`record_traffic_keys(level)` is provided by `TLSHandshake`; a
+`record_traffic_keys_at(level)` is provided by `TLSHandshake`; a
 `QuicHandshake` does not expose it. A QUIC engine uses
-`peer_traffic_secrets()` + the public `hkdf_expand_label()`.
+`peer_traffic_secrets_at()` + the public `hkdf_expand_label()`.
 
 ### 3.3 Handshake keys survive until no longer needed
 
@@ -201,7 +201,7 @@ handshake traffic secrets past `.connected`; the engine owns its derived packet
 keys and, when it processes `HANDSHAKE_DONE` (§4.9.2), calls `drop_handshake_keys()`
 — a single step that zeroizes the core's `.handshake` traffic secrets *and* zeroes
 the Handshake packet-protection states together, so neither half can be forgotten.
-The TCP adapter reaches the same `zeroize_traffic_secrets(.handshake)` after sending
+The TCP adapter reaches the same `zeroize_traffic_secrets_at(.handshake)` after sending
 its Finished because record-based TLS has no such window; **a QUIC engine must not**
 release them before it has finished using the Handshake packet keys. Terminal cleanup
 is centralized in `close()`, which seals the final `CONNECTION_CLOSE` first and only
@@ -271,7 +271,7 @@ for m in msgs {
 // 4. Now derive Handshake keys from the exported secrets and protect Handshake
 //    packets with them; the server flight (EE, [CertReq], Cert, CV, Finished)
 //    rides Handshake CRYPTO.
-(ck, sk) := hs.peer_traffic_secrets(.handshake)!
+(ck, sk) := hs.peer_traffic_secrets_at(.handshake)!
 suite := hs.negotiated_cipher_suite()
 hash := handshake.suite_hash_algo(suite)
 key_len := handshake.suite_key_len(suite)
@@ -289,12 +289,12 @@ for m in flight {
 }
 
 // 6. Application secrets are live at .connected. Derive 1-RTT packet keys with
-//    the 'quic key'/'quic iv'/'quic hp' labels from peer_traffic_secrets(.application).
-(cap, sap) := hs.peer_traffic_secrets(.application)!
+//    the 'quic key'/'quic iv'/'quic hp' labels from peer_traffic_secrets_at(.application).
+(cap, sap) := hs.peer_traffic_secrets_at(.application)!
 
 // 7. For a custom client adapter, release handshake-stage material after
 //    receiving HANDSHAKE_DONE. Conn does this automatically.
-hs.zeroize_traffic_secrets(.handshake)!
+hs.zeroize_traffic_secrets_at(.handshake)!
 
 // 8. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_recordless_message and decode with parse_new_session_ticket.

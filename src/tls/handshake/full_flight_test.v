@@ -15,10 +15,10 @@ fn fixture_trusted_validator() pki.Validator {
 	return pki.new_validator(ts)
 }
 
-// expect_no_handshake_keys reports whether record_traffic_keys(.handshake) refuses —
-// the expected state once zeroize_traffic_secrets(.handshake) dropped the handshake material.
+// expect_no_handshake_keys reports whether record_traffic_keys_at(.handshake) refuses —
+// the expected state once zeroize_traffic_secrets_at(.handshake) dropped the handshake material.
 fn expect_no_handshake_keys(h &TLSHandshake) bool {
-	h.record_traffic_keys(.handshake) or {
+	h.record_traffic_keys_at(.handshake) or {
 		return true
 	}
 	return false
@@ -108,16 +108,16 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert h.server_certs.len == 1
 
 	// Application traffic keys are the reusable post-handshake state (§7.1).
-	ck, civ, sk, siv := h.record_traffic_keys(.application)!
+	ck, civ, sk, siv := h.record_traffic_keys_at(.application)!
 	assert ck.len == 16
 	assert civ.len == 12
 	assert sk.len == 16
 	assert siv.len == 12
 
 	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
-	h.zeroize_traffic_secrets(.handshake)!
+	h.zeroize_traffic_secrets_at(.handshake)!
 	assert expect_no_handshake_keys(&h)
-	akc, _, aks, aks_iv := h.record_traffic_keys(.application)!
+	akc, _, aks, aks_iv := h.record_traffic_keys_at(.application)!
 	assert akc.len == 16
 	assert aks.len == 16
 	assert aks_iv.len == 12
@@ -331,6 +331,6 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
 	assert h.available_secret_phases().application
 	// The split key/iv derivers populated the record cache the transport consumes.
-	ck, civ, sk, siv := h.record_traffic_keys(.application)!
+	ck, civ, sk, siv := h.record_traffic_keys_at(.application)!
 	assert ck.len == 16 && civ.len == 12 && sk.len == 16 && siv.len == 12
 }

@@ -50,7 +50,7 @@ key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
 tls_handshake.v       TLS record facade: curated core forwarders, cached record keys, KeyUpdate,
                       reassembly hooks
-quic_handshake.v      QUIC facade: curated core forwarders, peer_traffic_secrets, peer transport params
+quic_handshake.v      QUIC facade: curated core forwarders, peer_traffic_secrets_at, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished

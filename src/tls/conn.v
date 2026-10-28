@@ -509,7 +509,7 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.available_secret_phases().handshake {
 					// Install once the core actually holds handshake secrets, keyed on the
 					// same readiness query the QUIC adapter uses, not on state().
-					c.install_ciphers(.handshake)!
+					c.install_ciphers_at(.handshake)!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
@@ -525,9 +525,9 @@ fn (mut c Conn) do_handshake() ! {
 		}
 	}
 	// The core verified the server Finished; install this adapter's post-handshake protection.
-	c.install_ciphers(.application)!
+	c.install_ciphers_at(.application)!
 	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
-	// core's drain stops at .connected, so take (and scrub) its buffered bytes.
+	// core's drain_at() stops at .connected, so take (and scrub) its buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()
 	if coalesced.len > 0 {
 		// handle_post_handshake failures already abort_connection; don't re-alert.
@@ -535,7 +535,7 @@ fn (mut c Conn) do_handshake() ! {
 	}
 	// Nothing may protect or decrypt at the handshake level now, so the core may
 	// destroy its secrets (RFC 8446 §7.5).
-	c.hs.zeroize_traffic_secrets(.handshake)!
+	c.hs.zeroize_traffic_secrets_at(.handshake)!
 }
 
 // validate_compat_ccs checks one dummy ChangeCipherSpec record and enforces max_compat_ccs_records.
@@ -622,11 +622,12 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	}
 }
 
-// install_ciphers builds both protection states for one key generation from the
-// core's record_traffic_keys(level); called once after the ServerHello is fed
-// (.handshake) and once at .connected (.application). Initial keys are refused:
+// install_ciphers_at builds both protection states for one key generation at the
+// given level from the facade's record_traffic_keys_at(level); called once after
+// the ServerHello is fed (.handshake) and once at .connected (.application).
+// Initial keys are refused:
 // this adapter never installs them, so a misleveled future call fails closed.
-fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
+fn (mut c Conn) install_ciphers_at(level handshake.EncryptionLevel) ! {
 	if level == .initial {
 		return error('tls: no record protection exists for the initial level')
 	}
@@ -644,7 +645,7 @@ fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
 		zero_bytes(mut sk)
 		zero_bytes(mut siv)
 	}
-	ck, civ, sk, siv = c.hs.record_traffic_keys(level)!
+	ck, civ, sk, siv = c.hs.record_traffic_keys_at(level)!
 	suite := c.hs.negotiated_cipher_suite()
 	if level == .handshake {
 		c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
@@ -661,7 +662,7 @@ fn (mut c Conn) install_ciphers(level handshake.EncryptionLevel) ! {
 // update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
 // restart at 0 per generation (§5.3).
 fn (mut c Conn) rekey_cipher(is_server bool) ! {
-	mut ck, mut civ, mut sk, mut siv := c.hs.record_traffic_keys(.application)!
+	mut ck, mut civ, mut sk, mut siv := c.hs.record_traffic_keys_at(.application)!
 	// Scrub every copy on all exit paths (§7.5): only the selected leg is installed, but
 	// both pairs are dead here and the AEAD backend/protection state own their copies.
 	defer {
@@ -1060,7 +1061,7 @@ fn (mut c Conn) wipe_protection_states() {
 // can clear one layer and forget the other (RFC 8446 §1.3.1/§7.5).
 fn (mut c Conn) destroy_on_close() ! {
 	if c.hs.state() == .connected {
-		c.hs.zeroize_traffic_secrets(.application)!
+		c.hs.zeroize_traffic_secrets_at(.application)!
 	} else {
 		c.hs.fail_and_zeroize_secrets()
 	}

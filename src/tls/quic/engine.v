@@ -497,20 +497,20 @@ fn (mut e Conn) install_exported_keys() ! {
 	// live secrets. The adapter keeps its own install-once flags.
 	phases := e.hs.available_secret_phases()
 	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none && phases.handshake {
-		e.install_level_protection(.handshake)!
+		e.install_protection_at(.handshake)!
 	}
 	if phases.application && e.app_tx == none && e.app_rx == none {
-		e.install_level_protection(.application)!
+		e.install_protection_at(.application)!
 	}
 }
 
-// install_level_protection expands one level's exported traffic secrets into that
+// install_protection_at expands one level's exported traffic secrets into that
 // level's packet protection (RFC 9001 §5.1). The exported secrets and the derived
 // packet keys are dead once new_protection has cloned what it needs into its state and
 // the AEAD backend has copied the key, so defer scrubs every local copy on all exit
 // paths (§7.5) — zeroing these inputs cannot disturb the live protection state.
-fn (mut e Conn) install_level_protection(level handshake.EncryptionLevel) ! {
-	mut ck, mut sk := e.hs.peer_traffic_secrets(level)!
+fn (mut e Conn) install_protection_at(level handshake.EncryptionLevel) ! {
+	mut ck, mut sk := e.hs.peer_traffic_secrets_at(level)!
 	defer {
 		zero_bytes(mut ck)
 		zero_bytes(mut sk)
@@ -653,7 +653,7 @@ fn (mut e Conn) fail_close() ! {
 // discard one and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
 // handshake protection states before releasing them, and is idempotent.
 fn (mut e Conn) drop_handshake_keys() ! {
-	e.hs.zeroize_traffic_secrets(.handshake)!
+	e.hs.zeroize_traffic_secrets_at(.handshake)!
 	mut tx := e.handshake_tx or { ProtectionState{ aead: unsafe { nil } } }
 	tx.wipe()
 	e.handshake_tx = none
@@ -694,7 +694,7 @@ fn (mut e Conn) wipe_packet_keys() {
 // needs the packet keys; that is why the failure path (fail_close) does not call it.
 fn (mut e Conn) destroy_on_close() ! {
 	if e.hs.state() == .connected {
-		e.hs.zeroize_traffic_secrets(.application)!
+		e.hs.zeroize_traffic_secrets_at(.application)!
 	} else {
 		e.hs.fail_and_zeroize_secrets()
 	}

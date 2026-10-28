@@ -91,19 +91,19 @@ pub fn (h &TLSHandshake) unconsumed_bytes(level EncryptionLevel) int {
 	return h.buffers.len(level)
 }
 
-// take_buffered_handshake_bytes moves whatever the core's drain left buffered at
+// take_buffered_handshake_bytes moves whatever the core's drain_at() left buffered at
 // .connected (legal only per RFC 8446 §4.6.1 coalescing) to the record adapter,
 // zeroizing the core's copy (§7.5).
 pub fn (mut h TLSHandshake) take_buffered_handshake_bytes() []u8 {
 	return h.buffers.take_handshake()
 }
 
-// record_traffic_keys returns independent copies of the cached client/server
+// record_traffic_keys_at returns independent copies of the cached client/server
 // record key and IV bytes at one TLS encryption level, ordered as
 // (client_key, client_iv, server_key, server_iv). The flat key fields stay
 // module-internal: the tls record layer receives plain []u8, never a named
 // key handle.
-pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !([]u8, []u8, []u8, []u8) {
+pub fn (h &TLSHandshake) record_traffic_keys_at(level EncryptionLevel) !([]u8, []u8, []u8, []u8) {
 	if level == .initial {
 		return error('handshake: initial level has no traffic keys')
 	}
@@ -114,7 +114,7 @@ pub fn (h &TLSHandshake) record_traffic_keys(level EncryptionLevel) !([]u8, []u8
 	}
 	if !keys_ready {
 		if level == .handshake {
-			return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_traffic_secrets(.handshake))')
+			return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_traffic_secrets_at(.handshake))')
 		}
 		return error('handshake: application traffic keys unavailable before the server Finished')
 	}
@@ -137,7 +137,7 @@ pub fn (mut h TLSHandshake) update_traffic_keys(is_server bool) ! {
 	}
 	secret := if is_server { h.s_app_tsec } else { h.c_app_tsec }
 	if secret.len == 0 {
-		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_traffic_secrets(.application))')
+		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_traffic_secrets_at(.application))')
 	}
 	next_secret, next_key, next_iv := derive_updated_traffic_keys(h.hash_algo, h.key_len, secret) or {
 		h.fail_and_zeroize_secrets()
@@ -169,12 +169,12 @@ pub fn (mut h TLSHandshake) fail_and_zeroize_secrets() {
 	h.wipe_record_keys()
 }
 
-// zeroize_traffic_secrets destroys the traffic secrets for one encryption level
+// zeroize_traffic_secrets_at destroys the traffic secrets for one encryption level
 // plus that level's cached record keys; valid only after .connected (core guard)
 // and the initial level is refused. Used both for application teardown and, once
 // the record adapter no longer needs them, for the handshake keys/secrets.
-pub fn (mut h TLSHandshake) zeroize_traffic_secrets(level EncryptionLevel) ! {
-	h.HandshakeCore.zeroize_traffic_secrets(level)!
+pub fn (mut h TLSHandshake) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
+	h.HandshakeCore.zeroize_traffic_secrets_at(level)!
 	h.wipe_record_keys_at(level)
 }
 
@@ -189,12 +189,12 @@ fn derive_updated_traffic_keys(hash_algo HashAlgorithm, key_len int, secret []u8
 	return new_secret, key, iv
 }
 
-// sync_keys_level expands one phase's traffic secrets into its cached record
+// sync_keys_at expands one phase's traffic secrets into its cached record
 // keys exactly once; complete keys or absent secrets both short-circuit (§7.1).
 // All four key and IV values are derived into locals before any field is written, so
 // a failure can never leave a level half-installed — the same atomicity
 // sync_record_keys relies on.
-fn (mut h TLSHandshake) sync_keys_level(level EncryptionLevel) ! {
+fn (mut h TLSHandshake) sync_keys_at(level EncryptionLevel) ! {
 	mut keys_ready := false
 	mut secrets_ready := false
 	if level == .handshake {
@@ -232,8 +232,8 @@ fn (mut h TLSHandshake) sync_keys_level(level EncryptionLevel) ! {
 // sync_record_keys derives and caches record keys when the core exposes
 // corresponding handshake or application traffic secrets.
 fn (mut h TLSHandshake) sync_record_keys() ! {
-	h.sync_keys_level(.handshake)!
-	h.sync_keys_level(.application)!
+	h.sync_keys_at(.handshake)!
+	h.sync_keys_at(.application)!
 }
 
 // wipe_keys_at zeroes the cached client/server record key and IV for one level;
@@ -258,7 +258,7 @@ fn (mut h TLSHandshake) wipe_keys_at(level EncryptionLevel) {
 }
 
 // wipe_record_keys_at zeroes one level's cached record keys (facade half of the
-// zeroize_traffic_secrets override).
+// zeroize_traffic_secrets_at override).
 fn (mut h TLSHandshake) wipe_record_keys_at(level EncryptionLevel) {
 	h.wipe_keys_at(level)
 }
