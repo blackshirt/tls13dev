@@ -17,11 +17,13 @@ fn fixture_trusted_validator() pki.Validator {
 
 // expect_no_handshake_keys reports whether handshake_record_keys() refuses —
 // the expected state once zeroize_handshake_secrets() dropped the handshake material.
+// Only the error is inspected: a refused generation must not leak a handle.
 fn expect_no_handshake_keys(h &TLSHandshake) bool {
+	mut refused := false
 	h.handshake_record_keys() or {
-		return true
+		refused = true
 	}
-	return false
+	return refused
 }
 
 // expect_no_exported_handshake_secrets reports whether the handshake traffic
@@ -107,20 +109,33 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert h.negotiated_alpn() == 'h2'
 	assert h.server_certs.len == 1
 
-	// Application traffic keys are the reusable post-handshake state (§7.1).
-	ck, civ, sk, siv := h.application_record_keys()!
-	assert ck.len == 16
-	assert civ.len == 12
-	assert sk.len == 16
-	assert siv.len == 12
+	// Application traffic keys are the reusable post-handshake state (§7.1). The
+	// generation arrives as one opaque handle per direction, so every length is
+	// asserted by name instead of by tuple position.
+	mut keys := h.application_record_keys()!
+	assert keys.ready()
+	mut client := keys.take_client()
+	mut server := keys.take_server()
+	assert client.take_key().len == 16
+	assert client.take_iv().len == 12
+	assert server.take_key().len == 16
+	assert server.take_iv().len == 12
+	keys.wipe()
+	client.wipe()
+	server.wipe()
 
 	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
 	h.zeroize_handshake_secrets()!
 	assert expect_no_handshake_keys(&h)
-	akc, _, aks, aks_iv := h.application_record_keys()!
-	assert akc.len == 16
-	assert aks.len == 16
-	assert aks_iv.len == 12
+	mut kept := h.application_record_keys()!
+	mut kept_client := kept.take_client()
+	mut kept_server := kept.take_server()
+	assert kept_client.take_key().len == 16
+	assert kept_server.take_key().len == 16
+	assert kept_server.take_iv().len == 12
+	kept.wipe()
+	kept_client.wipe()
+	kept_server.wipe()
 }
 
 // test_hello_retry_request_change_group_reaches_connected checks that the
@@ -331,6 +346,12 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
 	assert h.available_secret_phases().application
 	// The split key/iv derivers populated the record cache the transport consumes.
-	ck, civ, sk, siv := h.application_record_keys()!
-	assert ck.len == 16 && civ.len == 12 && sk.len == 16 && siv.len == 12
+	mut app_keys := h.application_record_keys()!
+	mut app_client := app_keys.take_client()
+	mut app_server := app_keys.take_server()
+	assert app_client.take_key().len == 16 && app_client.take_iv().len == 12
+	assert app_server.take_key().len == 16 && app_server.take_iv().len == 12
+	app_keys.wipe()
+	app_client.wipe()
+	app_server.wipe()
 }

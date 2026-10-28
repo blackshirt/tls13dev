@@ -49,7 +49,7 @@ state_machine.v       the whole shared HandshakeCore: states, the private Encryp
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
 tls_handshake.v       TLS record facade: curated core forwarders, phase-named receive, backlog,
-                      record-key and zeroize seams, cached record keys, KeyUpdate
+                      record-key and zeroize seams, cached record-key handles, KeyUpdate
 quic_handshake.v      QUIC facade: curated core forwarders, peer_handshake_secrets and
                       peer_application_secrets, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
@@ -80,10 +80,13 @@ Each `*_test.v` sits beside its source.
   is the `err.msg()`-unwrapping shorthand used by parse sites.
 - **Named phase material.** Handshake and application traffic secrets are stored as flat
   `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the TLS
-  facade caches matching record-key fields (`c_hsk_key`/`c_hsk_iv`, and so on). Both
+  facade caches the derived record keys one opaque handle per direction inside a
+  phase-typed generation (`HandshakeRecordKeys` / `ApplicationRecordKeys`, each holding a
+  `RecordKeys` per direction). Both
   phase buffers live in `ReassemblyBuffers`. Per-phase wipe and install helpers take a whole
   phase's two directions (and each key with its nonce base) together, so they cannot be cleared or
-  advanced independently.
+  advanced independently — and because the generation is a type, a wrong-phase install is
+  not expressible at all.
 - **One state machine.** `HandshakeState` is the single public enum, mirroring the client
   states of RFC 8446 Appendix A.1 (`start`, `wait_sh`, `wait_ee`, `wait_cert_cr`, `wait_cert`,
   `wait_cv`, `wait_finished`, `connected`, plus an implementation `failed`). It is itself the

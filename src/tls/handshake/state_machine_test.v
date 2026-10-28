@@ -34,7 +34,9 @@ fn test_encryption_level_order() ! {
 }
 
 // test_encryption_level_rejects_unsupported_operation checks that a shared
-// level value is rejected when it does not apply to the selected API operation.
+// level value is rejected when it does not apply to the selected API operation. The
+// TLS record accessor is not one of the refusal sites any more: its return names the
+// phase, so an initial-phase request cannot be written down at all.
 fn test_encryption_level_rejects_unsupported_operation() ! {
 	mut record := new_tls_handshake('example.com', HandshakeOptions{
 		validator: fixture_validator()
@@ -43,12 +45,6 @@ fn test_encryption_level_rejects_unsupported_operation() ! {
 	mut rejected := false
 	record.receive_msgs_at_level(.application, []u8{}) or {
 		assert err.msg().contains('does not accept application-level bytes')
-		rejected = true
-	}
-	assert rejected
-	rejected = false
-	record.record_traffic_keys_at(.initial) or {
-		assert err.msg().contains('initial level has no traffic keys')
 		rejected = true
 	}
 	assert rejected
@@ -530,14 +526,12 @@ fn test_feed_handshake_level_after_connected_refused() ! {
 	assert false
 }
 
-// ---- record keys / peer secrets lifecycle (white-box) ----
-
 // test_traffic_keys_unavailable_before_derivation checks that the accessors
 // refuse until the handshake derives keys.
 fn test_traffic_keys_unavailable_before_derivation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
-	_, _, _, _ := h.handshake_record_keys() or {
+	h.handshake_record_keys() or {
 		return
 	}
 	assert false
@@ -546,17 +540,21 @@ fn test_traffic_keys_unavailable_before_derivation() ! {
 // A rejected input at the wrong handshake phase must not discard usable keys.
 fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.c_app_key = [u8(1)]
-	h.c_app_iv = [u8(2)]
-	h.s_app_key = [u8(3)]
-	h.s_app_iv = [u8(4)]
+	h.app_keys.client = RecordKeys{
+		key: [u8(1)]
+		iv:  [u8(2)]
+	}
+	h.app_keys.server = RecordKeys{
+		key: [u8(3)]
+		iv:  [u8(4)]
+	}
 	h.HandshakeCore.state = HandshakeState.connected
 
 	h.receive_initial_bytes([u8(0)]) or {
 		assert err.msg().contains('only expected while awaiting ServerHello')
 		assert h.state() == .connected
-		assert h.c_app_key.len == 1
-		assert h.s_app_key.len == 1
+		assert h.app_keys.client.key.len == 1
+		assert h.app_keys.server.key.len == 1
 		return
 	}
 	assert false
@@ -567,20 +565,24 @@ fn test_zeroize_handshake_secrets_drops_keys() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.c_hsk_tsec = [u8(1), 2, 3]
 	h.s_hsk_tsec = [u8(4), 5, 6]
-	h.c_hsk_key = [u8(7)]
-	h.c_hsk_iv = [u8(8)]
-	h.s_hsk_key = [u8(9)]
-	h.s_hsk_iv = [u8(10)]
+	h.hsk_keys.client = RecordKeys{
+		key: [u8(7)]
+		iv:  [u8(8)]
+	}
+	h.hsk_keys.server = RecordKeys{
+		key: [u8(9)]
+		iv:  [u8(10)]
+	}
 	h.HandshakeCore.state = HandshakeState.connected
 
 	h.zeroize_handshake_secrets()!
 
 	assert h.c_hsk_tsec.len == 0
 	assert h.s_hsk_tsec.len == 0
-	assert h.c_hsk_key.len == 0
-	assert h.s_hsk_key.len == 0
+	assert h.hsk_keys.client.key.len == 0
+	assert h.hsk_keys.server.key.len == 0
 	// Handshake keys/secrets are gone: the record accessor now refuses.
-	_, _, _, _ := h.handshake_record_keys() or {
+	h.handshake_record_keys() or {
 		return
 	}
 	assert false
@@ -591,12 +593,14 @@ fn test_zeroize_handshake_secrets_drops_keys() ! {
 fn test_zeroize_handshake_secrets_requires_connected_state() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.c_hsk_tsec = [u8(1), 2, 3]
-	h.c_hsk_key = [u8(7)]
-	h.c_hsk_iv = [u8(8)]
+	h.hsk_keys.client = RecordKeys{
+		key: [u8(7)]
+		iv:  [u8(8)]
+	}
 	h.zeroize_handshake_secrets() or {
 		assert err.msg().contains('reaches .connected')
 		assert h.c_hsk_tsec.len == 3
-		assert h.c_hsk_key.len == 1
+		assert h.hsk_keys.client.key.len == 1
 		return
 	}
 	assert false
@@ -609,20 +613,24 @@ fn test_zeroize_application_secrets_clears_and_refuses() ! {
 	h.HandshakeCore.state = HandshakeState.connected
 	h.c_app_tsec = [u8(11), 12]
 	h.s_app_tsec = [u8(13), 14]
-	h.c_app_key = [u8(1)]
-	h.c_app_iv = [u8(2)]
-	h.s_app_key = [u8(3)]
-	h.s_app_iv = [u8(4)]
+	h.app_keys.client = RecordKeys{
+		key: [u8(1)]
+		iv:  [u8(2)]
+	}
+	h.app_keys.server = RecordKeys{
+		key: [u8(3)]
+		iv:  [u8(4)]
+	}
 
 	h.zeroize_application_secrets()!
 
 	assert h.c_app_tsec.len == 0
 	assert h.s_app_tsec.len == 0
 	// §7.5 says forget the secret values *and* the keys: the cached record keys die with them.
-	assert h.c_app_key.len == 0
-	assert h.c_app_iv.len == 0
-	assert h.s_app_key.len == 0
-	_, _, _, _ := h.application_record_keys() or {
+	assert h.app_keys.client.key.len == 0
+	assert h.app_keys.client.iv.len == 0
+	assert h.app_keys.server.key.len == 0
+	h.application_record_keys() or {
 		return
 	}
 	assert false
@@ -634,14 +642,16 @@ fn test_zeroize_application_secrets_refuses_before_connected() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.c_app_tsec = [u8(11), 12]
 	h.s_app_tsec = [u8(13), 14]
-	h.c_app_key = [u8(1)]
-	h.c_app_iv = [u8(2)]
+	h.app_keys.client = RecordKeys{
+		key: [u8(1)]
+		iv:  [u8(2)]
+	}
 
 	h.zeroize_application_secrets() or {
 		assert err.msg().contains('only valid once the handshake reaches .connected')
 		assert h.state() == .start
 		assert h.c_app_tsec == [u8(11), 12]
-		assert h.c_app_key == [u8(1)]
+		assert h.app_keys.client.key == [u8(1)]
 		return
 	}
 	assert false
@@ -689,12 +699,12 @@ fn test_update_traffic_keys_refuse_before_connected() ! {
 		assert err.msg().contains('before the handshake is connected')
 		assert h.state() == .start
 		assert h.s_app_tsec == old_server
-		assert h.s_app_key.len == 0
+		assert h.app_keys.server.key.len == 0
 		h.update_traffic_keys(false) or {
 			assert err.msg().contains('before the handshake is connected')
 			assert h.state() == .start
 			assert h.c_app_tsec == old_client
-			assert h.c_app_key.len == 0
+			assert h.app_keys.client.key.len == 0
 			return
 		}
 		assert false
@@ -718,8 +728,12 @@ fn test_update_traffic_keys_derives_next_keys() ! {
 	assert h.c_app_tsec != old_client
 	assert h.s_app_tsec.len == 32
 	assert h.c_app_tsec.len == 32
-	key, _, _, _ := h.application_record_keys()!
-	assert key.len > 0
+	// The rebuilt generation is still exportable, and both legs are populated.
+	mut keys := h.application_record_keys()!
+	assert keys.ready()
+	keys.wipe()
+	assert h.app_keys.client.key.len > 0
+	assert h.app_keys.server.key.len > 0
 }
 
 // test_update_traffic_keys_refuses_after_zeroize checks that a key update
@@ -728,8 +742,10 @@ fn test_update_traffic_keys_refuses_after_zeroize() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.HandshakeCore.state = HandshakeState.connected
 	h.c_app_tsec = [u8(1), 2, 3]
-	h.c_app_key = [u8(4)]
-	h.c_app_iv = [u8(5)]
+	h.app_keys.client = RecordKeys{
+		key: [u8(4)]
+		iv:  [u8(5)]
+	}
 	h.zeroize_application_secrets()!
 	h.update_traffic_keys(false) or {
 		assert err.msg().contains('destroyed by zeroize_application_secrets()')
@@ -813,16 +829,39 @@ fn test_next_recordless_rejects_oversize_length() ! {
 // copies, so a key update cannot wipe keys an adapter still holds.
 fn test_traffic_keys_returns_independent_copies() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.c_hsk_key = [u8(1), 2, 3]
-	h.c_hsk_iv = [u8(4), 5]
-	h.s_hsk_key = [u8(6), 7]
-	h.s_hsk_iv = [u8(8)]
-	ck, civ, sk, _ := h.handshake_record_keys()!
-	assert unsafe { voidptr(&ck[0]) } != unsafe { voidptr(&h.c_hsk_key[0]) }
-	assert unsafe { voidptr(&civ[0]) } != unsafe { voidptr(&h.c_hsk_iv[0]) }
-	assert unsafe { voidptr(&sk[0]) } != unsafe { voidptr(&h.s_hsk_key[0]) }
+	h.hsk_keys.client = RecordKeys{
+		key: [u8(1), 2, 3]
+		iv:  [u8(4), 5]
+	}
+	h.hsk_keys.server = RecordKeys{
+		key: [u8(6), 7]
+		iv:  [u8(8)]
+	}
+	mut keys := h.handshake_record_keys()!
+	mut client := keys.take_client()
+	mut server := keys.take_server()
+	mut ck := client.take_key()
+	mut civ := client.take_iv()
+	mut sk := server.take_key()
+	mut siv := server.take_iv()
+	assert unsafe { voidptr(&ck[0]) } != unsafe { voidptr(&h.hsk_keys.client.key[0]) }
+	assert unsafe { voidptr(&civ[0]) } != unsafe { voidptr(&h.hsk_keys.client.iv[0]) }
+	assert unsafe { voidptr(&sk[0]) } != unsafe { voidptr(&h.hsk_keys.server.key[0]) }
+	assert unsafe { voidptr(&siv[0]) } != unsafe { voidptr(&h.hsk_keys.server.iv[0]) }
 	assert ck == [u8(1), 2, 3]
 	assert sk == [u8(6), 7]
+	// Taking a value moves it, so the handles the copy came through are empty and the
+	// cache still holds its own bytes.
+	assert client.key.len == 0
+	assert server.iv.len == 0
+	assert h.hsk_keys.client.key.len == 3
+	keys.wipe()
+	client.wipe()
+	server.wipe()
+	wipe_secret(mut ck)
+	wipe_secret(mut civ)
+	wipe_secret(mut sk)
+	wipe_secret(mut siv)
 }
 
 // test_update_traffic_keys_wipes_superseded_generation checks that the
@@ -831,11 +870,13 @@ fn test_update_traffic_keys_wipes_superseded_generation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.HandshakeCore.state = HandshakeState.connected
 	h.s_app_tsec = []u8{len: 32, init: 7}
-	h.s_app_key = [u8(9), 9, 9]
-	h.s_app_iv = [u8(9)]
+	h.app_keys.server = RecordKeys{
+		key: [u8(9), 9, 9]
+		iv:  [u8(9)]
+	}
 	// Aliases into the old generation, captured before the key update runs.
 	old_secret := h.s_app_tsec
-	old_key := h.s_app_key
+	old_key := h.app_keys.server.key
 
 	h.update_traffic_keys(true)!
 
@@ -849,7 +890,7 @@ fn test_update_traffic_keys_wipes_superseded_generation() ! {
 	}
 	assert h.s_app_tsec != old_secret
 	assert h.s_app_tsec.len == 32
-	assert h.s_app_key.len > 0
+	assert h.app_keys.server.key.len > 0
 }
 
 // test_available_secret_phases_tracks_derivation locks the transport-neutral

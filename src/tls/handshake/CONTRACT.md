@@ -130,9 +130,16 @@ readiness.
 
 `TLSHandshake` exposes operations needed by TLS over TCP:
 
-- `handshake_record_keys()` and `application_record_keys()` return the derived
-  record keys (`client_key`, `client_iv`, `server_key`, `server_iv`) for their
-  phase.
+- `handshake_record_keys()` and `application_record_keys()` return the derived record
+  keys for their phase as opaque handles — `HandshakeRecordKeys` and
+  `ApplicationRecordKeys`, each holding one `RecordKeys` handle per direction. The type
+  names the phase and the field names the direction, so the values no longer
+  travel as a positional `(client_key, client_iv, server_key, server_iv)` tuple.
+  A returned generation is an independent copy the caller owns: `take_client()` /
+  `take_server()` move one direction's key-and-IV pair out of it, and `wipe()` scrubs
+  whatever is left, so no copy of the material escapes unscrubbed. The initial phase has
+  no record keys and no accessor either — asking for them is not expressible, rather
+  than refused at run time.
 - `initial_backlog()` and `handshake_backlog()` report the unconsumed bytes parked
   at each phase — `initial_backlog()` lets the record adapter enforce the
   ServerHello record-boundary rule, `handshake_backlog()` the coalesced-flight

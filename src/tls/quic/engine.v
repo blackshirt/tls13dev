@@ -66,13 +66,13 @@ mut:
 	app_rx       ?ProtectionState // 1-RTT keys for inbound packets.
 
 	// Packet-number spaces and inbound CRYPTO reassembly, one per level.
-	initial_ns   LevelKeys
-	handshake_ns LevelKeys
-	app_ns       LevelKeys
+	initial_ns   LevelKeys // Initial-space send state and inbound CRYPTO stream.
+	handshake_ns LevelKeys // Handshake-space equivalents.
+	app_ns       LevelKeys // Application-space equivalents; Retry and 0-RTT routing also resolve here.
 
 	// Outbound TLS handshake bytes awaiting CRYPTO packetization.
-	tx_crypto_initial []u8
-	tx_crypto_hands   []u8
+	tx_crypto_initial []u8 // queued bytes for the Initial-level CRYPTO stream.
+	tx_crypto_hands   []u8 // queued bytes for the Handshake-level CRYPTO stream.
 
 	// Connection and handshake lifecycle.
 	confirmed   bool // Whether HANDSHAKE_DONE was received.

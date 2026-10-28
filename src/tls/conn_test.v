@@ -144,7 +144,7 @@ fn test_read_bounds_empty_record_flood() ! {
 	mut c := new_test_conn()!
 	mut writer := new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	mut reader := new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.server_app_cipher = reader
+	c.s_app_protection = reader
 
 	// Below the bound: a run of empty padding records followed by real data.
 	for _ in 0 .. max_tolerated_records_per_read {
@@ -164,7 +164,7 @@ fn test_read_bounds_empty_record_flood() ! {
 	// Past the bound: the very next run of empty records must abort the read.
 	// Both sides restart their sequence numbers, as a fresh key generation would.
 	writer.seq_num = 0
-	c.server_app_cipher.seq_num = 0
+	c.s_app_protection.seq_num = 0
 	for _ in 0 .. max_tolerated_records_per_read + 1 {
 		c.recv_buf << writer.encrypt_record(.application_data, []u8{})!.serialize()
 	}
@@ -179,7 +179,7 @@ fn test_read_bounds_empty_record_flood() ! {
 }
 
 // test_malformed_record_fails_closed checks that record-framing errors become
-// sticky connection failures instead of leaving the read cipher usable.
+// sticky connection failures instead of leaving the read protection state usable.
 fn test_malformed_record_fails_closed() ! {
 	mut c := new_test_conn()!
 	c.recv_buf << [u8(0x7f), 0x03, 0x03, 0x00, 0x00]
@@ -203,7 +203,7 @@ fn test_application_write_failure_fails_closed() ! {
 		0xff, 0x00]
 	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
 	mut c := new_test_conn()!
-	c.client_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.c_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	// write() holds wlock across the encrypt/send and only reaches its phase-2 read-side
 	// teardown after releasing it; reproduce that split against the nil test socket.
 	c.wlock.lock()
@@ -212,11 +212,11 @@ fn test_application_write_failure_fails_closed() ! {
 		assert err.msg().contains('application write failed')
 		assert c.closed
 		assert c.fatal_error == err.msg()
-		// Phase 1 under wlock set the sticky flags; the cipher wipe and the state
+		// Phase 1 under wlock set the sticky flags; the protection-state wipe and the state
 		// transition are write()'s phase 2. Run it here, then assert the terminal teardown.
 		c.destroy_read_side()!
 		assert c.hs.state() == .failed
-		assert c.client_app_cipher.iv.len == 0
+		assert c.c_app_protection.iv.len == 0
 		return
 	}
 	c.wlock.unlock()
@@ -277,7 +277,7 @@ fn test_read_bounds_handshake_record_flood() ! {
 
 	mut c := new_test_conn()!
 	mut writer := new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.server_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.s_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	// An incomplete post-handshake fragment (declared body 1048568, never finished):
 	// handle_post_handshake buffers and returns without processing, so no parse
 	// error can preempt the bound — only the skipped-record cap may stop the flood.
@@ -325,7 +325,7 @@ fn test_read_protocol_violation_fails_closed() ! {
 	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
 	mut c := new_test_conn()!
 	mut writer := new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.server_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.s_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	c.recv_buf << writer.encrypt_record(.change_cipher_spec, [u8(1)])!.serialize()
 
 	mut buf := []u8{len: 1}
@@ -334,7 +334,7 @@ fn test_read_protocol_violation_fails_closed() ! {
 		assert c.closed
 		assert c.fatal_error == err.msg()
 		assert c.hs.state() == .failed
-		assert c.server_app_cipher.iv.len == 0
+		assert c.s_app_protection.iv.len == 0
 		return
 	}
 	assert false
@@ -430,41 +430,43 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	assert c.close_notify_sent
 	assert c.sock_closed
 	// Two-phase teardown reached every reader-owned protection state (§7.5). The fixture
-	// leaves the ciphers unset, so this pins that close() never rebound a nonempty IV.
-	assert c.server_app_cipher.iv.len == 0
-	assert c.client_app_cipher.iv.len == 0
-	assert c.server_hsk_cipher.iv.len == 0
-	assert c.client_hsk_cipher.iv.len == 0
+	// leaves the protection states unset, so this pins that close() never
+	// rebound a nonempty IV.
+	assert c.s_app_protection.iv.len == 0
+	assert c.c_app_protection.iv.len == 0
+	assert c.s_hsk_protection.iv.len == 0
+	assert c.c_hsk_protection.iv.len == 0
 
 	// The second close must be a no-op for the fd: no panic, no re-close.
 	c.close()!
 	assert c.sock_closed
 }
 
-// test_close_wipes_read_ciphers_and_buffers proves the Finding A two-phase teardown
-// actually reaches the reader-owned state: close() must destroy all four protection
-// ciphers (including the server/read legs it no longer touches under wlock alone) and
-// clear both read-side staging buffers, then surface a clean EOF on a later read().
-fn test_close_wipes_read_ciphers_and_buffers() ! {
+// test_close_wipes_read_protection_states_and_buffers proves the Finding A two-phase
+// teardown actually reaches the reader-owned state: close() must destroy all four
+// protection states (including the server/read legs it no longer touches under wlock
+// alone) and clear both read-side staging buffers, then surface a clean EOF on a later
+// read().
+fn test_close_wipes_read_protection_states_and_buffers() ! {
 	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
 		0xff, 0x00]
 	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
 	mut c := new_test_conn()!
-	c.server_hsk_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.client_hsk_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.server_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.client_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.s_hsk_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.c_hsk_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.s_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.c_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	// Stage undelivered plaintext and a partial post-handshake message so teardown must
-	// reach the reader-owned buffers, not just the ciphers.
+	// reach the reader-owned buffers, not just the protection states.
 	c.app_buf << [u8(1), 2, 3]
 	c.post_hsk_buf << [u8(4), 5, 6]
 
 	c.close()!
 
-	assert c.server_app_cipher.iv.len == 0
-	assert c.client_app_cipher.iv.len == 0
-	assert c.server_hsk_cipher.iv.len == 0
-	assert c.client_hsk_cipher.iv.len == 0
+	assert c.s_app_protection.iv.len == 0
+	assert c.c_app_protection.iv.len == 0
+	assert c.s_hsk_protection.iv.len == 0
+	assert c.c_hsk_protection.iv.len == 0
 	assert c.app_buf.len == 0
 	assert c.app_pos == 0
 	assert c.post_hsk_buf.len == 0
@@ -476,16 +478,17 @@ fn test_close_wipes_read_ciphers_and_buffers() ! {
 }
 
 // test_write_abort_terminates_read_side proves a write-origin abort destroys the
-// reader-owned cipher and buffers only via the phase-2 destroy_read_side() (rlock -> wlock),
-// never under wlock alone (Finding A). Forcing the nil-socket write failure and then running
-// the same phase 2 write() does must wipe the read cipher and clear both buffers.
+// reader-owned protection state and buffers only via the phase-2 destroy_read_side()
+// (rlock -> wlock), never under wlock alone (Finding A). Forcing the nil-socket write
+// failure and then running the same phase 2 write() does must wipe the read protection
+// state and clear both buffers.
 fn test_write_abort_terminates_read_side() ! {
 	key := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
 		0xff, 0x00]
 	iv := [u8(0xa0), 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab]
 	mut c := new_test_conn()!
-	c.client_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
-	c.server_app_cipher = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.c_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
+	c.s_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	c.app_buf << [u8(9), 8, 7]
 	c.post_hsk_buf << [u8(6), 5]
 	c.wlock.lock()
@@ -494,9 +497,10 @@ fn test_write_abort_terminates_read_side() ! {
 		// Phase 1 pinned the sticky failure and left the reader-owned state intact.
 		assert c.fatal_error != ''
 		assert c.closed
-		// Phase 2 (write() runs this after releasing wlock) reaches the read cipher/buffers.
+		// Phase 2 (write() runs this after releasing wlock) reaches the read
+		// protection state/buffers.
 		c.destroy_read_side()!
-		assert c.server_app_cipher.iv.len == 0
+		assert c.s_app_protection.iv.len == 0
 		assert c.app_buf.len == 0
 		assert c.post_hsk_buf.len == 0
 		return

@@ -193,7 +193,8 @@ RFC 9001 §5.1 expansions itself:
 `QuicHandshake` facade itself) hand out `(client, server)` clones of those
 secrets; the phase is in the method name, never an argument.
 `handshake_record_keys()` / `application_record_keys()` are provided by
-`TLSHandshake`; a `QuicHandshake` does not expose them. A QUIC engine uses
+`TLSHandshake`, where each phase's generation is its own opaque handle type; a
+`QuicHandshake` does not expose them. A QUIC engine uses
 the peer-secret accessors + the public `hkdf_expand_label()`.
 
 ### 3.3 Handshake keys survive until no longer needed

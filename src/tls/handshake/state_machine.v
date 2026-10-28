@@ -91,9 +91,11 @@ pub:
 	cipher_suites []CipherSuite
 	// signature_algorithms is preference-ordered; empty uses the built-in list.
 	signature_algorithms []SignatureScheme
-	// legacy_session_id and random are for deterministic test vectors only.
+	// legacy_session_id is the ClientHello session id echoed in ServerHello.
 	legacy_session_id []u8
-	random            []u8
+	// random is the ClientHello random; with legacy_session_id it lets a test vector
+	// pin a deterministic handshake.
+	random []u8
 pub mut:
 	// quic_transport_params is the encoded content of the TLS
 	// quic_transport_parameters extension (RFC 9001 §8.2), copied through without
@@ -143,7 +145,7 @@ mut:
 	s_app_tsec       []u8 // server application traffic secret
 
 	// Incoming handshake bytes that do not yet form complete messages.
-	buffers ReassemblyBuffers
+	buffers ReassemblyBuffers // the initial- and handshake-phase streams, keyed by phase
 
 	// Peer certificate validation and client certificate response state.
 	validator    pki.Validator     // checks the server's certificate and hostname
@@ -165,8 +167,8 @@ const reassembly_buf_cap = 4096
 // not yet form complete messages. Application-level bytes never reach the core.
 struct ReassemblyBuffers {
 mut:
-	initial   []u8
-	handshake []u8
+	initial   []u8 // pre-ServerHello bytes, pending a complete message
+	handshake []u8 // handshake-key-protected bytes, pending a complete message
 }
 
 // new_reassembly_buffers allocates both level buffers with the standard capacity.
@@ -195,8 +197,8 @@ fn (mut b ReassemblyBuffers) append(level EncryptionLevel, bytes []u8) {
 	}
 }
 
-// handshake_leader returns the first buffered handshake-level byte, if any.
-fn (b &ReassemblyBuffers) handshake_leader() ?u8 {
+// handshake_leading_byte returns the first buffered handshake-level byte, if any.
+fn (b &ReassemblyBuffers) handshake_leading_byte() ?u8 {
 	if b.handshake.len == 0 {
 		return none
 	}
@@ -250,7 +252,7 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	}
 
 	mut core := HandshakeCore{
-		state:      HandshakeState.start
+		state:      .start
 		config:     ClientHelloConfig{
 			server_name:           server_name
 			alpn:                  options.alpn.clone()
@@ -345,7 +347,7 @@ fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	// A second call would replay the first ClientHello into the transcript and
 	// corrupt every later hash; the retry ClientHello has its own path, produced
 	// while a HelloRetryRequest is fed.
-	if h.state != HandshakeState.start {
+	if h.state != .start {
 		return error('handshake: create_client_hello() only runs once (state: ${h.state()}); the retry ClientHello is produced while a HelloRetryRequest is fed')
 	}
 	_, full_client_hello := build_client_hello(h.config)!
@@ -363,10 +365,10 @@ fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 // ServerHello and Finished. Phase misuse is rejected without consuming bytes or
 // changing state.
 fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
-	if h.state == HandshakeState.start {
+	if h.state == .start {
 		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
 	}
-	if h.state == HandshakeState.failed {
+	if h.state == .failed {
 		return error('handshake: state machine has failed; further handshake bytes are refused')
 	}
 	if level == .application {
@@ -652,8 +654,6 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	return [new_handshake_message(.initial, full_ch2)!]
 }
 
-//  Encrypted flight: EE, Certificate, CertificateVerify, Finished (§4.3–§4.4)
-
 // handle_encrypted_extensions records ALPN and QUIC transport parameters.
 fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) ![]HandshakeMessage {
 	alpn, transport_parameters := parse_encrypted_extensions_for_transport(body,
@@ -774,14 +774,14 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
-	// adapter's take_buffered_handshake_bytes. Any other leader is flight garbage.
-	if leading := h.buffers.handshake_leader() {
+	// adapter's take_buffered_handshake_bytes. Any other leading byte is flight garbage.
+	if leading := h.buffers.handshake_leading_byte() {
 		if leading != u8(4) && leading != u8(24) {
 			return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
 		}
 	}
 
-	h.state = HandshakeState.connected
+	h.state = .connected
 	// Forward-secrecy cleanup: every ephemeral/handshake secret consumed to reach
 	// this point is now dead (RFC 8446 §7.5 / §1.3.1).
 	h.wipe_key_schedule_secrets()

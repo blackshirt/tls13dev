@@ -264,8 +264,9 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 
 // test_dial_chacha20_end_to_end negotiates TLS_CHACHA20_POLY1305_SHA256 alone and
 // completes the full handshake plus one application read over it. This is the
-// regression guard for the §7.5 key-ownership bug: install_ciphers scrubs its local
-// key copy after building the ChaCha cipher, which used to zero the AEAD's aliased
+// regression guard for the §7.5 key-ownership bug: tls_record_protection scrubs the
+// key bytes it takes from the facade's generation
+// only after building the ChaCha cipher, which used to zero the AEAD's aliased
 // key and fail every record with an 'unmatching tag' that no AES suite exhibits and
 // that AES-only tests could never surface. Offering ChaCha exclusively means merely
 // reaching connected proves the flight decrypted under ChaCha handshake keys.
@@ -440,7 +441,7 @@ fn key_update_rekey_script(mut c net.TcpConn) ! {
 
 // test_dial_key_update_rekeys_and_wipes_superseded_protection proves the §7.5
 // wipe of the replaced generation end to end: after a peer KeyUpdate, the read
-// cipher's old nonce base must be zeroed in place (an alias taken before the
+// protection state's old nonce base must be zeroed in place (an alias taken before the
 // rekey reads back all-zero), and the tail record must open only under the
 // next key generation.
 fn test_dial_key_update_rekeys_and_wipes_superseded_protection() ! {
@@ -459,12 +460,12 @@ fn test_dial_key_update_rekeys_and_wipes_superseded_protection() ! {
 	n := conn.read(mut buf)! // drains the ticket, then the app record
 	assert buf[..n] == 'hello from fakeserver'.bytes()
 
-	// Alias the live read cipher's nonce base before the rekey: V arrays share one
+	// Alias the live read protection state's nonce base before the rekey: V arrays share one
 	// underlying buffer, so `unsafe` here (the compiler's sanctioned opt-out from the
 	// `.clone()` guard) keeps a genuine alias rather than a copy. rekey_cipher's wipe then
 	// zeroes this same buffer in place, which the alias observes; a `.clone()` would instead
 	// snapshot the pre-rekey nonzero bytes and defeat the assertion below.
-	mut old_iv := unsafe { conn.server_app_cipher.iv }
+	mut old_iv := unsafe { conn.s_app_protection.iv }
 	assert old_iv.len == 12 && old_iv[0] != 0
 
 	mut tail := []u8{len: 32}
@@ -477,8 +478,8 @@ fn test_dial_key_update_rekeys_and_wipes_superseded_protection() ! {
 			nonzero = true
 		}
 	}
-	assert !nonzero, 'the superseded read cipher must leave its nonce base zeroed (§7.5)'
-	assert conn.server_app_cipher.iv.len == 12 // the new generation is live
+	assert !nonzero, 'the superseded read protection state must zero its nonce base (§7.5)'
+	assert conn.s_app_protection.iv.len == 12 // the new generation is live
 
 	conn.close() or {}
 	res := <-res_ch

@@ -149,6 +149,9 @@ const a5_hp_hex = '25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a
 
 const a5_sample_hex = '5e5cd55c41f69080575d7999c25a5bfb'
 
+// new_a5_protection builds the Appendix A.5 ChaCha20-Poly1305 protection state from the
+// fixture key, IV and header-protection constant above; every test that needs A.5 material
+// reads it through this one constructor, so a typo cannot desynchronize two of them.
 fn new_a5_protection() !ProtectionState {
 	return new_protection(ProtectionKeys{
 		key: hex.decode(a5_key_hex)!

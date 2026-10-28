@@ -108,8 +108,8 @@ pub fn (mut h QuicHandshake) fail_and_zeroize_secrets() {
 // private QUIC seam: the engine expands the two secrets into RFC 9001 §5.1 packet
 // keys through the phase-named peer_handshake_secrets() / peer_application_secrets()
 // below, and the TLS record path never reads raw secrets — TLSHandshake serves
-// handshake_record_keys() / application_record_keys() from its cached flat key
-// fields instead.
+// handshake_record_keys() / application_record_keys() from its phase-typed cached key
+// handles instead.
 fn (h &QuicHandshake) peer_traffic_secrets_at(level EncryptionLevel) !([]u8, []u8) {
 	if level == .initial {
 		return error('handshake: initial level has no traffic secrets')

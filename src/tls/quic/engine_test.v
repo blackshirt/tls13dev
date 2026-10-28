@@ -60,30 +60,30 @@ fn test_quic_packet_types_map_to_crypto_phases() ! {
 @[noinit]
 struct FerryServer {
 mut:
-	dcid         []u8            // the client's SCID (what the server addresses back)
-	server_cid   []u8            // the ferry's own CID, sent as SCID and adopted by the client
-	initial_tx   ProtectionState // server sends with server Initial keys
-	initial_rx   ProtectionState // server receives with client Initial keys
-	handshake_tx ?ProtectionState
-	handshake_rx ?ProtectionState
-	initial_pn   u64
-	handshake_pn u64
-	app_pn       u64
+	dcid         []u8             // the client's SCID (what the server addresses back)
+	server_cid   []u8             // the ferry's own CID, sent as SCID and adopted by the client
+	initial_tx   ProtectionState  // server sends with server Initial keys
+	initial_rx   ProtectionState  // server receives with client Initial keys
+	handshake_tx ?ProtectionState // server sends with its Handshake keys, once installed
+	handshake_rx ?ProtectionState // server receives with the client's Handshake keys
+	initial_pn   u64              // next Initial packet number to send
+	handshake_pn u64              // next Handshake packet number to send
+	app_pn       u64              // next Application packet number to send
 	// Each level's outbound CRYPTO stream is monotonic (RFC 9000 §19.6), so a
 	// second flight — the real ServerHello after a HelloRetryRequest — continues
 	// where the first ended instead of rewriting offset 0.
-	initial_tx_off   u64
-	handshake_tx_off u64
-	out              []u8 // accumulated outbound datagrams
-	srv              fakeserver.Server
-	got_finished     bool
+	initial_tx_off   u64               // next Initial-level CRYPTO offset to emit
+	handshake_tx_off u64               // next Handshake-level CRYPTO offset to emit
+	out              []u8              // accumulated outbound datagrams
+	srv              fakeserver.Server // generates the server flight bytes to send
+	got_finished     bool              // whether the client's Finished has been accepted
 	// Initial- and Handshake-level CRYPTO reassemblers, so a client frame is
 	// accepted only at a non-conflicting stream offset (RFC 9000 §19.6). The
 	// ferry used to feed cf.data straight to the fakeserver and ignore
 	// cf.offset, which hid an engine bug that re-emitted the retry ClientHello
 	// at offset 0 after a HelloRetryRequest.
-	init_reasm CryptoReasm
-	hs_reasm   CryptoReasm
+	init_reasm CryptoReasm // reassembles the client's Initial-level CRYPTO stream
+	hs_reasm   CryptoReasm // reassembles the client's Handshake-level CRYPTO stream
 	// Offsets of every Initial-level CRYPTO frame received, so a regression test
 	// can pin the retry ClientHello to len(original ClientHello).
 	initial_crypto_offsets []u64

@@ -78,10 +78,10 @@ mut:
 	hs   handshake.TLSHandshake // TLS handshake contract for the record adapter
 
 	// The four TLSProtections are the record layer's own state; the core never sees them.
-	server_hsk_cipher TLSProtection // AEAD state for records the server sends under handshake keys
-	client_hsk_cipher TLSProtection // AEAD state for records we send under handshake keys
-	server_app_cipher TLSProtection // AEAD state for records the server sends under app keys
-	client_app_cipher TLSProtection // AEAD state for records we send under app keys
+	s_hsk_protection TLSProtection // protection state for records the server sends under handshake keys
+	c_hsk_protection TLSProtection // protection state for records we send under handshake keys
+	s_app_protection TLSProtection // protection state for records the server sends under app keys
+	c_app_protection TLSProtection // protection state for records we send under app keys
 
 	// session_tickets holds the NewSessionTicket backlog the core parses but does
 	// not keep; exceeding it drops the ticket, never the connection (RFC 8446 §4.6.1).
@@ -131,14 +131,14 @@ mut:
 	// are exclusive mutexes, not RwLock read sides: every path rewrites AEAD
 	// sequence numbers.
 	// Lock discipline (RFC 8446 §7.5 teardown): every path that mutates reader-owned
-	// state (the read ciphers, app_buf, post_hsk_buf and the core's read-leg secrets)
+	// state (the read protection states, app_buf, post_hsk_buf and the core's read-leg secrets)
 	// holds rlock before wlock; no path ever holds wlock while waiting for rlock, so no
 	// ABBA inversion is possible. close() and a write-origin abort therefore split their
 	// teardown into a wlock-only phase (sticky flags, best-effort alert, socket close) and
 	// an rlock -> wlock phase that runs destroy_locked(); the socket is closed first so a
 	// blocked reader returns promptly and cannot make phase 2 hang.
-	rlock &sync.Mutex // serializes read() and every read-cipher/recv_buf mutation
-	wlock &sync.Mutex // serializes write() and every write-cipher mutation
+	rlock &sync.Mutex // serializes read() and every read-protection/recv_buf mutation
+	wlock &sync.Mutex // serializes write() and every write-protection mutation
 
 	// Negotiated connection identity and protocol.
 	negotiated_alpn string // server's ALPN pick — always one of HandshakeOptions.alpn (the handshake aborts otherwise), '' if none
@@ -291,7 +291,7 @@ pub fn dial(address string, config Config) !&Conn {
 
 // read decrypts application data into buf. Returns bytes read (0 on clean close).
 pub fn (mut c Conn) read(mut buf []u8) !int {
-	// Serialize the whole read path: recv_buf, the read cipher and the sticky error.
+	// Serialize the whole read path: recv_buf, the read protection state and the sticky error.
 	c.rlock.lock()
 	defer {
 		c.rlock.unlock()
@@ -335,7 +335,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				return c.abort_connection(.unexpected_message, 'tls: received unencrypted alert post-handshake (must be encrypted)')
 			}
 			.application_data {
-				mut dec := c.server_app_cipher.decrypt_record(rec) or {
+				mut dec := c.s_app_protection.decrypt_record(rec) or {
 					return c.abort_connection(decrypt_failure_alert(err.msg()), err.msg())
 				}
 				match dec.content_type {
@@ -509,7 +509,7 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.available_secret_phases().handshake {
 					// Install once the core actually holds handshake secrets, keyed on the
 					// same readiness query the QUIC adapter uses, not on state().
-					c.install_handshake_ciphers()!
+					c.install_handshake_protection()!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
@@ -525,7 +525,7 @@ fn (mut c Conn) do_handshake() ! {
 		}
 	}
 	// The core verified the server Finished; install this adapter's post-handshake protection.
-	c.install_application_ciphers()!
+	c.install_application_protection()!
 	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
 	// core's drain_at() stops at .connected, so take (and scrub) its buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()
@@ -579,7 +579,7 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	if c.hs.state() == .start || c.hs.state() == .wait_sh {
 		return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
 	}
-	dec := c.server_hsk_cipher.decrypt_record(rec) or {
+	dec := c.s_hsk_protection.decrypt_record(rec) or {
 		// Mirror the read() path: a record that will not open is a peer-caused
 		// integrity failure, so surface its specific alert, not internal_error.
 		return c.classify_failure(decrypt_failure_alert(err.msg()), err.msg())
@@ -595,7 +595,7 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 			msgs := c.hs.receive_handshake_bytes(dec.plaintext)!
 			for m in msgs {
 				// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
-				enc := c.client_hsk_cipher.encrypt_record(.handshake, m.msg())!
+				enc := c.c_hsk_protection.encrypt_record(.handshake, m.msg())!
 				c.write_records([enc])!
 			}
 		}
@@ -622,52 +622,42 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	}
 }
 
-// install_ciphers builds both protection states for one key generation from the
-// facade's phase-named record-key getter: is_application picks the handshake
-// generation (false, installed once the ServerHello is fed) or the application
-// generation (true, installed at .connected). Only the two phase-named wrappers
-// below call it, so a wrong-phase install is not expressible — the initial phase,
-// which has no record protection here at all, cannot be named by a caller.
-fn (mut c Conn) install_ciphers(is_application bool) ! {
-	mut ck := []u8{}
-	mut civ := []u8{}
-	mut sk := []u8{}
-	mut siv := []u8{}
-	// The facade hands independent copies; the AEAD backend keeps its own key and the
-	// protection state clones its IV, so these locals are dead once installed. Defer-scrub
-	// every copy on all exit paths (§7.5); zeroing the caller's copies cannot disturb the
-	// live cipher because the backend and protection state hold their own copies.
-	defer {
-		zero_bytes(mut ck)
-		zero_bytes(mut civ)
-		zero_bytes(mut sk)
-		zero_bytes(mut siv)
-	}
-	if is_application {
-		ck, civ, sk, siv = c.hs.application_record_keys()!
-	} else {
-		ck, civ, sk, siv = c.hs.handshake_record_keys()!
-	}
+// install_handshake_protection builds both protection states of the handshake generation,
+// called once after the ServerHello is fed. The facade hands the generation over as an
+// opaque HandshakeRecordKeys handle, so the phase cannot be named wrong here, and each
+// direction is taken by name out of the bundle it belongs to.
+fn (mut c Conn) install_handshake_protection() ! {
+	mut keys := c.hs.handshake_record_keys()!
 	suite := c.hs.negotiated_cipher_suite()
-	if !is_application {
-		c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
-		c.server_hsk_cipher = tls_protection_from_keys(suite, sk, siv)!
-	} else {
-		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
-		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
+	mut client := keys.take_client()
+	mut server := keys.take_server()
+	// The takes moved each pair out of the bundle, so these three handles are the only
+	// owners of the bytes. The builders drain the legs they install; these wipes scrub
+	// whatever is left on every other exit path, including a failed second AEAD (§7.5).
+	defer {
+		keys.wipe()
+		client.wipe()
+		server.wipe()
 	}
+	c.c_hsk_protection = tls_record_protection(suite, mut client)!
+	c.s_hsk_protection = tls_record_protection(suite, mut server)!
 }
 
-// install_handshake_ciphers builds the handshake-generation protection states,
-// called once after the ServerHello is fed.
-fn (mut c Conn) install_handshake_ciphers() ! {
-	c.install_ciphers(false)!
-}
-
-// install_application_ciphers builds the application-generation protection states,
-// called once the server Finished is verified.
-fn (mut c Conn) install_application_ciphers() ! {
-	c.install_ciphers(true)!
+// install_application_protection builds both protection states of the application
+// generation, called once the server Finished is verified.
+fn (mut c Conn) install_application_protection() ! {
+	mut keys := c.hs.application_record_keys()!
+	suite := c.hs.negotiated_cipher_suite()
+	mut client := keys.take_client()
+	mut server := keys.take_server()
+	// Same one-owner-per-byte discipline as install_handshake_protection (§7.5).
+	defer {
+		keys.wipe()
+		client.wipe()
+		server.wipe()
+	}
+	c.c_app_protection = tls_record_protection(suite, mut client)!
+	c.s_app_protection = tls_record_protection(suite, mut server)!
 }
 
 // rekey_cipher rebuilds one application protection state after the core updated
@@ -676,28 +666,29 @@ fn (mut c Conn) install_application_ciphers() ! {
 // update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
 // restart at 0 per generation (§5.3).
 fn (mut c Conn) rekey_cipher(is_server bool) ! {
-	mut ck, mut civ, mut sk, mut siv := c.hs.application_record_keys()!
+	mut keys := c.hs.application_record_keys()!
+	suite := c.hs.negotiated_cipher_suite()
+	mut client := keys.take_client()
+	mut server := keys.take_server()
 	// Scrub every copy on all exit paths (§7.5): only the selected leg is installed, but
 	// both pairs are dead here and the AEAD backend/protection state own their copies.
 	defer {
-		zero_bytes(mut ck)
-		zero_bytes(mut civ)
-		zero_bytes(mut sk)
-		zero_bytes(mut siv)
+		keys.wipe()
+		client.wipe()
+		server.wipe()
 	}
-	suite := c.hs.negotiated_cipher_suite()
 	// Capture the superseded generation before the assignment drops its last
 	// reference, then wipe its nonce base: §7.5 expects old traffic keys to stop
 	// existing once replaced. wipe() is IV-only (the AEAD backend key is a
 	// documented platform limit) and idempotent, so it is safe on a state that
 	// was never installed.
 	if is_server {
-		mut old := c.server_app_cipher
-		c.server_app_cipher = tls_protection_from_keys(suite, sk, siv)!
+		mut old := c.s_app_protection
+		c.s_app_protection = tls_record_protection(suite, mut server)!
 		old.wipe()
 	} else {
-		mut old := c.client_app_cipher
-		c.client_app_cipher = tls_protection_from_keys(suite, ck, civ)!
+		mut old := c.c_app_protection
+		c.c_app_protection = tls_record_protection(suite, mut client)!
 		old.wipe()
 	}
 }
@@ -775,7 +766,7 @@ fn (mut c Conn) compact_recv_buf() {
 // handle_alert processes an alert received after the handshake. It marks the
 // connection closed and returns 0 for a clean close_notify, else an error.
 fn (mut c Conn) handle_alert(payload []u8) !int {
-	// read() may hold rlock while a concurrent write() owns the write cipher.
+	// read() may hold rlock while a concurrent write() owns the write protection state.
 	// Preserve the connection's rlock -> wlock order before wiping shared state.
 	c.wlock.lock()
 	defer {
@@ -882,7 +873,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				c.hs.update_traffic_keys(true) or {
 					return c.abort_connection(.internal_error, err.msg())
 				}
-				// The core updated secrets only; swap in the new read cipher (seq restarts at 0, §5.3).
+				// The core updated secrets only; swap in the new read protection state (seq restarts at 0, §5.3).
 				c.rekey_cipher(true) or {
 					return c.abort_connection(.internal_error, err.msg())
 				}
@@ -944,7 +935,7 @@ fn (mut c Conn) write_application_data(data []u8) !int {
 			handshake.AlertDescription.internal_error
 		}
 		// Phase 1 under the held wlock: pin the sticky error, send the best-effort fatal
-		// alert and close the socket. The reader-owned ciphers and buffers are destroyed
+		// alert and close the socket. The reader-owned protection states and buffers are destroyed
 		// in write()'s phase 2 under rlock -> wlock so teardown never races a reader.
 		c.abort_write_locked(alert, 'tls: application write failed: ${err.msg()}')
 		return error(c.fatal_error)
@@ -961,7 +952,7 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 	mut batch_len := 0
 	for offset < data.len {
 		// §5.5: rekey one slot early so the KeyUpdate notice still fits under the old key.
-		if c.client_app_cipher.seq_num >= record_seq_limit - 1 {
+		if c.c_app_protection.seq_num >= record_seq_limit - 1 {
 			// Flush the pending batch first: it must precede the KeyUpdate notice on the wire.
 			c.write_records(batch)!
 			batch = []Record{}
@@ -974,7 +965,7 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 			data.len
 		}
 		chunk := data[offset..end]
-		enc := c.client_app_cipher.encrypt_record(.application_data, chunk)!
+		enc := c.c_app_protection.encrypt_record(.application_data, chunk)!
 		batch << enc
 		batch_len += record_header_len + enc.payload.len
 		// Ship at the batch bound or on the last chunk; coalescing never mixes generations.
@@ -993,11 +984,11 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 // (RFC 8446 §4.6.3/§5.5). The caller must already hold wlock.
 fn (mut c Conn) send_key_update_record_locked() ! {
 	msg := handshake.build_key_update(false)
-	enc := c.client_app_cipher.encrypt_record(.handshake, msg)!
+	enc := c.c_app_protection.encrypt_record(.handshake, msg)!
 	c.write_records([enc])!
 	// The write leg is the client direction: update_traffic_keys(false).
 	c.hs.update_traffic_keys(false)!
-	// Swap in the rebuilt write cipher before the next write() can reach it.
+	// Swap in the rebuilt write protection state before the next write() can reach it.
 	c.rekey_cipher(false)!
 }
 
@@ -1040,7 +1031,7 @@ fn (mut c Conn) abort_connection_locked(alert handshake.AlertDescription, messag
 
 // abort_write_locked records the terminal write failure while wlock is held: it pins the
 // sticky error, sends the best-effort fatal alert and closes the socket, but deliberately
-// leaves the reader-owned ciphers and buffers to write()'s phase-2 destroy_read_side(). A
+// leaves the reader-owned protection states and buffers to write()'s phase-2 destroy_read_side(). A
 // writer must never mutate reader-owned state under wlock alone (Finding A lock discipline).
 fn (mut c Conn) abort_write_locked(alert handshake.AlertDescription, message string) {
 	c.fail_alert = alert
@@ -1063,10 +1054,10 @@ fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message strin
 // wipe_protection_states zeroes this adapter's four record protection states; it is the
 // single place the record layer's own key material is destroyed (RFC 8446 §7.5).
 fn (mut c Conn) wipe_protection_states() {
-	c.server_hsk_cipher.wipe()
-	c.client_hsk_cipher.wipe()
-	c.server_app_cipher.wipe()
-	c.client_app_cipher.wipe()
+	c.s_hsk_protection.wipe()
+	c.c_hsk_protection.wipe()
+	c.s_app_protection.wipe()
+	c.c_app_protection.wipe()
 }
 
 // destroy_on_close is the terminal teardown for a closing connection: it drops the
@@ -1121,7 +1112,7 @@ fn (mut c Conn) destroy_on_failure() {
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
-// picking the protection phase from the ciphers actually installed.
+// picking the protection phase from the states actually installed.
 fn (mut c Conn) send_failure_alert() {
 	if c.peer_terminated {
 		return
@@ -1129,13 +1120,13 @@ fn (mut c Conn) send_failure_alert() {
 	desc := c.fail_alert or { c.hs.failure_alert() }
 	payload := handshake.new_alert(desc).encode()
 	// A protection state is initialized exactly when its IV is the full nonce base.
-	if c.client_app_cipher.iv.len == aead_nonce_len {
-		enc := c.client_app_cipher.encrypt_record(.alert, payload) or { return }
+	if c.c_app_protection.iv.len == aead_nonce_len {
+		enc := c.c_app_protection.encrypt_record(.alert, payload) or { return }
 		c.write_records([enc]) or {}
 		return
 	}
-	if c.client_hsk_cipher.iv.len == aead_nonce_len {
-		enc := c.client_hsk_cipher.encrypt_record(.alert, payload) or { return }
+	if c.c_hsk_protection.iv.len == aead_nonce_len {
+		enc := c.c_hsk_protection.encrypt_record(.alert, payload) or { return }
 		c.write_records([enc]) or {}
 		return
 	}
@@ -1162,7 +1153,7 @@ fn (mut c Conn) send_close_notify() {
 		return
 	}
 	notify := handshake.new_alert(.close_notify)
-	enc := c.client_app_cipher.encrypt_record(.alert, notify.encode()) or {
+	enc := c.c_app_protection.encrypt_record(.alert, notify.encode()) or {
 		return
 	}
 	c.write_records([enc]) or {}
@@ -1190,6 +1181,21 @@ fn (mut c Conn) clear_post_hsk_buf() {
 fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
 	aead := handshake.new_aead_for_suite(suite, key)!
 	return new_tls_protection(aead, iv)!
+}
+
+// tls_record_protection builds one direction's protection state from its opaque key pair
+// and drains the pair: the AEAD backend keeps its own key and the protection state clones
+// its IV, so both values are scrubbed here before returning (§7.5) and the caller is left
+// holding an empty handle. Which slot the result lands in is the caller's choice, made by
+// name off the generation (`take_client()` / `take_server()`).
+fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.RecordKeys) !TLSProtection {
+	mut key := keys.take_key()
+	mut iv := keys.take_iv()
+	defer {
+		zero_bytes(mut key)
+		zero_bytes(mut iv)
+	}
+	return tls_protection_from_keys(suite, key, iv)!
 }
 
 // decrypt_failure_alert maps a decrypt_record error to the fatal alert the record
