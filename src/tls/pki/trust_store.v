@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
 // trust_store.v loads and indexes trusted root CA certificates, seeding the
-// verifier's chain-of-trust check from the host's system trust bundle.
-// @[has_globals] opts in the process-wide cached_system_roots bundle below.
+// verifier's chain-of-trust check from the host's system trust bundle. The
+// @[has_globals] attribute opts in the module-level system-roots cache below.
 @[has_globals]
 module pki
 

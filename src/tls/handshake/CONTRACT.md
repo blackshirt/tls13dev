@@ -17,7 +17,10 @@ operation.
 
 The implementation is split by ownership:
 
-- [`state_machine.v`](./state_machine.v) contains the private shared core.
+- [`state_machine.v`](./state_machine.v) contains the private shared core: its types,
+  the `HandshakeCore` struct and constructor, the state cursor, and the failure
+  primitives, with inbound byte reassembly in [`reassembly.v`](./reassembly.v) and the
+  receive/dispatch routing and flight transitions in [`flight.v`](./flight.v).
 - [`key_schedule.v`](./key_schedule.v) runs the §7.1 HKDF ladder and holds the
   core's flat derived-secret fields (`c_hsk_tsec`/`s_hsk_tsec`/`c_app_tsec`/`s_app_tsec`) and the
   `SecretPhases` readiness type, with the §7.5 wiping and zeroization lifecycle methods.
@@ -64,14 +67,21 @@ Adapters call these lifecycle operations when aborting or tearing down; callers
 driving a handshake normally need only construct, send the ClientHello, feed
 peer messages, and observe the resulting state.
 Each adapter funnels every terminal path through one internal teardown that pairs a
-core call above with a wipe of its *own* key holders, so no code path can clear one
+core call above with a wipe of its *own* key holders, so no code path can wipe one
 layer and forget the other: `tls.Conn` wipes its four `TLSProtection`s, and the QUIC
 engine zeroes each `ProtectionState` (AEAD key, IV, header-protection key) before
 releasing it. Both use the same module-private, idempotent `holder.wipe()` mechanism;
 users never call it — the only public terminal action is the adapter's `close()` or
-failure handling. Clearing verbs are tiered: `wipe_*` zeroes bytes or handles (the
-mechanism), `zeroize_*` clears secret material under lifecycle guard rules (RFC 8446
-§7.5), and `destroy_*` tears down a whole adapter connection.
+failure handling. Clearing verbs form four tiers: `release_*` drops a whole handle,
+slot, or buffer that is not individually scrubbed (`release_ephemeral_keys`,
+`ReassemblyBuffers.release_buffers`); `wipe_*` / `.wipe()` zeroes bytes then drops
+them (secret material and decrypted plaintext, e.g. `Conn.wipe_app_buf`);
+`zeroize_*` clears secret material under lifecycle guard rules (RFC 8446 §7.5);
+and `destroy_*` tears down a whole adapter connection. `take_*` is orthogonal to
+all four: it moves ownership out of a handle rather than clearing it. Some facade
+forwarders are deliberately kept as pure pass-throughs because V will not expose a
+module-private `HandshakeCore` method to another module except through a `pub`
+wrapper (e.g. `QuicHandshake.fail_and_zeroize_secrets`).
 
 Within the core, a classified handshake failure is one atomic concept: the private
 `classify_failure(alert, message)` primitive pins the alert `failure_alert()` will

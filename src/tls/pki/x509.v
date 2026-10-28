@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
 // x509.v decodes DER-encoded X.509 v3 certificates, including the SAN,
-// basicConstraints, keyUsage, EKU, and nameConstraints extensions validator.v
-// consumes. Malformed or unsupported inputs fail the whole decode (fail closed).
+// basicConstraints, keyUsage, EKU and nameConstraints extensions. Malformed or
+// unsupported inputs fail the whole decode (fail closed).
 module pki
 
 import crypto.ecdsa

@@ -1,9 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// record.v frames and (re)assembles the TLS 1.3 record layer (RFC 8446 §5),
-// while record_protection.v carries per-direction AEAD sequence state across the
-// handshake-to-application key transition. The recordless QUIC CRYPTO-stream
-// reassembly (RFC 9001 §4) lives in tls.handshake's `passthrough.v`.
+// record.v frames and (re)assembles the TLS 1.3 record layer (RFC 8446 §5);
+// per-direction AEAD sequence state rides in record_protection.v.
 module tls
 
 import tls.wire

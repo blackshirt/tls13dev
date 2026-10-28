@@ -1,7 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// server_flight.v decodes the server's encrypted-flight messages: EncryptedExtensions,
-// CertificateRequest, Certificate, CertificateVerify and Finished (RFC 8446 §4.3–§4.4).
+// server_flight.v decodes the server's encrypted flight — EncryptedExtensions
+// through Finished (RFC 8446 §4.3–§4.4).
 module handshake
 
 import tls.pki

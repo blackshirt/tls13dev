@@ -5,22 +5,14 @@
 // full RFC 9001 handshake in memory or over any datagram transport without
 // touching the TLS record layer.
 //
-// The engine owns everything the handshake core deliberately does not:
-//
-//   * per-level packet-number spaces (Initial, Handshake, 1-RTT),
-//   * per-level packet protection, keyed from Initial secrets (§5.2, derived
-//     here) and from the core's exported Handshake/Application secrets (§5.1),
-//   * CRYPTO frame packing and stream reassembly (its own offset-ordered
-//     buffer, separate from the core's message reassembler, because a QUIC
-//     CRYPTO stream may arrive out of order and re-encrypted per packet),
-//   * the packet loop that turns handshake output into packets to send and
-//     turns received CRYPTO bytes into handshake input.
-//
-// What it does NOT do (see QUIC.md §7): ACK-based loss recovery, congestion
-// control, streams, flow control, connection migration, Retry/0-RTT, or the
-// 1-RTT Key Phase update. It is a handshake engine, not a full QUIC stack.
+// It owns what the core does not: per-level packet-number spaces and packet
+// protection, CRYPTO frame packing and offset-ordered reassembly, and the packet loop
+// shuttling bytes between transport and core. It is a handshake engine, not a full
+// QUIC stack — no loss recovery, congestion control, streams, migration, Retry/0-RTT,
+// or Key Phase (see QUIC.md §7).
 module quic
 
+import crypto.rand
 import tls.handshake
 
 // quic_version_1 is the RFC 9000 version number this engine speaks.
@@ -81,6 +73,25 @@ mut:
 
 	// Current 1-RTT Key Phase bit; key updates are not implemented yet.
 	key_phase bool
+}
+
+// Config holds options consumed when creating a QUIC client connection.
+@[params]
+pub struct Config {
+pub:
+	// hsk_options configures certificate validation, ALPN, and ClientHello preferences.
+	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
+}
+
+// max_cid_len is the longest connection ID a peer may carry (RFC 9000 §5.1).
+const max_cid_len = 20
+
+// random_cid returns n random connection-ID bytes (RFC 9000 §5.1).
+fn random_cid(n int) ![]u8 {
+	if n <= 0 || n > max_cid_len {
+		return error('quic: connection ID length ${n} must be 1..${max_cid_len} (RFC 9000 §17.2)')
+	}
+	return rand.bytes(n)!
 }
 
 // new_client_engine constructs a QUIC client connection for server_name.
@@ -414,7 +425,7 @@ fn (mut e Conn) handle_frames(ptype PacketType, payload []u8) ! {
 			}
 			frame_handshake_done {
 				e.confirmed = true
-				e.drop_handshake_keys()!
+				e.release_handshake_keys()!
 				off++
 			}
 			frame_connection_close_transport, frame_connection_close_application {
@@ -569,8 +580,8 @@ fn (mut e Conn) install_application_protection() ! {
 }
 
 // zero_bytes overwrites a buffer in place, the §7.5 scrub for dead QUIC key material
-// that never reaches a tracked protection state. Mirrors the tls adapter's helper of
-// the same name; the modules stay independent (tls.handshake cannot import tls.quic).
+// that never reaches a tracked protection state. tls.quic's copy of the per-module
+// zero-fill described in tls.handshake's wipe_secret comment.
 @[direct_array_access]
 fn zero_bytes(mut buf []u8) {
 	for i in 0 .. buf.len {
@@ -669,8 +680,8 @@ fn (mut e Conn) seal_raw(ptype PacketType, payload []u8) ![]u8 {
 
 // fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
 // records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
-// §7.5). The record adapter wipes its core secrets on failure (its
-// destroy_on_failure); the QUIC adapter must do the same, or a dead handshake
+// §7.5). The record adapter wipes its core secrets on failure (its dial-time
+// destroy_on_close); the QUIC adapter must do the same, or a dead handshake
 // leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
 // The caller emits a CONNECTION_CLOSE with the recorded code.
 fn (mut e Conn) fail_close() ! {
@@ -679,48 +690,42 @@ fn (mut e Conn) fail_close() ! {
 	e.closed = true
 }
 
-// drop_handshake_keys releases the Handshake-level packet keys AND the core's
-// handshake traffic secrets together after HANDSHAKE_DONE, so an adapter cannot
-// discard one and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
+// wipe_protection_state zeroes one protection slot's key material, then releases the
+// holder. The slot may already be none, which is the idempotent no-op; this is the
+// engine's only wipe-then-release sequence, so release_handshake_keys() and
+// wipe_packet_keys() cannot drift apart (RFC 8446 §7.5, RFC 9001 §4.9.2).
+fn wipe_protection_state(mut slot ?ProtectionState) {
+	mut ps := slot or { ProtectionState{ aead: unsafe { nil } } }
+	ps.wipe()
+	slot = none
+}
+
+// release_handshake_keys releases the Handshake-level packet keys AND the core's
+// handshake traffic secrets together after HANDSHAKE_DONE, so an adapter cannot wipe
+// one half and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
 // handshake protection states before releasing them, and is idempotent.
-fn (mut e Conn) drop_handshake_keys() ! {
+fn (mut e Conn) release_handshake_keys() ! {
 	e.hs.zeroize_handshake_secrets()!
-	mut tx := e.handshake_tx or { ProtectionState{ aead: unsafe { nil } } }
-	tx.wipe()
-	e.handshake_tx = none
-	mut rx := e.handshake_rx or { ProtectionState{ aead: unsafe { nil } } }
-	rx.wipe()
-	e.handshake_rx = none
+	wipe_protection_state(mut e.handshake_tx)
+	wipe_protection_state(mut e.handshake_rx)
 }
 
 // wipe_packet_keys zeroes and releases every packet-protection state this engine
 // owns, so a dead or closed connection leaves no AEAD key, IV, or header-protection
 // key behind (RFC 8446 §7.5, RFC 9001 §4.9.2). Idempotent.
 fn (mut e Conn) wipe_packet_keys() {
-	mut k1 := e.initial_tx or { ProtectionState{ aead: unsafe { nil } } }
-	k1.wipe()
-	e.initial_tx = none
-	mut k2 := e.initial_rx or { ProtectionState{ aead: unsafe { nil } } }
-	k2.wipe()
-	e.initial_rx = none
-	mut k3 := e.handshake_tx or { ProtectionState{ aead: unsafe { nil } } }
-	k3.wipe()
-	e.handshake_tx = none
-	mut k4 := e.handshake_rx or { ProtectionState{ aead: unsafe { nil } } }
-	k4.wipe()
-	e.handshake_rx = none
-	mut k5 := e.app_tx or { ProtectionState{ aead: unsafe { nil } } }
-	k5.wipe()
-	e.app_tx = none
-	mut k6 := e.app_rx or { ProtectionState{ aead: unsafe { nil } } }
-	k6.wipe()
-	e.app_rx = none
+	wipe_protection_state(mut e.initial_tx)
+	wipe_protection_state(mut e.initial_rx)
+	wipe_protection_state(mut e.handshake_tx)
+	wipe_protection_state(mut e.handshake_rx)
+	wipe_protection_state(mut e.app_tx)
+	wipe_protection_state(mut e.app_rx)
 }
 
 // destroy_on_close is the QUIC adapter's single terminal teardown: it drops the
 // application traffic secrets once the handshake reached .connected (or the whole
 // key schedule otherwise) and zeroes every packet-protection state, so no close path
-// can clear one layer and forget the other (RFC 8446 §1.3.1/§7.5, RFC 9001 §4.9.2).
+// can wipe one layer and forget the other (RFC 8446 §1.3.1/§7.5, RFC 9001 §4.9.2).
 // It runs only after the final CONNECTION_CLOSE has been sealed, since sealing still
 // needs the packet keys; that is why the failure path (fail_close) does not call it.
 fn (mut e Conn) destroy_on_close() ! {

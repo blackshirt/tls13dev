@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// messages.v owns the shared RFC 8446 §4 handshake vocabulary — the message, extension,
-// group, signature-scheme, and cipher-suite codes with their single-source supported
-// lists and `*_from_uN` decoders — plus the framing and extension-block parsing built on them.
+// messages.v owns the shared RFC 8446 §4 handshake vocabulary — message, extension,
+// group, signature-scheme and cipher-suite codes, their single-source supported lists,
+// and the wire decoders and framing built on them.
 module handshake
 
 import tls.wire

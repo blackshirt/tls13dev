@@ -1,16 +1,10 @@
 // Copyright (c) 2026 blackshirt.
 //
-// key_schedule.v runs the RFC 8446 §7.1 HKDF-Extract/Expand ladder over the
-// (EC)DHE and traffic-secret stages, deriving every handshake and application key.
-// The phase-stage derivations (derive_handshake_secret, derive_master_secret and
-// the per-direction traffic-secret derivers) that state_machine.v sequences live
-// here too, beside the ladder primitives they call.
-// It also owns the SecretPhases readiness type and the §7.5 zeroization lifecycle
-// methods declared on HandshakeCore; the traffic secrets they guard are flat []u8
-// fields on the core itself (c_hsk_tsec/s_hsk_tsec, c_app_tsec/s_app_tsec). The
-// RecordKeys / HandshakeRecordKeys / ApplicationRecordKeys opaque handles the record
-// facade caches are declared here too, beside the derive_traffic_key /
-// derive_traffic_iv calls that fill them.
+// key_schedule.v runs the RFC 8446 §7.1 HKDF key-derivation ladder that turns the
+// (EC)DHE secret into every handshake and application key, and owns the §7.5
+// zeroization lifecycle declared on HandshakeCore. The SecretPhases readiness type
+// and the opaque RecordKeys / TrafficRecordKeys handles the record facade caches are
+// declared here, beside the derivations that fill them.
 module handshake
 
 import crypto.hmac
@@ -184,10 +178,11 @@ fn derive_server_app_secret(hash_algo HashAlgorithm, master_secret []u8, th_sfin
 	return derive_secret(hash_algo, master_secret, 's ap traffic', th_sfin)!
 }
 
-// wipe_secret overwrites a secret buffer before releasing its contents. The
-// zeroing loop is the security-relevant step; the rebinding below only clears the
-// local handle — callers assign the replacement secret right after.
-@[direct_array_access]
+// wipe_secret overwrites a secret buffer before releasing it. The zeroing loop is
+// the security-relevant step; the rebinding merely clears the local handle. This is
+// tls.handshake's one zero-fill — tls and tls.quic each keep a private zero_bytes
+// (V cannot share a private fn across a module boundary), so the three loops stay
+// byte-identical by convention and every scrub in a module routes through its own.
 fn wipe_secret(mut secret []u8) {
 	for i in 0 .. secret.len {
 		secret[i] = 0
@@ -279,93 +274,51 @@ fn (k &RecordKeys) copies() RecordKeys {
 	}
 }
 
-// HandshakeRecordKeys is the handshake generation's cached record keys, one opaque
-// handle per direction. It is a nominally distinct type from ApplicationRecordKeys, so
-// the protection phase travels with the value instead of with a bool or a level.
+// TrafficRecordKeys is an opaque handle to one generation of cached TLS record keys,
+// holding one RecordKeys handle per direction (client and server).
 @[noinit]
-pub struct HandshakeRecordKeys {
+pub struct TrafficRecordKeys {
 mut:
 	client RecordKeys // client-direction key and nonce base
 	server RecordKeys // server-direction key and nonce base
 }
 
-// ApplicationRecordKeys is the application generation — the pair a KeyUpdate re-keys.
-@[noinit]
-pub struct ApplicationRecordKeys {
-mut:
-	client RecordKeys // client-direction key and nonce base
-	server RecordKeys // server-direction key and nonce base
-}
+// HandshakeRecordKeys and ApplicationRecordKeys are phase-typed aliases of TrafficRecordKeys.
+pub type HandshakeRecordKeys = TrafficRecordKeys
+pub type ApplicationRecordKeys = TrafficRecordKeys
 
 // take_client moves the client-direction pair out of the generation, leaving an empty
 // handle behind; take_server does the same for the server direction. The pair travels
 // whole, which is the reason a leg has no separate take method of its own.
-pub fn (mut k HandshakeRecordKeys) take_client() RecordKeys {
+pub fn (mut k TrafficRecordKeys) take_client() RecordKeys {
 	leg := k.client
 	k.client = RecordKeys{}
 	return leg
 }
 
-// take_server moves the server-direction pair out of the generation; the client side is
-// take_client. The pair travels whole either way, which is the reason a leg has no
-// separate take method of its own.
-pub fn (mut k HandshakeRecordKeys) take_server() RecordKeys {
+// take_server moves the server-direction pair out of the generation; take_client is
+// its client-side mirror.
+pub fn (mut k TrafficRecordKeys) take_server() RecordKeys {
 	leg := k.server
 	k.server = RecordKeys{}
 	return leg
 }
 
 // wipe zeroes both directions of this generation (§7.5).
-pub fn (mut k HandshakeRecordKeys) wipe() {
+pub fn (mut k TrafficRecordKeys) wipe() {
 	k.client.wipe()
 	k.server.wipe()
 }
 
 // ready reports whether both directions hold a key: an install or a wipe always takes
 // a whole generation, never one leg of it. Module-private, as on the direction handles.
-fn (k &HandshakeRecordKeys) ready() bool {
+fn (k &TrafficRecordKeys) ready() bool {
 	return k.client.ready() && k.server.ready()
 }
 
 // copies returns an independent deep copy of the generation; see the direction handles.
-fn (k &HandshakeRecordKeys) copies() HandshakeRecordKeys {
-	return HandshakeRecordKeys{
-		client: k.client.copies()
-		server: k.server.copies()
-	}
-}
-
-// take_client moves the client-direction pair out of the application generation, leaving
-// an empty handle behind — the same move-only drain the handshake generation documents.
-pub fn (mut k ApplicationRecordKeys) take_client() RecordKeys {
-	leg := k.client
-	k.client = RecordKeys{}
-	return leg
-}
-
-// take_server moves the server-direction pair out of the application generation.
-pub fn (mut k ApplicationRecordKeys) take_server() RecordKeys {
-	leg := k.server
-	k.server = RecordKeys{}
-	return leg
-}
-
-// wipe zeroes both directions of the application generation, never one leg of it (§7.5).
-pub fn (mut k ApplicationRecordKeys) wipe() {
-	k.client.wipe()
-	k.server.wipe()
-}
-
-// ready reports whether both directions of the application generation hold a key; it is
-// a precondition of the phase accessor, which is why it stays module-private.
-fn (k &ApplicationRecordKeys) ready() bool {
-	return k.client.ready() && k.server.ready()
-}
-
-// copies returns an independent deep copy of the application generation; the clone reason
-// is on RecordKeys.copies.
-fn (k &ApplicationRecordKeys) copies() ApplicationRecordKeys {
-	return ApplicationRecordKeys{
+fn (k &TrafficRecordKeys) copies() TrafficRecordKeys {
+	return TrafficRecordKeys{
 		client: k.client.copies()
 		server: k.server.copies()
 	}
@@ -389,10 +342,19 @@ fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	}
 }
 
-// wipe_traffic_secrets_at zeroes the client and server traffic secrets for one
-// encryption level; the initial level has no TLS traffic secrets. It mirrors the
-// QUIC-side peer_traffic_secrets_at() accessor (quic_handshake.v) so reads and
-// wipes share the same phase vocabulary.
+// release_ephemeral_keys drops both ephemeral ECDHE private halves: the vlib key
+// types expose no in-place wipe, so releasing the handles is the available
+// destruction (§7.5). Sole caller is wipe_key_schedule_secrets(), reached from both
+// the .connected lifecycle and the failure path.
+fn (mut h HandshakeCore) release_ephemeral_keys() {
+	h.priv_x25519 = unsafe { nil }
+	h.priv_p256 = none
+}
+
+// wipe_traffic_secrets_at is the unguarded per-level wipe: it zeroes the client and
+// server traffic secrets for one encryption level; the initial level has no TLS
+// traffic secrets. It mirrors the QUIC-side peer_traffic_secrets_at() accessor
+// (quic_handshake.v) so reads and wipes share the same phase vocabulary.
 fn (mut h HandshakeCore) wipe_traffic_secrets_at(level EncryptionLevel) {
 	match level {
 		.initial {}
@@ -407,19 +369,20 @@ fn (mut h HandshakeCore) wipe_traffic_secrets_at(level EncryptionLevel) {
 	}
 }
 
-// wipe_all_secrets zeroes the key-schedule intermediate and every traffic secret.
-fn (mut h HandshakeCore) wipe_all_secrets() {
+// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
+// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
+// handshake traffic secrets.
+fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
 	wipe_secret(mut h.handshake_secret)
-	h.wipe_traffic_secrets_at(.handshake)
-	h.wipe_traffic_secrets_at(.application)
+	h.release_ephemeral_keys()
 }
 
-// zeroize_traffic_secrets_at destroys the client and server traffic secrets for one
-// encryption level (and, on the record facade, that level's cached record keys)
-// once the adapter no longer needs them; it is valid only after .connected, and
-// the initial level — which has no TLS traffic secrets — is refused (RFC 8446 §7.5).
-// Module-private: adapters call their phase-named zeroize_handshake_secrets() /
-// zeroize_application_secrets() entry points.
+// zeroize_traffic_secrets_at is the guarded lifecycle entry, normal teardown's only
+// route to the per-level wipe: it destroys one level's client and server traffic
+// secrets (and, on the record facade, that level's cached record keys) once the
+// adapter no longer needs them. Valid only after .connected; the initial level is
+// refused (RFC 8446 §7.5). Module-private: adapters call their phase-named
+// zeroize_handshake_secrets() / zeroize_application_secrets() entry points.
 fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	match level {
 		.initial {
@@ -434,29 +397,15 @@ fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	}
 }
 
-// release_ephemeral_keys drops both ephemeral ECDHE private halves. The vlib key
-// types expose no in-place wipe, so releasing the handles is the available
-// destruction; fail_and_zeroize_secrets() and wipe_key_schedule_secrets() must
-// release them identically (§7.5), so they share this single site.
-fn (mut h HandshakeCore) release_ephemeral_keys() {
-	h.priv_x25519 = unsafe { nil }
-	h.priv_p256 = none
-}
-
-// fail_and_zeroize_secrets wipes derived secrets and parks the state machine
-// in .failed (RFC 8446 §1.3.1/§7.5).
+// fail_and_zeroize_secrets is the unguarded terminal entry: it composes every wipe
+// above — key-schedule intermediate, ephemeral halves, both traffic-secret levels —
+// releases the reassembly buffers, and parks the machine in .failed (RFC 8446
+// §1.3.1/§7.5). It bypasses the zeroize_* lifecycle guard: a failure can land before
+// .connected ever held.
 fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
-	h.wipe_all_secrets()
-	h.buffers.clear_all()
-	h.release_ephemeral_keys()
+	h.wipe_key_schedule_secrets()
+	h.wipe_traffic_secrets_at(.handshake)
+	h.wipe_traffic_secrets_at(.application)
+	h.buffers.release_buffers()
 	h.state = .failed
-}
-
-// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
-// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
-// handshake traffic secrets.
-fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
-	wipe_secret(mut h.handshake_secret)
-	// Release the ephemeral private keys; compute_shared_secret, their only consumer, already ran.
-	h.release_ephemeral_keys()
 }

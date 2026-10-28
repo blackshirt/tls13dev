@@ -1,9 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// varint.v implements the QUIC variable-length integer codec (RFC 9000 §16):
-// the 2-bit prefix of the first byte selects a 1-, 2-, 4- or 8-byte field, and
-// the value never exceeds 2^62-1. It is the only integer encoding in this
-// module, shared by packet fields, frames and transport parameters.
+// varint.v implements the QUIC variable-length integer codec (RFC 9000 §16): a
+// 2-bit prefix selects a 1-, 2-, 4- or 8-byte field, capped at 2^62-1. It is the
+// module's only integer encoding, shared by packets, frames and transport params.
 module quic
 
 // max_varint is the largest representable value, 2^62-1 (RFC 9000 §16).

@@ -1,6 +1,6 @@
 // Copyright (c) 2026 blackshirt.
 //
-// QUIC packet headers (RFC 9000 §17). Protection lives in protection.v.
+// QUIC packet headers (RFC 9000 §17).
 module quic
 
 // Long-header form and fixed-bit flags (RFC 9000 §17).

@@ -1,9 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// aead.v adapts the AEAD cipher suites (AES-128/256-GCM and ChaCha20-Poly1305) to the
-// single seal/open interface both protection styles need — suite→AEAD is key-schedule
-// knowledge and lives with the handshake core. Nonce construction and size limits live
-// in the TLS layer (record_protection.v), not here.
+// aead.v adapts the TLS 1.3 AEAD suites (AES-GCM, ChaCha20-Poly1305) to a single
+// seal/open interface shared by the TLS and QUIC protection styles. Nonce
+// construction and size limits live in the TLS layer, not here.
 module handshake
 
 import crypto.aes

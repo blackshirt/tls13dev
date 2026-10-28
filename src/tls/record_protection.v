@@ -171,9 +171,7 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 // wipe() clears everything this layer owns, and the backend key dies when the
 // unreferenced AEAD object is collected.
 fn (mut s TLSProtection) wipe() {
-	for i in 0 .. s.iv.len {
-		s.iv[i] = 0
-	}
+	zero_bytes(mut s.iv)
 	s.iv = []u8{}
 	s.seq_num = 0
 }

@@ -1,10 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// transport_params.v is the QUIC side of the TLS quic_transport_parameters
-// extension (RFC 9001 §8.2). TLS treats that extension as opaque bytes and only
-// rules on where they may appear; decoding the id/length/value triplets is a QUIC
-// concern, so it lives here, in the adapter above the handshake, framed with this
-// module's variable-length integer codec (RFC 9000 §16).
+// transport_params.v decodes the QUIC transport parameters carried in the TLS
+// quic_transport_parameters extension (RFC 9001 §8.2). TLS passes those bytes through
+// opaquely; interpreting the id/length/value triplets is a QUIC concern, framed with
+// this module's varint codec (RFC 9000 §16).
 module quic
 
 // param_initial_scid is the id of the initial_source_connection_id transport

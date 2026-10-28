@@ -1,11 +1,10 @@
 // Copyright (c) 2026 blackshirt.
 //
-// server.v is a minimal, adaptive TLS 1.3 server flight generator for tests:
-// it parses the client's real ClientHello and emits a byte-correct ServerHello
-// plus encrypted flight (RFC 8446 §7.1), so a record handshaker can be driven
-// to .connected without a socket. Scope: the SHA-256 suites TLS_AES_128_GCM_SHA256
-// (the default) and TLS_CHACHA20_POLY1305_SHA256, chosen per instance via
-// Config.cipher_suite.
+// server.v is a minimal, adaptive TLS 1.3 server flight generator for tests: it
+// parses the client's real ClientHello and emits a byte-correct ServerHello plus
+// encrypted flight (RFC 8446 §7.1), so a record handshaker can be driven to
+// .connected without a socket. Scope: the two SHA-256 suites, chosen per instance
+// via Config.cipher_suite.
 module fakeserver
 
 import crypto.ecdsa

@@ -1,9 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// This seam owns the recordless handshake framing of RFC 9001 §4: over QUIC a
+// passthrough.v owns the recordless handshake framing of RFC 9001 §4: over QUIC a
 // handshake message rides the CRYPTO stream self-framed by its own 4-byte header
-// (type || u24 length), so reassembly is the transport-neutral twin of the TLS
-// layer's handshake parser.
+// (type || u24 length), so reassembly skips the TLS record layer entirely.
 module handshake
 
 // max_handshake_message_len bounds one reassembled handshake message: the 24-bit

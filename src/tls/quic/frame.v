@@ -1,16 +1,10 @@
 // Copyright (c) 2026 blackshirt.
 //
-// frame.v implements the small set of QUIC frames (RFC 9000 §19) used during
-// the handshake:
-//
-//   * CRYPTO (§19.6) — carries the handshake message stream, one frame per
-//     encryption level, with an offset so a flight can span several packets.
-//   * ACK (§19.3) — parsed so handshake packets containing acknowledgments can
-//     be consumed; this engine does not track acknowledgments or emit ACKs.
-//   * PADDING (§19.1) — inflates a ClientHello packet to the 1200-byte minimum.
-//   * CONNECTION_CLOSE (§19.19) — carries a handshake failure's alert code.
-//   * HANDSHAKE_DONE (§19.20) — the server's signal that the handshake is
-//     confirmed, which is the engine's cue to zeroize handshake traffic secrets.
+// frame.v implements the small set of QUIC frames the handshake uses (RFC 9000 §19):
+// CRYPTO (§19.6) carries the handshake stream, offset across packets; ACK (§19.3) is
+// parsed but never emitted; PADDING (§19.1) inflates the Initial to the 1200-byte
+// minimum; CONNECTION_CLOSE (§19.19) carries a failure's alert code; and
+// HANDSHAKE_DONE (§19.20) is the engine's cue to release the handshake keys.
 //
 // Other frames (STREAM, flow control, Retry, NEW_TOKEN, etc.) are out of scope.
 module quic

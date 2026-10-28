@@ -1,10 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// key_exchange.v owns the ephemeral ECDHE half of the core: per-group key
-// generation, the wire-form public share, the §4.2.8.2 share-size gate, and the
-// peer-share validation and secret derivation, including the RFC 7748 §6.1
-// small-order bounds. The private-key holders live in HandshakeCore
-// (state_machine.v); these methods are declared in this file.
+// key_exchange.v owns the ephemeral ECDHE half of the handshake: per-group key
+// generation, the §4.2.8.2 share-size gate, peer-share validation and secret
+// derivation, including the RFC 7748 §6.1 small-order bounds. Its methods attach to
+// HandshakeCore, whose private-key holders are declared in state_machine.v.
 module handshake
 
 import crypto.ecdsa

@@ -69,12 +69,8 @@ fn new_protection(k ProtectionKeys, suite handshake.CipherSuite) !ProtectionStat
 // whole state to none. Guarded by the loop bounds, so calling it on an
 // already-wiped state is a safe no-op.
 fn (mut s ProtectionState) wipe() {
-	for i in 0 .. s.iv.len {
-		s.iv[i] = 0
-	}
-	for i in 0 .. s.hp.len {
-		s.hp[i] = 0
-	}
+	zero_bytes(mut s.iv)
+	zero_bytes(mut s.hp)
 	s.iv = []u8{}
 	s.hp = []u8{}
 }

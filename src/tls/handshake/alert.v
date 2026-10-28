@@ -1,9 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
 // alert.v models the RFC 8446 §6 alert vocabulary: the AlertLevel/AlertDescription
-// enums and their wire encoding, shared transport vocabulary. TLS frames alerts in
-// its own layer; QUIC maps the description to a CRYPTO_ERROR connection-close code
-// (0x100 + description) via quic_connection_error (RFC 9001 §4.8).
+// enums and their wire encoding — shared transport vocabulary each adapter frames or
+// maps its own way (QUIC folds the code into a CRYPTO_ERROR, RFC 9001 §4.8).
 module handshake
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).

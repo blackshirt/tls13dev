@@ -27,7 +27,7 @@ The core was therefore split so that the carrier is always someone else's job:
 
 ```
    ┌──────────────────────────── tls.handshake (this module) ───────────────────────────┐
-   │  Shared core: state_machine.v (transitions, flight) + key_exchange.v           │
+   │  Shared core: state_machine.v + flight.v + reassembly.v + key_exchange.v       │
    │  Key schedule: key_schedule.v (holders + §7.5 lifecycle)                       │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
@@ -203,7 +203,7 @@ A QUIC server may keep sending Handshake packets until the client
 confirms the handshake with `HANDSHAKE_DONE` (RFC 9001 §4.1.2), not merely
 until the client sends its Finished. So the core deliberately retains the
 handshake traffic secrets past `.connected`; the engine owns its derived packet
-keys and, when it processes `HANDSHAKE_DONE` (§4.9.2), calls `drop_handshake_keys()`
+keys and, when it processes `HANDSHAKE_DONE` (§4.9.2), calls `release_handshake_keys()`
 — a single step that zeroizes the core's `.handshake` traffic secrets *and* zeroes
 the Handshake packet-protection states together, so neither half can be forgotten.
 The TCP adapter reaches the same `zeroize_handshake_secrets()` after sending

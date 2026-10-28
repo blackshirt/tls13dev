@@ -1,10 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// conn.v is the public entry point of this TLS stack: Config/default_config()
-// carry the caller-facing options, dial() runs the TLS 1.3 handshake, and Conn
-// exposes the protected stream over TCP — RFC 8446 §5 record
-// framing, batched flights, reassembly of split records. The handshake core
-// (tls.handshake) stays transport-neutral; recordless QUIC (RFC 9001 §4) shares it.
+// conn.v is the public entry point of the TLS stack: dial() runs the TLS 1.3
+// handshake and Conn exposes the protected stream over TCP (RFC 8446 §5). The
+// handshake core (tls.handshake) stays transport-neutral; recordless QUIC shares it.
 module tls
 
 import net
@@ -274,7 +272,9 @@ pub fn dial(address string, config Config) !&Conn {
 	// classified sites already pinned fail_alert, so no future `return` path can leak material.
 	conn.do_handshake() or {
 		conn.send_failure_alert()
-		conn.destroy_on_failure()
+		// A handshake that failed never reached .connected, so destroy_on_close takes
+		// its no-error branch and the swallow below cannot discard a real failure.
+		conn.destroy_on_close() or {}
 		sock.close() or {}
 		return err
 	}
@@ -311,7 +311,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		n := copy(mut buf, c.app_buf[c.app_pos..])
 		c.app_pos += n
 		if c.app_pos == c.app_buf.len {
-			c.clear_app_buf()
+			c.wipe_app_buf()
 		}
 		return n
 	}
@@ -358,9 +358,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 						// Scrub the decrypted staging copy the moment it is fully
 						// delivered; the undelivered remainder is scrubbed when
 						// app_buf drains (§7.5 spirit: no plaintext left in freed memory).
-						for i in 0 .. dec.plaintext.len {
-							dec.plaintext[i] = 0
-						}
+						zero_bytes(mut dec.plaintext)
 						return n
 					}
 					.alert {
@@ -1063,7 +1061,7 @@ fn (mut c Conn) wipe_protection_states() {
 // destroy_on_close is the terminal teardown for a closing connection: it drops the
 // application traffic secrets once the handshake reached .connected (or the whole
 // key schedule otherwise), then wipes this adapter's protection states, so no close path
-// can clear one layer and forget the other (RFC 8446 §1.3.1/§7.5).
+// can wipe one layer and forget the other (RFC 8446 §1.3.1/§7.5).
 fn (mut c Conn) destroy_on_close() ! {
 	if c.hs.state() == .connected {
 		c.hs.zeroize_application_secrets()!
@@ -1083,8 +1081,8 @@ fn (mut c Conn) destroy_locked() ! {
 	c.destroy_on_close()!
 	// Scrub undelivered plaintext and any partial post-handshake message staged for the
 	// reader (§7.5 spirit: no decrypted or framed bytes left behind in freed memory).
-	c.clear_app_buf()
-	c.clear_post_hsk_buf()
+	c.wipe_app_buf()
+	c.wipe_post_hsk_buf()
 }
 
 // destroy_read_side acquires the contract's rlock -> wlock order and runs destroy_locked(),
@@ -1101,14 +1099,6 @@ fn (mut c Conn) destroy_read_side() ! {
 		c.wlock.unlock()
 	}
 	c.destroy_locked()!
-}
-
-// destroy_on_failure destroys every secret a failed handshake may have derived: the
-// core's key-schedule material plus this adapter's record protection states. It runs after
-// the fatal alert has been sent, so wiping the protection states cannot strand that alert.
-fn (mut c Conn) destroy_on_failure() {
-	c.hs.fail_and_zeroize_secrets()
-	c.wipe_protection_states()
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
@@ -1159,17 +1149,17 @@ fn (mut c Conn) send_close_notify() {
 	c.write_records([enc]) or {}
 }
 
-// clear_app_buf zeroes then drops the staged-but-undelivered application
+// wipe_app_buf zeroes then drops the staged-but-undelivered application
 // plaintext, so freed buffer memory never retains decrypted bytes (§7.5 spirit).
-fn (mut c Conn) clear_app_buf() {
+fn (mut c Conn) wipe_app_buf() {
 	zero_bytes(mut c.app_buf)
 	c.app_buf.clear()
 	c.app_pos = 0
 }
 
-// clear_post_hsk_buf zeroes then drops staged post-handshake bytes so freed memory
+// wipe_post_hsk_buf zeroes then drops staged post-handshake bytes so freed memory
 // retains no partial handshake message (RFC 8446 §5.2; §7.5 spirit).
-fn (mut c Conn) clear_post_hsk_buf() {
+fn (mut c Conn) wipe_post_hsk_buf() {
 	zero_bytes(mut c.post_hsk_buf)
 	c.post_hsk_buf = []u8{}
 }
@@ -1212,8 +1202,8 @@ fn decrypt_failure_alert(msg string) handshake.AlertDescription {
 }
 
 // zero_bytes wipes a buffer in place before it is dropped or reused, so freed
-// memory retains no plaintext (RFC 8446 §7.5 spirit); one implementation for
-// every staged-bytes scrub below.
+// memory retains no plaintext (RFC 8446 §7.5 spirit). It is tls's one zero-fill;
+// the other modules keep their own private equivalents.
 @[direct_array_access]
 fn zero_bytes(mut buf []u8) {
 	for i in 0 .. buf.len {

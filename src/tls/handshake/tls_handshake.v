@@ -1,10 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// TLSHandshake is the TLS record adapter facade over shared handshake
-// semantics. Record traffic keys (cached as phase-typed opaque bundles, one RecordKeys
-// handle per direction), TLS KeyUpdate state, and the record-side
-// reassembly hooks (initial_backlog / handshake_backlog / take_buffered_handshake_bytes)
-// live here — none of them has a QUIC caller, so none belongs to the core.
+// TLSHandshake is the TLS record adapter facade over shared handshake semantics.
+// The cached record keys, TLS KeyUpdate state, and the record-side reassembly
+// backlog hooks live here — none has a QUIC caller, so none belongs to the core.
 module handshake
 
 // TLSHandshake exposes only operations needed by the TLS record layer.
@@ -284,8 +282,9 @@ fn (mut h TLSHandshake) wipe_record_keys_at(level EncryptionLevel) {
 	}
 }
 
-// wipe_record_keys clears both cached generations.
+// wipe_record_keys zeroes both cached generations through the level accessor, so
+// what wiping a level means is defined in exactly one place.
 fn (mut h TLSHandshake) wipe_record_keys() {
-	h.hsk_keys.wipe()
-	h.app_keys.wipe()
+	h.wipe_record_keys_at(.handshake)
+	h.wipe_record_keys_at(.application)
 }

@@ -1,11 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
 // keys.v is the fakeserver's private copy of the RFC 8446 §7.1 key-schedule
-// primitives (HKDF-Extract/Expand/Expand-Label, Derive-Secret, traffic keys,
-// Finished verify_data), pinned to SHA-256 — the hash TLS_AES_128_GCM_SHA256 and
-// TLS_CHACHA20_POLY1305_SHA256 share, differing only in the AEAD key length that
-// traffic_keys takes per suite. It does NOT import tls.handshake: that would form
-// an import cycle with the handshake tests.
+// primitives, pinned to SHA-256 — the hash its two suites share, differing only in
+// AEAD key length. It does NOT import tls.handshake, which would form an import
+// cycle with the handshake tests.
 module fakeserver
 
 import crypto.hmac

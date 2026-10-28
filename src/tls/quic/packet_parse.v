@@ -1,11 +1,10 @@
 // Copyright (c) 2026 blackshirt.
 //
-// packet_parse.v extracts the *fixed* region of a long header — everything
-// before the packet number — without trusting the protected bits. Long-header
-// packet protection (RFC 9001 §5.4.1) only masks the first byte's low nibble
-// and the packet number, so the version, connection IDs, token and length field
-// are all readable before deprotection. This lets the engine locate the packet
-// number and the AEAD sample without first guessing their length.
+// packet_parse.v extracts the fixed region of a long header — everything before the
+// packet number — without trusting the protected bits. Header protection (RFC 9001
+// §5.4.1) masks only the first byte's low nibble and the packet number, so version,
+// connection IDs, token and length are readable before deprotection, letting the
+// engine locate the packet number and AEAD sample without guessing their length.
 module quic
 
 // LongPacketMeta is the framing a receiver can recover from a long header

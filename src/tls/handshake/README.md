@@ -43,9 +43,12 @@ CA bundle.
 ## File map
 
 ```
-state_machine.v       the whole shared HandshakeCore: states, the private EncryptionLevel,
-                      HandshakeOptions, create_client_hello, phase-named receives,
-                      ServerHello/HRR transition, encrypted flight
+state_machine.v       the shared core vocabulary + HandshakeCore: states, the private
+                      EncryptionLevel, HandshakeOptions, the struct + constructor, the state
+                      cursor, the failure primitives, create_client_hello
+reassembly.v          the per-level intake buffers (ReassemblyBuffers): append, drain, release
+flight.v              receive/dispatch routing, the ServerHello/HRR transition, the encrypted
+                      flight handlers
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
 tls_handshake.v       TLS record facade: curated core forwarders, phase-named receive, backlog,
@@ -71,9 +74,11 @@ Each `*_test.v` sits beside its source.
 ## Lifecycle and safety invariants
 
 - **Secret zeroization.** Every terminal path funnels through one teardown that pairs
-  `fail_and_zeroize_secrets()` with a wipe of the adapter's own key holders, so no path clears one
-  layer and forgets the other. Clearing verbs are tiered: `wipe_*` (zero bytes/handles), `zeroize_*`
-  (secret material under §7.5 lifecycle rules), `destroy_*` (whole-adapter teardown).
+  `fail_and_zeroize_secrets()` with a wipe of the adapter's own key holders, so no path wipes one
+  layer and forgets the other. Clearing verbs form four tiers: `release_*` (drop a whole
+  handle/slot/buffer not itself scrubbed), `wipe_*` (zero bytes/handles then drop), `zeroize_*`
+  (secret material under §7.5 lifecycle rules), `destroy_*` (whole-adapter teardown); `take_*`
+  is orthogonal (an ownership move, not a clear).
 - **Atomic failure classification.** The private `classify_failure(alert, message)` pins the alert
   `failure_alert()` will surface, zeroizes secrets, and returns the error — a peer-triggered decode
   error always both tears down and reports the RFC-correct alert, never a stale default. `fail_with()`

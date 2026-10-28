@@ -1,10 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// QuicHandshake is the QUIC adapter facade over shared TLS handshake
-// semantics. QUIC derives packet protection from the exported traffic secrets,
-// so the raw-secret accessors peer_handshake_secrets() / peer_application_secrets()
-// live here: the record facade caches flat record-key fields instead and has no
-// caller for them.
+// QuicHandshake is the QUIC adapter facade over shared TLS handshake semantics.
+// QUIC derives packet protection from the exported traffic secrets, so the
+// raw-secret accessors live here — the record facade caches record keys instead and
+// has no caller for them.
 module handshake
 
 // QuicHandshake exposes only operations needed by a QUIC adapter.
@@ -80,22 +79,17 @@ pub fn (mut h QuicHandshake) receive_handshake_bytes(bytes []u8) ![]HandshakeMes
 	return h.receive_msgs_at_level(.handshake, bytes)!
 }
 
-// zeroize_traffic_secrets_at destroys one level's traffic secrets after use (§7.5).
-// Module-private: the engine calls the phase-named forwarders below.
-fn (mut h QuicHandshake) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
-	h.HandshakeCore.zeroize_traffic_secrets_at(level)!
-}
-
 // zeroize_handshake_secrets releases the handshake traffic secrets once the engine
 // has finished using the Handshake packet keys (RFC 8446 §7.5, RFC 9001 §4.9.2).
+// QUIC caches no record keys, so it reaches the core guard directly.
 pub fn (mut h QuicHandshake) zeroize_handshake_secrets() ! {
-	h.zeroize_traffic_secrets_at(.handshake)!
+	h.HandshakeCore.zeroize_traffic_secrets_at(.handshake)!
 }
 
 // zeroize_application_secrets releases the application traffic secrets — the
 // terminal teardown at close() (§7.5).
 pub fn (mut h QuicHandshake) zeroize_application_secrets() ! {
-	h.zeroize_traffic_secrets_at(.application)!
+	h.HandshakeCore.zeroize_traffic_secrets_at(.application)!
 }
 
 // fail_and_zeroize_secrets wipes every secret and parks the machine in .failed (§7.5).
