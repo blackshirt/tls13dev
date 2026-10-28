@@ -3,8 +3,8 @@
 // TLSHandshake is the TLS record adapter facade over shared handshake
 // semantics. Record traffic keys (held as flat []u8 fields keyed by
 // c_/s_ direction and hsk_/app_ phase), TLS KeyUpdate state, and the record-side
-// reassembly hooks (unconsumed_bytes / take_buffered_handshake_bytes) live
-// here — none of them has a QUIC caller, so none belongs to the core.
+// reassembly hooks (initial_backlog / handshake_backlog / take_buffered_handshake_bytes)
+// live here — none of them has a QUIC caller, so none belongs to the core.
 module handshake
 
 // TLSHandshake exposes only operations needed by the TLS record layer.
@@ -69,8 +69,11 @@ pub fn (mut h TLSHandshake) create_client_hello() ![]u8 {
 }
 
 // receive_msgs_at_level feeds TLS handshake bytes at one encryption level and returns
-// any complete outbound handshake messages triggered by the input.
-pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+// any complete outbound handshake messages triggered by the input. Module-private:
+// the phase type is an implementation detail, so adapters call the phase-named
+// receive_initial_bytes() / receive_handshake_bytes() below, which add the same
+// TLS record-key sync and failure wipe.
+fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	messages := h.HandshakeCore.receive_msgs_at_level(level, bytes) or {
 		if h.state() == .failed {
 			h.wipe_record_keys()
@@ -84,11 +87,27 @@ pub fn (mut h TLSHandshake) receive_msgs_at_level(level EncryptionLevel, bytes [
 	return messages
 }
 
-// unconsumed_bytes reports bytes the core's reassembly retained after complete
-// TLS messages were consumed. Record-path scope: only the TLS adapter enforces
-// the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO stream.
-pub fn (h &TLSHandshake) unconsumed_bytes(level EncryptionLevel) int {
-	return h.buffers.len(level)
+// receive_initial_bytes feeds pre-ServerHello (plaintext) handshake bytes.
+pub fn (mut h TLSHandshake) receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
+	return h.receive_msgs_at_level(.initial, bytes)!
+}
+
+// receive_handshake_bytes feeds bytes protected by the handshake traffic keys.
+pub fn (mut h TLSHandshake) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
+	return h.receive_msgs_at_level(.handshake, bytes)!
+}
+
+// initial_backlog reports bytes the core's initial-phase reassembly retained after
+// complete TLS messages were consumed. Record-path scope: only the TLS adapter
+// enforces the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO stream.
+pub fn (h &TLSHandshake) initial_backlog() int {
+	return h.buffers.len(.initial)
+}
+
+// handshake_backlog reports bytes the core's handshake-phase reassembly retained —
+// the drain check the record adapter runs once the encrypted flight is consumed.
+pub fn (h &TLSHandshake) handshake_backlog() int {
+	return h.buffers.len(.handshake)
 }
 
 // take_buffered_handshake_bytes moves whatever the core's drain_at() left buffered at
@@ -100,10 +119,11 @@ pub fn (mut h TLSHandshake) take_buffered_handshake_bytes() []u8 {
 
 // record_traffic_keys_at returns independent copies of the cached client/server
 // record key and IV bytes at one TLS encryption level, ordered as
-// (client_key, client_iv, server_key, server_iv). The flat key fields stay
-// module-internal: the tls record layer receives plain []u8, never a named
-// key handle.
-pub fn (h &TLSHandshake) record_traffic_keys_at(level EncryptionLevel) !([]u8, []u8, []u8, []u8) {
+// (client_key, client_iv, server_key, server_iv). Module-private: the flat key
+// fields stay internal and the tls record layer receives plain []u8, never a named
+// key handle, through the phase-named handshake_record_keys() /
+// application_record_keys() below.
+fn (h &TLSHandshake) record_traffic_keys_at(level EncryptionLevel) !([]u8, []u8, []u8, []u8) {
 	if level == .initial {
 		return error('handshake: initial level has no traffic keys')
 	}
@@ -114,7 +134,7 @@ pub fn (h &TLSHandshake) record_traffic_keys_at(level EncryptionLevel) !([]u8, [
 	}
 	if !keys_ready {
 		if level == .handshake {
-			return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_traffic_secrets_at(.handshake))')
+			return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_secrets())')
 		}
 		return error('handshake: application traffic keys unavailable before the server Finished')
 	}
@@ -122,6 +142,20 @@ pub fn (h &TLSHandshake) record_traffic_keys_at(level EncryptionLevel) !([]u8, [
 		return h.c_hsk_key.clone(), h.c_hsk_iv.clone(), h.s_hsk_key.clone(), h.s_hsk_iv.clone()
 	}
 	return h.c_app_key.clone(), h.c_app_iv.clone(), h.s_app_key.clone(), h.s_app_iv.clone()
+}
+
+// handshake_record_keys returns the cached handshake-level (client_key, client_iv,
+// server_key, server_iv) copies the record layer installs.
+pub fn (h &TLSHandshake) handshake_record_keys() !([]u8, []u8, []u8, []u8) {
+	ck, civ, sk, siv := h.record_traffic_keys_at(.handshake)!
+	return ck, civ, sk, siv
+}
+
+// application_record_keys returns the cached application-level (client_key,
+// client_iv, server_key, server_iv) copies, the pair a KeyUpdate re-keys.
+pub fn (h &TLSHandshake) application_record_keys() !([]u8, []u8, []u8, []u8) {
+	ck, civ, sk, siv := h.record_traffic_keys_at(.application)!
+	return ck, civ, sk, siv
 }
 
 // update_traffic_keys updates one direction's application traffic keys around a
@@ -137,7 +171,7 @@ pub fn (mut h TLSHandshake) update_traffic_keys(is_server bool) ! {
 	}
 	secret := if is_server { h.s_app_tsec } else { h.c_app_tsec }
 	if secret.len == 0 {
-		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_traffic_secrets_at(.application))')
+		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_application_secrets())')
 	}
 	next_secret, next_key, next_iv := derive_updated_traffic_keys(h.hash_algo, h.key_len, secret) or {
 		h.fail_and_zeroize_secrets()
@@ -171,11 +205,23 @@ pub fn (mut h TLSHandshake) fail_and_zeroize_secrets() {
 
 // zeroize_traffic_secrets_at destroys the traffic secrets for one encryption level
 // plus that level's cached record keys; valid only after .connected (core guard)
-// and the initial level is refused. Used both for application teardown and, once
-// the record adapter no longer needs them, for the handshake keys/secrets.
-pub fn (mut h TLSHandshake) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
+// and the initial level is refused. Module-private: adapters call the phase-named
+// zeroize_handshake_secrets() / zeroize_application_secrets() below.
+fn (mut h TLSHandshake) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	h.HandshakeCore.zeroize_traffic_secrets_at(level)!
 	h.wipe_record_keys_at(level)
+}
+
+// zeroize_handshake_secrets drops the handshake traffic secrets and this facade's
+// cached handshake record keys once the record adapter no longer needs them (§7.5).
+pub fn (mut h TLSHandshake) zeroize_handshake_secrets() ! {
+	h.zeroize_traffic_secrets_at(.handshake)!
+}
+
+// zeroize_application_secrets drops the application traffic secrets and this
+// facade's cached application record keys — the terminal teardown at close() (§7.5).
+pub fn (mut h TLSHandshake) zeroize_application_secrets() ! {
+	h.zeroize_traffic_secrets_at(.application)!
 }
 
 // derive_updated_traffic_keys performs the TLS KeyUpdate "traffic upd" derivation:

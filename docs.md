@@ -139,7 +139,7 @@ is test-only scaffolding — both are listed in the table below.
 | `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal strict DER reader and X.509 v3 decoding behind element-count guards, RFC 5280 chain building to a trusted root with name-constraint enforcement, RFC 6125 hostname matching, RSA/PSS/ECDSA/Ed25519 signature verification, and system trust-bundle loading. The rejection rules are enumerated in §4.3; `TrustStore` is public so `Config.root_cas` can be populated. |
 | `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `passthrough.v`, `state_machine.v`, `key_exchange.v`, `client_hello.v`, `server_hello.v`, `server_flight.v`, `post_handshake.v`, `tls_handshake.v`, `quic_handshake.v` | The transport-neutral core: RFC 8446 §4 message structures and the running Transcript-Hash (§4.4.1), the §7.1 HKDF ladder and phase derivations with the retained secret holders and their §7.5 lifecycle (`key_schedule.v`), AEAD constructors (`aead.v`), the CertificateVerify check (`certificate_verify.v`), the shared alert vocabulary with the RFC 9001 §4.8 mapping (`alert.v`), recordless CRYPTO-stream reassembly (`passthrough.v`), and post-handshake NewSessionTicket/KeyUpdate parsing (`post_handshake.v`). `state_machine.v` holds the entire shared `HandshakeCore` — sequencing over the public `HandshakeState` cursor (the RFC 8446 Appendix A.1 client states, plus an implementation `failed` terminal), the ServerHello/HRR and encrypted-flight transitions — with its ephemeral ECDHE methods in `key_exchange.v` and its derived-secret holders and lifecycle in `key_schedule.v` — and owns the key ratchet behind the `pub` seam; facade-exclusive methods live on the facades, never promoted from it — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. Facade choice at construction fixes the transport (§1.5); secret-hygiene timing is in §2.1 and the source preambles. |
 | `tls` | `record.v`, `record_protection.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `Record` frame, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side framing helpers (`new_record`, `change_cipher_spec`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `passthrough.v`. |
-| `tls` | `conn.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, the caller-facing `Config`/`default_config()`, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `TLSProtection` installation from `record_traffic_keys_at()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits). |
+| `tls` | `conn.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, the caller-facing `Config`/`default_config()`, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, `TLSProtection` installation from `handshake_record_keys()` / `application_record_keys()`, and the §5.1 ServerHello record-boundary check all live here, alongside the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits). |
 | `tls.quic` | `engine.v`, `config.v`, `packet.v`, `packet_parse.v`, `protection.v`, `initial_keys.v`, `frame.v`, `varint.v`, `cid.v`, `reasm.v`, `transport_params.v` | The QUIC client engine (RFC 9000/9001): the eight-step loop driving `tls.handshake` through the recordless `QuicHandshake` facade, long/short header (de)serialization and sample-based packet + header protection, Initial-key derivation from the original DCID, CRYPTO-stream reassembly, varints, frames, and the `original_destination_connection_id`-guarded transport parameters. Construction and the protection layers never import `tls`; see [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). |
 | `tls.fakeserver` | `server.v`, `fixtures.v`, `keys.v` | Test-only adaptive TLS 1.3 server flight generator: builds a spec-conformant server response — full flight or HelloRetryRequest — from the client's actual ClientHello so the end-to-end tests can drive the real client byte by byte. Ships no library API. |
 
@@ -224,37 +224,46 @@ building a QUIC adapter. The API contract is documented in
 new_tls_handshake(server_name string, options HandshakeOptions) !TLSHandshake
 new_quic_handshake(server_name string, options HandshakeOptions) !QuicHandshake
 (mut h) create_client_hello() ![]u8
-(mut h) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage
+(mut h) receive_initial_bytes(bytes []u8) ![]HandshakeMessage    // pre-ServerHello phase
+(mut h) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage  // handshake-key phase
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
      (h) failure_alert() AlertDescription
 (mut h) fail_and_zeroize_secrets()   // bulk, unguarded; wipes everything and parks .failed
-(mut h) zeroize_traffic_secrets_at(level EncryptionLevel) !   // guarded per-level teardown: .handshake or .application
+(mut h) zeroize_handshake_secrets() !    // guarded teardown of the handshake-phase secrets
+(mut h) zeroize_application_secrets() !  // guarded teardown of the application-phase secrets
 
 // TLS record path (hooks defined on the TLSHandshake facade itself)
-     (h) unconsumed_bytes(level EncryptionLevel) int                         // §5.1 ServerHello record-boundary hook
-     (h) record_traffic_keys_at(level EncryptionLevel) !([]u8, []u8, []u8, []u8)   // client_key, client_iv, server_key, server_iv
+     (h) initial_backlog() int   /   (h) handshake_backlog() int   // §5.1 ServerHello record-boundary hook
+     (h) handshake_record_keys() !([]u8, []u8, []u8, []u8)         // client_key, client_iv, server_key, server_iv
+     (h) application_record_keys() !([]u8, []u8, []u8, []u8)       // same four values, application phase
 (mut h) update_traffic_keys(is_server bool) !   // §7.2 key update: true = read/server leg, false = write/client leg
 
 // QUIC path (accessors defined on the QuicHandshake facade itself)
-     (h) peer_traffic_secrets_at(level EncryptionLevel) !([]u8, []u8)   // raw client/server traffic secrets; the adapter expands RFC 9001 §5.1 packet keys itself
+     (h) peer_handshake_secrets() !([]u8, []u8)   /   (h) peer_application_secrets() !([]u8, []u8)   // raw client/server traffic secrets; the adapter expands RFC 9001 §5.1 packet keys itself
+
+// outbound message routing (both transports)
+     (m) is_initial() bool   // the only phase fact the public seam exposes: true = pre-ServerHello
 ```
 
-- **`EncryptionLevel`** (`initial`/`handshake`/`application`) gives handshake
-  input and derived traffic secrets one shared phase vocabulary, independent of
-  transport packet levels. `.initial` means the initial TLS handshake phase
-  before handshake keys are installed; it is not QUIC Initial packet
-  protection. `receive_msgs_at_level()` accepts only initial and handshake input, buffering
-  each separately; traffic-key/secret access accepts handshake or application.
-  QUIC Initial packet keys derive from the destination connection ID and are
+- **The protection phases are module-private.** `EncryptionLevel`
+  (`initial`/`handshake`/`application`) still gives handshake input and derived
+  traffic secrets one shared vocabulary *inside* `tls.handshake`, but it is an
+  implementation detail: the public seam names the phase in the method —
+  `receive_initial_bytes()`, `handshake_record_keys()`, `peer_application_secrets()`,
+  `zeroize_handshake_secrets()` — so no adapter ever builds or matches on a level
+  value. `HandshakeMessage.is_initial()` is the single phase fact adapters may
+  read, and only to pick a transmit queue. The initial phase means the
+  pre-ServerHello TLS handshake stage; it is not QUIC Initial packet
+  protection. QUIC Initial packet keys derive from the destination connection ID and are
   not part of this TLS secret API.
 - **Keys stay adapter-owned.** `TLSHandshake` caches its flat record-key fields
   and implements the TLS KeyUpdate derivation. `QuicHandshake` exposes TLS traffic
   secrets for RFC 9001 packet-key derivation; the QUIC engine owns packet keys
   and QUIC key updates.
 - **Lifecycle and framing stay explicit.** Both facades share failure cleanup
-  and handshake-secret zeroization. The reassembly count the record adapter
-  needs for the TLS ServerHello record-boundary rule lives on the
-  `TLSHandshake` facade as `unconsumed_bytes()` — it and
+  and handshake-secret zeroization. The reassembly counts the record adapter
+  needs for the TLS ServerHello record-boundary rule live on the
+  `TLSHandshake` facade as `initial_backlog()` / `handshake_backlog()` — they and
   `take_buffered_handshake_bytes()` have no QUIC caller; QUIC maps alert
   descriptions to QUIC connection errors.
 
@@ -319,7 +328,7 @@ Behavior and guarantees:
 - <span style="color:#2ea44f">**Forward secrecy of retained secrets**</span> — the
   handshake secret and ephemeral X25519 / P-256 private keys are released when
   the state machine reaches `.connected`. Handshake traffic secrets remain
-  until `zeroize_traffic_secrets_at(.handshake)` because QUIC may still need them;
+  until `zeroize_handshake_secrets()` because QUIC may still need them;
   application traffic secrets are released at `close()` or on a fatal alert.
   The §7.1 derivations also zeroize their own in-function intermediates — the
   Early and Master secrets, the `derived` seeds, every HKDF-Expand round input,

@@ -41,9 +41,12 @@ pub struct HandshakeMessage {
 	msg   []u8            // complete handshake message bytes, including the header
 }
 
-// level returns the TLS protection phase this message belongs to.
-pub fn (m &HandshakeMessage) level() EncryptionLevel {
-	return m.level
+// is_initial reports whether this outbound message belongs to the pre-ServerHello
+// (plaintext) phase; a false result means it is protected by handshake keys. It is
+// the only phase fact adapters need in order to pick a transmit queue — the phase
+// itself is a module-private EncryptionLevel, so it is not exposed as an accessor.
+pub fn (m &HandshakeMessage) is_initial() bool {
+	return m.level == .initial
 }
 
 // msg returns the complete handshake message bytes (4-byte header included).
@@ -62,7 +65,9 @@ fn new_handshake_message(level EncryptionLevel, msg []u8) !HandshakeMessage {
 
 // EncryptionLevel names TLS protection phases shared by handshake messages
 // and traffic-secret access, independent of transport packet or record levels.
-pub enum EncryptionLevel {
+// Module-private: adapters reach each phase through the facades' phase-named
+// methods, so the phase vocabulary stays an implementation detail.
+enum EncryptionLevel {
 	initial     // handshake messages sent before handshake keys are available
 	handshake   // messages protected with handshake traffic keys
 	application // data protected with application traffic keys
@@ -338,10 +343,10 @@ fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 // .wait_sh and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
 fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	// A second call would replay the first ClientHello into the transcript and
-	// corrupt every later hash; the retry ClientHello has its own path via
-	// receive_msgs_at_level().
+	// corrupt every later hash; the retry ClientHello has its own path, produced
+	// while a HelloRetryRequest is fed.
 	if h.state != HandshakeState.start {
-		return error('handshake: create_client_hello() only runs once (state: ${h.state()}); the retry ClientHello is produced by receive_msgs_at_level() during HelloRetryRequest handling')
+		return error('handshake: create_client_hello() only runs once (state: ${h.state()}); the retry ClientHello is produced while a HelloRetryRequest is fed')
 	}
 	_, full_client_hello := build_client_hello(h.config)!
 	h.update_transcript(full_client_hello)!
@@ -352,18 +357,20 @@ fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 
 // receive_msgs_at_level processes bytes using the encryption-level reassembly buffers
 // owned by the selected transport facade, returning any outbound messages triggered.
-// Initial-level input is accepted only while awaiting ServerHello; handshake-level
-// input is accepted only between ServerHello and Finished. Phase misuse is rejected
-// without consuming bytes or changing state.
+// Module-private: adapters reach it through their phase-named receive_initial_bytes()
+// and receive_handshake_bytes() entry points. Initial-level input is accepted only
+// while awaiting ServerHello; handshake-level input is accepted only between
+// ServerHello and Finished. Phase misuse is rejected without consuming bytes or
+// changing state.
 fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == HandshakeState.start {
-		return error('handshake: receive_msgs_at_level() before create_client_hello() — no ClientHello has been sent yet')
+		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
 	}
 	if h.state == HandshakeState.failed {
-		return error('handshake: state machine has failed; receive_msgs_at_level() refuses further messages')
+		return error('handshake: state machine has failed; further handshake bytes are refused')
 	}
 	if level == .application {
-		return error('handshake: receive_msgs_at_level() does not accept application-level bytes')
+		return error('handshake: the handshake core does not accept application-level bytes')
 	}
 	if !h.level_is_open(level) {
 		msg := if level == .handshake {
@@ -490,8 +497,6 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 		}
 	}
 }
-
-//  ServerHello / HelloRetryRequest transition (RFC 8446 §4.1.3/§4.1.4)
 
 // handle_server_hello_message consumes one complete initial-level ServerHello
 // or HelloRetryRequest and returns the follow-up messages (RFC 8446 §4.1.3).

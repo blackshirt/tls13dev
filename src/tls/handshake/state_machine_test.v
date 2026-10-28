@@ -1,8 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Core-contract suite for the transport-neutral handshake: level-tagged receive_msgs_at_level()
-// reassembly across adversarial splits, the unconsumed-bytes accessor, the
-// confirm/zeroize secret lifecycle, and the traffic-keys guards.
+// Core-contract suite for the transport-neutral handshake: phase-named
+// receive_initial_bytes()/receive_handshake_bytes() reassembly across adversarial
+// splits, the backlog accessors, the confirm/zeroize secret lifecycle, and the
+// record-key guards.
 module handshake
 
 import tls.pki
@@ -93,7 +94,7 @@ fn test_new_handshake_message_rejects_truncated_header() ! {
 	assert false
 }
 
-// ---- receive_msgs_at_level() reassembly: split and coalesced delivery ----
+// ---- receive_initial_bytes()/receive_handshake_bytes() reassembly: split and coalesced delivery ----
 
 // test_feed_initial_buffers_incomplete_message checks that an incomplete
 // ServerHello parks in the initial-level buffer without parsing.
@@ -104,29 +105,29 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 	full := wrap_hsk(.server_hello, []u8{len: 10, init: 0xAA})
 	split := full.len / 2
 
-	first := h.receive_msgs_at_level(.initial, full[..split])!
+	first := h.receive_initial_bytes(full[..split])!
 	assert first.len == 0
-	assert h.unconsumed_bytes(.initial) == split
+	assert h.initial_backlog() == split
 
 	// Completing the frame consumes it; the garbage body then fails to parse.
-	h.receive_msgs_at_level(.initial, full[split..]) or {
-		assert h.unconsumed_bytes(.initial) == 0
+	h.receive_initial_bytes(full[split..]) or {
+		assert h.initial_backlog() == 0
 		return
 	}
 	assert false // a garbage ServerHello body must never parse cleanly
 }
 
-// test_unconsumed_bytes_levels_start_empty checks that both handshake
+// test_backlog_tracks_parked_fragment checks that both handshake
 // reassembly buffers start empty and the accessor tracks a parked fragment.
-fn test_unconsumed_bytes_levels_start_empty() ! {
+fn test_backlog_tracks_parked_fragment() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	assert h.unconsumed_bytes(.handshake) == 0
-	assert h.unconsumed_bytes(.initial) == 0
+	assert h.handshake_backlog() == 0
+	assert h.initial_backlog() == 0
 	_ = h.create_client_hello()!
 	h.HandshakeCore.state = .wait_ee
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
-	_ = h.receive_msgs_at_level(.handshake, [u8(2), 0x00])!
-	assert h.unconsumed_bytes(.handshake) == 2
+	_ = h.receive_handshake_bytes([u8(2), 0x00])!
+	assert h.handshake_backlog() == 2
 }
 
 // ---- state machine accessor ----
@@ -360,14 +361,14 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	_ = record.create_client_hello()!
 	_ = quic.create_client_hello()!
 
-	_ = record.receive_msgs_at_level(.initial, [u8(2), 0])!
-	_ = quic.receive_msgs_at_level(.initial, [u8(2)])!
+	_ = record.receive_initial_bytes([u8(2), 0])!
+	_ = quic.receive_initial_bytes([u8(2)])!
 
 	assert record.HandshakeCore.buffers.initial.len == 2
 	assert quic.HandshakeCore.buffers.initial.len == 1
-	assert record.unconsumed_bytes(.initial) == 2
+	assert record.initial_backlog() == 2
 	record.fail_and_zeroize_secrets()
-	assert record.unconsumed_bytes(.initial) == 0
+	assert record.initial_backlog() == 0
 	assert quic.HandshakeCore.buffers.initial.len == 1
 }
 
@@ -386,16 +387,16 @@ fn test_feed_rejects_out_of_order_message() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	cert := wrap_hsk(.certificate, []u8{len: 4, init: 0x01})
-	h.receive_msgs_at_level(.handshake, cert) or {
+	h.receive_handshake_bytes(cert) or {
 		assert err.msg().contains('only expected after ServerHello')
-		assert h.unconsumed_bytes(.handshake) == 0
+		assert h.handshake_backlog() == 0
 		assert h.state() == .wait_sh
 		return
 	}
 	assert false
 }
 
-// ---- receive_msgs_at_level() phase guards & failure semantics ----
+// ---- receive_initial_bytes()/receive_handshake_bytes() phase guards & failure semantics ----
 
 // test_create_client_hello_only_runs_once checks that the single-shot entry
 // point refuses a second call that would poison the transcript.
@@ -414,8 +415,8 @@ fn test_create_client_hello_only_runs_once() ! {
 // ClientHello are refused as a contract error, leaving the state .start.
 fn test_feed_before_client_hello_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.receive_msgs_at_level(.initial, wrap_hsk(.server_hello, []u8{len: 4})) or {
-		assert err.msg().contains('receive_msgs_at_level() before create_client_hello()')
+	h.receive_initial_bytes(wrap_hsk(.server_hello, []u8{len: 4})) or {
+		assert err.msg().contains('before create_client_hello()')
 		assert h.state() == .start
 		return
 	}
@@ -428,7 +429,7 @@ fn test_feed_initial_after_server_hello_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.HandshakeCore.state = .wait_ee
-	h.receive_msgs_at_level(.initial, wrap_hsk(.server_hello, []u8{len: 4})) or {
+	h.receive_initial_bytes(wrap_hsk(.server_hello, []u8{len: 4})) or {
 		assert err.msg().contains('while awaiting ServerHello')
 		assert h.state() == .wait_ee
 		return
@@ -443,10 +444,10 @@ fn test_feed_marks_failed_and_refuses_after_protocol_error() ! {
 	_ = h.create_client_hello()!
 	// A garbage ServerHello body fails to parse; the failure is terminal.
 	bad := wrap_hsk(.server_hello, []u8{len: 8, init: 0x01})
-	h.receive_msgs_at_level(.initial, bad) or {
+	h.receive_initial_bytes(bad) or {
 		assert h.state() == .failed
-		// No later receive_msgs_at_level() may make progress against a dead machine.
-		h.receive_msgs_at_level(.initial, bad) or {
+		// No later phase-named receive may make progress against a dead machine.
+		h.receive_initial_bytes(bad) or {
 			assert err.msg().contains('state machine has failed')
 			return
 		}
@@ -468,7 +469,7 @@ fn test_class_a_failure_zeroizes_and_parks_failed() ! {
 	h.s_hsk_tsec = [u8(4), 5, 6]
 	h.HandshakeCore.state = .wait_ee
 	// Class A: a Certificate is illegal while EncryptedExtensions is awaited (unexpected_message).
-	h.receive_msgs_at_level(.handshake, wrap_hsk(.certificate, []u8{len: 4, init: 0x01})) or {
+	h.receive_handshake_bytes(wrap_hsk(.certificate, []u8{len: 4, init: 0x01})) or {
 		assert h.state() == .failed
 		assert h.handshake_secret.len == 0
 		assert h.c_hsk_tsec.len == 0
@@ -489,7 +490,7 @@ fn test_class_b_parse_failure_zeroizes_and_reports_decode_error() ! {
 	h.c_hsk_tsec = [u8(1), 2, 3]
 	h.HandshakeCore.state = .wait_cert
 	// Class B: a malformed Certificate body fails to decode while in the right state.
-	h.receive_msgs_at_level(.handshake, wrap_hsk(.certificate, []u8{len: 8, init: 0x01})) or {
+	h.receive_handshake_bytes(wrap_hsk(.certificate, []u8{len: 8, init: 0x01})) or {
 		assert h.state() == .failed
 		assert h.failure_alert() == .decode_error
 		assert h.handshake_secret.len == 0
@@ -506,7 +507,7 @@ fn test_malformed_finished_reports_decode_error() ! {
 	_ = h.create_client_hello()!
 	h.s_hsk_tsec = [u8(1), 2, 3]
 	h.HandshakeCore.state = .wait_finished
-	h.receive_msgs_at_level(.handshake, wrap_hsk(.finished, []u8{len: 4, init: 0xab})) or {
+	h.receive_handshake_bytes(wrap_hsk(.finished, []u8{len: 4, init: 0xab})) or {
 		assert h.state() == .failed
 		assert h.failure_alert() == .decode_error
 		return
@@ -520,23 +521,23 @@ fn test_feed_handshake_level_after_connected_refused() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
 	h.HandshakeCore.state = HandshakeState.connected
-	h.receive_msgs_at_level(.handshake, wrap_hsk(.new_session_ticket, [u8(0)])) or {
+	h.receive_handshake_bytes(wrap_hsk(.new_session_ticket, [u8(0)])) or {
 		assert err.msg().contains('only expected after ServerHello')
 		assert h.state() == .connected
-		assert h.unconsumed_bytes(.handshake) == 0
+		assert h.handshake_backlog() == 0
 		return
 	}
 	assert false
 }
 
-// ---- traffic_keys / peer_traffic_secrets_at lifecycle (white-box) ----
+// ---- record keys / peer secrets lifecycle (white-box) ----
 
 // test_traffic_keys_unavailable_before_derivation checks that the accessors
 // refuse until the handshake derives keys.
 fn test_traffic_keys_unavailable_before_derivation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	_ = h.create_client_hello()!
-	_, _, _, _ := h.record_traffic_keys_at(.handshake) or {
+	_, _, _, _ := h.handshake_record_keys() or {
 		return
 	}
 	assert false
@@ -551,7 +552,7 @@ fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	h.s_app_iv = [u8(4)]
 	h.HandshakeCore.state = HandshakeState.connected
 
-	h.receive_msgs_at_level(.initial, [u8(0)]) or {
+	h.receive_initial_bytes([u8(0)]) or {
 		assert err.msg().contains('only expected while awaiting ServerHello')
 		assert h.state() == .connected
 		assert h.c_app_key.len == 1
@@ -561,8 +562,8 @@ fn test_nonfatal_receive_error_preserves_record_keys() ! {
 	assert false
 }
 
-// test_zeroize_traffic_secrets_handshake drops cached handshake keys and secrets.
-fn test_zeroize_traffic_secrets_handshake() ! {
+// test_zeroize_handshake_secrets_drops_keys drops cached handshake keys and secrets.
+fn test_zeroize_handshake_secrets_drops_keys() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.c_hsk_tsec = [u8(1), 2, 3]
 	h.s_hsk_tsec = [u8(4), 5, 6]
@@ -572,27 +573,27 @@ fn test_zeroize_traffic_secrets_handshake() ! {
 	h.s_hsk_iv = [u8(10)]
 	h.HandshakeCore.state = HandshakeState.connected
 
-	h.zeroize_traffic_secrets_at(.handshake)!
+	h.zeroize_handshake_secrets()!
 
 	assert h.c_hsk_tsec.len == 0
 	assert h.s_hsk_tsec.len == 0
 	assert h.c_hsk_key.len == 0
 	assert h.s_hsk_key.len == 0
 	// Handshake keys/secrets are gone: the record accessor now refuses.
-	_, _, _, _ := h.record_traffic_keys_at(.handshake) or {
+	_, _, _, _ := h.handshake_record_keys() or {
 		return
 	}
 	assert false
 }
 
-// test_zeroize_traffic_secrets_handshake_requires_connected_state checks that
+// test_zeroize_handshake_secrets_requires_connected_state checks that
 // early cleanup is refused with nothing wiped.
-fn test_zeroize_traffic_secrets_handshake_requires_connected_state() ! {
+fn test_zeroize_handshake_secrets_requires_connected_state() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.c_hsk_tsec = [u8(1), 2, 3]
 	h.c_hsk_key = [u8(7)]
 	h.c_hsk_iv = [u8(8)]
-	h.zeroize_traffic_secrets_at(.handshake) or {
+	h.zeroize_handshake_secrets() or {
 		assert err.msg().contains('reaches .connected')
 		assert h.c_hsk_tsec.len == 3
 		assert h.c_hsk_key.len == 1
@@ -601,9 +602,9 @@ fn test_zeroize_traffic_secrets_handshake_requires_connected_state() ! {
 	assert false
 }
 
-// test_zeroize_traffic_secrets_application_clears_and_refuses checks that zeroization forgets
+// test_zeroize_application_secrets_clears_and_refuses checks that zeroization forgets
 // the application secrets and their cached keys (§7.5).
-fn test_zeroize_traffic_secrets_application_clears_and_refuses() ! {
+fn test_zeroize_application_secrets_clears_and_refuses() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.HandshakeCore.state = HandshakeState.connected
 	h.c_app_tsec = [u8(11), 12]
@@ -613,7 +614,7 @@ fn test_zeroize_traffic_secrets_application_clears_and_refuses() ! {
 	h.s_app_key = [u8(3)]
 	h.s_app_iv = [u8(4)]
 
-	h.zeroize_traffic_secrets_at(.application)!
+	h.zeroize_application_secrets()!
 
 	assert h.c_app_tsec.len == 0
 	assert h.s_app_tsec.len == 0
@@ -621,22 +622,22 @@ fn test_zeroize_traffic_secrets_application_clears_and_refuses() ! {
 	assert h.c_app_key.len == 0
 	assert h.c_app_iv.len == 0
 	assert h.s_app_key.len == 0
-	_, _, _, _ := h.record_traffic_keys_at(.application) or {
+	_, _, _, _ := h.application_record_keys() or {
 		return
 	}
 	assert false
 }
 
-// test_zeroize_traffic_secrets_application_refuses_before_connected keeps an out-of-phase
+// test_zeroize_application_secrets_refuses_before_connected keeps an out-of-phase
 // cleanup call from silently destroying keys needed by the handshake.
-fn test_zeroize_traffic_secrets_application_refuses_before_connected() ! {
+fn test_zeroize_application_secrets_refuses_before_connected() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.c_app_tsec = [u8(11), 12]
 	h.s_app_tsec = [u8(13), 14]
 	h.c_app_key = [u8(1)]
 	h.c_app_iv = [u8(2)]
 
-	h.zeroize_traffic_secrets_at(.application) or {
+	h.zeroize_application_secrets() or {
 		assert err.msg().contains('only valid once the handshake reaches .connected')
 		assert h.state() == .start
 		assert h.c_app_tsec == [u8(11), 12]
@@ -646,9 +647,9 @@ fn test_zeroize_traffic_secrets_application_refuses_before_connected() ! {
 	assert false
 }
 
-// test_zeroize_traffic_secrets_refuses_initial checks the initial level, which has
+// test_zeroize_traffic_secrets_at_refuses_initial checks the initial level, which has
 // no TLS traffic secrets, is refused rather than silently accepted.
-fn test_zeroize_traffic_secrets_refuses_initial() ! {
+fn test_zeroize_traffic_secrets_at_refuses_initial() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.HandshakeCore.state = HandshakeState.connected
 	h.zeroize_traffic_secrets_at(.initial) or {
@@ -717,7 +718,7 @@ fn test_update_traffic_keys_derives_next_keys() ! {
 	assert h.c_app_tsec != old_client
 	assert h.s_app_tsec.len == 32
 	assert h.c_app_tsec.len == 32
-	key, _, _, _ := h.record_traffic_keys_at(.application)!
+	key, _, _, _ := h.application_record_keys()!
 	assert key.len > 0
 }
 
@@ -729,9 +730,9 @@ fn test_update_traffic_keys_refuses_after_zeroize() ! {
 	h.c_app_tsec = [u8(1), 2, 3]
 	h.c_app_key = [u8(4)]
 	h.c_app_iv = [u8(5)]
-	h.zeroize_traffic_secrets_at(.application)!
+	h.zeroize_application_secrets()!
 	h.update_traffic_keys(false) or {
-		assert err.msg().contains('destroyed by zeroize_traffic_secrets_at(.application)')
+		assert err.msg().contains('destroyed by zeroize_application_secrets()')
 		return
 	}
 	assert false
@@ -816,7 +817,7 @@ fn test_traffic_keys_returns_independent_copies() ! {
 	h.c_hsk_iv = [u8(4), 5]
 	h.s_hsk_key = [u8(6), 7]
 	h.s_hsk_iv = [u8(8)]
-	ck, civ, sk, _ := h.record_traffic_keys_at(.handshake)!
+	ck, civ, sk, _ := h.handshake_record_keys()!
 	assert unsafe { voidptr(&ck[0]) } != unsafe { voidptr(&h.c_hsk_key[0]) }
 	assert unsafe { voidptr(&civ[0]) } != unsafe { voidptr(&h.c_hsk_iv[0]) }
 	assert unsafe { voidptr(&sk[0]) } != unsafe { voidptr(&h.s_hsk_key[0]) }

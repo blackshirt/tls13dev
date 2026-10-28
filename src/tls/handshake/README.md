@@ -21,7 +21,7 @@ each of the two public transport facades re-exports only what its adapter uses, 
   TLS-over-TCP. Also derives and owns the cached TLS record keys and implements the TLS KeyUpdate
   derivation.
 - **`QuicHandshake`** (`new_quic_handshake(server_name, options)`) — the QUIC adapter. Exposes raw
-  traffic secrets for RFC 9001 key expansion instead of record keys; QUIC packet levels and CRYPTO
+  traffic secrets for RFC 9001 key expansion instead of record keys; QUIC packet types and CRYPTO
   reassembly live in the QUIC engine, not here.
 
 A caller picks its transport at construction; there is no runtime mode flag and no wrong-transport
@@ -31,7 +31,7 @@ absent from `QuicHandshake`.
 ```v
 mut hs := new_tls_handshake(server_name, opts)!   // or new_quic_handshake(...)
 client_hello := hs.create_client_hello()!
-messages := hs.receive_msgs_at_level(.initial, bytes)!
+messages := hs.receive_initial_bytes(bytes)!   // or hs.receive_handshake_bytes(bytes)!
 state := hs.state()
 ```
 
@@ -43,14 +43,15 @@ CA bundle.
 ## File map
 
 ```
-state_machine.v       the whole shared HandshakeCore: states, EncryptionLevel,
-                      HandshakeOptions, create_client_hello, receive_msgs_at_level,
+state_machine.v       the whole shared HandshakeCore: states, the private EncryptionLevel,
+                      HandshakeOptions, create_client_hello, phase-named receives,
                       ServerHello/HRR transition, encrypted flight
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
-tls_handshake.v       TLS record facade: curated core forwarders, cached record keys, KeyUpdate,
-                      reassembly hooks
-quic_handshake.v      QUIC facade: curated core forwarders, peer_traffic_secrets_at, peer transport params
+tls_handshake.v       TLS record facade: curated core forwarders, phase-named receive, backlog,
+                      record-key and zeroize seams, cached record keys, KeyUpdate
+quic_handshake.v      QUIC facade: curated core forwarders, peer_handshake_secrets and
+                      peer_application_secrets, peer transport params
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
@@ -80,8 +81,8 @@ Each `*_test.v` sits beside its source.
 - **Named phase material.** Handshake and application traffic secrets are stored as flat
   `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the TLS
   facade caches matching record-key fields (`c_hsk_key`/`c_hsk_iv`, and so on). Both
-  level buffers live in `ReassemblyBuffers`. Per-level wipe and install helpers take a whole
-  level's two directions (and each key with its nonce base) together, so they cannot be cleared or
+  phase buffers live in `ReassemblyBuffers`. Per-phase wipe and install helpers take a whole
+  phase's two directions (and each key with its nonce base) together, so they cannot be cleared or
   advanced independently.
 - **One state machine.** `HandshakeState` is the single public enum, mirroring the client
   states of RFC 8446 Appendix A.1 (`start`, `wait_sh`, `wait_ee`, `wait_cert_cr`, `wait_cert`,
@@ -91,15 +92,16 @@ Each `*_test.v` sits beside its source.
   transition, and `state()` returns the cursor directly.
 - **Key-material readiness** is queried via `available_secret_phases()` rather than inferred from
   `state()`, so a `.failed` handshake (schedule wiped) never presents stale readiness.
-- **Phase-checked input.** `receive_msgs_at_level()` accepts initial-level input only in
-  `wait_sh` and handshake-level input only while the flight is in progress (`wait_ee` through
+- **Phase-checked input.** `receive_initial_bytes()` accepts input only in
+  `wait_sh` and `receive_handshake_bytes()` only while the flight is in progress (`wait_ee` through
   `wait_finished`); out-of-phase calls are rejected without consuming input or discarding usable
-  keys.
+  keys. The phase itself is a module-private `EncryptionLevel`, so the entry points carry it in
+  their names rather than as an argument.
 - **Transcript bound.** `transcript.v` caps the running transcript (`max_transcript_len`) so a peer
   cannot grow the buffer indefinitely with legal-size records that never complete the flight.
 
 The core owns handshake ordering, transcript updates, certificate validation (via `tls.pki`), the
-key schedule, and per-level reassembly buffers. It delegates certificate trust decisions entirely to
+key schedule, and per-phase reassembly buffers. It delegates certificate trust decisions entirely to
 `tls.pki` and never touches records or packets.
 
 ## Testing

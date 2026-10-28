@@ -272,6 +272,8 @@ fn (mut h HandshakeCore) wipe_all_secrets() {
 // encryption level (and, on the record facade, that level's cached record keys)
 // once the adapter no longer needs them; it is valid only after .connected, and
 // the initial level — which has no TLS traffic secrets — is refused (RFC 8446 §7.5).
+// Module-private: adapters call their phase-named zeroize_handshake_secrets() /
+// zeroize_application_secrets() entry points.
 fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	match level {
 		.initial {
@@ -279,7 +281,7 @@ fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 		}
 		.handshake, .application {
 			if h.state != HandshakeState.connected {
-				return error('handshake: zeroize_traffic_secrets_at(${level}) is only valid once the handshake reaches .connected (state: ${h.state()})')
+				return error('handshake: zeroizing ${level} traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
 			}
 			h.wipe_traffic_secrets_at(level)
 		}

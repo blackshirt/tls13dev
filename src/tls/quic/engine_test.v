@@ -43,10 +43,13 @@ fn test_connection_close_uses_quic_varints() ! {
 	assert parsed_application.reason == 'done'.bytes()
 }
 
-fn test_quic_packet_levels_map_to_shared_handshake_phases() ! {
-	assert level_of(.initial)! == .initial
-	assert level_of(.handshake)! == .handshake
-	level_of(.one_rtt) or {
+// test_quic_packet_types_map_to_crypto_phases pins the packet-type gate that picks
+// which phase-named receive the CRYPTO bytes go to, and refuses the packet types
+// that must never carry handshake data.
+fn test_quic_packet_types_map_to_crypto_phases() ! {
+	assert crypto_is_initial(.initial)!
+	assert crypto_is_initial(.handshake)! == false
+	crypto_is_initial(.one_rtt) or {
 		assert err.msg().contains('post-handshake traffic')
 		return
 	}

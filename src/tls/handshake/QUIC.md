@@ -20,7 +20,7 @@ transcript, plus a **key schedule** that turns a shared secret into traffic
 secrets. Everything else — records, AEAD framing, sequence numbers, sockets —
 is how those messages and secrets are *carried*. RFC 9001 (TLS over QUIC)
 changes the carrier completely: handshake messages ride QUIC **CRYPTO frames**
-on three encryption levels, and packet protection is a QUIC concern, not a TLS
+on three packet levels, and packet protection is a QUIC concern, not a TLS
 record concern.
 
 The core was therefore split so that the carrier is always someone else's job:
@@ -36,8 +36,8 @@ The core was therefore split so that the carrier is always someone else's job:
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
-        │ receive_msgs_at_level                │ record_traffic_keys_at /              │ create_client_hello /
-        │                                      │ peer_traffic_secrets_at               │ receive_msgs_at_level
+        │ receive_initial_bytes                │ handshake keys / secrets             │ create_client_hello /
+        │ receive_handshake_bytes              │ application key/secrets              │ phase-named receives
         │                                      │                                      │
    ┌────┴──────────────┐              ┌───────┴───────────┐               ┌─────────┴──────────┐
    │ tls TCP adapter   │              │ a QUIC engine     │               │ tests / other      │
@@ -54,28 +54,30 @@ Two properties make this work:
    `change_cipher_spec`, `record_header_len`) keeps it that way. The core never
    encrypts, never frames a record, and never calls `read(2)`/`write(2)`.
 
-2. **The public boundary is a small, level-tagged seam.** The unit the adapter
+2. **The public boundary is a small, phase-named seam.** The unit the adapter
    exchanges with the core is a `HandshakeMessage` — a complete handshake
-   message (4-byte header included) tagged with the `EncryptionLevel` it belongs
-   to. Framing (records vs. CRYPTO frames) and protection (AEAD records vs.
-   QUIC packet protection) are entirely adapter-side.
+   message (4-byte header included) whose TLS protection phase is a
+   module-private tag. Framing (records vs. CRYPTO frames) and protection (AEAD
+   records vs. QUIC packet protection) are entirely adapter-side.
 
-`EncryptionLevel` is transport-neutral:
+The phase vocabulary is transport-neutral but stays inside the module:
 
 ```v
-pub enum EncryptionLevel {
+enum EncryptionLevel { // module-private — no public signature names it
     initial      // initial TLS handshake messages before handshake keys are installed
     handshake    // messages protected with handshake traffic keys
     application  // application traffic keys/secrets
 }
 ```
 
-Here `.initial` names the initial TLS handshake phase, not QUIC Initial packet
-protection. The QUIC engine maps Initial packet CRYPTO to `.initial` and
-Handshake packet CRYPTO to `.handshake`; it rejects 1-RTT CRYPTO because
-post-handshake messages are handled separately. The TCP adapter maps plaintext
-handshake records to `.initial` and decrypted handshake records to
-`.handshake`. QUIC packet levels and packet-number spaces remain adapter-side.
+Here the initial phase names the pre-ServerHello TLS handshake stage, not QUIC
+Initial packet protection. The QUIC engine routes Initial packet CRYPTO to
+`receive_initial_bytes()` and Handshake packet CRYPTO to
+`receive_handshake_bytes()`; it rejects 1-RTT CRYPTO because
+post-handshake messages are handled separately. The TCP adapter routes plaintext
+handshake records to `receive_initial_bytes()` and decrypted handshake records to
+`receive_handshake_bytes()`. QUIC packet levels and packet-number spaces remain
+adapter-side.
 
 QUIC handshakes include the TLS `quic_transport_parameters` extension
 (RFC 9001 §8.2). The core treats its content as opaque bytes: it rules only on
@@ -125,7 +127,7 @@ encrypted-flight message, advancing only as each message is handled; adapters ma
 poll any of these states — `conn.v` keys its record routing on `wait_sh`,
 `connected`, and `failed` — while key-material readiness comes from
 `available_secret_phases()`. `failed` is terminal: once reached,
-`receive_msgs_at_level()` refuses further input. A protocol violation moves the
+the phase-named receives refuse further input. A protocol violation moves the
 machine to `failed` and wipes all derived material (see
 `fail_and_zeroize_secrets()` in [CONTRACT.md](./CONTRACT.md)). The public
 accessors `state()`, `negotiated_alpn()`, and `negotiated_cipher_suite()` let an
@@ -139,8 +141,9 @@ the built-in TLS 1.3 defaults), `supported_groups`, `signature_algorithms`, and
 `supported_versions`. `SNI` is included for a DNS server name, and `ALPN` when
 protocols are configured.
 A HelloRetryRequest is fed as plaintext handshake input; the core switches to
-the requested group, regenerates the share, echoes any cookie, and `receive_msgs_at_level()`
-**returns the second ClientHello** (tagged `.initial`) for the adapter to send.
+the requested group, regenerates the share, echoes any cookie, and the receive
+**returns the second ClientHello** (an initial-phase message, so it goes back on
+the Initial/plaintext path) for the adapter to send.
 The transcript substitutes the first ClientHello with its
 `message_hash` (§4.4.1) so the Finished binds the whole two-round exchange.
 The retry suite is remembered (`hrr_cipher_suite`) and the final ServerHello
@@ -171,8 +174,8 @@ and key-schedule state.
 ### 3.1 Initial secrets are not the core's business
 
 QUIC derives its **Initial** packet keys from the destination connection ID
-(RFC 9001 §5.2), not from the TLS key schedule. Those packet keys are not
-represented by `EncryptionLevel`; the engine derives them itself, below this
+(RFC 9001 §5.2), not from the TLS key schedule. Those packet keys are outside
+the core's phase vocabulary; the engine derives them itself, below this
 layer. The shared handshake API starts with plaintext ServerHello processing.
 
 ### 3.2 Secrets, not record keys, cross the boundary
@@ -186,22 +189,23 @@ RFC 9001 §5.1 expansions itself:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-`peer_traffic_secrets_at(level)` (defined on the `QuicHandshake` facade itself)
-hands out `(client, server)` clones of those secrets.
-`record_traffic_keys_at(level)` is provided by `TLSHandshake`; a
-`QuicHandshake` does not expose it. A QUIC engine uses
-`peer_traffic_secrets_at()` + the public `hkdf_expand_label()`.
+`peer_handshake_secrets()` and `peer_application_secrets()` (defined on the
+`QuicHandshake` facade itself) hand out `(client, server)` clones of those
+secrets; the phase is in the method name, never an argument.
+`handshake_record_keys()` / `application_record_keys()` are provided by
+`TLSHandshake`; a `QuicHandshake` does not expose them. A QUIC engine uses
+the peer-secret accessors + the public `hkdf_expand_label()`.
 
 ### 3.3 Handshake keys survive until no longer needed
 
-A QUIC server may keep sending at the Handshake level until the client
+A QUIC server may keep sending Handshake packets until the client
 confirms the handshake with `HANDSHAKE_DONE` (RFC 9001 §4.1.2), not merely
 until the client sends its Finished. So the core deliberately retains the
 handshake traffic secrets past `.connected`; the engine owns its derived packet
 keys and, when it processes `HANDSHAKE_DONE` (§4.9.2), calls `drop_handshake_keys()`
 — a single step that zeroizes the core's `.handshake` traffic secrets *and* zeroes
 the Handshake packet-protection states together, so neither half can be forgotten.
-The TCP adapter reaches the same `zeroize_traffic_secrets_at(.handshake)` after sending
+The TCP adapter reaches the same `zeroize_handshake_secrets()` after sending
 its Finished because record-based TLS has no such window; **a QUIC engine must not**
 release them before it has finished using the Handshake packet keys. Terminal cleanup
 is centralized in `close()`, which seals the final `CONNECTION_CLOSE` first and only
@@ -227,13 +231,13 @@ CRYPTO alert path at all.
 
 ### 3.6 CRYPTO reassembly
 
-Within a level the CRYPTO stream is self-framed handshake messages
+Within a phase the CRYPTO stream is self-framed handshake messages
 (type ∥ u24 length). `next_recordless_message()` — the recordless twin of the
 record layer's parser — extracts one complete message from the front of a byte
 buffer, capping the declared length at `max_handshake_message_len` (1 MiB) from
 the header alone so a hostile peer cannot make the adapter buffer indefinitely.
 It is public precisely so an engine can reuse it engine-side. The shared core
-owns the initial- and handshake-level reassembly buffers for each handshake instance.
+owns the initial- and handshake-phase reassembly buffers for each handshake instance.
 
 ---
 
@@ -261,9 +265,9 @@ ch1 := hs.create_client_hello()!
 //    concatenate CRYPTO frame payloads into `initial_stream`.
 
 // 3. Feed the ServerHello (ServerHello rides Initial; HRR also rides Initial).
-msgs := hs.receive_msgs_at_level(.initial, initial_stream)!
+msgs := hs.receive_initial_bytes(initial_stream)!
 for m in msgs {
-    // The only .initial output here is the retry ClientHello after a
+    // The only initial-phase output here is the retry ClientHello after a
     // HelloRetryRequest — send it in an Initial CRYPTO frame and loop.
     _ = m
 }
@@ -271,7 +275,7 @@ for m in msgs {
 // 4. Now derive Handshake keys from the exported secrets and protect Handshake
 //    packets with them; the server flight (EE, [CertReq], Cert, CV, Finished)
 //    rides Handshake CRYPTO.
-(ck, sk) := hs.peer_traffic_secrets_at(.handshake)!
+(ck, sk) := hs.peer_handshake_secrets()!
 suite := hs.negotiated_cipher_suite()
 hash := handshake.suite_hash_algo(suite)
 key_len := handshake.suite_key_len(suite)
@@ -279,22 +283,22 @@ qkey := handshake.hkdf_expand_label(hash, ck, 'quic key', []u8{}, key_len)!
 // ... 'quic iv' (12 bytes) and 'quic hp' (key_len) likewise ...
 
 // 5. Feed the reassembled Handshake CRYPTO stream. The return carries the
-//    client Finished (tagged .handshake) once the server flight verifies.
-flight := hs.receive_msgs_at_level(.handshake, handshake_stream)!
+//    client Finished (a handshake-phase message) once the server flight verifies.
+flight := hs.receive_handshake_bytes(handshake_stream)!
 for m in flight {
-    if m.level == .handshake {
+    if !m.is_initial() {
         // Send m.msg in a Handshake CRYPTO frame, protected with the client
         // Handshake keys. (The TCP adapter sends a dummy CCS here; QUIC does not.)
     }
 }
 
 // 6. Application secrets are live at .connected. Derive 1-RTT packet keys with
-//    the 'quic key'/'quic iv'/'quic hp' labels from peer_traffic_secrets_at(.application).
-(cap, sap) := hs.peer_traffic_secrets_at(.application)!
+//    the 'quic key'/'quic iv'/'quic hp' labels from peer_application_secrets().
+(cap, sap) := hs.peer_application_secrets()!
 
 // 7. For a custom client adapter, release handshake-stage material after
 //    receiving HANDSHAKE_DONE. Conn does this automatically.
-hs.zeroize_traffic_secrets_at(.handshake)!
+hs.zeroize_handshake_secrets()!
 
 // 8. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_recordless_message and decode with parse_new_session_ticket.
@@ -305,8 +309,8 @@ hs.zeroize_traffic_secrets_at(.handshake)!
 
 - The shared API sequence, phase guards, and TLS-only operations are specified
   in the [handshake adapter contract](./CONTRACT.md). For QUIC, queue every
-  returned message at its tagged level; map `.initial` to Initial CRYPTO and
-  `.handshake` to Handshake CRYPTO.
+  returned message by phase — `m.is_initial()` is the only phase fact the public
+  seam exposes: true means Initial CRYPTO, false means Handshake CRYPTO.
 - The QUIC engine rejects CRYPTO data carried in 1-RTT packets. Handle
   post-handshake CRYPTO separately with `next_recordless_message()` and
   `parse_new_session_ticket()`.
@@ -355,7 +359,7 @@ functionality is provided separately by this repository's
 
 What the module *does* give you: the entire TLS 1.3 state machine, transcript,
 key schedule, certificate validation hook, alert vocabulary, and the
-level-tagged seam to plug them into your packet layer — so your adapter only
+phase-named seam to plug them into your packet layer — so your adapter only
 has to be a transport.
 
 ---

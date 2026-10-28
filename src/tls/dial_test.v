@@ -264,7 +264,7 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 
 // test_dial_chacha20_end_to_end negotiates TLS_CHACHA20_POLY1305_SHA256 alone and
 // completes the full handshake plus one application read over it. This is the
-// regression guard for the §7.5 key-ownership bug: install_ciphers_at scrubs its local
+// regression guard for the §7.5 key-ownership bug: install_ciphers scrubs its local
 // key copy after building the ChaCha cipher, which used to zero the AEAD's aliased
 // key and fail every record with an 'unmatching tag' that no AES suite exhibits and
 // that AES-only tests could never surface. Offering ChaCha exclusively means merely
@@ -338,7 +338,7 @@ fn test_dial_accepts_ticket_coalesced_after_finished() ! {
 
 	assert conn.session_tickets.len == 1 // handled inside do_handshake itself
 	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
-	assert conn.hs.unconsumed_bytes(.handshake) == 0 // drained, not orphaned
+	assert conn.hs.handshake_backlog() == 0 // drained, not orphaned
 
 	mut buf := []u8{len: 64}
 	n := conn.read(mut buf)!

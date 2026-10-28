@@ -456,7 +456,9 @@ fn (mut e Conn) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
 // Delivery goes through reasm.next_message(), which advances the reassembler's
 // absolute offset so a peer may keep appending to the stream past what we took.
 fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
-	level := level_of(ptype)!
+	// The packet type settles which core phase to feed, and is rejected outright
+	// before anything is consumed from the reassembler.
+	is_initial := crypto_is_initial(ptype)!
 	mut produced := []handshake.HandshakeMessage{}
 	for {
 		mut ns := e.ns_mut(ptype)
@@ -464,7 +466,7 @@ fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
 		if msg.len == 0 {
 			break
 		}
-		out := e.hs.receive_msgs_at_level(level, msg) or {
+		out := e.feed_crypto(is_initial, msg) or {
 			// A core failure must become a QUIC connection error: classify the
 			// alert, record the CRYPTO_ERROR code, and stop.
 			e.fail_close()!
@@ -478,12 +480,22 @@ fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
 	e.install_exported_keys()!
 }
 
+// feed_crypto routes one complete CRYPTO message to the core phase selected by
+// is_initial and returns the outbound messages it triggers.
+fn (mut e Conn) feed_crypto(is_initial bool, msg []u8) ![]handshake.HandshakeMessage {
+	if is_initial {
+		return e.hs.receive_initial_bytes(msg)!
+	}
+	return e.hs.receive_handshake_bytes(msg)!
+}
+
 // queue_outbound places an outbound handshake message into the right level's
 // outbound CRYPTO buffer.
 fn (mut e Conn) queue_outbound(m handshake.HandshakeMessage) ! {
-	match m.level() {
-		.initial { e.tx_crypto_initial << m.msg() }
-		.handshake { e.tx_crypto_hands << m.msg() }
+	if m.is_initial() {
+		e.tx_crypto_initial << m.msg()
+	} else {
+		e.tx_crypto_hands << m.msg()
 	}
 }
 
@@ -497,20 +509,27 @@ fn (mut e Conn) install_exported_keys() ! {
 	// live secrets. The adapter keeps its own install-once flags.
 	phases := e.hs.available_secret_phases()
 	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none && phases.handshake {
-		e.install_protection_at(.handshake)!
+		e.install_handshake_protection()!
 	}
 	if phases.application && e.app_tx == none && e.app_rx == none {
-		e.install_protection_at(.application)!
+		e.install_application_protection()!
 	}
 }
 
-// install_protection_at expands one level's exported traffic secrets into that
-// level's packet protection (RFC 9001 §5.1). The exported secrets and the derived
-// packet keys are dead once new_protection has cloned what it needs into its state and
+// install_protection expands one phase's exported traffic secrets into that
+// level's packet protection (RFC 9001 §5.1); is_application selects 1-RTT over
+// Handshake. The exported secrets and the derived packet keys are dead once
+// new_protection has cloned what it needs into its state and
 // the AEAD backend has copied the key, so defer scrubs every local copy on all exit
 // paths (§7.5) — zeroing these inputs cannot disturb the live protection state.
-fn (mut e Conn) install_protection_at(level handshake.EncryptionLevel) ! {
-	mut ck, mut sk := e.hs.peer_traffic_secrets_at(level)!
+fn (mut e Conn) install_protection(is_application bool) ! {
+	mut ck := []u8{}
+	mut sk := []u8{}
+	if is_application {
+		ck, sk = e.hs.peer_application_secrets()!
+	} else {
+		ck, sk = e.hs.peer_handshake_secrets()!
+	}
 	defer {
 		zero_bytes(mut ck)
 		zero_bytes(mut sk)
@@ -528,13 +547,25 @@ fn (mut e Conn) install_protection_at(level handshake.EncryptionLevel) ! {
 		zero_bytes(mut server_keys.iv)
 		zero_bytes(mut server_keys.hp)
 	}
-	if level == .handshake {
+	if !is_application {
 		e.handshake_tx = new_protection(client_keys, suite)!
 		e.handshake_rx = new_protection(server_keys, suite)!
 	} else {
 		e.app_tx = new_protection(client_keys, suite)!
 		e.app_rx = new_protection(server_keys, suite)!
 	}
+}
+
+// install_handshake_protection derives the Handshake-level packet protection from
+// the core's exported handshake traffic secrets.
+fn (mut e Conn) install_handshake_protection() ! {
+	e.install_protection(false)!
+}
+
+// install_application_protection derives the 1-RTT packet protection from the
+// core's exported application traffic secrets.
+fn (mut e Conn) install_application_protection() ! {
+	e.install_protection(true)!
 }
 
 // zero_bytes overwrites a buffer in place, the §7.5 scrub for dead QUIC key material
@@ -653,7 +684,7 @@ fn (mut e Conn) fail_close() ! {
 // discard one and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
 // handshake protection states before releasing them, and is idempotent.
 fn (mut e Conn) drop_handshake_keys() ! {
-	e.hs.zeroize_traffic_secrets_at(.handshake)!
+	e.hs.zeroize_handshake_secrets()!
 	mut tx := e.handshake_tx or { ProtectionState{ aead: unsafe { nil } } }
 	tx.wipe()
 	e.handshake_tx = none
@@ -694,7 +725,7 @@ fn (mut e Conn) wipe_packet_keys() {
 // needs the packet keys; that is why the failure path (fail_close) does not call it.
 fn (mut e Conn) destroy_on_close() ! {
 	if e.hs.state() == .connected {
-		e.hs.zeroize_traffic_secrets_at(.application)!
+		e.hs.zeroize_application_secrets()!
 	} else {
 		e.hs.fail_and_zeroize_secrets()
 	}
@@ -732,11 +763,14 @@ fn (mut e Conn) note_rx(ptype PacketType, pn u64) {
 	ns.any_rx = true
 }
 
-// level_of maps QUIC packet protection levels to shared TLS handshake phases.
-fn level_of(ptype PacketType) !handshake.EncryptionLevel {
+// crypto_is_initial validates that a packet type may carry handshake CRYPTO and
+// reports the core phase to feed: Initial packets carry the pre-ServerHello phase,
+// Handshake packets the handshake-key phase. 1-RTT CRYPTO is post-handshake traffic
+// this engine does not accept; Retry and 0-RTT packets carry none (RFC 9001 §4.1.4).
+fn crypto_is_initial(ptype PacketType) !bool {
 	return match ptype {
-		.initial { .initial }
-		.handshake { .handshake }
+		.initial { true }
+		.handshake { false }
 		.one_rtt {
 			return error('quic: 1-RTT CRYPTO data is post-handshake traffic and is unsupported')
 		}

@@ -15,10 +15,10 @@ fn fixture_trusted_validator() pki.Validator {
 	return pki.new_validator(ts)
 }
 
-// expect_no_handshake_keys reports whether record_traffic_keys_at(.handshake) refuses —
-// the expected state once zeroize_traffic_secrets_at(.handshake) dropped the handshake material.
+// expect_no_handshake_keys reports whether handshake_record_keys() refuses —
+// the expected state once zeroize_handshake_secrets() dropped the handshake material.
 fn expect_no_handshake_keys(h &TLSHandshake) bool {
-	h.record_traffic_keys_at(.handshake) or {
+	h.handshake_record_keys() or {
 		return true
 	}
 	return false
@@ -43,7 +43,7 @@ fn assert_handshake_material_destroyed(h &TLSHandshake) {
 fn feed_encrypted_flight(mut h TLSHandshake, flight []u8) ![]HandshakeMessage {
 	mut produced := []HandshakeMessage{}
 	for i in 0 .. flight.len {
-		msgs := h.receive_msgs_at_level(.handshake, [flight[i]])!
+		msgs := h.receive_handshake_bytes([flight[i]])!
 		produced << msgs
 	}
 	return produced
@@ -58,7 +58,7 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
 	assert !fl.is_hrr
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 
 	// EE + CertificateRequest: the client must emit exactly its empty Certificate.
 	assert fl.rest.len == 2
@@ -91,7 +91,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert !fl.is_hrr
 
 	// Plaintext ServerHello on the Initial level; nothing outbound yet.
-	out := h.receive_msgs_at_level(.initial, fl.server_hello)!
+	out := h.receive_initial_bytes(fl.server_hello)!
 	assert out.len == 0
 	assert h.state() == .wait_ee
 
@@ -108,16 +108,16 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	assert h.server_certs.len == 1
 
 	// Application traffic keys are the reusable post-handshake state (§7.1).
-	ck, civ, sk, siv := h.record_traffic_keys_at(.application)!
+	ck, civ, sk, siv := h.application_record_keys()!
 	assert ck.len == 16
 	assert civ.len == 12
 	assert sk.len == 16
 	assert siv.len == 12
 
 	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
-	h.zeroize_traffic_secrets_at(.handshake)!
+	h.zeroize_handshake_secrets()!
 	assert expect_no_handshake_keys(&h)
-	akc, _, aks, aks_iv := h.record_traffic_keys_at(.application)!
+	akc, _, aks, aks_iv := h.application_record_keys()!
 	assert akc.len == 16
 	assert aks.len == 16
 	assert aks_iv.len == 12
@@ -134,18 +134,18 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 	assert fl1.is_hrr
 
 	// The HRR arrives at Initial level; the core answers with the retry ClientHello.
-	out := h.receive_msgs_at_level(.initial, fl1.server_hello)!
+	out := h.receive_initial_bytes(fl1.server_hello)!
 	assert out.len == 1
 	assert out[0].level == .initial
 	assert h.state() == .wait_sh
 
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
-	out2 := h.receive_msgs_at_level(.initial, fl2.server_hello)!
+	out2 := h.receive_initial_bytes(fl2.server_hello)!
 	assert out2.len == 0
 	assert h.state() == .wait_ee
 
-	produced := h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl2.rest))!
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1
 	srv.handle_client_finished(produced[0].msg)!
 	assert h.state() == .connected
@@ -162,15 +162,15 @@ fn test_hello_retry_request_cookie_only_reaches_connected() ! {
 	fl1 := srv.handle_client_hello(ch)!
 	assert fl1.is_hrr
 
-	out := h.receive_msgs_at_level(.initial, fl1.server_hello)!
+	out := h.receive_initial_bytes(fl1.server_hello)!
 	assert out.len == 1
 	// The retry ClientHello must carry the echoed cookie; the fakeserver verifies it.
 	fl2 := srv.handle_client_hello(out[0].msg)!
 	assert !fl2.is_hrr
 
-	out2 := h.receive_msgs_at_level(.initial, fl2.server_hello)!
+	out2 := h.receive_initial_bytes(fl2.server_hello)!
 	assert out2.len == 0
-	produced := h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl2.rest))!
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl2.rest))!
 	assert produced.len == 1
 	srv.handle_client_finished(produced[0].msg)!
 	assert h.state() == .connected
@@ -184,9 +184,9 @@ fn test_rejects_bad_server_finished() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 
-	h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive_handshake_bytes(fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('Finished verify_data mismatch')
 		assert h.failure_alert() == .decrypt_error
 		assert_handshake_material_destroyed(h)
@@ -203,9 +203,9 @@ fn test_rejects_bad_certificate_verify() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 
-	h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive_handshake_bytes(fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('Ed25519 CertificateVerify failed')
 		assert h.failure_alert() == .decrypt_error
 		assert_handshake_material_destroyed(h)
@@ -222,11 +222,11 @@ fn test_rejects_out_of_order_certificate() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 
 	// fl.rest is [EE, Cert, CV, Fin]; feed Certificate where EncryptedExtensions is expected.
 	assert fl.rest.len == 4
-	h.receive_msgs_at_level(.handshake, fl.rest[1]) or {
+	h.receive_handshake_bytes(fl.rest[1]) or {
 		assert err.msg().contains('unexpected Certificate')
 		assert h.failure_alert() == .unexpected_message
 		assert_handshake_material_destroyed(h)
@@ -243,9 +243,9 @@ fn test_rejects_unoffered_alpn() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 
-	h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive_handshake_bytes(fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('not offered by client')
 		assert h.failure_alert() == .illegal_parameter
 		assert_handshake_material_destroyed(h)
@@ -264,9 +264,9 @@ fn test_rejects_substring_alpn() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 
-	h.receive_msgs_at_level(.handshake, fakeserver.flatten(fl.rest)) or {
+	h.receive_handshake_bytes(fakeserver.flatten(fl.rest)) or {
 		assert err.msg().contains('not offered by client')
 		assert h.failure_alert() == .illegal_parameter
 		assert_handshake_material_destroyed(h)
@@ -290,7 +290,7 @@ fn test_malformed_server_hello_aborts_and_destroys() ! {
 	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	_ := h.create_client_hello()!
 	// A complete ServerHello header with an empty body: parse fails before the key schedule ran.
-	h.receive_msgs_at_level(.initial, [u8(0x02), 0x00, 0x00, 0x00]) or {
+	h.receive_initial_bytes([u8(0x02), 0x00, 0x00, 0x00]) or {
 		assert h.state() == .failed
 		assert expect_no_handshake_keys(h)
 		return
@@ -317,7 +317,7 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
-	h.receive_msgs_at_level(.initial, fl.server_hello)!
+	h.receive_initial_bytes(fl.server_hello)!
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
 	assert produced.len == 1
 	srv.handle_client_finished(produced[0].msg)!
@@ -331,6 +331,6 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
 	assert h.available_secret_phases().application
 	// The split key/iv derivers populated the record cache the transport consumes.
-	ck, civ, sk, siv := h.record_traffic_keys_at(.application)!
+	ck, civ, sk, siv := h.application_record_keys()!
 	assert ck.len == 16 && civ.len == 12 && sk.len == 16 && siv.len == 12
 }

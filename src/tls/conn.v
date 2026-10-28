@@ -498,10 +498,10 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.state() != .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
-				msgs := c.hs.receive_msgs_at_level(.initial, rec.payload)!
+				msgs := c.hs.receive_initial_bytes(rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
-				if c.hs.unconsumed_bytes(.initial) != 0 {
-					return c.classify_failure(.unexpected_message, 'tls: misframed ServerHello record: ${c.hs.unconsumed_bytes(.initial)} leftover byte(s) (unexpected_message)')
+				if c.hs.initial_backlog() != 0 {
+					return c.classify_failure(.unexpected_message, 'tls: misframed ServerHello record: ${c.hs.initial_backlog()} leftover byte(s) (unexpected_message)')
 				}
 				if msgs.len == 0 && c.hs.state() == .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: incomplete ServerHello at record boundary (unexpected_message)')
@@ -509,7 +509,7 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.available_secret_phases().handshake {
 					// Install once the core actually holds handshake secrets, keyed on the
 					// same readiness query the QUIC adapter uses, not on state().
-					c.install_ciphers_at(.handshake)!
+					c.install_handshake_ciphers()!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
@@ -525,7 +525,7 @@ fn (mut c Conn) do_handshake() ! {
 		}
 	}
 	// The core verified the server Finished; install this adapter's post-handshake protection.
-	c.install_ciphers_at(.application)!
+	c.install_application_ciphers()!
 	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
 	// core's drain_at() stops at .connected, so take (and scrub) its buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()
@@ -533,9 +533,9 @@ fn (mut c Conn) do_handshake() ! {
 		// handle_post_handshake failures already abort_connection; don't re-alert.
 		c.handle_post_handshake(coalesced)!
 	}
-	// Nothing may protect or decrypt at the handshake level now, so the core may
+	// Nothing may protect or decrypt in the handshake phase now, so the core may
 	// destroy its secrets (RFC 8446 §7.5).
-	c.hs.zeroize_traffic_secrets_at(.handshake)!
+	c.hs.zeroize_handshake_secrets()!
 }
 
 // validate_compat_ccs checks one dummy ChangeCipherSpec record and enforces max_compat_ccs_records.
@@ -592,7 +592,7 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 			if dec.plaintext.len == 0 {
 				return c.classify_failure(.unexpected_message, 'tls: empty handshake record under handshake keys (unexpected_message)')
 			}
-			msgs := c.hs.receive_msgs_at_level(.handshake, dec.plaintext)!
+			msgs := c.hs.receive_handshake_bytes(dec.plaintext)!
 			for m in msgs {
 				// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
 				enc := c.client_hsk_cipher.encrypt_record(.handshake, m.msg())!
@@ -622,15 +622,13 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	}
 }
 
-// install_ciphers_at builds both protection states for one key generation at the
-// given level from the facade's record_traffic_keys_at(level); called once after
-// the ServerHello is fed (.handshake) and once at .connected (.application).
-// Initial keys are refused:
-// this adapter never installs them, so a misleveled future call fails closed.
-fn (mut c Conn) install_ciphers_at(level handshake.EncryptionLevel) ! {
-	if level == .initial {
-		return error('tls: no record protection exists for the initial level')
-	}
+// install_ciphers builds both protection states for one key generation from the
+// facade's phase-named record-key getter: is_application picks the handshake
+// generation (false, installed once the ServerHello is fed) or the application
+// generation (true, installed at .connected). Only the two phase-named wrappers
+// below call it, so a wrong-phase install is not expressible — the initial phase,
+// which has no record protection here at all, cannot be named by a caller.
+fn (mut c Conn) install_ciphers(is_application bool) ! {
 	mut ck := []u8{}
 	mut civ := []u8{}
 	mut sk := []u8{}
@@ -645,9 +643,13 @@ fn (mut c Conn) install_ciphers_at(level handshake.EncryptionLevel) ! {
 		zero_bytes(mut sk)
 		zero_bytes(mut siv)
 	}
-	ck, civ, sk, siv = c.hs.record_traffic_keys_at(level)!
+	if is_application {
+		ck, civ, sk, siv = c.hs.application_record_keys()!
+	} else {
+		ck, civ, sk, siv = c.hs.handshake_record_keys()!
+	}
 	suite := c.hs.negotiated_cipher_suite()
-	if level == .handshake {
+	if !is_application {
 		c.client_hsk_cipher = tls_protection_from_keys(suite, ck, civ)!
 		c.server_hsk_cipher = tls_protection_from_keys(suite, sk, siv)!
 	} else {
@@ -656,13 +658,25 @@ fn (mut c Conn) install_ciphers_at(level handshake.EncryptionLevel) ! {
 	}
 }
 
+// install_handshake_ciphers builds the handshake-generation protection states,
+// called once after the ServerHello is fed.
+fn (mut c Conn) install_handshake_ciphers() ! {
+	c.install_ciphers(false)!
+}
+
+// install_application_ciphers builds the application-generation protection states,
+// called once the server Finished is verified.
+fn (mut c Conn) install_application_ciphers() ! {
+	c.install_ciphers(true)!
+}
+
 // rekey_cipher rebuilds one application protection state after the core updated
 // the matching secret (RFC 8446 §4.6.3): is_server=true swaps the read (server)
 // leg, false the write (client) leg — the same direction vocabulary the core's
 // update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
 // restart at 0 per generation (§5.3).
 fn (mut c Conn) rekey_cipher(is_server bool) ! {
-	mut ck, mut civ, mut sk, mut siv := c.hs.record_traffic_keys_at(.application)!
+	mut ck, mut civ, mut sk, mut siv := c.hs.application_record_keys()!
 	// Scrub every copy on all exit paths (§7.5): only the selected leg is installed, but
 	// both pairs are dead here and the AEAD backend/protection state own their copies.
 	defer {
@@ -1061,7 +1075,7 @@ fn (mut c Conn) wipe_protection_states() {
 // can clear one layer and forget the other (RFC 8446 §1.3.1/§7.5).
 fn (mut c Conn) destroy_on_close() ! {
 	if c.hs.state() == .connected {
-		c.hs.zeroize_traffic_secrets_at(.application)!
+		c.hs.zeroize_application_secrets()!
 	} else {
 		c.hs.fail_and_zeroize_secrets()
 	}
@@ -1107,7 +1121,7 @@ fn (mut c Conn) destroy_on_failure() {
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
-// picking the encryption level from the ciphers actually installed.
+// picking the protection phase from the ciphers actually installed.
 fn (mut c Conn) send_failure_alert() {
 	if c.peer_terminated {
 		return
