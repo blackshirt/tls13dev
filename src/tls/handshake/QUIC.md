@@ -27,7 +27,7 @@ The core was therefore split so that the carrier is always someone else's job:
 
 ```
    ┌──────────────────────────── tls.handshake (this module) ───────────────────────────┐
-   │  Shared core: state_machine.v + flight.v + reassembly.v + key_exchange.v       │
+   │  Shared core: state_machine.v + state_machine_extra.v + key_exchange.v         │
    │  Key schedule: key_schedule.v (holders + §7.5 lifecycle)                       │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │

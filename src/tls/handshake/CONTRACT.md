@@ -18,9 +18,10 @@ operation.
 The implementation is split by ownership:
 
 - [`state_machine.v`](./state_machine.v) contains the private shared core: its types,
-  the `HandshakeCore` struct and constructor, the state cursor, and the failure
-  primitives, with inbound byte reassembly in [`reassembly.v`](./reassembly.v) and the
-  receive/dispatch routing and flight transitions in [`flight.v`](./flight.v).
+  the `HandshakeCore` struct and constructor, the state cursor, and the
+  ServerHello/HelloRetryRequest and encrypted-flight phase transitions, with inbound
+  byte reassembly, the receive/dispatch routing and the terminal-failure primitives in
+  [`state_machine_extra.v`](./state_machine_extra.v).
 - [`key_schedule.v`](./key_schedule.v) runs the §7.1 HKDF ladder and holds the
   core's flat derived-secret fields (`c_hsk_tsec`/`s_hsk_tsec`/`c_app_tsec`/`s_app_tsec`) and the
   `SecretPhases` readiness type, with the §7.5 wiping and zeroization lifecycle methods.

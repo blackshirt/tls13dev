@@ -45,10 +45,11 @@ CA bundle.
 ```
 state_machine.v       the shared core vocabulary + HandshakeCore: states, the private
                       EncryptionLevel, HandshakeOptions, the struct + constructor, the state
-                      cursor, the failure primitives, create_client_hello
-reassembly.v          the per-level intake buffers (ReassemblyBuffers): append, drain, release
-flight.v              receive/dispatch routing, the ServerHello/HRR transition, the encrypted
-                      flight handlers
+                      cursor, create_client_hello, and the ServerHello/HRR and encrypted-flight
+                      phase transitions
+state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the per-level
+                      reassembly buffers (ReassemblyBuffers), the receive/dispatch routing, and
+                      classify_failure / fail_with / failure_alert
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
 tls_handshake.v       TLS record facade: curated core forwarders, phase-named receive, backlog,
