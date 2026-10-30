@@ -95,19 +95,20 @@ pub fn (h &HandshakeCore) application_traffic_keys() !TrafficKeys {
 
 // update_traffic_keys ratchets one direction's application traffic secret around a
 // TLS KeyUpdate (RFC 8446 §7.2); TLS-record-only, and valid only once connected.
-// is_server selects the read leg (server, after receiving) vs the write leg (client,
-// before sending). Only the secret is stored: application_traffic_keys() re-derives the
-// record-key generation from it on the next call, so the two legs never update
-// asymmetrically and no superseded key handle is left to scrub.
-pub fn (mut h HandshakeCore) update_traffic_keys(is_server bool) ! {
+// is_server_leg selects the server→client read leg (true, after receiving) vs the
+// client→server write leg (false, before sending). Only the secret is stored:
+// application_traffic_keys() re-derives the record-key generation from it on the next
+// call, so the two legs never update asymmetrically and no superseded key handle is
+// left to scrub.
+pub fn (mut h HandshakeCore) update_traffic_keys(is_server_leg bool) ! {
 	if h.is_quic {
 		return error('handshake: update_traffic_keys() is TLS-record-only (QUIC key updates live in the packet layer)')
 	}
-	side := if is_server { 'server' } else { 'client' }
+	side := if is_server_leg { 'server' } else { 'client' }
 	if h.state() != .connected {
 		return error('handshake: cannot update ${side} application traffic keys before the handshake is connected (state: ${h.state()})')
 	}
-	secret := if is_server { h.s_app_tsec } else { h.c_app_tsec }
+	secret := if is_server_leg { h.s_app_tsec } else { h.c_app_tsec }
 	if secret.len == 0 {
 		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_application_secrets())')
 	}
@@ -117,7 +118,7 @@ pub fn (mut h HandshakeCore) update_traffic_keys(is_server bool) ! {
 	}
 	// The superseded secret is zeroed in place before its field is rebound, which is
 	// what lets an adapter aliasing the old bytes observe the zeros.
-	if is_server {
+	if is_server_leg {
 		wipe_secret(mut h.s_app_tsec)
 		h.s_app_tsec = next_secret
 	} else {

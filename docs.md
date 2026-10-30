@@ -237,7 +237,7 @@ new_quic_handshake(server_name string, options HandshakeOptions) !HandshakeCore 
      (h) initial_backlog() !int   /   (h) handshake_backlog() !int   // §5.1 ServerHello record-boundary hook
      (h) handshake_traffic_keys() !TrafficKeys        // opaque KeyPair handles, client and server, handshake phase
      (h) application_traffic_keys() !TrafficKeys     // same shape, application phase
-(mut h) update_traffic_keys(is_server bool) !   // §7.2 key update: true = read/server leg, false = write/client leg
+(mut h) update_traffic_keys(is_server_leg bool) !   // §7.2 key update: true = server→client read leg, false = client→server write leg
 (mut h) take_buffered_handshake_bytes() ![]u8   // hand off bytes coalesced behind the server Finished (§4.6.1)
 
 // QUIC path (is_quic-guarded: refuses a TLS-mode core with an error)

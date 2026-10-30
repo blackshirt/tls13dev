@@ -17,8 +17,8 @@ import tls.wire
 // (RFC 8446 §4.6.1).
 const max_stored_session_tickets = 32
 
-// recv_buf_compact_threshold bounds the consumed prefix recv_buf may retain before
-// its tail is shifted to the front, keeping compaction amortized O(1) per byte.
+// recv_buf_compact_threshold is the consumed-prefix size at which try_reclaim_recv_buf
+// shifts recv_buf's tail to the front, keeping the reclaim amortized O(1) per byte.
 const recv_buf_compact_threshold = 16384
 
 // recv_read_size is the number of bytes requested from the socket per read, sized
@@ -101,7 +101,7 @@ mut:
 	// remaining bytes for the next call.
 	recv_buf []u8
 	// Index of the first unread byte in recv_buf; advancing it avoids shifting the
-	// tail per record, and compact_recv_buf reclaims the prefix when appropriate.
+	// tail per record, and try_reclaim_recv_buf reclaims the prefix when appropriate.
 	recv_pos int
 	// Unread remainder of a decrypted application record when the caller's buffer
 	// is smaller; Conn.read drains this before decrypting another, preserving
@@ -342,7 +342,7 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 			// caller's condition, not a protocol fault: pass it through unpinned
 			// and un-destroyed so a retry or close() still works. Everything else
 			// is stream/protocol damage and stays terminal (RFC 8446 §6).
-			if transport_error(err.msg()) {
+			if is_transport_error(err.msg()) {
 				return err
 			}
 			alert := c.fail_alert or { handshake.AlertDescription.decode_error }
@@ -508,7 +508,7 @@ fn (mut c Conn) do_handshake() ! {
 	mut flight_records := 0
 	for c.hs.state() != .connected {
 		// Cheap early check; the fill loop enforces the same deadline per read.
-		_ := c.handshake_read_budget()!
+		_ := c.handshake_read_timeleft()!
 		rec := c.read_raw_record()!
 		flight_records++
 		if flight_records > max_handshake_flight_records {
@@ -610,10 +610,10 @@ fn (mut c Conn) send_plaintext_flight(msg []u8) ! {
 	c.write_records([new_record(.handshake, msg), change_cipher_spec()])!
 }
 
-// handshake_read_budget returns ms left before the dial deadline, failing with the
+// handshake_read_timeleft returns ms left before the dial deadline, failing with the
 // pinned unexpected_message alert when spent, and shrinks the socket read timeout
 // to the remainder when it is the tighter bound.
-fn (mut c Conn) handshake_read_budget() !i64 {
+fn (mut c Conn) handshake_read_timeleft() !i64 {
 	remaining_ms := c.deadline_ms - mono_ms()
 	if remaining_ms <= 0 {
 		return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
@@ -720,12 +720,13 @@ fn (mut c Conn) install_application_protection() ! {
 	c.s_app_protection = tls_record_protection(suite, mut server)!
 }
 
-// rekey_cipher rebuilds one application protection state after the core updated
-// the matching secret (RFC 8446 §4.6.3): is_server=true swaps the read (server)
-// leg, false the write (client) leg — the same direction vocabulary the core's
-// update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
-// restart at 0 per generation (§5.3).
-fn (mut c Conn) rekey_cipher(is_server bool) ! {
+// rebuild_tls_protection rebuilds one application protection state after the core
+// updated the matching secret (RFC 8446 §4.6.3): it leaves the secrets untouched and
+// swaps in fresh protection for one leg. is_server_leg=true rebuilds the server→client
+// leg (the one this endpoint reads), false the client→server leg (the one it writes) —
+// the same direction vocabulary the core's update_traffic_keys uses, so the pair reads
+// as update-then-rebuild. Sequence numbers restart at 0 per generation (§5.3).
+fn (mut c Conn) rebuild_tls_protection(is_server_leg bool) ! {
 	mut keys := c.hs.application_traffic_keys()!
 	suite := c.hs.negotiated_cipher_suite()
 	mut client := keys.take_client_keypair()
@@ -742,7 +743,7 @@ fn (mut c Conn) rekey_cipher(is_server bool) ! {
 	// existing once replaced. wipe() is IV-only (the AEAD backend key is a
 	// documented platform limit) and idempotent, so it is safe on a state that
 	// was never installed.
-	if is_server {
+	if is_server_leg {
 		mut old := c.s_app_protection
 		c.s_app_protection = tls_record_protection(suite, mut server)!
 		old.wipe()
@@ -776,7 +777,7 @@ fn (mut c Conn) read_raw_record() !Record {
 				mut r := wire.new_reader(c.recv_buf[c.recv_pos..c.recv_pos + total])
 				c.recv_pos += total
 				rec := read_record(mut r)!
-				c.compact_recv_buf()
+				c.try_reclaim_recv_buf()
 				return rec
 			} else if c.deadline_ms != 0 && avail > max_handshake_recv_buf_len {
 				// Handshake-phase only: dribbled bytes must not grow the framing
@@ -791,7 +792,7 @@ fn (mut c Conn) read_raw_record() !Record {
 		if c.deadline_ms != 0 {
 			// The deadline must also bite inside an incomplete record: a slow-loris
 			// dribble never completes one, so this fill loop is where the stall lives.
-			c.handshake_read_budget()!
+			c.handshake_read_timeleft()!
 		}
 		// Never hold guard across the indefinite blocking socket read: releasing it here
 		// is what lets a concurrent close() acquire guard. Register as a parked reader
@@ -803,7 +804,7 @@ fn (mut c Conn) read_raw_record() !Record {
 		c.guard.unlock()
 		// Classify socket-level failures: a mundane I/O condition — the per-op
 		// timeout, an interrupt, EAGAIN — is returned as a non-sticky transport tag
-		// (transport_error recognises it) so read() can retry; EOF/reset stays a
+		// (is_transport_error recognises it) so read() can retry; EOF/reset stays a
 		// plain terminal error because the stream is truncated, which §6.1 makes
 		// a truncation-attack boundary. Every branch returns, so the or-block
 		// never falls through with an unbound n.
@@ -852,9 +853,9 @@ fn (mut c Conn) read_raw_record() !Record {
 	return error('tls: unreachable')
 }
 
-// compact_recv_buf reclaims the already-consumed prefix of recv_buf, keeping its
+// try_reclaim_recv_buf reclaims the already-consumed prefix of recv_buf, keeping its
 // capacity when fully drained and shifting the tail down past the threshold.
-fn (mut c Conn) compact_recv_buf() {
+fn (mut c Conn) try_reclaim_recv_buf() {
 	if c.recv_pos == c.recv_buf.len {
 		// Fully drained: clear() keeps the capacity for the next record.
 		c.recv_buf.clear()
@@ -983,7 +984,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 					return c.abort_connection(.internal_error, err.msg())
 				}
 				// The core updated secrets only; swap in the new read protection state (seq restarts at 0, §5.3).
-				c.rekey_cipher(true) or {
+				c.rebuild_tls_protection(true) or {
 					return c.abort_connection(.internal_error, err.msg())
 				}
 				if request_update {
@@ -1096,7 +1097,7 @@ fn (mut c Conn) send_key_update_record_locked() ! {
 	// The write leg is the client direction: update_traffic_keys(false).
 	c.hs.update_traffic_keys(false)!
 	// Swap in the rebuilt write protection state before the next write() can reach it.
-	c.rekey_cipher(false)!
+	c.rebuild_tls_protection(false)!
 }
 
 // send_key_update_response answers a peer KeyUpdate(update_requested) (§4.6.3). The
@@ -1131,7 +1132,7 @@ fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message strin
 }
 
 // wipe_protection_states zeroes this adapter's four record protection states; it is
-// the single place the four *installed* states are destroyed — rekey_cipher()
+// the single place the four *installed* states are destroyed — rebuild_tls_protection()
 // additionally wipes the one superseded leg the arrays no longer reference
 // (RFC 8446 §7.5).
 fn (mut c Conn) wipe_protection_states() {
@@ -1199,7 +1200,7 @@ fn (mut c Conn) send_failure_alert() {
 // to call even when nothing is pending.
 fn (mut c Conn) finish_parked_read() {
 	c.readers--
-	if c.sock_close_pending && c.readers == 0 && !c.sock_closed && c.sock != unsafe { nil } {
+	if c.sock_close_pending && c.readers <= 0 && !c.sock_closed && c.sock != unsafe { nil } {
 		c.sock.close() or {}
 		c.sock_closed = true
 		c.sock_close_pending = false
@@ -1258,19 +1259,13 @@ fn (mut c Conn) wipe_post_hsk_buf() {
 
 // Helpers (utility)
 
-// tls_protection_from_keys instantiates one direction's record protection from
-// the core's derived key and IV bytes; sequence numbers restart at 0 per generation (§5.3).
-fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLSProtection {
-	aead := handshake.new_aead_for_suite(suite, key)!
-	return new_tls_protection(aead, iv)!
-}
-
 // tls_record_protection builds one direction's protection state from its opaque key pair
 // and drains the pair: the AEAD backend keeps its own key and the protection state clones
 // its IV, so both values are scrubbed here before returning (§7.5). The takes empty this
 // by-value copy's fields; the caller's handle keeps the zeroed bytes at their original
 // length, which its own wipe() covers. Which slot the result lands in is the caller's
 // choice, made by name off the generation (`take_client_keypair()` / `take_server_keypair()`).
+// Sequence numbers restart at 0 per generation (§5.3).
 fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyPair) !TLSProtection {
 	mut key := keys.take_key()
 	mut iv := keys.take_iv()
@@ -1278,14 +1273,15 @@ fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyPair
 		zero_bytes(mut key)
 		zero_bytes(mut iv)
 	}
-	return tls_protection_from_keys(suite, key, iv)!
+	aead := handshake.new_aead_for_suite(suite, key)!
+	return new_tls_protection(aead, iv)!
 }
 
-// transport_error reports whether a read_raw_record failure carries the socket
+// is_transport_error reports whether a read_raw_record failure carries the socket
 // I/O tag: a transient condition (per-op timeout, EINTR, EAGAIN) the caller may
 // retry, not a protocol fault. Un-tagged errors — stream damage or framing
 // failures — stay terminal so truncation is still detected (§6.1).
-fn transport_error(msg string) bool {
+fn is_transport_error(msg string) bool {
 	return msg.starts_with('tls: socket read timed out or interrupted')
 }
 

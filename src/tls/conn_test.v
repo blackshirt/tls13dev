@@ -609,18 +609,18 @@ fn test_close_is_not_blocked_by_parked_read() ! {
 	assert c.closed
 }
 
-// test_transport_error_predicate pins the socket-read timeout classifier boundary
+// test_is_transport_error_predicate pins the socket-read timeout classifier boundary
 // added so a per-operation timeout is not mistaken for a protocol fault: only the
 // tagged transient condition is retryable, while EOF, a peer reset, and every
 // framing/protocol error stay untagged so a truncated stream still fails closed (§6.1).
-fn test_transport_error_predicate() {
-	assert transport_error('tls: socket read timed out or interrupted')
+fn test_is_transport_error_predicate() {
+	assert is_transport_error('tls: socket read timed out or interrupted')
 	// Stream damage and framing faults must stay terminal (they carry no transport tag).
-	assert !transport_error('tls: socket read failed: Connection reset by peer')
-	assert !transport_error('tls: connection closed while reading record')
-	assert !transport_error('tls: socket read failed: EOF')
-	assert !transport_error('record: record length 70000 exceeds maximum allowed 16384')
-	assert !transport_error('')
+	assert !is_transport_error('tls: socket read failed: Connection reset by peer')
+	assert !is_transport_error('tls: connection closed while reading record')
+	assert !is_transport_error('tls: socket read failed: EOF')
+	assert !is_transport_error('record: record length 70000 exceeds maximum allowed 16384')
+	assert !is_transport_error('')
 }
 
 // test_handle_alert_answers_close_notify pins the §6.1 symmetric answer now emitted

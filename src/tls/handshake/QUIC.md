@@ -219,7 +219,7 @@ then zeroizes the core secrets and every remaining packet key (`destroy_on_close
 Over QUIC, TLS KeyUpdate does not exist: an endpoint MUST NOT send one and MUST
 treat a received one as a connection error (RFC 9001 §6). The next generation
 of 1-RTT secrets is derived engine-side with the `quic ku` label
-(§6.1) — **not** via `update_traffic_keys(is_server)`,
+(§6.1) — **not** via `update_traffic_keys(is_server_leg)`,
 whose `traffic upd` label is the TLS record path's. The header-protection key
 never updates.
 

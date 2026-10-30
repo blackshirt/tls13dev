@@ -161,7 +161,7 @@ with a plain error:
   still held at `.connected` (a server ticket coalesced after its `Finished`,
   §4.6.1) into the record adapter's post-handshake reassembler and wipes the
   core copy.
-- `update_traffic_keys(is_server)` implements TLS KeyUpdate — the read leg
+- `update_traffic_keys(is_server_leg)` implements TLS KeyUpdate — the read leg
   (`true`, server keys, after receiving) and the write leg (`false`, client
   keys, before sending) — and is valid only after the handshake reaches
   `.connected`.
