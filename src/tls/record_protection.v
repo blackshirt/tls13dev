@@ -92,6 +92,12 @@ fn (mut s TLSProtection) encrypt_record(inner_type ContentType, plaintext []u8) 
 	mut inner_plaintext := []u8{cap: plaintext.len + 1}
 	inner_plaintext << plaintext
 	inner_plaintext << u8(inner_type)
+	// §7.5: the assembled TLSInnerPlaintext (outbound plaintext || type) must not
+	// outlive this call; the returned `ciphertext` is an independent buffer, so
+	// zeroing inner_plaintext at function exit cannot corrupt the result.
+	defer {
+		zero_bytes(mut inner_plaintext)
+	}
 
 	// The 5-byte outer header is bound in as AAD to prove it was not tampered with (§5.2).
 	aad := record_aad(.application_data, legacy_record_version, inner_plaintext.len + s.aead.overhead())
@@ -123,8 +129,15 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 
 	aad := record_aad(rec.content_type, rec.legacy_version, rec.payload.len)
 	nonce := s.compute_nonce(s.seq_num)
-	inner_plaintext := s.aead.decrypt(rec.payload, nonce, aad) or {
+	mut inner_plaintext := s.aead.decrypt(rec.payload, nonce, aad) or {
 		return error('record: AEAD decryption failed: ${err.msg()}')
+	}
+	// §7.5: this is the raw AEAD-decrypted plaintext; scrub it on every exit (the
+	// returned `plaintext` below is an independent clone, so zeroing the source at
+	// function exit never corrupts the delivered copy). Covers the malformed-inner
+	// and overflow error returns too, where seq_num has already advanced.
+	defer {
+		zero_bytes(mut inner_plaintext)
 	}
 
 	// Increment only on success: a bad tag is fatal anyway (RFC 8446 §6).
@@ -152,8 +165,10 @@ fn (mut s TLSProtection) decrypt_record(rec Record) !DecryptedRecord {
 	if inner_type == .invalid {
 		return error('record: invalid inner content type (unexpected_message)')
 	}
-	plaintext := inner_plaintext[..end].clone()
+	mut plaintext := inner_plaintext[..end].clone()
 	if plaintext.len > max_plaintext_record_len {
+		// §7.5: this oversized clone is dropped on the error return — scrub it first.
+		zero_bytes(mut plaintext)
 		return error('record: decrypted plaintext length ${plaintext.len} exceeds maximum allowed ${max_plaintext_record_len} (record_overflow)')
 	}
 

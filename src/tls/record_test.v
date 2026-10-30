@@ -8,6 +8,7 @@
 module tls
 
 import crypto.aes
+import tls.handshake
 import tls.wire
 
 // test_record_serialization_roundtrip checks that serialize/parse preserve the
@@ -138,7 +139,7 @@ fn test_read_record_rejects_invalid_content_type() ! {
 // test_read_record_rejects_oversized_length: a declared length above
 // max_ciphertext_record_len (RFC 8446 §5.2) is refused before any allocation.
 fn test_read_record_rejects_oversized_length() ! {
-	// length field 0x5000 = 20480 > max_ciphertext_record_len 16640
+	// length field 0x5000 = 20480 > max_ciphertext_record_len 17408
 	mut r := wire.new_reader([u8(0x17), 0x03, 0x03, 0x50, 0x00])
 	read_record(mut r) or {
 		assert err.msg().contains('exceeds maximum')
@@ -267,4 +268,52 @@ fn test_tls_protection_wipe_clears_state() ! {
 	assert p.seq_num == 0
 	p.wipe()
 	assert p.iv.len == 0
+}
+
+// check_aead_key_not_aliased builds one suite's AEAD from a caller-owned key buffer,
+// then scrubs that buffer AFTER installation — exactly what tls_record_protection's
+// §7.5 defer does to the traffic key. That is safe only because new_aead_for_suite
+// must NOT retain a reference to the caller's bytes (AES expands into its own round
+// schedule; ChaCha20-Poly1305 clones first — see aead.v). If either leg ever aliases
+// the source slice, the scrub zeroes the live key and every later record silently
+// corrupts. The guard detects it by comparing a cipher built from the soon-to-be-
+// scrubbed source against one built from a live copy: same key/nonce/aad/pt must
+// yield identical ciphertext, and the scrubbed-source cipher must still open it.
+fn check_aead_key_not_aliased(suite handshake.CipherSuite) ! {
+	klen := handshake.suite_key_len(suite)
+	mut key := []u8{len: klen}
+	for i in 0 .. klen {
+		key[i] = u8(i + 1)
+	}
+	live := key.clone() // pristine copy feeding the reference cipher
+	mut nonce := []u8{len: handshake.aead_nonce_len}
+	for i in 0 .. nonce.len {
+		nonce[i] = u8(0xa0 + i)
+	}
+	aad := 'tls-record-aad'.bytes()
+	pt := 'attack at dawn'.bytes()
+
+	mut keep := handshake.new_aead_for_suite(suite, live)!
+	mut scrubbed := handshake.new_aead_for_suite(suite, key)!
+	// Mirror the record layer: zero the caller's key only once the AEAD is installed.
+	zero_bytes(mut key)
+
+	ct_keep := keep.encrypt(pt, nonce, aad)!
+	ct_scrubbed := scrubbed.encrypt(pt, nonce, aad)!
+	assert ct_keep == ct_scrubbed, '${suite}: AEAD corrupted after the caller key was scrubbed (it aliased the source slice)'
+
+	// A record made under the live-key cipher must still open on the scrubbed-source
+	// one, and a sustained second seal stays correct (not just first use).
+	rt := scrubbed.decrypt(ct_keep, nonce, aad)!
+	assert rt == pt
+	ct_again := scrubbed.encrypt(pt, nonce, aad)!
+	assert ct_again == ct_keep
+}
+
+// test_aead_key_not_aliased_by_record_scrub runs the §7.5 key-scrub aliasing guard
+// across AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
+fn test_aead_key_not_aliased_by_record_scrub() ! {
+	check_aead_key_not_aliased(.tls_aes_128_gcm_sha256)!
+	check_aead_key_not_aliased(.tls_aes_256_gcm_sha384)!
+	check_aead_key_not_aliased(.tls_chacha20_poly1305_sha256)!
 }

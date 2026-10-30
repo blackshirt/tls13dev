@@ -103,7 +103,7 @@ fn test_host_from_address_edge_cases() ! {
 // with declared length > max_ciphertext_record_len before allocating/reading.
 fn test_read_raw_record_oversized_payload() ! {
 	mut c := new_test_conn()!
-	// Header declaring 20000 bytes payload (> max_ciphertext_record_len 16640)
+	// Header declaring 20000 bytes payload (> max_ciphertext_record_len 17408)
 	c.recv_buf << [u8(0x17), 0x03, 0x03, 0x4e, 0x20]
 	if _ := c.read_raw_record() {
 		assert false

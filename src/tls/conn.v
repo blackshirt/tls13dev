@@ -68,7 +68,7 @@ const max_post_handshake_messages_per_record = 1000
 
 // Conn is a TLS 1.3 client connection over TCP, built only by dial(). A single
 // mutex serializes every public operation; see the lock discipline note below.
-@[heap; noinit]
+@[noinit]
 pub struct Conn {
 mut:
 	// Transport and transport-neutral handshake adapter.
@@ -120,6 +120,13 @@ mut:
 	// Whether close_tcp_socket() has run; separate from `closed` because
 	// handle_alert closes the protocol but leaves the socket for close().
 	sock_closed bool
+	// Number of readers currently parked in sock.read() with guard released (see the
+	// Conn lock discipline). While nonzero, close_tcp_socket() defers the physical fd
+	// close so a parked recv() can never have its descriptor recycled under it.
+	readers int
+	// Set by close_tcp_socket() when it deferred the fd close behind a parked reader;
+	// the last finish_parked_read() to drive `readers` back to 0 performs the close.
+	sock_close_pending bool
 	// Sticky fatal read error; returned again on subsequent read() calls instead
 	// of appearing as a clean EOF.
 	fatal_error string
@@ -132,11 +139,15 @@ mut:
 	// sequence numbers. Internal helpers run with guard already held and never lock
 	// themselves; only the public entry points and dial()'s do_handshake acquire it.
 	// The single exception: guard is released around the indefinite blocking
-	// sock.read() in read_raw_record() so a concurrent close() can acquire it. Note
-	// that close() of the descriptor does not by itself wake a thread parked in
-	// recv(2) on POSIX; the parked read returns on its own (socket timeout or
-	// arriving bytes), and the reader re-checks the terminal flags right after
-	// reacquiring, so it never touches state a close() has already destroyed.
+	// sock.read() in read_raw_record() so a concurrent close() can acquire it. The
+	// reader registers in `readers` before releasing guard, so close() never closes
+	// the fd out from under a parked recv() (which would let another thread recycle
+	// that descriptor number); close_tcp_socket() defers the physical close and the
+	// last reader to finish performs it. close() of a descriptor does not by itself
+	// wake a thread parked in recv(2) on POSIX anyway, so the parked read still
+	// returns on its own (socket timeout or arriving bytes), and the reader re-checks
+	// the terminal flags right after reacquiring, so it never touches state close()
+	// has already destroyed.
 	// Socket writes stay under guard because they are bounded by the write timeout
 	// that dial() sets, so they can never pin close().
 	// A Conn therefore supports at most one concurrent reader and one concurrent
@@ -251,36 +262,21 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:               sock
-		hs:                 hs
-		session_tickets:    []handshake.NewSessionTicket{cap: 4}
-		sock_buf:           []u8{len: recv_read_size} // reused by every socket read for this connection
-		recv_buf:           []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
-		recv_pos:           0
-		app_buf:            []u8{cap: max_plaintext_record_len} // one full plaintext record
-		app_pos:            0
-		closed:             false
-		close_notify_sent:  false
-		sock_closed:        false
-		fatal_error:        ''
-		deadline_ms:        deadline_ms
-		sock_timeout:       timeout
-		guard:              sync.new_mutex()
-		negotiated_alpn:    ''
-		server_name:        server_name
-		// Restated explicitly rather than relying on noinit heap zeroing: the record
-		// layer probes protection state (send_failure_alert) and reads these latches
-		// on error paths that can run before any install.
-		s_hsk_protection:   TLSProtection{ aead: unsafe { nil } }
-		c_hsk_protection:   TLSProtection{ aead: unsafe { nil } }
-		s_app_protection:   TLSProtection{ aead: unsafe { nil } }
-		c_app_protection:   TLSProtection{ aead: unsafe { nil } }
-		post_hsk_buf:       []u8{}
-		peer_key_update:    false
-		peer_terminated:    false
-		failure_alert_sent: false
-		sock_closed:        false
-		fail_alert:         none
+		sock:             sock
+		hs:               hs
+		session_tickets:  []handshake.NewSessionTicket{cap: 4}
+		sock_buf:         []u8{len: recv_read_size} // reused by every socket read for this connection
+		recv_buf:         []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
+		app_buf:          []u8{cap: max_plaintext_record_len} // one full plaintext record
+		deadline_ms:      deadline_ms
+		sock_timeout:     timeout
+		guard:            sync.new_mutex()
+		server_name:      server_name
+		// The four protections are probed (send_failure_alert) before any install.
+		s_hsk_protection: TLSProtection{ aead: unsafe { nil } }
+		c_hsk_protection: TLSProtection{ aead: unsafe { nil } }
+		s_app_protection: TLSProtection{ aead: unsafe { nil } }
+		c_app_protection: TLSProtection{ aead: unsafe { nil } }
 	}
 
 	// The single handshake-phase teardown choke-point: every do_handshake() failure —
@@ -476,8 +472,16 @@ pub fn (mut c Conn) close() ! {
 		c.send_close_notify()
 	}
 	c.closed = true
-	c.destroy_all()!
+	// Destroy every secret, but never skip releasing the socket: a zeroization error
+	// must not leak the fd, so close_tcp_socket runs on both the clean and error path.
+	mut teardown_err := ''
+	c.destroy_all() or {
+		teardown_err = err.msg()
+	}
 	c.close_tcp_socket()
+	if teardown_err != '' {
+		return error('tls: secret zeroization failed during close: ${teardown_err}')
+	}
 }
 
 // negotiated_alpn returns the negotiated ALPN protocol, if any.
@@ -496,11 +500,8 @@ fn (mut c Conn) do_handshake() ! {
 		c.guard.unlock()
 	}
 	ch := c.hs.create_client_hello()!
-	// RFC 8446 §5.1: the initial ClientHello must fit exactly one record; an
-	// oversized locally built one is our own fault, so abort before framing it.
-	if ch.len > max_plaintext_record_len {
-		return c.abort_connection(.internal_error, 'tls: ClientHello exceeds one record (${ch.len} > ${max_plaintext_record_len} bytes)')
-	}
+	// The one-record bound (§5.1) is enforced inside send_plaintext_flight, the single
+	// choke point shared with the retry ClientHello below.
 	c.send_plaintext_flight(ch)!
 
 	mut ccs_seen := 0
@@ -598,6 +599,14 @@ fn validate_compat_ccs(payload []u8, seen int) !int {
 // send_plaintext_flight emits one handshake flight — the initial or a retry
 // ClientHello — as a plaintext record followed by the dummy CCS (§5/App. D.4).
 fn (mut c Conn) send_plaintext_flight(msg []u8) ! {
+	// RFC 8446 §5.1: every plaintext flight — the initial ClientHello or a retry —
+	// must fit exactly one record. serialize_into encodes the length in two bytes
+	// without a re-check, so an oversized locally built message would silently
+	// mis-frame. Pin internal_error and fail before framing; dial()'s teardown
+	// wrapper then emits the pinned alert (the handshake-phase convention).
+	if msg.len > max_plaintext_record_len {
+		return c.classify_failure(.internal_error, 'tls: ClientHello exceeds one record (${msg.len} > ${max_plaintext_record_len} bytes)')
+	}
 	c.write_records([new_record(.handshake, msg), change_cipher_spec()])!
 }
 
@@ -623,10 +632,16 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	if c.hs.state() == .start || c.hs.state() == .wait_sh {
 		return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
 	}
-	dec := c.s_hsk_protection.decrypt_record(rec) or {
+	mut dec := c.s_hsk_protection.decrypt_record(rec) or {
 		// Mirror the read() path: a record that will not open is a peer-caused
 		// integrity failure, so surface its specific alert, not internal_error.
 		return c.classify_failure(decrypt_failure_alert(err.msg()), err.msg())
+	}
+	// §7.5: scrub this handshake record's decrypted staging copy on every exit
+	// (function-scope defer is safe here — handle_flight_record is not a loop); the
+	// body below consumes dec.plaintext synchronously before the defer fires.
+	defer {
+		zero_bytes(mut dec.plaintext)
 	}
 	// Inner-type routing is record-layer policy; the core has no ContentType concept.
 	match dec.content_type {
@@ -779,8 +794,12 @@ fn (mut c Conn) read_raw_record() !Record {
 			c.handshake_read_budget()!
 		}
 		// Never hold guard across the indefinite blocking socket read: releasing it here
-		// is what lets a concurrent close() acquire guard, close the socket and unblock a
-		// parked reader (see the Conn lock discipline). Reacquire before touching state.
+		// is what lets a concurrent close() acquire guard. Register as a parked reader
+		// first — under guard, atomically with the sock_closed check above — so close()
+		// defers the fd close rather than recycling the descriptor under this recv();
+		// the close still surfaces to us via this read's own socket timeout plus the
+		// post-reacquire terminal-flag re-check. Reacquire before touching state.
+		c.readers++
 		c.guard.unlock()
 		// Classify socket-level failures: a mundane I/O condition — the per-op
 		// timeout, an interrupt, EAGAIN — is returned as a non-sticky transport tag
@@ -790,6 +809,7 @@ fn (mut c Conn) read_raw_record() !Record {
 		// never falls through with an unbound n.
 		n := c.sock.read(mut c.sock_buf) or {
 			c.guard.lock()
+			c.finish_parked_read()
 			// A concurrent close()/abort may have run in the unguarded window: surface its
 			// sticky failure before doing any further work.
 			if c.fatal_error != '' {
@@ -810,6 +830,7 @@ fn (mut c Conn) read_raw_record() !Record {
 			return error('tls: connection closed while reading record')
 		}
 		c.guard.lock()
+		c.finish_parked_read()
 		// The promised post-reacquire terminal-flag re-check (see the Conn lock
 		// discipline): if close()/abort ran during the unguarded read, stop here
 		// instead of decrypting against protections destroy_all already wiped —
@@ -1172,12 +1193,32 @@ fn (mut c Conn) send_failure_alert() {
 	c.write_records([new_record(.alert, payload)]) or {}
 }
 
+// finish_parked_read is called by a reader under guard once it stops parking in
+// sock.read(): it drops the parked-reader count and, if a close() deferred the fd
+// close behind this very reader, performs that close once no reader remains. Safe
+// to call even when nothing is pending.
+fn (mut c Conn) finish_parked_read() {
+	c.readers--
+	if c.sock_close_pending && c.readers == 0 && !c.sock_closed && c.sock != unsafe { nil } {
+		c.sock.close() or {}
+		c.sock_closed = true
+		c.sock_close_pending = false
+	}
+}
+
 // close_tcp_socket releases the TCP socket without sending TLS shutdown alerts.
 // It is guarded separately because handle_alert marks closed but leaves it open.
-// A parked reader is not woken by close() on POSIX (see the Conn lock discipline);
-// it surfaces the closed state when its own socket timeout returns.
+// If a reader is parked in sock.read() (`readers > 0`) the descriptor is NOT closed
+// here — that would let another thread recycle the fd under the in-flight recv() —
+// instead the close is deferred to that reader's finish_parked_read(). A parked read
+// is not woken by close() on POSIX regardless (see the Conn lock discipline), so
+// deferring the close costs nothing on the wake-up path.
 fn (mut c Conn) close_tcp_socket() {
 	if c.sock_closed || c.sock == unsafe { nil } {
+		return
+	}
+	if c.readers > 0 {
+		c.sock_close_pending = true
 		return
 	}
 	c.sock.close() or {}

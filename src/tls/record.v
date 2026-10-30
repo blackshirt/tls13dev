@@ -32,10 +32,13 @@ fn content_type_from_u8(b u8) !ContentType {
 const legacy_record_version = u16(0x0303) // TLS 1.2
 
 // Wire-size limits for a single record (RFC 8446 §5.2): a plaintext record carries
-// at most 2^14 bytes, a ciphertext record more by inner type byte, tag and padding.
+// at most 2^14 bytes; the decrypted content is bounded by 2^14, but a received
+// ciphertext may be larger by the inner type byte, the AEAD tag and padding, and
+// §5.2 caps the whole record at 2^14 + 1024. Rejecting anything above that would
+// drop a conforming peer's padded records, so the receive bound keeps the full slack.
 const record_header_len = 5
 const max_plaintext_record_len = 16384 // 2^14 bytes
-const max_record_overhead = 256 // inner type byte + AEAD tag + padding (§5.2)
+const max_record_overhead = 1024 // inner type byte + AEAD tag + padding (RFC 8446 §5.2 receive bound)
 const max_ciphertext_record_len = max_plaintext_record_len + max_record_overhead
 
 // Record is a raw TLS record frame: the 5-byte header plus its opaque payload.
