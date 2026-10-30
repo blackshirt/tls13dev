@@ -117,9 +117,9 @@ pub fn (e &Conn) negotiated_cipher_suite() handshake.CipherSuite {
 	return e.hs.negotiated_cipher_suite()
 }
 
-// confirmed reports whether the engine has processed HANDSHAKE_DONE and released
+// is_confirmed reports whether the engine has processed HANDSHAKE_DONE and released
 // the handshake-stage material.
-pub fn (e &Conn) confirmed() bool {
+pub fn (e &Conn) is_confirmed() bool {
 	return e.confirmed
 }
 
@@ -282,7 +282,7 @@ fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
 // are absolute and monotonic (§19.6), which is what lets the retry ClientHello
 // continue past the original instead of rewriting offset 0.
 fn (mut e Conn) rederive_initial_keys_after_retry() ! {
-	if e.initial_rekeyed || !e.hs.hello_retry_request_received()! {
+	if e.initial_rekeyed || !e.hs.is_hello_retry_request_received()! {
 		return
 	}
 	e.install_initial_keys(e.dcid)!

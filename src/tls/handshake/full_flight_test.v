@@ -15,12 +15,12 @@ fn fixture_trusted_validator() pki.Validator {
 	return pki.new_validator(ts)
 }
 
-// expect_no_handshake_keys reports whether handshake_record_keys() refuses —
+// expect_no_handshake_keys reports whether handshake_traffic_keys() refuses —
 // the expected state once zeroize_handshake_secrets() dropped the handshake material.
 // Only the error is inspected: a refused generation must not leak a handle.
 fn expect_no_handshake_keys(h &HandshakeCore) bool {
 	mut refused := false
-	h.handshake_record_keys() or {
+	h.handshake_traffic_keys() or {
 		refused = true
 	}
 	return refused
@@ -112,10 +112,10 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// Application traffic keys are the reusable post-handshake state (§7.1). The
 	// generation arrives as one opaque handle per direction, so every length is
 	// asserted by name instead of by tuple position.
-	mut keys := h.application_record_keys()!
-	assert keys.ready()
-	mut client := keys.take_client()
-	mut server := keys.take_server()
+	mut keys := h.application_traffic_keys()!
+	assert keys.is_ready()
+	mut client := keys.take_client_keypair()
+	mut server := keys.take_server_keypair()
 	assert client.take_key().len == 16
 	assert client.take_iv().len == 12
 	assert server.take_key().len == 16
@@ -127,9 +127,9 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
 	h.zeroize_handshake_secrets()!
 	assert expect_no_handshake_keys(&h)
-	mut kept := h.application_record_keys()!
-	mut kept_client := kept.take_client()
-	mut kept_server := kept.take_server()
+	mut kept := h.application_traffic_keys()!
+	mut kept_client := kept.take_client_keypair()
+	mut kept_server := kept.take_server_keypair()
 	assert kept_client.take_key().len == 16
 	assert kept_server.take_key().len == 16
 	assert kept_server.take_iv().len == 12
@@ -345,10 +345,10 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	// Master Secret survive, and readiness reports them.
 	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
 	assert h.available_secret_phases().application
-	// The split key/iv derivers populated the record cache the transport consumes.
-	mut app_keys := h.application_record_keys()!
-	mut app_client := app_keys.take_client()
-	mut app_server := app_keys.take_server()
+	// The record accessor derives the key/iv pair the transport consumes on demand.
+	mut app_keys := h.application_traffic_keys()!
+	mut app_client := app_keys.take_client_keypair()
+	mut app_server := app_keys.take_server_keypair()
 	assert app_client.take_key().len == 16 && app_client.take_iv().len == 12
 	assert app_server.take_key().len == 16 && app_server.take_iv().len == 12
 	app_keys.wipe()

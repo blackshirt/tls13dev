@@ -3,8 +3,9 @@
 // key_schedule.v runs the RFC 8446 §7.1 HKDF key-derivation ladder that turns the
 // (EC)DHE secret into every handshake and application key, and owns the §7.5
 // zeroization lifecycle declared on HandshakeCore. The SecretPhases readiness type
-// and the opaque RecordKeys / TrafficRecordKeys handles the core's TLS-record side
-// caches (core_record.v) are declared here, beside the derivations that fill them.
+// and the opaque KeyPair / TrafficKeys handles the core's TLS-record side
+// derives on demand (core_record.v) are declared here, beside the derivations that
+// fill them.
 module handshake
 
 import crypto.hmac
@@ -223,13 +224,13 @@ fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_ha
 	return hash.compute_hmac(finished_key, transcript_hash)
 }
 
-// RecordKeys is one direction's record material: the AEAD key and the nonce base it must
+// KeyPair is one direction's record material: the AEAD key and the nonce base it must
 // always travel with. The fields are private, which makes the handle opaque:
 // tls.handshake constructs it, and a caller outside the module can only take values out
 // of it or wipe it, so a key can never be installed without its IV. The direction is
 // carried by the field name it is stored under (`client` / `server`), not by the type.
 @[noinit]
-pub struct RecordKeys {
+pub struct KeyPair {
 mut:
 	key []u8 // AEAD key
 	iv  []u8 // nonce base
@@ -238,7 +239,7 @@ mut:
 // take_key moves the AEAD key out and leaves the field empty, so the bytes have exactly
 // one owner and that owner can prove it scrubbed them (§7.5). Moving instead of cloning
 // keeps the key copy count across the module boundary at one per generation.
-pub fn (mut k RecordKeys) take_key() []u8 {
+pub fn (mut k KeyPair) take_key() []u8 {
 	bytes := k.key
 	k.key = []u8{}
 	return bytes
@@ -246,7 +247,7 @@ pub fn (mut k RecordKeys) take_key() []u8 {
 
 // take_iv moves the nonce base out on the same terms as take_key: a leg is drained a pair
 // at a time, never a half of it, so no key can reach the record layer without its IV.
-pub fn (mut k RecordKeys) take_iv() []u8 {
+pub fn (mut k KeyPair) take_iv() []u8 {
 	bytes := k.iv
 	k.iv = []u8{}
 	return bytes
@@ -254,74 +255,53 @@ pub fn (mut k RecordKeys) take_iv() []u8 {
 
 // wipe zeroes every value the handle still owns and drops them; idempotent, so it is
 // safe as a deferred safety net after a partial drain.
-pub fn (mut k RecordKeys) wipe() {
+pub fn (mut k KeyPair) wipe() {
 	wipe_secret(mut k.key)
 	wipe_secret(mut k.iv)
 }
 
-// ready reports whether this handle holds a key. Module-private: presence is an internal
+// is_ready reports whether this handle holds a key. Module-private: presence is an internal
 // precondition of the phase accessor, whose error says more than a bool.
-fn (k &RecordKeys) ready() bool {
+fn (k &KeyPair) is_ready() bool {
 	return k.key.len > 0
 }
 
-// copies is the one non-moving read: it clones, because a V struct copy would share the
-// cache's array data and leave the record layer unable to scrub its own generation.
-fn (k &RecordKeys) copies() RecordKeys {
-	return RecordKeys{
-		key: k.key.clone()
-		iv:  k.iv.clone()
-	}
-}
-
-// TrafficRecordKeys is an opaque handle to one generation of cached TLS record keys,
-// holding one RecordKeys handle per direction (client and server).
+// TrafficKeys is an opaque handle to one generation of TLS record keys,
+// holding one KeyPair per direction (client and server).
 @[noinit]
-pub struct TrafficRecordKeys {
+pub struct TrafficKeys {
 mut:
-	client RecordKeys // client-direction key and nonce base
-	server RecordKeys // server-direction key and nonce base
+	client KeyPair // client-direction key and nonce base
+	server KeyPair // server-direction key and nonce base
 }
 
-// HandshakeRecordKeys and ApplicationRecordKeys are phase-typed aliases of TrafficRecordKeys.
-pub type HandshakeRecordKeys = TrafficRecordKeys
-pub type ApplicationRecordKeys = TrafficRecordKeys
-
-// take_client moves the client-direction pair out of the generation, leaving an empty
-// handle behind; take_server does the same for the server direction. The pair travels
+// take_client_keypair moves the client-direction pair out of the generation, leaving an empty
+// handle behind; take_server_keypair does the same for the server direction. The pair travels
 // whole, which is the reason a leg has no separate take method of its own.
-pub fn (mut k TrafficRecordKeys) take_client() RecordKeys {
+pub fn (mut k TrafficKeys) take_client_keypair() KeyPair {
 	leg := k.client
-	k.client = RecordKeys{}
+	k.client = KeyPair{}
 	return leg
 }
 
-// take_server moves the server-direction pair out of the generation; take_client is
+// take_server_keypair moves the server-direction pair out of the generation; take_client_keypair is
 // its client-side mirror.
-pub fn (mut k TrafficRecordKeys) take_server() RecordKeys {
+pub fn (mut k TrafficKeys) take_server_keypair() KeyPair {
 	leg := k.server
-	k.server = RecordKeys{}
+	k.server = KeyPair{}
 	return leg
 }
 
 // wipe zeroes both directions of this generation (§7.5).
-pub fn (mut k TrafficRecordKeys) wipe() {
+pub fn (mut k TrafficKeys) wipe() {
 	k.client.wipe()
 	k.server.wipe()
 }
 
-// ready reports whether both directions hold a key: an install or a wipe always takes
+// is_ready reports whether both directions hold a key: an install or a wipe always takes
 // a whole generation, never one leg of it. Module-private, as on the direction handles.
-fn (k &TrafficRecordKeys) ready() bool {
-	return k.client.ready() && k.server.ready()
-}
-
-// copies returns an independent deep copy of the generation; see the direction handles.
-fn (k &TrafficRecordKeys) copies() TrafficRecordKeys {
-	return TrafficRecordKeys{
-		client: k.client.copies()
-		server: k.server.copies()
-	}
+fn (k &TrafficKeys) is_ready() bool {
+	return k.client.is_ready() && k.server.is_ready()
 }
 
 // SecretPhases reports which traffic-secret phases the core currently holds
@@ -379,10 +359,11 @@ fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
 
 // zeroize_traffic_secrets_at is the guarded lifecycle entry, normal teardown's only
 // route to the per-level wipe: it destroys one level's client and server traffic
-// secrets and, on the TLS-record side (is_quic false), that level's cached record
-// keys, once the adapter no longer needs them. Valid only after .connected; the
-// initial level is refused (RFC 8446 §7.5). Public wrappers: the phase-named
-// zeroize_handshake_secrets() / zeroize_application_secrets() entry points.
+// secrets once the adapter no longer needs them. The record keys are derived from those
+// secrets on demand, so wiping the secrets is the single truth — there is no separate
+// cached generation to scrub. Valid only after .connected; the initial level is refused
+// (RFC 8446 §7.5). Public wrappers: the phase-named zeroize_handshake_secrets() /
+// zeroize_application_secrets() entry points.
 pub fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	match level {
 		.initial {
@@ -393,9 +374,6 @@ pub fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) !
 				return error('handshake: zeroizing ${level} traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
 			}
 			h.wipe_traffic_secrets_at(level)
-			if !h.is_quic {
-				h.wipe_record_keys_at(level)
-			}
 		}
 	}
 }
@@ -403,16 +381,13 @@ pub fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) !
 // fail_and_zeroize_secrets is the unguarded terminal entry: it composes every wipe
 // above — key-schedule intermediate, ephemeral halves, both traffic-secret levels —
 // releases the reassembly buffers, and parks the machine in .failed (RFC 8446
-// §1.3.1/§7.5). On the TLS-record side (is_quic false) it also wipes both cached
-// record-key generations. It bypasses the zeroize_* lifecycle guard: a failure can
-// land before .connected ever held.
+// §1.3.1/§7.5). Wiping the traffic secrets also retires the record keys, since they are
+// derived from those secrets on demand. It bypasses the zeroize_* lifecycle guard: a
+// failure can land before .connected ever held.
 pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_key_schedule_secrets()
 	h.wipe_traffic_secrets_at(.handshake)
 	h.wipe_traffic_secrets_at(.application)
 	h.buffers.release_buffers()
-	if !h.is_quic {
-		h.wipe_record_keys()
-	}
 	h.state = .failed
 }

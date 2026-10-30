@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
 // core_quic.v holds the QUIC side of the unified HandshakeCore: raw traffic-secret
-// export (QUIC derives packet protection from it; the record side caches record
-// keys instead and has no caller for these), the opaque server transport parameters,
+// export (QUIC derives packet protection from it; the record side derives record
+// keys on demand instead and has no caller for these), the opaque server transport parameters,
 // and the HelloRetryRequest flag the QUIC adapter needs for Initial re-keying.
 // Every entry point here is guarded by is_quic — a TLS-mode core refuses it with a
 // plain error, without touching state or keys.
@@ -13,11 +13,11 @@ module handshake
 // private QUIC seam: the engine expands the two secrets into RFC 9001 §5.1 packet
 // keys through the phase-named peer_handshake_secrets() / peer_application_secrets()
 // below, and the TLS record path never reads raw secrets — the record side serves
-// handshake_record_keys() / application_record_keys() from its phase-typed cached
-// key handles instead.
+// handshake_traffic_keys() / application_traffic_keys(), deriving those record keys on
+// demand from the same secrets instead.
 fn (h &HandshakeCore) peer_traffic_secrets_at(level EncryptionLevel) !([]u8, []u8) {
 	if !h.is_quic {
-		return error('handshake: traffic-secret export is QUIC-only (the record path serves cached record keys)')
+		return error('handshake: traffic-secret export is QUIC-only (the record path derives its record keys from the secrets instead)')
 	}
 	if level == .initial {
 		return error('handshake: initial level has no traffic secrets')
@@ -70,14 +70,14 @@ pub fn (h &HandshakeCore) peer_transport_parameters() ![]u8 {
 	return params.clone()
 }
 
-// hello_retry_request_received reports whether the core has already accepted a
+// is_hello_retry_request_received reports whether the core has already accepted a
 // HelloRetryRequest. TLS itself has no further use for the flag once it has
 // built the retry ClientHello, but a QUIC adapter must: the retry is sent under a
 // different destination connection ID, and Initial protection is a function of
 // that ID, so the adapter's Initial keys go stale here (RFC 9001 §5.5).
-pub fn (h &HandshakeCore) hello_retry_request_received() !bool {
+pub fn (h &HandshakeCore) is_hello_retry_request_received() !bool {
 	if !h.is_quic {
-		return error('handshake: hello_retry_request_received() is QUIC-only (the record path re-keys inside the core)')
+		return error('handshake: is_hello_retry_request_received() is QUIC-only (the record path re-keys inside the core)')
 	}
 	return h.hrr_cipher_suite != none
 }

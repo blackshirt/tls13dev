@@ -373,7 +373,7 @@ fn test_engine_completes_quic_handshake() ! {
 	// proves the whole server flight was accepted over real packet protection.
 	client_finished := eng.receive(flight)!
 	assert eng.state() == .connected, 'client should reach connected, got ${eng.state()}'
-	assert !eng.confirmed(), 'client must not confirm before HANDSHAKE_DONE'
+	assert !eng.is_confirmed(), 'client must not confirm before HANDSHAKE_DONE'
 	assert client_finished.len > 0
 
 	// Round 2: the server consumes the client Finished and answers with
@@ -383,7 +383,7 @@ fn test_engine_completes_quic_handshake() ! {
 
 	// Round 3: the client processes HANDSHAKE_DONE and confirms.
 	_ = eng.receive(done)!
-	assert eng.confirmed(), 'HANDSHAKE_DONE should confirm the handshake'
+	assert eng.is_confirmed(), 'HANDSHAKE_DONE should confirm the handshake'
 
 	assert eng.negotiated_alpn() == 'h3'
 	assert eng.negotiated_cipher_suite() == .tls_aes_128_gcm_sha256
@@ -425,7 +425,7 @@ fn test_engine_handshake_with_asymmetric_cids() ! {
 	done := ferry.exchange(client_finished)!
 	assert ferry.dcid == scid, 'the ferry must address the client by its source CID'
 	_ = eng.receive(done)!
-	assert eng.confirmed(), 'HANDSHAKE_DONE must confirm the handshake at a 6-byte destination CID'
+	assert eng.is_confirmed(), 'HANDSHAKE_DONE must confirm the handshake at a 6-byte destination CID'
 }
 
 fn test_engine_adopts_server_source_cid() ! {
@@ -503,7 +503,7 @@ fn test_engine_hello_retry_request_reassembles_retry_at_correct_offset() ! {
 	assert eng.state() == .connected, 'client should reach connected after HRR, got ${eng.state()}'
 	done := ferry.exchange(client_finished)!
 	_ = eng.receive(done)!
-	assert eng.confirmed(), 'HANDSHAKE_DONE must confirm the handshake after a HelloRetryRequest'
+	assert eng.is_confirmed(), 'HANDSHAKE_DONE must confirm the handshake after a HelloRetryRequest'
 	assert eng.negotiated_alpn() == 'h3'
 	assert eng.negotiated_cipher_suite() == .tls_aes_128_gcm_sha256
 }

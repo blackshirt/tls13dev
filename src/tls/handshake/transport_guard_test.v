@@ -57,7 +57,7 @@ fn test_tls_mode_refuses_quic_only_calls() ! {
 	}
 	assert rejected
 	rejected = false
-	h.hello_retry_request_received() or {
+	h.is_hello_retry_request_received() or {
 		rejected = err.msg().contains('QUIC-only')
 	}
 	assert rejected
@@ -68,19 +68,19 @@ fn test_tls_mode_refuses_quic_only_calls() ! {
 }
 
 // test_quic_mode_refuses_tls_only_calls covers the TLS-record surface on a
-// QUIC-mode core: cached record keys, KeyUpdate, the backlog accessors, and the
+// QUIC-mode core: the record-key accessors, KeyUpdate, the backlog accessors, and the
 // coalesced-bytes handoff.
 fn test_quic_mode_refuses_tls_only_calls() ! {
 	mut h := quic_mode_core()!
 	_ = h.create_client_hello()!
 	mut rejected := false
 
-	h.handshake_record_keys() or {
+	h.handshake_traffic_keys() or {
 		rejected = err.msg().contains('TLS-record-only')
 	}
 	assert rejected
 	rejected = false
-	h.application_record_keys() or {
+	h.application_traffic_keys() or {
 		rejected = err.msg().contains('TLS-record-only')
 	}
 	assert rejected
@@ -114,50 +114,49 @@ fn test_quic_mode_refuses_tls_only_calls() ! {
 	assert h.failure_alert() == .internal_error
 }
 
-// test_quic_mode_skips_record_key_sync locks the is_quic branch of the receive
-// path: a QUIC-mode core feeds the drain directly and never expands the cached
-// record-key generations it does not own.
-fn test_quic_mode_skips_record_key_sync() ! {
+// test_quic_mode_tls_accessors_refuse_even_with_secrets locks the is_quic guard
+// precedence on a QUIC-mode core: even with handshake traffic secrets planted, the
+// TLS-record accessors refuse with the transport guard — never a derivation, never a
+// silent empty result.
+fn test_quic_mode_tls_accessors_refuse_even_with_secrets() ! {
 	mut h := quic_mode_core()!
 	_ = h.create_client_hello()!
-	// Plant both handshake secrets, as the ServerHello derivation would; the TLS
-	// receive path would sync them into hsk_keys, the QUIC path must not.
 	h.c_hsk_tsec = [u8(1), 2, 3]
 	h.s_hsk_tsec = [u8(4), 5, 6]
-	// The garbage ServerHello body fails to parse and tears down (idempotently);
-	// the point is that neither path ever expands the record-key generations.
+	mut rejected := false
+	h.handshake_traffic_keys() or {
+		rejected = err.msg().contains('TLS-record-only')
+	}
+	assert rejected
+	// A garbage ServerHello still tears the machine down through the normal parse path.
 	h.receive_initial_bytes(wrap_hsk(.server_hello, []u8{len: 4, init: 0xAA})) or {}
-	assert h.hsk_keys.client.key.len == 0
-	assert h.app_keys.client.key.len == 0
 	assert h.state() == .failed
 }
 
-// test_tls_mode_zeroize_and_failure_still_wipe_record_keys guards the behavior-
-// preserving half of the merge: on a TLS-mode core the unified teardown bodies
-// must keep scrubbing the cached generations exactly as the old facade did.
-fn test_tls_mode_zeroize_and_failure_still_wipe_record_keys() ! {
+// test_tls_mode_zeroize_and_failure_retire_record_keys guards the behavior-preserving
+// half of the change: on a TLS-mode core the unified teardown still makes the record
+// accessor refuse, because it now derives from secrets the wipe just cleared.
+fn test_tls_mode_zeroize_and_failure_retire_record_keys() ! {
 	mut h := tls_mode_core()!
 	h.state = HandshakeState.connected
 	h.c_app_tsec = [u8(11), 12]
 	h.s_app_tsec = [u8(13), 14]
-	h.app_keys.client = RecordKeys{
-		key: [u8(1)]
-		iv:  [u8(2)]
-	}
-	h.app_keys.server = RecordKeys{
-		key: [u8(3)]
-		iv:  [u8(4)]
+	// While both secrets live the accessor derives; the guard is presence, not a cache.
+	h.application_traffic_keys() or {
+		assert false, 'record keys should derive while the application secrets live'
 	}
 	h.zeroize_application_secrets()!
-	assert h.app_keys.client.key.len == 0
-	assert h.app_keys.server.key.len == 0
-
-	// The failure path wipes both generations too (§7.5).
-	h.app_keys.client = RecordKeys{
-		key: [u8(5)]
-		iv:  [u8(6)]
+	assert h.c_app_tsec.len == 0
+	assert h.s_app_tsec.len == 0
+	h.application_traffic_keys() or {
+		assert err.msg().contains('application traffic keys unavailable')
 	}
+
+	// The failure path wipes both levels too (§7.5), so the secrets go with them.
+	h.c_hsk_tsec = [u8(1), 2]
+	h.s_hsk_tsec = [u8(3), 4]
 	h.fail_and_zeroize_secrets()
-	assert h.app_keys.client.key.len == 0
+	assert h.c_hsk_tsec.len == 0
+	assert h.s_hsk_tsec.len == 0
 	assert h.state() == .failed
 }

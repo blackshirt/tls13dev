@@ -34,8 +34,8 @@ fn (mut h HandshakeCore) fail_with(alert AlertDescription, err IError) IError {
 // core_receive_msgs_at_level is the transport-neutral intake guard and dispatch:
 // it bounds the state-machine contract, then feeds the level's reassembly buffers
 // owned by the core. The unified entry point HandshakeCore.receive_msgs_at_level()
-// (state_machine.v) wraps it with the TLS-only record-key sync; adapters reach both
-// through their phase-named receive_initial_bytes() and receive_handshake_bytes()
+// (state_machine.v) delegates straight to it; adapters reach it through their
+// phase-named receive_initial_bytes() and receive_handshake_bytes()
 // entry points. Initial-level input is accepted only while awaiting ServerHello;
 // handshake-level input is accepted only between ServerHello and Finished. Phase
 // misuse is rejected without consuming bytes or changing state.
@@ -49,7 +49,7 @@ fn (mut h HandshakeCore) core_receive_msgs_at_level(level EncryptionLevel, bytes
 	if level == .application {
 		return error('handshake: the handshake core does not accept application-level bytes')
 	}
-	if !h.level_is_open(level) {
+	if !h.is_level_open(level) {
 		msg := if level == .handshake {
 			'handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state()})'
 		} else {
@@ -91,12 +91,12 @@ fn (mut h HandshakeCore) append_and_drain_at(level EncryptionLevel, bytes []u8) 
 	return out
 }
 
-// level_is_open reports whether one level's buffer is legal for the current state;
+// is_level_open reports whether one level's buffer is legal for the current state;
 // core_receive_msgs_at_level and drain_at() share it as the single phase-legality rule.
-fn (h &HandshakeCore) level_is_open(level EncryptionLevel) bool {
+fn (h &HandshakeCore) is_level_open(level EncryptionLevel) bool {
 	return match level {
 		.initial { h.state == .wait_sh }
-		.handshake { h.in_flight() }
+		.handshake { h.is_in_flight() }
 		.application { false }
 	}
 }
@@ -105,7 +105,7 @@ fn (h &HandshakeCore) level_is_open(level EncryptionLevel) bool {
 // Framing-boundary checks remain adapter policy.
 fn (mut h HandshakeCore) drain_at(level EncryptionLevel) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
-	for h.level_is_open(level) {
+	for h.is_level_open(level) {
 		msg := h.buffers.next_message(level) or {
 			return h.fail_with(.decode_error, err)
 		}
@@ -122,10 +122,10 @@ fn (mut h HandshakeCore) drain_at(level EncryptionLevel) ![]HandshakeMessage {
 	return out
 }
 
-// accepts_handshake_message is the single ordering check for the encrypted
+// is_handshake_message_accepted is the single ordering check for the encrypted
 // flight: it names the message types legal in the current state, so each handler
 // only parses and transitions.
-fn (h &HandshakeCore) accepts_handshake_message(msg_type HandshakeType) bool {
+fn (h &HandshakeCore) is_handshake_message_accepted(msg_type HandshakeType) bool {
 	return match h.state {
 		.wait_ee { msg_type == .encrypted_extensions }
 		.wait_cert_cr {

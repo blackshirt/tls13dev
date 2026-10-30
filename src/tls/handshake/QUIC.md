@@ -194,8 +194,8 @@ RFC 9001 §5.1 expansions itself:
 `peer_handshake_secrets()` and `peer_application_secrets()` (the QUIC side of
 `HandshakeCore`, core_quic.v) hand out `(client, server)` clones of those
 secrets; the phase is in the method name, never an argument.
-`handshake_record_keys()` / `application_record_keys()` are the TLS-record side,
-where each phase's generation is its own opaque handle type; on a QUIC-mode core
+`handshake_traffic_keys()` / `application_traffic_keys()` are the TLS-record side,
+where each call returns a fresh `TrafficKeys` generation the caller owns; on a QUIC-mode core
 they are `is_quic`-guarded and refuse with an error. A QUIC engine uses
 the peer-secret accessors + the public `hkdf_expand_label()`.
 

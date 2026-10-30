@@ -623,13 +623,13 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 
 // install_handshake_protection builds both protection states of the handshake generation,
 // called once after the ServerHello is fed. The core hands the generation over as an
-// opaque HandshakeRecordKeys handle, so the phase cannot be named wrong here, and each
-// direction is taken by name out of the bundle it belongs to.
+// opaque TrafficKeys handle, with the phase fixed by the accessor that produced it,
+// and each direction is taken by name out of the bundle it belongs to.
 fn (mut c Conn) install_handshake_protection() ! {
-	mut keys := c.hs.handshake_record_keys()!
+	mut keys := c.hs.handshake_traffic_keys()!
 	suite := c.hs.negotiated_cipher_suite()
-	mut client := keys.take_client()
-	mut server := keys.take_server()
+	mut client := keys.take_client_keypair()
+	mut server := keys.take_server_keypair()
 	// The takes moved each pair out of the bundle, so these three handles are the only
 	// owners of the bytes. The builders drain the legs they install; these wipes scrub
 	// whatever is left on every other exit path, including a failed second AEAD (§7.5).
@@ -645,10 +645,10 @@ fn (mut c Conn) install_handshake_protection() ! {
 // install_application_protection builds both protection states of the application
 // generation, called once the server Finished is verified.
 fn (mut c Conn) install_application_protection() ! {
-	mut keys := c.hs.application_record_keys()!
+	mut keys := c.hs.application_traffic_keys()!
 	suite := c.hs.negotiated_cipher_suite()
-	mut client := keys.take_client()
-	mut server := keys.take_server()
+	mut client := keys.take_client_keypair()
+	mut server := keys.take_server_keypair()
 	// Same one-owner-per-byte discipline as install_handshake_protection (§7.5).
 	defer {
 		keys.wipe()
@@ -665,10 +665,10 @@ fn (mut c Conn) install_application_protection() ! {
 // update_traffic_keys uses, so both rekey verbs read alike. Sequence numbers
 // restart at 0 per generation (§5.3).
 fn (mut c Conn) rekey_cipher(is_server bool) ! {
-	mut keys := c.hs.application_record_keys()!
+	mut keys := c.hs.application_traffic_keys()!
 	suite := c.hs.negotiated_cipher_suite()
-	mut client := keys.take_client()
-	mut server := keys.take_server()
+	mut client := keys.take_client_keypair()
+	mut server := keys.take_server_keypair()
 	// Scrub every copy on all exit paths (§7.5): only the selected leg is installed, but
 	// both pairs are dead here and the AEAD backend/protection state own their copies.
 	defer {
@@ -1128,8 +1128,8 @@ fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLS
 // and drains the pair: the AEAD backend keeps its own key and the protection state clones
 // its IV, so both values are scrubbed here before returning (§7.5) and the caller is left
 // holding an empty handle. Which slot the result lands in is the caller's choice, made by
-// name off the generation (`take_client()` / `take_server()`).
-fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.RecordKeys) !TLSProtection {
+// name off the generation (`take_client_keypair()` / `take_server_keypair()`).
+fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyPair) !TLSProtection {
 	mut key := keys.take_key()
 	mut iv := keys.take_iv()
 	defer {

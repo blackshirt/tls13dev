@@ -38,7 +38,7 @@ fn run() ! {
 	send_datagram(mut socket, initial)!
 
 	mut buf := []u8{len: 65535}
-	for !engine.confirmed() {
+	for !engine.is_confirmed() {
 		n, _ := socket.read(mut buf)!
 		if n == 0 {
 			continue
