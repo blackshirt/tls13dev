@@ -8,8 +8,8 @@ TLS state machine.
 
 The module it describes is `tls.handshake` (`src/tls/handshake/`). Everything
 `pub` in that module is the adapter contract; everything else is private. This
-file is the long-form guide to the QUIC facade in `quic_handshake.v` and shared
-handshake engine in `state_machine.v`.
+file is the long-form guide to the QUIC surface of the unified core in
+`core_quic.v` and the shared handshake engine in `state_machine.v`.
 
 ---
 
@@ -31,8 +31,8 @@ The core was therefore split so that the carrier is always someone else's job:
    │  Key schedule: key_schedule.v (holders + §7.5 lifecycle)                       │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
-   │  Record facade: tls_handshake.v owns TLS record keys and the KeyUpdate path    │
-   │  QUIC facade: quic_handshake.v exports TLS traffic secrets                     │
+   │  Record side: core_record.v owns TLS record keys and the KeyUpdate path        │
+   │  QUIC side: core_quic.v exports TLS traffic secrets (both is_quic-guarded)     │
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
@@ -165,11 +165,13 @@ is verified.
 
 ## 3. How QUIC support was adapted in
 
-The integration is **not a separate handshake implementation**. A
-`QuicHandshake` facade drives the same private TLS handshake core as the
-`TLSHandshake` used by `tls.Conn`. The separate facade types make the
-transport-specific API explicit while sharing TLS message processing, transcript
-and key-schedule state.
+The integration is **not a separate handshake implementation**. A QUIC-mode
+`HandshakeCore` (built by `new_quic_handshake`, `is_quic true`) drives the same
+TLS handshake state machine as the record mode (`is_quic false`) used by
+`tls.Conn`. One type, one flag: the transport-specific methods stay explicit
+because each guards on `is_quic` — a wrong-transport call returns an error
+without touching state or keys — while TLS message processing, transcript and
+key-schedule state are shared outright.
 
 ### 3.1 Initial secrets are not the core's business
 
@@ -189,12 +191,12 @@ RFC 9001 §5.1 expansions itself:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-`peer_handshake_secrets()` and `peer_application_secrets()` (defined on the
-`QuicHandshake` facade itself) hand out `(client, server)` clones of those
+`peer_handshake_secrets()` and `peer_application_secrets()` (the QUIC side of
+`HandshakeCore`, core_quic.v) hand out `(client, server)` clones of those
 secrets; the phase is in the method name, never an argument.
-`handshake_record_keys()` / `application_record_keys()` are provided by
-`TLSHandshake`, where each phase's generation is its own opaque handle type; a
-`QuicHandshake` does not expose them. A QUIC engine uses
+`handshake_record_keys()` / `application_record_keys()` are the TLS-record side,
+where each phase's generation is its own opaque handle type; on a QUIC-mode core
+they are `is_quic`-guarded and refuse with an error. A QUIC engine uses
 the peer-secret accessors + the public `hkdf_expand_label()`.
 
 ### 3.3 Handshake keys survive until no longer needed
@@ -367,14 +369,14 @@ has to be a transport.
 
 ## 7. See also
 
-- `src/tls/handshake/CONTRACT.md` — the shared-core and transport-facade
-  contract, including the remaining opportunity to report handshake milestones
+- `src/tls/handshake/CONTRACT.md` — the unified-core contract, including the
+  remaining opportunity to report handshake milestones
   through structured progress results.
-- `src/tls/handshake/state_machine.v` — private shared TLS handshake core.
-- `src/tls/handshake/tls_handshake.v` — record-layer facade and record-key
-  lifecycle.
-- `src/tls/handshake/quic_handshake.v` — QUIC facade and exported-secret
-  lifecycle.
+- `src/tls/handshake/state_machine.v` — the unified TLS handshake core.
+- `src/tls/handshake/core_record.v` — the TLS-record side of the core and the
+  record-key lifecycle (is_quic-guarded).
+- `src/tls/handshake/core_quic.v` — the QUIC side of the core and the
+  exported-secret lifecycle (is_quic-guarded).
 - `src/tls/handshake/passthrough.v` — CRYPTO-stream reassembly (RFC 9001 §4).
 - `src/tls/handshake/alert.v` — `AlertDescription` + `quic_connection_error()`.
 - `src/tls/handshake/key_schedule.v` — `hkdf_expand_label`, the §7.1 ladder.

@@ -1,19 +1,19 @@
 # Handshake adapter contract
 
-The `tls.handshake` module has one private `HandshakeCore` for shared TLS 1.3
-semantics and two public facades for its transport adapters:
+The `tls.handshake` module has one public `HandshakeCore` that carries the shared
+TLS 1.3 semantics *and* both transport surfaces. The transport mode is chosen at
+construction and stored as the `is_quic` flag:
 
-- `TLSHandshake` for the TLS record adapter (`tls.Conn`).
-- `QuicHandshake` for the QUIC adapter (`tls.quic.Conn`).
+- `new_tls_handshake(...)` — record mode (`is_quic false`) for the TLS record adapter (`tls.Conn`).
+- `new_quic_handshake(...)` — QUIC mode (`is_quic true`) for the QUIC adapter (`tls.quic.Conn`).
 
-The facades contain the shared core but expose different transport-specific
-operations. A caller chooses its transport at construction, and does not need a
-runtime mode flag or a wrong-transport call that fails at runtime.
-The shared core is a private type with module-private methods, so nothing leaks
-through embedded promotion; each facade re-exports only what its adapter calls,
-as curated `pub` forwarders over the core. A facade still defines a method
-itself where it adds transport-specific behavior or exposes a transport-only
-operation.
+The mode does not split the type: transport-specific entry points exist on both
+modes and guard themselves. A TLS-record-only call on a QUIC-mode core, and a
+QUIC-only call on a TLS-mode core, return a plain error without touching state or
+key material — the same convention as the out-of-phase API guards — rather than
+being absent from the surface. The shared core is still a private type: only the
+curated `pub` entry points are reachable from another module; the routing bodies
+and the seams below stay module-private.
 
 The implementation is split by ownership:
 
@@ -28,14 +28,16 @@ The implementation is split by ownership:
 - [`key_exchange.v`](./key_exchange.v) implements the core's ephemeral ECDHE
   methods: per-group key generation, the public share, and the peer-share
   validation and secret derivation.
-- [`tls_handshake.v`](./tls_handshake.v) defines and implements the
-  record facade and its cached TLS keys and the TLS KeyUpdate derivation.
-- [`quic_handshake.v`](./quic_handshake.v) defines and implements the QUIC
-  facade and exposes TLS traffic secrets without deriving record keys.
+- [`core_record.v`](./core_record.v) defines and implements the TLS-record side
+  of the core (guarded by `is_quic`): its cached record keys, sync/wipe helpers,
+  the backlog accessors, and the TLS KeyUpdate derivation.
+- [`core_quic.v`](./core_quic.v) defines and implements the QUIC side of the
+  core (guarded by `is_quic`) and exposes TLS traffic secrets without deriving
+  record keys, plus the opaque transport parameters and the HelloRetryRequest flag.
 
 ## Shared behavior
 
-Both facades expose the same handshake operations:
+`HandshakeCore` exposes the same handshake operations in both modes:
 
 ```v
 mut hs := new_tls_handshake(server_name)! // or new_quic_handshake(...)
@@ -59,8 +61,8 @@ same public state; key-material readiness is still polled via
 handshake never presents stale readiness.
 
 `fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
-secrets; it does not close a socket or QUIC connection. `TLSHandshake` also
-wipes its cached record keys during failure cleanup. `zeroize_handshake_secrets()`
+secrets; it does not close a socket or QUIC connection. In record mode it also
+wipes the cached record keys during failure cleanup. `zeroize_handshake_secrets()`
 and `zeroize_application_secrets()` are fallible teardown operations, accepted only
 after `.connected`, so an out-of-phase call cannot discard traffic material needed
 to finish a handshake.
@@ -79,10 +81,7 @@ slot, or buffer that is not individually scrubbed (`release_ephemeral_keys`,
 them (secret material and decrypted plaintext, e.g. `Conn.wipe_app_buf`);
 `zeroize_*` clears secret material under lifecycle guard rules (RFC 8446 §7.5);
 and `destroy_*` tears down a whole adapter connection. `take_*` is orthogonal to
-all four: it moves ownership out of a handle rather than clearing it. Some facade
-forwarders are deliberately kept as pure pass-throughs because V will not expose a
-module-private `HandshakeCore` method to another module except through a `pub`
-wrapper (e.g. `QuicHandshake.fail_and_zeroize_secrets`).
+all four: it moves ownership out of a handle rather than clearing it.
 
 Within the core, a classified handshake failure is one atomic concept: the private
 `classify_failure(alert, message)` primitive pins the alert `failure_alert()` will
@@ -93,12 +92,12 @@ tears down and reports the RFC-correct alert (e.g. `decode_error` for a malforme
 message) rather than a stale default. Every handshake-level and ServerHello-path
 parse/framing failure routes through it; `append_and_drain_at()` keeps an
 `or { fail_and_zeroize_secrets() }` safety net for any non-classified internal error
-(teardown is idempotent, so the belt-and-suspenders call is harmless). On the record
-facade this still triggers the cached-record-key wipe: `TLSHandshake`'s phase-named
-receive methods detect the `.failed` state and drop their cached record keys.
-Out-of-phase API guards in the core's receive entry point deliberately return a
-plain error *without* `classify_failure`, so a rejected mis-ordered call cannot
-discard usable keys.
+(teardown is idempotent, so the belt-and-suspenders call is harmless). In record
+mode this still triggers the cached-record-key wipe: the unified receive path
+detects the `.failed` state behind a refused feed and drops the cached record keys.
+Out-of-phase API guards — and the wrong-transport `is_quic` guards — deliberately
+return a plain error *without* `classify_failure`, so a rejected mis-ordered or
+wrong-mode call cannot discard usable keys.
 
 `create_client_hello()` returns the initial, complete handshake message.
 The constructors require only `server_name`. Optional named
@@ -139,7 +138,8 @@ readiness.
 
 ## Record-only operations
 
-`TLSHandshake` exposes operations needed by TLS over TCP:
+The TLS-record entry points below serve `tls.Conn` and refuse a QUIC-mode core
+with a plain error:
 
 - `handshake_record_keys()` and `application_record_keys()` return the derived record
   keys for their phase as opaque handles — `HandshakeRecordKeys` and
@@ -151,13 +151,12 @@ readiness.
   whatever is left, so no copy of the material escapes unscrubbed. The initial phase has
   no record keys and no accessor either — asking for them is not expressible, rather
   than refused at run time.
-- `initial_backlog()` and `handshake_backlog()` report the unconsumed bytes parked
-  at each phase — `initial_backlog()` lets the record adapter enforce the
+- `initial_backlog()` and `handshake_backlog()` report the unconsumed byte count
+  parked at each phase — `initial_backlog()` lets the record adapter enforce the
   ServerHello record-boundary rule, `handshake_backlog()` the coalesced-flight
-  drain check. They and `take_buffered_handshake_bytes()`
-  are defined on the facade itself, called directly by `tls.Conn` (only the
-  record layer feeds through TLS record framing, so the pair has no QUIC
-  caller).
+  drain check. They and `take_buffered_handshake_bytes()` are fallible, partly
+  for the `is_quic` guard: only the record layer feeds through TLS record
+  framing, so the trio has no QUIC caller.
 - `take_buffered_handshake_bytes()` moves any handshake-level bytes the core
   still held at `.connected` (a server ticket coalesced after its `Finished`,
   §4.6.1) into the record adapter's post-handshake reassembler and wipes the
@@ -168,27 +167,29 @@ readiness.
   `.connected`.
 - `zeroize_handshake_secrets()` and `zeroize_application_secrets()` destroy the
   traffic secrets for one phase once the adapter no longer needs them; valid only
-  after `.connected`, and the record facade also wipes that phase's cached record
+  after `.connected`, and in record mode they also wipe that phase's cached record
   keys. Handshake cleanup is not a handshake-confirmation signal. The initial
-  phase has no secrets, so the core entry point behind this pair refuses it.
+  phase has no secrets, so the entry point behind this pair refuses it.
 
 ## QUIC-only operations
 
-`QuicHandshake` defines `peer_handshake_secrets()` and `peer_application_secrets()`
-on the facade itself and exposes raw traffic secrets instead of record keys:
+The QUIC entry points below refuse a TLS-mode core with a plain error.
+`HandshakeCore` defines `peer_handshake_secrets()` and `peer_application_secrets()`
+and exposes raw traffic secrets instead of record keys:
 raw-secret export has no TLS caller — the record adapter keeps its cached-key surface
 (`handshake_record_keys()` / `application_record_keys()`) and never reads the secrets.
 The QUIC adapter expands these secrets with the RFC 9001 `quic key`, `quic iv`, and
 `quic hp` labels. It calls `zeroize_handshake_secrets()` only when QUIC no longer
 needs the handshake keys, which may be after the handshake is confirmed.
-`peer_transport_parameters()` returns the server's opaque extension bytes once
-received, and `hello_retry_request_received()` reports whether a retry occurred.
-Application teardown calls `zeroize_application_secrets()`, a `pub` forwarder on the
-`QuicHandshake` facade over the shared core — each phase is reached through the
-facade's curated forwarders, never embedded promotion.
+`peer_transport_parameters()` returns the server's opaque extension bytes (empty
+until EncryptedExtensions arrives), and `hello_retry_request_received()` reports
+whether a retry occurred.
+Application teardown calls `zeroize_application_secrets()`, shared by both modes
+through the core's phase-named entry points.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
-are absent from `QuicHandshake`, rather than present as runtime-rejected calls.
+exist on the type but are runtime-rejected on a QUIC-mode core by the `is_quic`
+guards, which change no state and zeroize nothing.
 
 ## Supporting protocol helpers
 
@@ -197,15 +198,15 @@ post-handshake handling or transport key setup: `next_recordless_message()`,
 `parse_new_session_ticket()`, `parse_key_update()`, `quic_connection_error()`,
 `hkdf_expand_label()`, `suite_hash_algo()`, `suite_key_len()`, and
 `new_aead_for_suite()`. These are protocol building blocks, not alternatives
-to the facade's phase-checked handshake entry points.
+to the core's phase-checked handshake entry points.
 
 ## Ownership boundary
 
 The core owns TLS handshake ordering, transcript updates, certificate
 validation, the TLS key schedule, shared traffic secrets, and per-phase TLS
-message reassembly buffers.
-`TLSHandshake` derives and owns the cached TLS record keys; `QuicHandshake`
-only exposes traffic secrets for QUIC key derivation. The record adapter owns
+message reassembly buffers. `HandshakeCore` in record mode derives and owns the
+cached TLS record keys; in QUIC mode it only exposes traffic secrets for QUIC key
+derivation. The record adapter owns
 TLS records and record protection. The QUIC adapter owns CRYPTO offset
 reassembly, packets, packet protection, and QUIC key updates. The core does not
 frame or encrypt transport records or packets.

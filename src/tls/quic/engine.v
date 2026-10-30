@@ -33,14 +33,14 @@ mut:
 	reasm      CryptoReasm // Contiguous inbound CRYPTO stream and pending fragments.
 }
 
-// Conn is a QUIC client handshake. It wraps a `handshake.QuicHandshake`
-// and the packet layer around it. Construct it with new_client_engine, feed it
-// datagrams, and take the datagrams it returns to send.
+// Conn is a QUIC client handshake. It wraps a `handshake.HandshakeCore`
+// in QUIC mode and the packet layer around it. Construct it with new_client_engine,
+// feed it datagrams, and take the datagrams it returns to send.
 @[noinit]
 pub struct Conn {
 mut:
 	// TLS handshake state and negotiated parameters.
-	hs handshake.QuicHandshake // Shared TLS handshake and traffic-secret state.
+	hs handshake.HandshakeCore // Unified handshake core in QUIC mode (is_quic true).
 
 	// Connection IDs used for packet routing and Initial key derivation.
 	dcid            []u8 // Current destination CID used in outbound packets.
@@ -185,7 +185,8 @@ pub fn (mut e Conn) receive(datagram []u8) ![]u8 {
 	// under keys already known to be unbound. The handshake guarantees a QUIC server
 	// sent *something* here and hands it over undecoded; interpreting it is this
 	// adapter's responsibility.
-	if raw := e.hs.peer_transport_parameters() {
+	raw := e.hs.peer_transport_parameters()!
+	if raw.len > 0 {
 		params := parse_transport_parameters(raw)!
 		// initial_source_connection_id binds the server's declaration to the source
 		// ID it really sent; original_destination_connection_id echoes the client's own
@@ -281,7 +282,7 @@ fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
 // are absolute and monotonic (§19.6), which is what lets the retry ClientHello
 // continue past the original instead of rewriting offset 0.
 fn (mut e Conn) rederive_initial_keys_after_retry() ! {
-	if e.initial_rekeyed || !e.hs.hello_retry_request_received() {
+	if e.initial_rekeyed || !e.hs.hello_retry_request_received()! {
 		return
 	}
 	e.install_initial_keys(e.dcid)!

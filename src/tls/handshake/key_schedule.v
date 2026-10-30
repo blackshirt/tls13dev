@@ -3,8 +3,8 @@
 // key_schedule.v runs the RFC 8446 §7.1 HKDF key-derivation ladder that turns the
 // (EC)DHE secret into every handshake and application key, and owns the §7.5
 // zeroization lifecycle declared on HandshakeCore. The SecretPhases readiness type
-// and the opaque RecordKeys / TrafficRecordKeys handles the record facade caches are
-// declared here, beside the derivations that fill them.
+// and the opaque RecordKeys / TrafficRecordKeys handles the core's TLS-record side
+// caches (core_record.v) are declared here, beside the derivations that fill them.
 module handshake
 
 import crypto.hmac
@@ -335,7 +335,7 @@ pub:
 }
 
 // available_secret_phases reports the current key-material readiness.
-fn (h &HandshakeCore) available_secret_phases() SecretPhases {
+pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
 	return SecretPhases{
 		handshake:   h.c_hsk_tsec.len > 0 && h.s_hsk_tsec.len > 0
 		application: h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
@@ -354,7 +354,7 @@ fn (mut h HandshakeCore) release_ephemeral_keys() {
 // wipe_traffic_secrets_at is the unguarded per-level wipe: it zeroes the client and
 // server traffic secrets for one encryption level; the initial level has no TLS
 // traffic secrets. It mirrors the QUIC-side peer_traffic_secrets_at() accessor
-// (quic_handshake.v) so reads and wipes share the same phase vocabulary.
+// (core_quic.v) so reads and wipes share the same phase vocabulary.
 fn (mut h HandshakeCore) wipe_traffic_secrets_at(level EncryptionLevel) {
 	match level {
 		.initial {}
@@ -379,11 +379,11 @@ fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
 
 // zeroize_traffic_secrets_at is the guarded lifecycle entry, normal teardown's only
 // route to the per-level wipe: it destroys one level's client and server traffic
-// secrets (and, on the record facade, that level's cached record keys) once the
-// adapter no longer needs them. Valid only after .connected; the initial level is
-// refused (RFC 8446 §7.5). Module-private: adapters call their phase-named
+// secrets and, on the TLS-record side (is_quic false), that level's cached record
+// keys, once the adapter no longer needs them. Valid only after .connected; the
+// initial level is refused (RFC 8446 §7.5). Public wrappers: the phase-named
 // zeroize_handshake_secrets() / zeroize_application_secrets() entry points.
-fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
+pub fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 	match level {
 		.initial {
 			return error('handshake: initial level has no traffic secrets to zeroize')
@@ -393,6 +393,9 @@ fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 				return error('handshake: zeroizing ${level} traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
 			}
 			h.wipe_traffic_secrets_at(level)
+			if !h.is_quic {
+				h.wipe_record_keys_at(level)
+			}
 		}
 	}
 }
@@ -400,12 +403,16 @@ fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
 // fail_and_zeroize_secrets is the unguarded terminal entry: it composes every wipe
 // above — key-schedule intermediate, ephemeral halves, both traffic-secret levels —
 // releases the reassembly buffers, and parks the machine in .failed (RFC 8446
-// §1.3.1/§7.5). It bypasses the zeroize_* lifecycle guard: a failure can land before
-// .connected ever held.
-fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
+// §1.3.1/§7.5). On the TLS-record side (is_quic false) it also wipes both cached
+// record-key generations. It bypasses the zeroize_* lifecycle guard: a failure can
+// land before .connected ever held.
+pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_key_schedule_secrets()
 	h.wipe_traffic_secrets_at(.handshake)
 	h.wipe_traffic_secrets_at(.application)
 	h.buffers.release_buffers()
+	if !h.is_quic {
+		h.wipe_record_keys()
+	}
 	h.state = .failed
 }

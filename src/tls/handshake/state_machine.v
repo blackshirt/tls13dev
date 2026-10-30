@@ -1,13 +1,15 @@
 // Copyright (c) 2026 blackshirt.
 //
-// state_machine.v defines the transport-neutral handshake core shared by both
-// adapters: the state and message vocabulary types, the HandshakeCore struct and its
-// constructor, the state cursor accessors, and the ServerHello/HelloRetryRequest and
+// state_machine.v defines the unified handshake core both adapters drive: the
+// state and message vocabulary types, the HandshakeCore struct and its
+// constructors, the state cursor accessors, and the ServerHello/HelloRetryRequest and
 // encrypted-flight phase transitions that advance the machine to .connected. Its
 // methods attach to HandshakeCore; the inbound reassembly buffers, receive/dispatch
 // routing and terminal-failure primitives live in state_machine_extra.v, ECDHE and the
-// derived-secret lifecycle in key_exchange.v and key_schedule.v, and transport-specific
-// behavior stays on the facades (tls_handshake.v, quic_handshake.v), never promoted here.
+// derived-secret lifecycle in key_exchange.v and key_schedule.v, and the transport-
+// specific surfaces guarded by is_quic live in core_record.v (TLS record) and
+// core_quic.v (QUIC), as HandshakeCore methods too — V keeps one struct's methods
+// in its declaring module, not one file.
 module handshake
 
 import crypto.ecdsa
@@ -64,7 +66,7 @@ pub fn (m &HandshakeMessage) msg() []u8 {
 
 // EncryptionLevel names TLS protection phases shared by handshake messages
 // and traffic-secret access, independent of transport packet or record levels.
-// Module-private: adapters reach each phase through the facades' phase-named
+// Module-private: adapters reach each phase through the core's phase-named
 // methods, so the phase vocabulary stays an implementation detail.
 enum EncryptionLevel {
 	initial     // handshake messages sent before handshake keys are available
@@ -119,10 +121,17 @@ pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOpt
 	}
 }
 
-// HandshakeCore owns shared TLS 1.3 handshake state and behavior.
+// HandshakeCore owns shared TLS 1.3 handshake state and behavior, plus the
+// TLS-record-side surface guarded by is_quic: the cached record keys live here
+// and simply never sync in QUIC mode.
 @[noinit]
 struct HandshakeCore {
 mut:
+	// Transport mode. Mirrors config.is_quic and guards the transport-specific
+	// entry points: a TLS-record-only call on a QUIC-mode core (and vice versa)
+	// is refused at run time rather than silently misbehaving.
+	is_quic bool
+
 	// ClientHello settings and key exchange state.
 	config      ClientHelloConfig // settings used to build or retry the ClientHello
 	ecdhe_group NamedGroup        // key exchange group used for the shared secret
@@ -146,6 +155,12 @@ mut:
 	// Incoming handshake bytes that do not yet form complete messages.
 	buffers ReassemblyBuffers // the initial- and handshake-phase streams, keyed by phase
 
+	// Cached record keys, one opaque generation per protection phase; each generation
+	// holds one handle per direction, so a key never travels without its nonce base.
+	// TLS-record side only (core_record.v): a QUIC-mode core never syncs them.
+	hsk_keys HandshakeRecordKeys   // cached handshake-phase record keys
+	app_keys ApplicationRecordKeys // cached application-phase record keys
+
 	// Peer certificate validation and client certificate response state.
 	validator    pki.Validator     // checks the server's certificate and hostname
 	server_certs []pki.Certificate // certificates received from the server, leaf first
@@ -157,8 +172,10 @@ mut:
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
 }
 
-// new_handshake_core creates shared state from the server name and complete
-// handshake options, including ALPN and certificate validation.
+// new_handshake_core creates the unified handshake state from the server name,
+// complete handshake options (including ALPN and certificate validation) and the
+// transport mode. new_tls_handshake() and new_quic_handshake() are the public
+// wrappers fixing is_quic to false / true.
 fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool) !HandshakeCore {
 	validate_handshake_options(options)!
 	validator := options.validator or {
@@ -180,6 +197,7 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 
 	mut core := HandshakeCore{
 		state:      .start
+		is_quic:    is_quic
 		config:     ClientHelloConfig{
 			server_name:           server_name
 			alpn:                  options.alpn.clone()
@@ -209,12 +227,22 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 	return core
 }
 
+// new_tls_handshake creates a TLS-over-records handshaker.
+// HandshakeOptions fields can be supplied as optional named arguments.
+pub fn new_tls_handshake(server_name string, options HandshakeOptions) !HandshakeCore {
+	return new_handshake_core(server_name, options, false)
+}
+
+// new_quic_handshake creates a QUIC handshaker. HandshakeOptions fields can
+// be supplied as optional named arguments after server_name.
+pub fn new_quic_handshake(server_name string, options HandshakeOptions) !HandshakeCore {
+	return new_handshake_core(server_name, options, true)
+}
+
 // state reports the client's position in the RFC 8446 Appendix A.1 handshake
 // state machine; adapters poll it to know when the handshake completed and which
-// messages are still legal on the wire. Module-private like every HandshakeCore
-// method: callers reach it only through each facade's curated pub forwarder,
-// never through embedded-field promotion.
-fn (h &HandshakeCore) state() HandshakeState {
+// messages are still legal on the wire.
+pub fn (h &HandshakeCore) state() HandshakeState {
 	return h.state
 }
 
@@ -228,12 +256,12 @@ fn (h &HandshakeCore) in_flight() bool {
 }
 
 // negotiated_alpn returns the ALPN protocol the server picked ('' when none).
-fn (h &HandshakeCore) negotiated_alpn() string {
+pub fn (h &HandshakeCore) negotiated_alpn() string {
 	return h.negotiated_alpn
 }
 
 // negotiated_cipher_suite reports the suite selected by the server in ServerHello.
-fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
+pub fn (h &HandshakeCore) negotiated_cipher_suite() CipherSuite {
 	return h.cipher_suite
 }
 
@@ -247,7 +275,7 @@ fn (mut h HandshakeCore) update_transcript(msg []u8) ! {
 
 // create_client_hello generates the initial ClientHello, advances to
 // .wait_sh and returns the raw bytes to hash and frame (RFC 8446 App. D.4).
-fn (mut h HandshakeCore) create_client_hello() ![]u8 {
+pub fn (mut h HandshakeCore) create_client_hello() ![]u8 {
 	// A second call would replay the first ClientHello into the transcript and
 	// corrupt every later hash; the retry ClientHello has its own path, produced
 	// while a HelloRetryRequest is fed.
@@ -377,7 +405,6 @@ fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg 
 	if h.hrr_cipher_suite != none {
 		return h.classify_failure(.unexpected_message, 'handshake: received second HelloRetryRequest (unexpected_message)')
 	}
-
 	if !sh.has_key_share && sh.cookie.len == 0 {
 		return h.classify_failure(.illegal_parameter, 'handshake: HelloRetryRequest would not change the ClientHello (illegal_parameter)')
 	}
@@ -558,6 +585,55 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// Hand the raw client Finished to the transport, which encrypts it under the
 	// still-active handshake keys.
 	return [new_handshake_message(.handshake, client_fin_msg)!]
+}
+
+// receive_msgs_at_level processes bytes using the encryption-level reassembly
+// buffers, returning any outbound messages they complete. On the TLS-record side
+// (is_quic false) it then syncs the cached record keys, and a failure that parked
+// the machine in .failed wipes them; the QUIC path drives the core drain directly,
+// since it derives packet protection from the exported secrets instead. Module-
+// private: adapters reach it through the phase-named receive_initial_bytes() and
+// receive_handshake_bytes() entry points below.
+fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+	messages := h.core_receive_msgs_at_level(level, bytes) or {
+		if !h.is_quic && h.state == .failed {
+			h.wipe_record_keys()
+		}
+		return err
+	}
+	if !h.is_quic {
+		h.sync_record_keys() or {
+			h.fail_and_zeroize_secrets()
+			return err
+		}
+	}
+	return messages
+}
+
+// receive_initial_bytes feeds pre-ServerHello (plaintext) handshake bytes —
+// TLS records or Initial-packet CRYPTO bytes alike.
+pub fn (mut h HandshakeCore) receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
+	return h.receive_msgs_at_level(.initial, bytes)!
+}
+
+// receive_handshake_bytes feeds bytes protected by the handshake traffic keys —
+// TLS records or Handshake-packet CRYPTO bytes alike.
+pub fn (mut h HandshakeCore) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
+	return h.receive_msgs_at_level(.handshake, bytes)!
+}
+
+// zeroize_handshake_secrets destroys the handshake traffic secrets — and, on the
+// TLS-record side, the cached handshake record keys — once the adapter no longer
+// needs them (RFC 8446 §7.5, RFC 9001 §4.9.2); valid only after .connected.
+pub fn (mut h HandshakeCore) zeroize_handshake_secrets() ! {
+	h.zeroize_traffic_secrets_at(.handshake)!
+}
+
+// zeroize_application_secrets destroys the application traffic secrets — and, on
+// the TLS-record side, the cached application record keys — the terminal teardown
+// at close() (§7.5); valid only after .connected.
+pub fn (mut h HandshakeCore) zeroize_application_secrets() ! {
+	h.zeroize_traffic_secrets_at(.application)!
 }
 
 // set_hash_algo adopts the negotiated suite's hash, rebuilding the transcript

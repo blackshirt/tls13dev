@@ -10,23 +10,25 @@ This file orients you to the layout. The transport-facing contract is documented
 [`CONTRACT.md`](./CONTRACT.md), and the eight-step QUIC engine loop over the seam is walked
 through in [`QUIC.md`](./QUIC.md).
 
-## One core, two facades
+## One core, one type, two guarded surfaces
 
-There is a single private `HandshakeCore` holding the shared TLS semantics. All its methods are
-module-private, so nothing reaches callers through embedded promotion;
-each of the two public transport facades re-exports only what its adapter uses, as a curated set of
-`pub` forwarders over the core:
+There is a single `HandshakeCore` holding the shared TLS semantics and both transport surfaces.
+It is a private type, but its curated entry points are `pub` directly on it; the two constructors
+fix the transport mode once, at construction:
 
-- **`TLSHandshake`** (`new_tls_handshake(server_name, options)`) — the record adapter for
-  TLS-over-TCP. Also derives and owns the cached TLS record keys and implements the TLS KeyUpdate
-  derivation.
-- **`QuicHandshake`** (`new_quic_handshake(server_name, options)`) — the QUIC adapter. Exposes raw
+- **`new_tls_handshake(server_name, options)`** — TLS-over-TCP record mode (`is_quic false`). Also
+  derives and owns the cached TLS record keys and implements the TLS KeyUpdate derivation.
+- **`new_quic_handshake(server_name, options)`** — QUIC mode (`is_quic true`). Exposes raw
   traffic secrets for RFC 9001 key expansion instead of record keys; QUIC packet types and CRYPTO
   reassembly live in the QUIC engine, not here.
 
-A caller picks its transport at construction; there is no runtime mode flag and no wrong-transport
-call that only fails at runtime. TLS-specific methods (record boundary, TLS KeyUpdate) are simply
-absent from `QuicHandshake`.
+A caller still picks its transport at construction, but the mode is now a runtime flag: transport-
+specific methods exist on both modes and guard themselves — a TLS-record-only call on a QUIC-mode
+core (`handshake_record_keys()`, `application_record_keys()`, `update_traffic_keys()`, the backlog
+accessors, `take_buffered_handshake_bytes()`) and a QUIC-only call on a TLS-mode core
+(`peer_handshake_secrets()`, `peer_application_secrets()`, `peer_transport_parameters()`,
+`hello_retry_request_received()`) each return a plain error without touching state or keys, the
+same convention as the out-of-phase guards.
 
 ```v
 mut hs := new_tls_handshake(server_name, opts)!   // or new_quic_handshake(...)
@@ -43,19 +45,19 @@ CA bundle.
 ## File map
 
 ```
-state_machine.v       the shared core vocabulary + HandshakeCore: states, the private
-                      EncryptionLevel, HandshakeOptions, the struct + constructor, the state
-                      cursor, create_client_hello, and the ServerHello/HRR and encrypted-flight
-                      phase transitions
+state_machine.v       the unified core vocabulary + HandshakeCore: states, the private
+                      EncryptionLevel, HandshakeOptions, the struct + constructors, the state
+                      cursor, create_client_hello, the receive lifecycle, and the ServerHello/HRR
+                      and encrypted-flight phase transitions
 state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the per-level
                       reassembly buffers (ReassemblyBuffers), the receive/dispatch routing, and
                       classify_failure / fail_with / failure_alert
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
-tls_handshake.v       TLS record facade: curated core forwarders, phase-named receive, backlog,
-                      record-key and zeroize seams, cached record-key handles, KeyUpdate
-quic_handshake.v      QUIC facade: curated core forwarders, peer_handshake_secrets and
-                      peer_application_secrets, peer transport params
+core_record.v         TLS-record side of the core (is_quic-guarded): backlog, record-key and
+                      zeroize seams, cached record-key handles, KeyUpdate
+core_quic.v           QUIC side of the core (is_quic-guarded): peer_handshake_secrets and
+                      peer_application_secrets, peer transport params, HRR flag
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
@@ -85,8 +87,8 @@ Each `*_test.v` sits beside its source.
   error always both tears down and reports the RFC-correct alert, never a stale default. `fail_with()`
   is the `err.msg()`-unwrapping shorthand used by parse sites.
 - **Named phase material.** Handshake and application traffic secrets are stored as flat
-  `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the TLS
-  facade caches the derived record keys one opaque handle per direction inside a
+  `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the core's
+  TLS-record side caches the derived record keys one opaque handle per direction inside a
   phase-typed generation (`HandshakeRecordKeys` / `ApplicationRecordKeys`, each holding a
   `RecordKeys` per direction). Both
   phase buffers live in `ReassemblyBuffers`. Per-phase wipe and install helpers take a whole

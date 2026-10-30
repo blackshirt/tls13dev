@@ -10,7 +10,7 @@ module handshake
 
 // failure_alert returns the alert description an adapter should surface when
 // this handshake dies (RFC 8446 §6).
-fn (h &HandshakeCore) failure_alert() AlertDescription {
+pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
 
@@ -31,14 +31,15 @@ fn (mut h HandshakeCore) fail_with(alert AlertDescription, err IError) IError {
 	return h.classify_failure(alert, err.msg())
 }
 
-// receive_msgs_at_level processes bytes using the encryption-level reassembly buffers
-// owned by the selected transport facade, returning any outbound messages triggered.
-// Module-private: adapters reach it through their phase-named receive_initial_bytes()
-// and receive_handshake_bytes() entry points. Initial-level input is accepted only
-// while awaiting ServerHello; handshake-level input is accepted only between
-// ServerHello and Finished. Phase misuse is rejected without consuming bytes or
-// changing state.
-fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+// core_receive_msgs_at_level is the transport-neutral intake guard and dispatch:
+// it bounds the state-machine contract, then feeds the level's reassembly buffers
+// owned by the core. The unified entry point HandshakeCore.receive_msgs_at_level()
+// (state_machine.v) wraps it with the TLS-only record-key sync; adapters reach both
+// through their phase-named receive_initial_bytes() and receive_handshake_bytes()
+// entry points. Initial-level input is accepted only while awaiting ServerHello;
+// handshake-level input is accepted only between ServerHello and Finished. Phase
+// misuse is rejected without consuming bytes or changing state.
+fn (mut h HandshakeCore) core_receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
 	}
@@ -91,7 +92,7 @@ fn (mut h HandshakeCore) append_and_drain_at(level EncryptionLevel, bytes []u8) 
 }
 
 // level_is_open reports whether one level's buffer is legal for the current state;
-// receive_msgs_at_level and drain_at() share it as the single phase-legality rule.
+// core_receive_msgs_at_level and drain_at() share it as the single phase-legality rule.
 fn (h &HandshakeCore) level_is_open(level EncryptionLevel) bool {
 	return match level {
 		.initial { h.state == .wait_sh }
