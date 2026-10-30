@@ -14,11 +14,9 @@ pub fn (h &HandshakeCore) failure_alert() AlertDescription {
 	return h.fail_alert
 }
 
-// classify_failure is the single terminal-failure primitive for the core: it pins
-// the alert the adapter must surface, zeroes every derived secret, parks the
-// machine in .failed, and returns the IError to propagate (RFC 8446 §7.5), so a
-// call site cannot record an alert and forget to zeroize. Idempotent, so outer
-// teardown safety nets stay harmless.
+// classify_failure is the core's single terminal-failure primitive: it pins the alert,
+// zeroes every derived secret, parks .failed, and returns the IError (§7.5), so no site
+// can record an alert and forget to zeroize. Idempotent, so safety nets stay harmless.
 fn (mut h HandshakeCore) classify_failure(alert AlertDescription, message string) IError {
 	h.fail_alert = alert
 	h.fail_and_zeroize_secrets()
@@ -31,14 +29,9 @@ fn (mut h HandshakeCore) fail_with(alert AlertDescription, err IError) IError {
 	return h.classify_failure(alert, err.msg())
 }
 
-// core_receive_msgs_at_level is the transport-neutral intake guard and dispatch:
-// it bounds the state-machine contract, then feeds the level's reassembly buffers
-// owned by the core. The unified entry point HandshakeCore.receive_msgs_at_level()
-// (state_machine.v) delegates straight to it; adapters reach it through their
-// phase-named receive_initial_bytes() and receive_handshake_bytes()
-// entry points. Initial-level input is accepted only while awaiting ServerHello;
-// handshake-level input is accepted only between ServerHello and Finished. Phase
-// misuse is rejected without consuming bytes or changing state.
+// core_receive_msgs_at_level guards and dispatches inbound bytes: a level is accepted only
+// while phase-legal (initial until ServerHello, handshake until Finished), and misuse is
+// rejected without consuming bytes or changing state; legal bytes append then consume.
 fn (mut h HandshakeCore) core_receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
@@ -57,14 +50,13 @@ fn (mut h HandshakeCore) core_receive_msgs_at_level(level EncryptionLevel, bytes
 		}
 		return error(msg)
 	}
-	return h.append_and_drain_at(level, bytes)
+	return h.append_and_consume_msgs_at(level, bytes)
 }
 
-// append_and_drain_at bounds each append before allocating, while still allowing a
-// transport to deliver multiple complete messages in one call. Inner failures
-// already tear down via classify_failure; the fail_and_zeroize_secrets() safety
-// nets below catch anything else — teardown is idempotent.
-fn (mut h HandshakeCore) append_and_drain_at(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+// append_and_consume_msgs_at bounds each append before allocating, while letting one
+// call deliver several complete messages. Inner failures tear down via classify_failure;
+// the fail_and_zeroize_secrets() nets below catch the rest (teardown is idempotent).
+fn (mut h HandshakeCore) append_and_consume_msgs_at(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	mut offset := 0
 	limit := handshake_header_len + max_handshake_message_len
@@ -79,7 +71,7 @@ fn (mut h HandshakeCore) append_and_drain_at(level EncryptionLevel, bytes []u8) 
 			h.buffers.append(level, bytes[offset..offset + take])
 			offset += take
 		}
-		messages := h.drain_at(level) or {
+		messages := h.consume_msgs_at(level) or {
 			h.fail_and_zeroize_secrets()
 			return err
 		}
@@ -92,7 +84,7 @@ fn (mut h HandshakeCore) append_and_drain_at(level EncryptionLevel, bytes []u8) 
 }
 
 // is_level_open reports whether one level's buffer is legal for the current state;
-// core_receive_msgs_at_level and drain_at() share it as the single phase-legality rule.
+// core_receive_msgs_at_level and consume_msgs_at() share it as the single phase-legality rule.
 fn (h &HandshakeCore) is_level_open(level EncryptionLevel) bool {
 	return match level {
 		.initial { h.state == .wait_sh }
@@ -101,9 +93,10 @@ fn (h &HandshakeCore) is_level_open(level EncryptionLevel) bool {
 	}
 }
 
-// drain_at consumes every complete message one level's buffer currently holds.
+// consume_msgs_at consumes the complete messages one level's buffer currently holds,
+// dispatching each through the state machine and returning the messages it produces.
 // Framing-boundary checks remain adapter policy.
-fn (mut h HandshakeCore) drain_at(level EncryptionLevel) ![]HandshakeMessage {
+fn (mut h HandshakeCore) consume_msgs_at(level EncryptionLevel) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.is_level_open(level) {
 		msg := h.buffers.next_message(level) or {
@@ -153,7 +146,7 @@ fn unexpected_handshake_message(msg_type HandshakeType) string {
 
 // reassembly_buf_cap is the initial per-level reassembly allocation, not a limit: the
 // hard bound a hostile peer must never exceed is enforced against
-// max_handshake_message_len in append_and_drain_at and next_recordless_message.
+// max_handshake_message_len in append_and_consume_msgs_at and next_recordless_message.
 const reassembly_buf_cap = 4096
 
 // ReassemblyBuffers holds the initial- and handshake-level byte streams that do

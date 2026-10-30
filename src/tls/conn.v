@@ -134,25 +134,10 @@ mut:
 	// (RFC 8446 §6): abort_connection and dial()'s teardown cannot double-send.
 	failure_alert_sent bool
 
-	// Lock discipline: one exclusive mutex serializes read(), write() and every
-	// teardown. It is not an RwLock read side because every path rewrites AEAD
-	// sequence numbers. Internal helpers run with guard already held and never lock
-	// themselves; only the public entry points and dial()'s do_handshake acquire it.
-	// The single exception: guard is released around the indefinite blocking
-	// sock.read() in read_raw_record() so a concurrent close() can acquire it. The
-	// reader registers in `readers` before releasing guard, so close() never closes
-	// the fd out from under a parked recv() (which would let another thread recycle
-	// that descriptor number); close_tcp_socket() defers the physical close and the
-	// last reader to finish performs it. close() of a descriptor does not by itself
-	// wake a thread parked in recv(2) on POSIX anyway, so the parked read still
-	// returns on its own (socket timeout or arriving bytes), and the reader re-checks
-	// the terminal flags right after reacquiring, so it never touches state close()
-	// has already destroyed.
-	// Socket writes stay under guard because they are bounded by the write timeout
-	// that dial() sets, so they can never pin close().
-	// A Conn therefore supports at most one concurrent reader and one concurrent
-	// writer (the same contract Go crypto/tls documents); it does not do true
-	// full-duplex simultaneous read+write.
+	// One exclusive mutex serializes read(), write() and teardown; helpers assume it held, so only
+	// the public entry points and dial()'s do_handshake acquire it. The sole exception: guard is
+	// released around the blocking sock.read() in read_raw_record(), the reader registering in
+	// `readers` first so close() never closes/recycles the fd under a parked recv(). 1 reader+writer max.
 	guard &sync.Mutex // serializes read(), write(), close() and every teardown
 
 	// Negotiated connection identity and protocol.
@@ -571,7 +556,7 @@ fn (mut c Conn) do_handshake() ! {
 	// The core verified the server Finished; install this adapter's post-handshake protection.
 	c.install_application_protection()!
 	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
-	// core's drain_at() stops at .connected, so take (and scrub) its buffered bytes.
+	// core's consume_msgs_at() stops at .connected, so take (and scrub) its buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()!
 	if coalesced.len > 0 {
 		// handle_post_handshake failures already run abort_connection (which latches
@@ -690,10 +675,9 @@ fn (mut c Conn) install_handshake_protection() ! {
 	suite := c.hs.negotiated_cipher_suite()
 	mut client := keys.take_client_keypair()
 	mut server := keys.take_server_keypair()
-	// The takes moved each pair out of the bundle; the builders drain the legs they
-	// install, and these wipes scrub whatever is left on every other exit path
-	// (§7.5). The bytes are zeroed on all paths; a handle may retain zero-filled
-	// buffers of the original length, since the builders take their by-value copies.
+	// The builders drain the legs they install, so these wipes scrub every remaining
+	// copy on all exit paths (§7.5); a handle may keep zero-filled buffers of the
+	// original length, since the builders take their by-value copies.
 	defer {
 		keys.wipe()
 		client.wipe()
@@ -738,11 +722,9 @@ fn (mut c Conn) rebuild_tls_protection(is_server_leg bool) ! {
 		client.wipe()
 		server.wipe()
 	}
-	// Capture the superseded generation before the assignment drops its last
-	// reference, then wipe its nonce base: §7.5 expects old traffic keys to stop
-	// existing once replaced. wipe() is IV-only (the AEAD backend key is a
-	// documented platform limit) and idempotent, so it is safe on a state that
-	// was never installed.
+	// Copy the superseded leg before rebinding it, then wipe its nonce base: §7.5 wants
+	// old traffic keys gone once replaced. wipe() is IV-only (the AEAD backend key is a
+	// documented platform limit) and idempotent, so it is safe even if never installed.
 	if is_server_leg {
 		mut old := c.s_app_protection
 		c.s_app_protection = tls_record_protection(suite, mut server)!
@@ -853,15 +835,14 @@ fn (mut c Conn) read_raw_record() !Record {
 	return error('tls: unreachable')
 }
 
-// try_reclaim_recv_buf reclaims the already-consumed prefix of recv_buf, keeping its
-// capacity when fully drained and shifting the tail down past the threshold.
+// try_reclaim_recv_buf reclaims recv_buf's consumed prefix: a full drain clear()s the
+// buffer in place to keep its capacity, and past recv_buf_compact_threshold it shifts
+// the live tail down once; a smaller prefix is left untouched until the next read.
 fn (mut c Conn) try_reclaim_recv_buf() {
 	if c.recv_pos == c.recv_buf.len {
-		// Fully drained: clear() keeps the capacity for the next record.
 		c.recv_buf.clear()
 		c.recv_pos = 0
 	} else if c.recv_pos >= recv_buf_compact_threshold {
-		// Prefix over the bound: shift the live tail down once, keeping reclaim O(1) per byte.
 		c.recv_buf = c.recv_buf[c.recv_pos..].clone()
 		c.recv_pos = 0
 	}

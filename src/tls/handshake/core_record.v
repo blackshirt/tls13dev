@@ -27,7 +27,7 @@ pub fn (h &HandshakeCore) handshake_backlog() !int {
 	return h.buffers.len(.handshake)
 }
 
-// take_buffered_handshake_bytes moves whatever drain_at() left buffered at
+// take_buffered_handshake_bytes moves whatever consume_msgs_at() left buffered at
 // .connected (legal only per RFC 8446 §4.6.1 coalescing) to the record adapter,
 // zeroizing the core's copy (§7.5).
 pub fn (mut h HandshakeCore) take_buffered_handshake_bytes() ![]u8 {

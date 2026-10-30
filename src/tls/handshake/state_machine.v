@@ -18,10 +18,9 @@ import crypto.subtle
 import tls.pki
 import x.crypto.curve25519
 
-// HandshakeState is the client handshake state machine, mirroring the client
-// states of RFC 8446 Appendix A.1 (the all-caps RFC names carry no formal meaning,
-// so they are rendered in snake_case here); `failed` is an implementation terminal
-// the RFC does not define.
+// HandshakeState is the client handshake state machine, mirroring the client states of
+// RFC 8446 Appendix A.1 (all-caps RFC names carry no formal meaning, so rendered here in
+// snake_case); `failed` is an implementation terminal the RFC does not define.
 pub enum HandshakeState {
 	start         // RFC START: nothing sent yet; create_client_hello moves us out of here
 	wait_sh       // RFC WAIT_SH: ClientHello sent; awaiting ServerHello or HelloRetryRequest
@@ -51,10 +50,9 @@ fn new_handshake_message(level EncryptionLevel, msg []u8) !HandshakeMessage {
 	}
 }
 
-// is_initial reports whether this outbound message belongs to the pre-ServerHello
-// (plaintext) phase; a false result means it is protected by handshake keys. It is
-// the only phase fact adapters need in order to pick a transmit queue — the phase
-// itself is a module-private EncryptionLevel, so it is not exposed as an accessor.
+// is_initial reports whether this outbound message is in the pre-ServerHello (plaintext)
+// phase; false means it is protected by handshake keys. It is the only phase fact adapters
+// need to pick a transmit queue, so the module-private EncryptionLevel stays unexposed.
 pub fn (m &HandshakeMessage) is_initial() bool {
 	return m.level == .initial
 }
@@ -64,10 +62,9 @@ pub fn (m &HandshakeMessage) msg() []u8 {
 	return m.msg
 }
 
-// EncryptionLevel names TLS protection phases shared by handshake messages
-// and traffic-secret access, independent of transport packet or record levels.
-// Module-private: adapters reach each phase through the core's phase-named
-// methods, so the phase vocabulary stays an implementation detail.
+// EncryptionLevel names the TLS protection phases shared by handshake messages and
+// traffic-secret access, independent of transport packet/record levels. Module-private:
+// adapters reach each phase through the core's phase-named methods instead.
 enum EncryptionLevel {
 	initial     // handshake messages sent before handshake keys are available
 	handshake   // messages protected with handshake traffic keys
@@ -121,20 +118,14 @@ pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOpt
 	}
 }
 
-// HandshakeCore owns shared TLS 1.3 handshake state and behavior, plus both
-// transport surfaces guarded by is_quic. The TLS-record side derives its record keys
-// on demand from the retained traffic secrets (core_record.v); QUIC exports the raw
-// secrets instead (core_quic.v).
+// HandshakeCore owns shared TLS 1.3 handshake state and behavior, plus both transport
+// surfaces guarded by is_quic: the TLS-record side derives record keys on demand from the
+// retained traffic secrets (core_record.v), while QUIC exports the raw secrets (core_quic.v).
 @[noinit]
 struct HandshakeCore {
-	// Fixed at construction and never reassigned, because both are part of the core's
-	// identity for its whole lifetime. is_quic guards the transport-specific entry points
-	// (a TLS-record-only call on a QUIC-mode core, and vice versa, is refused at run time
-	// rather than silently misbehaving); validator holds the certificate-checking policy.
-	// Flipping either mid-handshake would invalidate the guards and any material derived
-	// against the original values, so they are declared immutable. The negotiated suite
-	// (hash_algo, cipher_suite, key_len) is set later, once the ServerHello arrives, and
-	// stays mutable.
+	// is_quic (guards the transport entry points; mismatched calls are refused at run time)
+	// and validator (cert policy) are core identity, fixed at construction: flipping either
+	// mid-handshake would void the guards and any material derived against the originals.
 	is_quic   bool
 	validator pki.Validator
 mut:
@@ -172,10 +163,9 @@ mut:
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
 }
 
-// new_handshake_core creates the unified handshake state from the server name,
-// complete handshake options (including ALPN and certificate validation) and the
-// transport mode. new_tls_handshake() and new_quic_handshake() are the public
-// wrappers fixing is_quic to false / true.
+// new_handshake_core creates the unified handshake state from the server name, full
+// HandshakeOptions (ALPN, cert validation) and the transport mode; new_tls_handshake() and
+// new_quic_handshake() are the public wrappers fixing is_quic to false / true.
 fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool) !HandshakeCore {
 	validate_handshake_options(options)!
 	validator := options.validator or {
@@ -373,12 +363,9 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 
 	// The handshake secret is retained because the Master Secret derives from it.
 	th_ch_sh := h.transcript.current_hash()
-	// Derive the retained Handshake Secret first, then expand each direction's traffic
-	// secret from it; all three land in locals before moving to the core's flat fields.
-	// The Handshake Secret is retained (stored to h.handshake_secret below), so it
-	// cannot be defer-wiped — a defer would zero the shared buffer the field still
-	// needs. Instead each expansion wipes it on its own error path, before any field
-	// owns it, so the split's cross-function value never leaks even if HKDF fails.
+	// Derive the retained Handshake Secret, then each direction's traffic secret from it.
+	// Stored to h.handshake_secret, so it cannot be defer-wiped (a defer would zero the
+	// buffer the field still needs); each expansion wipes it on its own error path instead.
 	mut hs_secret := derive_handshake_secret(h.hash_algo, shared_secret)!
 	c_hs := derive_client_hs_secret(h.hash_algo, hs_secret, th_ch_sh) or {
 		wipe_secret(mut hs_secret)
@@ -457,10 +444,9 @@ fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) !
 		h.config.is_quic) or {
 		return h.fail_with(.decode_error, err)
 	}
-	// RFC 7301 §3.1: the server must pick from the offered list; an unoffered value
-	// could steer the application protocol below us. `in` is exact element
-	// membership — a substring test would let a hostile pick like "1.1" pass
-	// against the offer "http/1.1".
+	// RFC 7301 §3.1: the server must pick from the offered list, else an unoffered value
+	// could steer the protocol below us. `in` is exact element membership — a substring
+	// test would let a hostile "1.1" pass against the offer "http/1.1".
 	if alpn != '' && !(alpn in h.config.alpn) {
 		return h.classify_failure(.illegal_parameter, 'handshake: server selected ALPN "${alpn}" not offered by client')
 	}
@@ -587,13 +573,9 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	return [new_handshake_message(.handshake, client_fin_msg)!]
 }
 
-// receive_msgs_at_level processes bytes using the encryption-level reassembly
-// buffers, returning any outbound messages they complete. It is transport-neutral:
-// the record keys are derived on demand by handshake_traffic_keys() /
-// application_traffic_keys() from the retained traffic secrets, so the receive path
-// carries no record-side branch. Module-private: adapters reach it through the
-// phase-named receive_initial_bytes() and receive_handshake_bytes() entry points
-// below.
+// receive_msgs_at_level processes bytes through the reassembly buffers, returning the
+// messages they complete. Transport-neutral (record keys derive on demand), so the receive
+// path has no record-side branch; adapters use the phase-named entry points below.
 fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
 	return h.core_receive_msgs_at_level(level, bytes)
 }

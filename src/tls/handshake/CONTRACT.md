@@ -90,7 +90,7 @@ the machine in `.failed`, and returns the `IError` to propagate. No call site ca
 produce one of those steps without the others, so a peer-triggered decode error both
 tears down and reports the RFC-correct alert (e.g. `decode_error` for a malformed
 message) rather than a stale default. Every handshake-level and ServerHello-path
-parse/framing failure routes through it; `append_and_drain_at()` keeps an
+parse/framing failure routes through it; `append_and_consume_msgs_at()` keeps an
 `or { fail_and_zeroize_secrets() }` safety net for any non-classified internal error
 (teardown is idempotent, so the belt-and-suspenders call is harmless). The record
 keys need no separate wipe because they are derived from the secrets these calls
