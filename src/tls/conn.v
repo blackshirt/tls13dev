@@ -123,16 +123,22 @@ mut:
 	// Sticky fatal read error; returned again on subsequent read() calls instead
 	// of appearing as a clean EOF.
 	fatal_error string
+	// Set by the first failure alert sent, so one failure emits at most one alert
+	// (RFC 8446 §6): abort_connection and dial()'s teardown cannot double-send.
+	failure_alert_sent bool
 
 	// Lock discipline: one exclusive mutex serializes read(), write() and every
 	// teardown. It is not an RwLock read side because every path rewrites AEAD
 	// sequence numbers. Internal helpers run with guard already held and never lock
 	// themselves; only the public entry points and dial()'s do_handshake acquire it.
 	// The single exception: guard is released around the indefinite blocking
-	// sock.read() in read_raw_record() so a concurrent close() can acquire it, close
-	// the socket and unblock a parked reader; the read path re-checks the terminal
-	// flags right after reacquiring. Socket writes stay under guard because they are
-	// bounded by the write timeout that dial() sets, so they can never pin close().
+	// sock.read() in read_raw_record() so a concurrent close() can acquire it. Note
+	// that close() of the descriptor does not by itself wake a thread parked in
+	// recv(2) on POSIX; the parked read returns on its own (socket timeout or
+	// arriving bytes), and the reader re-checks the terminal flags right after
+	// reacquiring, so it never touches state a close() has already destroyed.
+	// Socket writes stay under guard because they are bounded by the write timeout
+	// that dial() sets, so they can never pin close().
 	// A Conn therefore supports at most one concurrent reader and one concurrent
 	// writer (the same contract Go crypto/tls documents); it does not do true
 	// full-duplex simultaneous read+write.
@@ -245,23 +251,36 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:              sock
-		hs:                hs
-		session_tickets:   []handshake.NewSessionTicket{cap: 4}
-		sock_buf:          []u8{len: recv_read_size} // reused by every socket read for this connection
-		recv_buf:          []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
-		recv_pos:          0
-		app_buf:           []u8{cap: max_plaintext_record_len} // one full plaintext record
-		app_pos:           0
-		closed:            false
-		close_notify_sent: false
-		sock_closed:       false
-		fatal_error:       ''
-		deadline_ms:       deadline_ms
-		sock_timeout:      timeout
-		guard:             sync.new_mutex()
-		negotiated_alpn:   ''
-		server_name:       server_name
+		sock:               sock
+		hs:                 hs
+		session_tickets:    []handshake.NewSessionTicket{cap: 4}
+		sock_buf:           []u8{len: recv_read_size} // reused by every socket read for this connection
+		recv_buf:           []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
+		recv_pos:           0
+		app_buf:            []u8{cap: max_plaintext_record_len} // one full plaintext record
+		app_pos:            0
+		closed:             false
+		close_notify_sent:  false
+		sock_closed:        false
+		fatal_error:        ''
+		deadline_ms:        deadline_ms
+		sock_timeout:       timeout
+		guard:              sync.new_mutex()
+		negotiated_alpn:    ''
+		server_name:        server_name
+		// Restated explicitly rather than relying on noinit heap zeroing: the record
+		// layer probes protection state (send_failure_alert) and reads these latches
+		// on error paths that can run before any install.
+		s_hsk_protection:   TLSProtection{ aead: unsafe { nil } }
+		c_hsk_protection:   TLSProtection{ aead: unsafe { nil } }
+		s_app_protection:   TLSProtection{ aead: unsafe { nil } }
+		c_app_protection:   TLSProtection{ aead: unsafe { nil } }
+		post_hsk_buf:       []u8{}
+		peer_key_update:    false
+		peer_terminated:    false
+		failure_alert_sent: false
+		sock_closed:        false
+		fail_alert:         none
 	}
 
 	// The single handshake-phase teardown choke-point: every do_handshake() failure —
@@ -323,6 +342,13 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 	mut tolerated_records := 0
 	for {
 		rec := c.read_raw_record() or {
+			// A socket-level I/O failure (per-op timeout, EINTR, EAGAIN) is the
+			// caller's condition, not a protocol fault: pass it through unpinned
+			// and un-destroyed so a retry or close() still works. Everything else
+			// is stream/protocol damage and stays terminal (RFC 8446 §6).
+			if transport_error(err.msg()) {
+				return err
+			}
 			alert := c.fail_alert or { handshake.AlertDescription.decode_error }
 			return c.abort_connection(alert, err.msg())
 		}
@@ -356,27 +382,43 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 						if n < dec.plaintext.len {
 							c.app_buf << dec.plaintext[n..]
 						}
-						// Scrub the decrypted staging copy the moment it is fully
-						// delivered; the undelivered remainder is scrubbed when
-						// app_buf drains (§7.5 spirit: no plaintext left in freed memory).
+						// §7.5 spirit: scrub the decrypted staging copy on every exit path
+						// (delivered prefix, alert, post-handshake, or error); the app_buf
+						// remainder is scrubbed when it drains. Each arm scrubs explicitly
+						// because a defer registered in this loop only fires at function exit.
 						zero_bytes(mut dec.plaintext)
 						return n
 					}
 					.alert {
 						// Post-handshake alerts arrive encrypted as the inner type (RFC 8446 §5.1/§6).
-						return c.handle_alert(dec.plaintext)
+						// handle_alert consumes the body synchronously; scrub the staging copy on
+						// both the clean-0 and the error path before returning (§7.5 spirit).
+						mut res := c.handle_alert(dec.plaintext) or {
+							zero_bytes(mut dec.plaintext)
+							return err
+						}
+						zero_bytes(mut dec.plaintext)
+						return res
 					}
 					.handshake {
 						// NewSessionTicket/KeyUpdate must not surface as application data, but a
 						// record flood of them is the same starvation vector as empty padding.
 						tolerated_records++
 						if tolerated_records > max_tolerated_records_per_read {
+							zero_bytes(mut dec.plaintext)
 							return c.abort_connection(.unexpected_message, 'tls: too many skipped records in one read (unexpected_message)')
 						}
-						c.handle_post_handshake(dec.plaintext)!
+						c.handle_post_handshake(dec.plaintext) or {
+							zero_bytes(mut dec.plaintext)
+							return err
+						}
+						// This record's plaintext is fully consumed; scrub before the next
+						// iteration's dec would drop it unscrubbed (§7.5 spirit).
+						zero_bytes(mut dec.plaintext)
 						continue
 					}
 					else {
+						zero_bytes(mut dec.plaintext)
 						return c.abort_connection(.unexpected_message, 'tls: unexpected inner content type ${dec.content_type}')
 					}
 				}
@@ -417,8 +459,10 @@ pub fn (mut c Conn) close() ! {
 	// Single-phase teardown under guard: emit close_notify at most once (it needs the
 	// write keys alive, so it runs before destroy_all wipes them), mark closed, destroy
 	// every secret and buffer, then release the socket. A reader parked in sock.read()
-	// is not holding guard, so this acquires it, and close_tcp_socket() unblocks that
-	// parked read; the reader re-checks the terminal flags right after reacquiring.
+	// is not holding guard, so this acquires it; the parked read surfaces the close on
+	// its own (see the Conn lock discipline) and re-checks the terminal flags after
+	// reacquiring. A short-circuit here after a peer close_notify is correct: the
+	// §6.1 reply already went out from handle_alert while the keys existed.
 	c.guard.lock()
 	defer {
 		c.guard.unlock()
@@ -529,7 +573,8 @@ fn (mut c Conn) do_handshake() ! {
 	// core's drain_at() stops at .connected, so take (and scrub) its buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()!
 	if coalesced.len > 0 {
-		// handle_post_handshake failures already abort_connection; don't re-alert.
+		// handle_post_handshake failures already run abort_connection (which latches
+		// the failure alert), so dial()'s teardown wrapper will not double-alert.
 		c.handle_post_handshake(coalesced)!
 	}
 	// Nothing may protect or decrypt in the handshake phase now, so the core may
@@ -630,9 +675,10 @@ fn (mut c Conn) install_handshake_protection() ! {
 	suite := c.hs.negotiated_cipher_suite()
 	mut client := keys.take_client_keypair()
 	mut server := keys.take_server_keypair()
-	// The takes moved each pair out of the bundle, so these three handles are the only
-	// owners of the bytes. The builders drain the legs they install; these wipes scrub
-	// whatever is left on every other exit path, including a failed second AEAD (§7.5).
+	// The takes moved each pair out of the bundle; the builders drain the legs they
+	// install, and these wipes scrub whatever is left on every other exit path
+	// (§7.5). The bytes are zeroed on all paths; a handle may retain zero-filled
+	// buffers of the original length, since the builders take their by-value copies.
 	defer {
 		keys.wipe()
 		client.wipe()
@@ -724,7 +770,7 @@ fn (mut c Conn) read_raw_record() !Record {
 				return error('record: ${avail} unconsumed bytes exceed the handshake framing bound ${max_handshake_recv_buf_len}')
 			}
 		}
-		if c.sock == unsafe { nil } {
+		if c.sock_closed || c.sock == unsafe { nil } {
 			return error('tls: connection closed (no socket available to read further records)')
 		}
 		if c.deadline_ms != 0 {
@@ -736,6 +782,12 @@ fn (mut c Conn) read_raw_record() !Record {
 		// is what lets a concurrent close() acquire guard, close the socket and unblock a
 		// parked reader (see the Conn lock discipline). Reacquire before touching state.
 		c.guard.unlock()
+		// Classify socket-level failures: a mundane I/O condition — the per-op
+		// timeout, an interrupt, EAGAIN — is returned as a non-sticky transport tag
+		// (transport_error recognises it) so read() can retry; EOF/reset stays a
+		// plain terminal error because the stream is truncated, which §6.1 makes
+		// a truncation-attack boundary. Every branch returns, so the or-block
+		// never falls through with an unbound n.
 		n := c.sock.read(mut c.sock_buf) or {
 			c.guard.lock()
 			// A concurrent close()/abort may have run in the unguarded window: surface its
@@ -746,9 +798,29 @@ fn (mut c Conn) read_raw_record() !Record {
 			if c.deadline_ms != 0 && mono_ms() >= c.deadline_ms {
 				return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
 			}
-			return error('tls: connection closed while reading record: ${err}')
+			msg := err.msg().to_lower()
+			if msg.contains('timed out') || msg.contains('timeout') || msg.contains('eagain') || msg.contains('would block') || msg.contains('interrupted') {
+				return error('tls: socket read timed out or interrupted')
+			}
+			// EOF, connection reset, broken pipe, aborted: the peer ended the stream
+			// without a close_notify. V surfaces a clean FIN as an `EOF` read error, not
+			// `n == 0`, so truncation lands here rather than at the `n == 0` re-check.
+			// RFC 8446 §6.1 makes it terminal and sticky (a silent clean EOF would hide a
+			// truncation attack), so classify it with the same 'connection closed' wording.
+			return error('tls: connection closed while reading record')
 		}
 		c.guard.lock()
+		// The promised post-reacquire terminal-flag re-check (see the Conn lock
+		// discipline): if close()/abort ran during the unguarded read, stop here
+		// instead of decrypting against protections destroy_all already wiped —
+		// which would surface as a spurious protocol error or a plaintext alert.
+		if c.fatal_error != '' {
+			return error(c.fatal_error)
+		}
+		if c.closed || c.sock_closed {
+			// A concurrent close()/abort turned the transient condition terminal.
+			return error('tls: connection closed while reading record')
+		}
 		if n == 0 {
 			return error('tls: connection closed while reading record')
 		}
@@ -780,10 +852,11 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// every secret and buffer directly (RFC 8446 §1.3.1/§7.5).
 	// Any alert is terminal: mark closed before decoding, even a malformed body.
 	c.closed = true
-	c.destroy_all()!
 	peer_alert := handshake.parse_alert(payload) or {
-		// A malformed alert body is fatal: pin a sticky error so later reads re-report it.
+		// A malformed alert body is fatal: destroy everything, then pin a sticky error
+		// so later reads re-report it.
 		c.fatal_error = 'tls: received malformed alert'
+		c.destroy_all()!
 		return error(c.fatal_error)
 	}
 	// close_notify is the one clean-shutdown signal: return 0 like a normal EOF read.
@@ -791,8 +864,21 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// still send the warning-level legacy form, while §6 makes the fatal-level
 	// form the TLS 1.3 conforming one — both end the stream cleanly.
 	if peer_alert.description == .close_notify {
+		// §6.1 demands a symmetric answer: reply with our close_notify while the write
+		// keys still exist, before destroy_all wipes them. close_notify_sent is set
+		// first, so a failed reply is never retried — same rule as in close().
+		c.close_notify_sent = true
+		c.send_close_notify()
+		// §6: never alert back after the peer terminated; the reply above already
+		// ran while the keys existed, and setting the latch keeps dial()'s teardown
+		// wrapper from emitting a stray alert if a later path reuses this Conn.
+		c.peer_terminated = true
+		c.destroy_all()!
 		return 0
 	}
+	// A fatal (or illegal warning) alert needs no reply — §6 forbids alerting back —
+	// but our own keys must die with it (§7.5).
+	c.destroy_all()!
 	// Warning level is prohibited in TLS 1.3 except close_notify (§6.2): a peer
 	// dressing a non-close_notify alert as a warning is non-conforming, so refuse
 	// it as a sticky unexpected_message — never a clean shutdown — so a truncated
@@ -901,8 +987,8 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 // continuing after short writes. It returns only after all bytes are sent or an
 // error occurs, so callers do not need a partial byte count (RFC 8446 §5).
 fn (mut c Conn) write_records(recs []Record) ! {
-	if c.sock == unsafe { nil } {
-		return error('tls: socket is nil')
+	if c.sock_closed || c.sock == unsafe { nil } {
+		return error('tls: socket is closed')
 	}
 	if recs.len == 0 {
 		return
@@ -1023,8 +1109,10 @@ fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message strin
 	return error(message)
 }
 
-// wipe_protection_states zeroes this adapter's four record protection states; it is the
-// single place the record layer's own key material is destroyed (RFC 8446 §7.5).
+// wipe_protection_states zeroes this adapter's four record protection states; it is
+// the single place the four *installed* states are destroyed — rekey_cipher()
+// additionally wipes the one superseded leg the arrays no longer reference
+// (RFC 8446 §7.5).
 fn (mut c Conn) wipe_protection_states() {
 	c.s_hsk_protection.wipe()
 	c.c_hsk_protection.wipe()
@@ -1041,6 +1129,10 @@ fn (mut c Conn) wipe_protection_states() {
 // wipe() is idempotent, so it is safe on protection state that was never installed.
 fn (mut c Conn) destroy_all() ! {
 	if c.hs.state() == .connected {
+		// The core reaches .connected before do_handshake's explicit handshake zeroize
+		// runs, so a failure in that tail window must wipe both levels; the handshake
+		// zeroize is idempotent, making the normal double call after it is a no-op.
+		c.hs.zeroize_handshake_secrets() or {}
 		c.hs.zeroize_application_secrets()!
 	} else {
 		c.hs.fail_and_zeroize_secrets()
@@ -1058,6 +1150,12 @@ fn (mut c Conn) send_failure_alert() {
 	if c.peer_terminated {
 		return
 	}
+	// One alert per failure (§6): a second caller (abort_connection then dial()'s
+	// wrapper) must never re-alert, least of all plaintext onto a closed socket.
+	if c.failure_alert_sent {
+		return
+	}
+	c.failure_alert_sent = true
 	desc := c.fail_alert or { c.hs.failure_alert() }
 	payload := handshake.new_alert(desc).encode()
 	// A protection state is initialized exactly when its IV is the full nonce base.
@@ -1076,8 +1174,10 @@ fn (mut c Conn) send_failure_alert() {
 
 // close_tcp_socket releases the TCP socket without sending TLS shutdown alerts.
 // It is guarded separately because handle_alert marks closed but leaves it open.
+// A parked reader is not woken by close() on POSIX (see the Conn lock discipline);
+// it surfaces the closed state when its own socket timeout returns.
 fn (mut c Conn) close_tcp_socket() {
-	if c.sock == unsafe { nil } || c.sock_closed {
+	if c.sock_closed || c.sock == unsafe { nil } {
 		return
 	}
 	c.sock.close() or {}
@@ -1087,7 +1187,7 @@ fn (mut c Conn) close_tcp_socket() {
 // send_close_notify writes a close_notify alert, encrypted with the application
 // keys (RFC 8446 §5.2/§6.1); a plaintext alert would violate §6, so send nothing.
 fn (mut c Conn) send_close_notify() {
-	if c.sock == unsafe { nil } {
+	if c.sock_closed || c.sock == unsafe { nil } {
 		return
 	}
 	if c.hs.state() != .connected {
@@ -1126,9 +1226,10 @@ fn tls_protection_from_keys(suite handshake.CipherSuite, key []u8, iv []u8) !TLS
 
 // tls_record_protection builds one direction's protection state from its opaque key pair
 // and drains the pair: the AEAD backend keeps its own key and the protection state clones
-// its IV, so both values are scrubbed here before returning (§7.5) and the caller is left
-// holding an empty handle. Which slot the result lands in is the caller's choice, made by
-// name off the generation (`take_client_keypair()` / `take_server_keypair()`).
+// its IV, so both values are scrubbed here before returning (§7.5). The takes empty this
+// by-value copy's fields; the caller's handle keeps the zeroed bytes at their original
+// length, which its own wipe() covers. Which slot the result lands in is the caller's
+// choice, made by name off the generation (`take_client_keypair()` / `take_server_keypair()`).
 fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyPair) !TLSProtection {
 	mut key := keys.take_key()
 	mut iv := keys.take_iv()
@@ -1137,6 +1238,14 @@ fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyPair
 		zero_bytes(mut iv)
 	}
 	return tls_protection_from_keys(suite, key, iv)!
+}
+
+// transport_error reports whether a read_raw_record failure carries the socket
+// I/O tag: a transient condition (per-op timeout, EINTR, EAGAIN) the caller may
+// retry, not a protocol fault. Un-tagged errors — stream damage or framing
+// failures — stay terminal so truncation is still detected (§6.1).
+fn transport_error(msg string) bool {
+	return msg.starts_with('tls: socket read timed out or interrupted')
 }
 
 // decrypt_failure_alert maps a decrypt_record error to the fatal alert the record

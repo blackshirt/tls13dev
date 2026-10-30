@@ -391,10 +391,15 @@ clean end of stream (peer `close_notify` or connection already closed).
 - Zero-length (padding-only) records and inner-type-handshake records are skipped
   transparently, up to the per-`read()` tolerated-record bound (§2.1 Resource bounds);
   past it the connection fails closed with `unexpected_message`.
-- **Plaintext hygiene** — the decrypted staging copy is scrubbed the moment its
-  bytes are delivered, the undelivered `app_buf` remainder is zeroed when it
+- **Plaintext hygiene** — the decrypted staging copy is scrubbed on every exit
+  from the record branch (delivered prefix, alert, post-handshake, or error),
+  the undelivered `app_buf` remainder is zeroed when it
   drains or on terminal teardown, and post-handshake reassembly bytes are wiped
   when the connection dies (RFC 8446 §7.5 spirit: freed memory retains no plaintext).
+- The per-operation socket timeout (`Config.timeout`) is a **transient, retryable
+  error**, not a protocol fault: `read()` reports it and leaves the connection
+  intact — no alert, no key teardown, and a later `read()` continues normally.
+  Stream damage (an abrupt TCP close without `close_notify`) stays terminal.
 - A **plaintext outer alert after the handshake is
   <span style="color:#2ea44f">rejected</span>**, and so is a
   plaintext ChangeCipherSpec record — RFC 8446 §5/§6 make both fatal
@@ -438,7 +443,9 @@ Sends `close_notify` (encrypted with application keys when they exist, per
 TCP socket. <span style="color:#2ea44f">**Idempotent**</span>: a second
 `close()` neither re-sends `close_notify` nor double-closes the socket, and
 never errors. Use it in a `defer` block.
-If the peer sends `close_notify`, `read()` returns `0` but leaves the TCP socket
+If the peer sends `close_notify`, `read()` answers with our own `close_notify`
+first — the symmetric §6.1 answer, emitted while the write keys still exist —
+then returns `0` but leaves the TCP socket
 open; call `close()` to release it.
 
 #### `negotiated_alpn`
@@ -711,9 +718,9 @@ recorded session (§7.5).
 | Situation | Result |
 |---|---|
 | DNS / TCP connect failure | <span style="color:#cf222e">`dial()` error</span> |
-| Socket timeout (read or write) | `dial()` / `read()` / `write()` error after `Config.timeout` |
+| Socket timeout (read or write) | `dial()` / `write()` error after `Config.timeout`; a post-handshake `read()` timeout is a transient error — retryable, connection intact |
 | Peer sends a fatal alert during handshake | <span style="color:#cf222e">`dial()` error</span> carrying the alert description |
-| Peer `close_notify` while reading | <span style="color:#2ea44f">`read()` returns `0` (clean EOF); call `close()` to release the TCP socket</span> |
+| Peer `close_notify` while reading | <span style="color:#2ea44f">`read()` answers with our own `close_notify` (§6.1), then returns `0` (clean EOF); call `close()` to release the TCP socket</span> |
 | Peer fatal alert (encrypted, post-handshake) | <span style="color:#cf222e">`read()` error</span> carrying the alert description |
 | `write()` after `close()` or before handshake | error, nothing sent |
 | `close()` twice | <span style="color:#2ea44f">no-op, no error, `close_notify` sent at most once</span> |

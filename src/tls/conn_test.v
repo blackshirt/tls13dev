@@ -18,20 +18,32 @@ import tls.pki
 fn new_test_conn() !&Conn {
 	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store()) })!
 	return &Conn{
-		sock:              unsafe { nil }
-		hs:                hs
-		recv_buf:          []u8{}
-		recv_pos:          0
-		app_buf:           []u8{}
-		app_pos:           0
-		closed:            false
-		close_notify_sent: false
-		fatal_error:       ''
-		deadline_ms:       0 // socket-free fixture: post-handshake shape, no framing cap
-		sock_timeout:      0 // unused without the do_handshake loop
-		guard:             sync.new_mutex()
-		negotiated_alpn:   ''
-		server_name:       ''
+		sock:               unsafe { nil }
+		hs:                 hs
+		session_tickets:    []handshake.NewSessionTicket{cap: 4}
+		sock_buf:           []u8{len: recv_read_size}
+		recv_buf:           []u8{}
+		recv_pos:           0
+		app_buf:            []u8{}
+		app_pos:            0
+		closed:             false
+		close_notify_sent:  false
+		sock_closed:        false
+		fatal_error:        ''
+		failure_alert_sent: false
+		peer_terminated:    false
+		fail_alert:         none
+		deadline_ms:        0 // socket-free fixture: post-handshake shape, no framing cap
+		sock_timeout:       0 // unused without the do_handshake loop
+		guard:              sync.new_mutex()
+		negotiated_alpn:    ''
+		server_name:        ''
+		s_hsk_protection:   TLSProtection{ aead: unsafe { nil } }
+		c_hsk_protection:   TLSProtection{ aead: unsafe { nil } }
+		s_app_protection:   TLSProtection{ aead: unsafe { nil } }
+		c_app_protection:   TLSProtection{ aead: unsafe { nil } }
+		post_hsk_buf:       []u8{}
+		peer_key_update:    false
 	}
 }
 
@@ -407,18 +419,21 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	mut sock := net.dial_tcp(local.str())!
 	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store()) })!
 	mut c := &Conn{
-		sock:              sock
-		hs:                hs
-		recv_buf:          []u8{}
-		app_buf:           []u8{}
-		app_pos:           0
-		closed:            false
-		close_notify_sent: false
-		sock_closed:       false
-		fatal_error:       ''
-		guard:             sync.new_mutex()
-		negotiated_alpn:   ''
-		server_name:       ''
+		sock:               sock
+		hs:                 hs
+		recv_buf:           []u8{}
+		app_buf:            []u8{}
+		app_pos:            0
+		closed:             false
+		close_notify_sent:  false
+		sock_closed:        false
+		fatal_error:        ''
+		peer_terminated:    false
+		failure_alert_sent: false
+		fail_alert:         none
+		guard:              sync.new_mutex()
+		negotiated_alpn:    ''
+		server_name:        ''
 	}
 
 	c.close()!
@@ -564,18 +579,21 @@ fn test_close_is_not_blocked_by_parked_read() ! {
 	cli.set_read_timeout(1 * time.second)
 	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store()) })!
 	mut c := &Conn{
-		sock:              cli
-		hs:                hs
-		recv_buf:          []u8{}
-		app_buf:           []u8{}
-		app_pos:           0
-		closed:            false
-		close_notify_sent: false
-		sock_closed:       false
-		fatal_error:       ''
-		guard:             sync.new_mutex()
-		negotiated_alpn:   ''
-		server_name:       ''
+		sock:               cli
+		hs:                 hs
+		recv_buf:           []u8{}
+		app_buf:            []u8{}
+		app_pos:            0
+		closed:             false
+		close_notify_sent:  false
+		sock_closed:        false
+		fatal_error:        ''
+		peer_terminated:    false
+		failure_alert_sent: false
+		fail_alert:         none
+		guard:              sync.new_mutex()
+		negotiated_alpn:    ''
+		server_name:        ''
 	}
 	done_ch := chan bool{cap: 1}
 	spawn parked_read_worker(mut c, done_ch)
@@ -589,4 +607,56 @@ fn test_close_is_not_blocked_by_parked_read() ! {
 	_ := <-done_ch
 	assert close_us < 900000 // µs; well under the 1s read timeout
 	assert c.closed
+}
+
+// test_transport_error_predicate pins the socket-read timeout classifier boundary
+// added so a per-operation timeout is not mistaken for a protocol fault: only the
+// tagged transient condition is retryable, while EOF, a peer reset, and every
+// framing/protocol error stay untagged so a truncated stream still fails closed (§6.1).
+fn test_transport_error_predicate() {
+	assert transport_error('tls: socket read timed out or interrupted')
+	// Stream damage and framing faults must stay terminal (they carry no transport tag).
+	assert !transport_error('tls: socket read failed: Connection reset by peer')
+	assert !transport_error('tls: connection closed while reading record')
+	assert !transport_error('tls: socket read failed: EOF')
+	assert !transport_error('record: record length 70000 exceeds maximum allowed 16384')
+	assert !transport_error('')
+}
+
+// test_handle_alert_answers_close_notify pins the §6.1 symmetric answer now emitted
+// by handle_alert. On the socket-free fixture the reply write itself self-skips (the
+// core is not .connected and the socket is nil), so the observable contract is the
+// two latches that guarantee a one-shot, silent teardown: close_notify_sent stops a
+// later close() from re-sending, and peer_terminated stops send_failure_alert from
+// emitting a stray alert after the peer already shut down.
+fn test_handle_alert_answers_close_notify() ! {
+	mut c := new_test_conn()!
+	n := c.handle_alert([u8(2), 0])! // fatal-level close_notify
+	assert n == 0
+	assert c.closed
+	assert c.close_notify_sent, 'the §6.1 reply must latch close_notify_sent'
+	assert c.peer_terminated, 'after the peer terminated, no later alert may be sent'
+	assert c.fatal_error == '', 'a clean close_notify must never pin a sticky fatal'
+	// A follow-up failure alert must be suppressed by peer_terminated: send_failure_alert
+	// returns at its first guard, before it could ever set the one-alert latch.
+	c.send_failure_alert()
+	assert !c.failure_alert_sent, 'a terminated peer must not receive a failure alert'
+}
+
+// test_send_failure_alert_latches_once pins the one-alert-per-failure guard: the
+// first send_failure_alert() records that it fired and any later call is a no-op, so
+// abort_connection followed by dial()'s teardown wrapper can never emit two alerts —
+// the second of which would be plaintext onto an already-dead socket (§6).
+fn test_send_failure_alert_latches_once() ! {
+	mut c := new_test_conn()!
+	// Fresh, non-terminated fixture with no installed protection state: the alert falls
+	// to the plaintext branch and the nil socket rejects the write, but the latch still
+	// records that a single failure alert was attempted.
+	assert !c.peer_terminated
+	assert !c.failure_alert_sent
+	c.send_failure_alert()
+	assert c.failure_alert_sent
+	// The second call short-circuits on the latch; nothing further is emitted.
+	c.send_failure_alert()
+	assert c.failure_alert_sent
 }
