@@ -54,7 +54,7 @@ fn test_encryption_level_rejects_unsupported_operation() ! {
 		validator: fixture_validator()
 	})!
 	rejected = false
-	quic.peer_traffic_secrets_at(.initial) or {
+	quic.traffic_keys_at(.initial) or {
 		assert err.msg().contains('initial level has no traffic secrets')
 		rejected = true
 	}
@@ -641,14 +641,14 @@ fn test_zeroize_traffic_secrets_at_refuses_initial() ! {
 	assert false
 }
 
-// test_update_traffic_keys_refuse_missing_secrets checks that a key
+// test_next_application_key_material_refuse_missing_secrets checks that a key
 // update refuses while the application traffic secrets are still empty.
-fn test_update_traffic_keys_refuse_missing_secrets() ! {
+fn test_next_application_key_material_refuse_missing_secrets() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = HandshakeState.connected
-	h.update_traffic_keys(true) or {
+	h.next_application_key_material(true) or {
 		assert err.msg().contains('server application traffic secret')
-		h.update_traffic_keys(false) or {
+		h.next_application_key_material(false) or {
 			assert err.msg().contains('client application traffic secret')
 			return
 		}
@@ -658,20 +658,20 @@ fn test_update_traffic_keys_refuse_missing_secrets() ! {
 	assert false
 }
 
-// test_update_traffic_keys_refuse_before_connected ensures a caller
+// test_next_application_key_material_refuse_before_connected ensures a caller
 // cannot update secrets merely because they are present in the core.
-fn test_update_traffic_keys_refuse_before_connected() ! {
+fn test_next_application_key_material_refuse_before_connected() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.s_app_tsec = []u8{len: 32, init: 1}
 	h.c_app_tsec = []u8{len: 32, init: 2}
 	old_server := h.s_app_tsec.clone()
 	old_client := h.c_app_tsec.clone()
 
-	h.update_traffic_keys(true) or {
+	h.next_application_key_material(true) or {
 		assert err.msg().contains('before the handshake is connected')
 		assert h.state() == .start
 		assert h.s_app_tsec == old_server
-		h.update_traffic_keys(false) or {
+		h.next_application_key_material(false) or {
 			assert err.msg().contains('before the handshake is connected')
 			assert h.state() == .start
 			assert h.c_app_tsec == old_client
@@ -683,37 +683,56 @@ fn test_update_traffic_keys_refuse_before_connected() ! {
 	assert false
 }
 
-// test_update_traffic_keys_derives_next_keys checks that the key update ratchets the
-// application secrets (§7.2) and that the record accessor re-derives from them.
-fn test_update_traffic_keys_derives_next_keys() ! {
+// test_next_application_key_material_derives_next_generation checks that one call both
+// ratchets the application secret (§7.2) and hands back the keys derived from the
+// ratcheted secret — the invariant the split accessor/ratchet pair could not enforce.
+fn test_next_application_key_material_derives_next_generation() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = HandshakeState.connected
 	h.s_app_tsec = []u8{len: 32, init: 1}
 	h.c_app_tsec = []u8{len: 32, init: 2}
 	old_server := h.s_app_tsec.clone()
 	old_client := h.c_app_tsec.clone()
-	h.update_traffic_keys(true)!
-	h.update_traffic_keys(false)!
+
+	mut read_leg := h.next_application_key_material(true)!
+	mut write_leg := h.next_application_key_material(false)!
 	assert h.s_app_tsec != old_server
 	assert h.c_app_tsec != old_client
 	assert h.s_app_tsec.len == 32
 	assert h.c_app_tsec.len == 32
-	// The generation re-derives from the ratcheted secrets, and both legs are populated.
-	mut keys := h.application_traffic_keys()!
-	assert keys.is_ready()
-	assert keys.client.key.len > 0
-	assert keys.server.key.len > 0
-	keys.wipe()
+	assert read_leg.key.len == h.key_len && read_leg.iv.len == aead_nonce_len
+	assert write_leg.key.len == h.key_len && write_leg.iv.len == aead_nonce_len
+	// TLS record legs hand over an empty header-protection slot.
+	assert read_leg.hp.len == 0 && write_leg.hp.len == 0
+	// The pair a ratchet returned is exactly the generation the record accessor now
+	// derives: the secret advanced and the keys came with it, so no generation is skipped.
+	mut gen := h.application_traffic_keys()!
+	assert gen.is_ready()
+	mut server := gen.take_server_material()
+	mut client := gen.take_client_material()
+	assert server.key == read_leg.key
+	assert server.iv == read_leg.iv
+	assert client.key == write_leg.key
+	assert client.iv == write_leg.iv
+	// Ratcheting again moves to a different generation rather than reusing this one.
+	mut next := h.next_application_key_material(true)!
+	assert next.key != read_leg.key
+	read_leg.wipe()
+	write_leg.wipe()
+	next.wipe()
+	server.wipe()
+	client.wipe()
+	gen.wipe()
 }
 
-// test_update_traffic_keys_refuses_after_zeroize checks that a key update
+// test_next_application_key_material_refuses_after_zeroize checks that a key update
 // after teardown is refused instead of resurrecting the secret.
-fn test_update_traffic_keys_refuses_after_zeroize() ! {
+fn test_next_application_key_material_refuses_after_zeroize() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = HandshakeState.connected
 	h.c_app_tsec = [u8(1), 2, 3]
 	h.zeroize_application_secrets()!
-	h.update_traffic_keys(false) or {
+	h.next_application_key_material(false) or {
 		assert err.msg().contains('destroyed by zeroize_application_secrets()')
 		return
 	}
@@ -804,7 +823,7 @@ fn test_traffic_keys_are_caller_owned() ! {
 	assert keys.client.key.len == h.key_len
 	assert keys.client.iv.len == aead_nonce_len
 	// Draining a leg moves it out of the generation and empties that handle.
-	mut client := keys.take_client_keypair()
+	mut client := keys.take_client_material()
 	assert client.key.len == h.key_len
 	assert keys.client.key.len == 0
 	client.wipe()
@@ -815,9 +834,9 @@ fn test_traffic_keys_are_caller_owned() ! {
 	again.wipe()
 }
 
-// test_update_traffic_keys_wipes_superseded_secret checks that the superseded
+// test_next_application_key_material_wipes_superseded_secret checks that the superseded
 // application traffic secret is zeroed in place after the key update.
-fn test_update_traffic_keys_wipes_superseded_secret() ! {
+fn test_next_application_key_material_wipes_superseded_secret() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	h.state = HandshakeState.connected
 	h.s_app_tsec = []u8{len: 32, init: 7}
@@ -825,7 +844,7 @@ fn test_update_traffic_keys_wipes_superseded_secret() ! {
 	// Alias into the old secret, captured before the key update runs.
 	old_secret := h.s_app_tsec
 
-	h.update_traffic_keys(true)!
+	mut keys := h.next_application_key_material(true)!
 
 	// The update derives the successor first, then zeroes the superseded secret in place.
 	assert old_secret.len == 32
@@ -834,6 +853,9 @@ fn test_update_traffic_keys_wipes_superseded_secret() ! {
 	}
 	assert h.s_app_tsec != old_secret
 	assert h.s_app_tsec.len == 32
+	// The handed-back pair came from the surviving secret, not the zeroed alias.
+	assert keys.key.len == h.key_len
+	keys.wipe()
 }
 
 // test_available_secret_phases_tracks_derivation locks the transport-neutral

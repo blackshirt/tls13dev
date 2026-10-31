@@ -28,12 +28,13 @@ The implementation is split by ownership:
 - [`key_exchange.v`](./key_exchange.v) implements the core's ephemeral ECDHE
   methods: per-group key generation, the public share, and the peer-share
   validation and secret derivation.
-- [`core_record.v`](./core_record.v) defines and implements the TLS-record side
-  of the core (guarded by `is_quic`): the record keys derived on demand from the
-  retained traffic secrets, the backlog accessors, and the TLS KeyUpdate ratchet.
-- [`core_quic.v`](./core_quic.v) defines and implements the QUIC side of the
-  core (guarded by `is_quic`) and exposes TLS traffic secrets without deriving
-  record keys, plus the opaque transport parameters and the HelloRetryRequest flag.
+- [`core_guarded.v`](./core_guarded.v) defines and implements the core's one-sided
+  methods — each guarded by `is_quic` and refusing the wrong-mode core with a plain
+  error. TLS-record side: the backlog accessors and the TLS KeyUpdate ratchet —
+  which returns the very generation it just derived, so a secret can never advance
+  without its keys coming along. QUIC side: the opaque transport parameters and the
+  HelloRetryRequest flag. The per-phase key accessors are not here; they are shared
+  and live in `key_schedule.v`.
 
 ## Shared behavior
 
@@ -136,21 +137,27 @@ call it to decide when to install transport keys, so that decision lives in one
 place and a `.failed` handshake (whose schedule is wiped) never presents stale
 readiness.
 
+## Key generation accessors (shared by both modes)
+
+`handshake_traffic_keys()` and `application_traffic_keys()` are transport-neutral:
+each derives its phase's key generation on demand from the retained traffic secrets
+and returns it as an opaque `TrafficKeys` handle holding one `KeyMaterial` per
+direction. The core's mode — not the accessor name — selects the leg shape: record
+legs leave the handle's header-protection slot empty (TLS protects record bodies, not
+record headers), packet legs fill all three slots (RFC 9001 §5.1). The accessor names
+the phase and the field names the direction, so the values never travel as a
+positional `(client_key, client_iv, server_key, server_iv)` tuple.
+Each call derives a fresh generation the caller owns: `take_client_material()` /
+`take_server_material()` move one direction's material out of it, and `wipe()` scrubs
+whatever is left, so no copy of the material escapes unscrubbed. The initial phase has
+no keys and no accessor either — asking for them is not expressible, rather
+than refused at run time.
+
 ## Record-only operations
 
 The TLS-record entry points below serve `tls.Conn` and refuse a QUIC-mode core
 with a plain error:
 
-- `handshake_traffic_keys()` and `application_traffic_keys()` return the derived record
-  keys for their phase as an opaque `TrafficKeys` handle, holding one `KeyPair`
-  handle per direction. The accessor names the phase and the field names the direction, so
-  the values no longer travel as a positional `(client_key, client_iv, server_key, server_iv)`
-  tuple.
-  Each call derives a fresh generation the caller owns: `take_client_keypair()` /
-  `take_server_keypair()` move one direction's key-and-IV pair out of it, and `wipe()` scrubs
-  whatever is left, so no copy of the material escapes unscrubbed. The initial phase has
-  no record keys and no accessor either — asking for them is not expressible, rather
-  than refused at run time.
 - `initial_backlog()` and `handshake_backlog()` report the unconsumed byte count
   parked at each phase — `initial_backlog()` lets the record adapter enforce the
   ServerHello record-boundary rule, `handshake_backlog()` the coalesced-flight
@@ -161,10 +168,13 @@ with a plain error:
   still held at `.connected` (a server ticket coalesced after its `Finished`,
   §4.6.1) into the record adapter's post-handshake reassembler and wipes the
   core copy.
-- `update_traffic_keys(is_server_leg)` implements TLS KeyUpdate — the read leg
-  (`true`, server keys, after receiving) and the write leg (`false`, client
-  keys, before sending) — and is valid only after the handshake reaches
-  `.connected`.
+- `next_application_key_material(is_server_leg)` implements the TLS KeyUpdate
+  ratchet — the read leg (`true`, server keys, after receiving) and the write leg
+  (`false`, client keys, before sending) — and is valid only after the handshake reaches
+  `.connected`. It ratchets the selected leg's secret and returns that leg's next
+  `KeyMaterial` in one call, so the adapter cannot install a generation that does not match
+  the stored secret. `application_traffic_keys()` stays the initial-install accessor;
+  rekeying never goes through it.
 - `zeroize_handshake_secrets()` and `zeroize_application_secrets()` destroy the
   traffic secrets for one phase once the adapter no longer needs them; valid only
   after `.connected`. Because the record keys derive from those secrets, wiping a
@@ -174,20 +184,17 @@ with a plain error:
 
 ## QUIC-only operations
 
-The QUIC entry points below refuse a TLS-mode core with a plain error.
-`HandshakeCore` defines `peer_handshake_secrets()` and `peer_application_secrets()`
-and exposes raw traffic secrets instead of record keys:
-raw-secret export has no TLS caller — the record adapter keeps its derived-record-key
-surface (`handshake_traffic_keys()` / `application_traffic_keys()`), which derives from
-the secrets but never hands the raw secrets out.
-The QUIC adapter expands these secrets with the RFC 9001 `quic key`, `quic iv`, and
-`quic hp` labels. It calls `zeroize_handshake_secrets()` only when QUIC no longer
-needs the handshake keys, which may be after the handshake is confirmed.
+The QUIC entry points below refuse a TLS-mode core with a plain error:
 `peer_transport_parameters()` returns the server's opaque extension bytes (empty
 until EncryptedExtensions arrives), and `is_hello_retry_request_received()` reports
-whether a retry occurred.
-Application teardown calls `zeroize_application_secrets()`, shared by both modes
-through the core's phase-named entry points.
+whether a retry occurred. Packet protection comes from the shared accessors above:
+on a QUIC-mode core they run the RFC 9001 `quic key`, `quic iv`, and `quic hp`
+expansions inside the core and hand out filled legs — raw traffic secrets never
+leave the core in either mode (the earlier QUIC-only secret export was retired when
+the derivation moved in). The QUIC adapter calls `zeroize_handshake_secrets()` only
+when it no longer needs the handshake keys, which may be after the handshake is
+confirmed. Application teardown calls `zeroize_application_secrets()`, shared by
+both modes through the core's phase-named entry points.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 exist on the type but are runtime-rejected on a QUIC-mode core by the `is_quic`
@@ -209,7 +216,9 @@ validation, the TLS key schedule, shared traffic secrets, and per-phase TLS
 message reassembly buffers. `HandshakeCore` in record mode derives TLS record keys on
 demand from its retained traffic secrets; in QUIC mode it only exposes traffic secrets for QUIC key
 derivation. The record adapter owns
-TLS records and record protection. The QUIC adapter owns CRYPTO offset
+TLS records and record protection — in this stack the `RecordLayer` facade
+(`tls/record_layer.v`) holds the four protection states and the KeyUpdate policy built
+on them. The QUIC adapter owns CRYPTO offset
 reassembly, packets, packet protection, and QUIC key updates. The core does not
 frame or encrypt transport records or packets.
 

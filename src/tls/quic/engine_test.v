@@ -289,6 +289,22 @@ fn (mut f FerryServer) install_handshake_keys() ! {
 	f.handshake_rx = new_protection(client_keys, .tls_aes_128_gcm_sha256)!
 }
 
+// expand_direction runs the RFC 9001 §5.1 per-direction expansions over one traffic
+// secret. Fixture-side only: the client engine derives its packet keys through the
+// core's accessors, but the fakeserver exports raw secrets, so the ferry expands them
+// itself — which also cross-checks that the core's new derivation produces the same
+// bytes the independent expansion does.
+fn expand_direction(hash handshake.HashAlgorithm, secret []u8, key_len int) !ProtectionKeys {
+	key := handshake.hkdf_expand_label(hash, secret, 'quic key', []u8{}, key_len)!
+	iv := handshake.hkdf_expand_label(hash, secret, 'quic iv', []u8{}, handshake.aead_nonce_len)!
+	hp := handshake.hkdf_expand_label(hash, secret, 'quic hp', []u8{}, key_len)!
+	return ProtectionKeys{
+		key: key
+		iv:  iv
+		hp:  hp
+	}
+}
+
 // seal_initial writes a payload into an Initial packet and appends it to `out`.
 fn (mut f FerryServer) seal_initial(payload []u8) ! {
 	mut tx := f.initial_tx

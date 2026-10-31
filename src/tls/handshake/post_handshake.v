@@ -6,11 +6,12 @@ module handshake
 import tls.wire
 
 // parse_key_update decodes a KeyUpdate body (RFC 8446 §4.6.3) and reports whether
-// the sender requested that we also update our keys.
+// the sender requested that we also update our keys. Each failure tags the alert the
+// record adapter must surface, so it can classify from the message alone.
 @[direct_array_access]
 pub fn parse_key_update(body []u8) !bool {
 	if body.len != 1 {
-		return error('handshake: KeyUpdate body must be 1 byte')
+		return error('handshake: KeyUpdate body must be 1 byte (decode_error)')
 	}
 	if body[0] > 1 {
 		return error('handshake: invalid KeyUpdate request_update value ${body[0]} (illegal_parameter)')

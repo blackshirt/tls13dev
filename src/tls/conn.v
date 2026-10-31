@@ -2,7 +2,9 @@
 //
 // conn.v is the public entry point of the TLS stack: dial() runs the TLS 1.3
 // handshake and Conn exposes the protected stream over TCP (RFC 8446 §5). The
-// handshake core (tls.handshake) stays transport-neutral; recordless QUIC shares it.
+// record-layer state and policy live in the RecordLayer facade (record_layer.v);
+// Conn keeps transport, alert and lifecycle concerns. The handshake core
+// (tls.handshake) stays transport-neutral; recordless QUIC shares it.
 module tls
 
 import net
@@ -75,21 +77,14 @@ mut:
 	sock &net.TcpConn            // underlying TCP transport
 	hs   handshake.HandshakeCore // Unified handshake core in TLS-record mode (is_quic false)
 
-	// The four TLSProtections are the record layer's own state; the core never sees them.
-	s_hsk_protection TLSProtection // protection state for records the server sends under handshake keys
-	c_hsk_protection TLSProtection // protection state for records we send under handshake keys
-	s_app_protection TLSProtection // protection state for records the server sends under app keys
-	c_app_protection TLSProtection // protection state for records we send under app keys
+	// Record facade: the four protection states, the post-handshake reassembly buffer and
+	// the KeyUpdate mechanism (see record_layer.v). dial() must assign new_record_layer(),
+	// because Conn is @[noinit] and an uninitialized nested struct is garbage, not zeros.
+	rec RecordLayer
 
 	// session_tickets holds the NewSessionTicket backlog the core parses but does
 	// not keep; exceeding it drops the ticket, never the connection (RFC 8446 §4.6.1).
 	session_tickets []handshake.NewSessionTicket
-	// Decrypted handshake bytes staged when a post-handshake message spans
-	// records; the incomplete tail waits for the next record (RFC 8446 §5.2).
-	post_hsk_buf []u8
-	// Set on processing a peer KeyUpdate, cleared by any delivered traffic: §4.5
-	// forbids two in a row, so a second aborts before its rekey is paid for.
-	peer_key_update bool
 
 	// Read-side buffers: socket bytes are framed into records, then decrypted
 	// application bytes are delivered to callers.
@@ -247,21 +242,19 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:             sock
-		hs:               hs
-		session_tickets:  []handshake.NewSessionTicket{cap: 4}
-		sock_buf:         []u8{len: recv_read_size} // reused by every socket read for this connection
-		recv_buf:         []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
-		app_buf:          []u8{cap: max_plaintext_record_len} // one full plaintext record
-		deadline_ms:      deadline_ms
-		sock_timeout:     timeout
-		guard:            sync.new_mutex()
-		server_name:      server_name
-		// The four protections are probed (send_failure_alert) before any install.
-		s_hsk_protection: TLSProtection{ aead: unsafe { nil } }
-		c_hsk_protection: TLSProtection{ aead: unsafe { nil } }
-		s_app_protection: TLSProtection{ aead: unsafe { nil } }
-		c_app_protection: TLSProtection{ aead: unsafe { nil } }
+		sock:            sock
+		hs:              hs
+		session_tickets: []handshake.NewSessionTicket{cap: 4}
+		sock_buf:        []u8{len: recv_read_size} // reused by every socket read for this connection
+		recv_buf:        []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
+		app_buf:         []u8{cap: max_plaintext_record_len} // one full plaintext record
+		deadline_ms:     deadline_ms
+		sock_timeout:    timeout
+		guard:           sync.new_mutex()
+		server_name:     server_name
+		// The record facade's four protections are probed (send_failure_alert) before any
+		// install, so they start uninitialized rather than carrying key material.
+		rec:             new_record_layer()
 	}
 
 	// The single handshake-phase teardown choke-point: every do_handshake() failure —
@@ -343,13 +336,13 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 				return c.abort_connection(.unexpected_message, 'tls: received unencrypted alert post-handshake (must be encrypted)')
 			}
 			.application_data {
-				mut dec := c.s_app_protection.decrypt_record(rec) or {
+				mut dec := c.rec.s_app_protection.decrypt_record(rec) or {
 					return c.abort_connection(decrypt_failure_alert(err.msg()), err.msg())
 				}
 				match dec.content_type {
 					.application_data {
 						// Application traffic of any length breaks a KeyUpdate run (§4.5).
-						c.peer_key_update = false
+						c.rec.clear_key_update_run()
 						if dec.plaintext.len == 0 {
 							// Zero-length records are legal (padding only), but a verified flood
 							// must not spin this loop forever (max_tolerated_records_per_read).
@@ -538,7 +531,7 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.available_secret_phases().handshake {
 					// Install once the core actually holds handshake secrets, keyed on the
 					// same readiness query the QUIC adapter uses, not on state().
-					c.install_handshake_protection()!
+					c.rec.install_handshake_protection(mut c.hs)!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
@@ -554,7 +547,7 @@ fn (mut c Conn) do_handshake() ! {
 		}
 	}
 	// The core verified the server Finished; install this adapter's post-handshake protection.
-	c.install_application_protection()!
+	c.rec.install_application_protection(mut c.hs)!
 	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
 	// core's consume_msgs_at() stops at .connected, so take (and scrub) its buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()!
@@ -617,7 +610,7 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 	if c.hs.state() == .start || c.hs.state() == .wait_sh {
 		return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
 	}
-	mut dec := c.s_hsk_protection.decrypt_record(rec) or {
+	mut dec := c.rec.s_hsk_protection.decrypt_record(rec) or {
 		// Mirror the read() path: a record that will not open is a peer-caused
 		// integrity failure, so surface its specific alert, not internal_error.
 		return c.classify_failure(decrypt_failure_alert(err.msg()), err.msg())
@@ -639,7 +632,7 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 			msgs := c.hs.receive_handshake_bytes(dec.plaintext)!
 			for m in msgs {
 				// The client's Finished travels under the client handshake keys (RFC 8446 §7.1).
-				enc := c.c_hsk_protection.encrypt_record(.handshake, m.msg())!
+				enc := c.rec.c_hsk_protection.encrypt_record(.handshake, m.msg())!
 				c.write_records([enc])!
 			}
 		}
@@ -663,76 +656,6 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 			// Only handshake and alert are legal here; anything else violates §5.6.
 			return c.classify_failure(.unexpected_message, 'tls: unexpected content type in handshake phase: ${dec.content_type}')
 		}
-	}
-}
-
-// install_handshake_protection builds both protection states of the handshake generation,
-// called once after the ServerHello is fed. The core hands the generation over as an
-// opaque TrafficKeys handle, with the phase fixed by the accessor that produced it,
-// and each direction is taken by name out of the bundle it belongs to.
-fn (mut c Conn) install_handshake_protection() ! {
-	mut keys := c.hs.handshake_traffic_keys()!
-	suite := c.hs.negotiated_cipher_suite()
-	mut client := keys.take_client_keypair()
-	mut server := keys.take_server_keypair()
-	// The builders drain the legs they install, so these wipes scrub every remaining
-	// copy on all exit paths (§7.5); a handle may keep zero-filled buffers of the
-	// original length, since the builders take their by-value copies.
-	defer {
-		keys.wipe()
-		client.wipe()
-		server.wipe()
-	}
-	c.c_hsk_protection = tls_record_protection(suite, mut client)!
-	c.s_hsk_protection = tls_record_protection(suite, mut server)!
-}
-
-// install_application_protection builds both protection states of the application
-// generation, called once the server Finished is verified.
-fn (mut c Conn) install_application_protection() ! {
-	mut keys := c.hs.application_traffic_keys()!
-	suite := c.hs.negotiated_cipher_suite()
-	mut client := keys.take_client_keypair()
-	mut server := keys.take_server_keypair()
-	// Same one-owner-per-byte discipline as install_handshake_protection (§7.5).
-	defer {
-		keys.wipe()
-		client.wipe()
-		server.wipe()
-	}
-	c.c_app_protection = tls_record_protection(suite, mut client)!
-	c.s_app_protection = tls_record_protection(suite, mut server)!
-}
-
-// rebuild_tls_protection rebuilds one application protection state after the core
-// updated the matching secret (RFC 8446 §4.6.3): it leaves the secrets untouched and
-// swaps in fresh protection for one leg. is_server_leg=true rebuilds the server→client
-// leg (the one this endpoint reads), false the client→server leg (the one it writes) —
-// the same direction vocabulary the core's update_traffic_keys uses, so the pair reads
-// as update-then-rebuild. Sequence numbers restart at 0 per generation (§5.3).
-fn (mut c Conn) rebuild_tls_protection(is_server_leg bool) ! {
-	mut keys := c.hs.application_traffic_keys()!
-	suite := c.hs.negotiated_cipher_suite()
-	mut client := keys.take_client_keypair()
-	mut server := keys.take_server_keypair()
-	// Scrub every copy on all exit paths (§7.5): only the selected leg is installed, but
-	// both pairs are dead here and the AEAD backend/protection state own their copies.
-	defer {
-		keys.wipe()
-		client.wipe()
-		server.wipe()
-	}
-	// Copy the superseded leg before rebinding it, then wipe its nonce base: §7.5 wants
-	// old traffic keys gone once replaced. wipe() is IV-only (the AEAD backend key is a
-	// documented platform limit) and idempotent, so it is safe even if never installed.
-	if is_server_leg {
-		mut old := c.s_app_protection
-		c.s_app_protection = tls_record_protection(suite, mut server)!
-		old.wipe()
-	} else {
-		mut old := c.c_app_protection
-		c.c_app_protection = tls_record_protection(suite, mut client)!
-		old.wipe()
 	}
 }
 
@@ -901,13 +824,13 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	// Check before appending so a hostile fragment cannot make the buffer exceed
 	// the per-message cap, even transiently.
 	max_buffered := record_header_len + handshake.max_handshake_message_len
-	if data.len > max_buffered - c.post_hsk_buf.len {
+	if data.len > max_buffered - c.rec.post_hsk_buf.len {
 		return c.abort_connection(.record_overflow, 'tls: post-handshake reassembly exceeds ${handshake.max_handshake_message_len} bytes without completing a message (record_overflow)')
 	}
-	c.post_hsk_buf << data
+	c.rec.post_hsk_buf << data
 	mut messages_seen := 0
 	for {
-		msg := handshake.next_recordless_message(mut c.post_hsk_buf) or {
+		msg := handshake.next_recordless_message(mut c.rec.post_hsk_buf) or {
 			return c.abort_connection(.decode_error, err.msg())
 		}
 		if msg.len == 0 {
@@ -941,35 +864,18 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 					c.session_tickets << ticket
 				}
 				// An accepted non-KeyUpdate message breaks the run (§4.5).
-				c.peer_key_update = false
+				c.rec.clear_key_update_run()
 			}
 			.key_update {
-				// §4.5: "Clients and servers MUST NOT send more than one KeyUpdate
-				// message in a row." Checked before parse and rekey so the violation is
-				// terminal at zero derivation cost, not an endless HKDF-amplification loop.
-				if c.peer_key_update {
-					return c.abort_connection(.unexpected_message, 'tls: consecutive KeyUpdate from peer (unexpected_message)')
-				}
-				c.peer_key_update = true
-				// §4.6.3: a recipient always advances its read keys on receiving a KeyUpdate.
-				// The read leg is the server direction: update_traffic_keys(true).
-				request_update := handshake.parse_key_update(body) or {
-					alert := if body.len != 1 {
-						handshake.AlertDescription.decode_error
-					} else {
-						handshake.AlertDescription.illegal_parameter
-					}
-					return c.abort_connection(alert, err.msg())
-				}
-				c.hs.update_traffic_keys(true) or {
-					return c.abort_connection(.internal_error, err.msg())
-				}
-				// The core updated secrets only; swap in the new read protection state (seq restarts at 0, §5.3).
-				c.rebuild_tls_protection(true) or {
-					return c.abort_connection(.internal_error, err.msg())
+				// The record facade owns this mechanism: it enforces §4.5's one-in-a-row rule
+				// before the parse and before any rekey derivation, then advances the read leg
+				// (seq restarts at 0, §5.3). Only answering a request_update needs this side's
+				// socket, so the record layer hands that back rather than owning the transport.
+				request_update := c.rec.receive_key_update(mut c.hs, body) or {
+					return c.abort_connection(key_update_failure_alert(err.msg()), err.msg())
 				}
 				if request_update {
-					c.send_key_update_response() or {
+					c.send_key_update() or {
 						return c.abort_connection(.internal_error, err.msg())
 					}
 				}
@@ -1041,12 +947,12 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 	mut batch_len := 0
 	for offset < data.len {
 		// §5.5: rekey one slot early so the KeyUpdate notice still fits under the old key.
-		if c.c_app_protection.seq_num >= record_seq_limit - 1 {
+		if c.rec.needs_rekey() {
 			// Flush the pending batch first: it must precede the KeyUpdate notice on the wire.
 			c.write_records(batch)!
 			batch = []Record{}
 			batch_len = 0
-			c.send_key_update_record_locked()!
+			c.send_key_update()!
 		}
 		end := if data.len - offset > max_plaintext_record_len {
 			offset + max_plaintext_record_len
@@ -1054,7 +960,7 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 			data.len
 		}
 		chunk := data[offset..end]
-		enc := c.c_app_protection.encrypt_record(.application_data, chunk)!
+		enc := c.rec.c_app_protection.encrypt_record(.application_data, chunk)!
 		batch << enc
 		batch_len += record_header_len + enc.payload.len
 		// Ship at the batch bound or on the last chunk; coalescing never mixes generations.
@@ -1068,23 +974,35 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 	return data.len
 }
 
-// send_key_update_record_locked emits a KeyUpdate(update_not_requested) under the
-// current write keys, advances the write secret, and swaps in the rebuilt cipher
-// (RFC 8446 §4.6.3/§5.5). The caller must already hold guard.
-fn (mut c Conn) send_key_update_record_locked() ! {
-	msg := handshake.build_key_update(false)
-	enc := c.c_app_protection.encrypt_record(.handshake, msg)!
-	c.write_records([enc])!
-	// The write leg is the client direction: update_traffic_keys(false).
-	c.hs.update_traffic_keys(false)!
-	// Swap in the rebuilt write protection state before the next write() can reach it.
-	c.rebuild_tls_protection(false)!
+// send_key_update emits a KeyUpdate(update_not_requested) under the current write keys
+// and then swaps in the next write generation (RFC 8446 §4.6.3/§5.5) — the record facade
+// builds the notice and completes the rekey on either side of this socket write, so the
+// notice is always the last record of the generation it retires. Both the §5.5 write-path
+// trigger and the answer to a peer's request_update come through here. The caller must
+// already hold guard.
+fn (mut c Conn) send_key_update() ! {
+	notice := c.rec.build_key_update_notice()!
+	c.write_records([notice])!
+	c.rec.complete_key_update(mut c.hs)!
 }
 
-// send_key_update_response answers a peer KeyUpdate(update_requested) (§4.6.3). The
-// caller already holds guard, so it encrypts with the write state and sends directly.
-fn (mut c Conn) send_key_update_response() ! {
-	c.send_key_update_record_locked()!
+// key_update_failure_alert maps a receive_key_update error to the fatal alert it must
+// surface: each record-layer and core path tags its own error, so the RFC name in the
+// message decides — a §4.5 run violation is unexpected_message, a misframed body
+// decode_error, a bad request_update value illegal_parameter, and a derivation or
+// install fault falls back to internal_error (RFC 8446 §4.6.3/§6). Same approach as
+// decrypt_failure_alert.
+fn key_update_failure_alert(msg string) handshake.AlertDescription {
+	if msg.contains('unexpected_message') {
+		return .unexpected_message
+	}
+	if msg.contains('illegal_parameter') {
+		return .illegal_parameter
+	}
+	if msg.contains('decode_error') {
+		return .decode_error
+	}
+	return .internal_error
 }
 
 // abort_connection terminates the connection while the caller holds guard: it pins the
@@ -1112,20 +1030,9 @@ fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message strin
 	return error(message)
 }
 
-// wipe_protection_states zeroes this adapter's four record protection states; it is
-// the single place the four *installed* states are destroyed — rebuild_tls_protection()
-// additionally wipes the one superseded leg the arrays no longer reference
-// (RFC 8446 §7.5).
-fn (mut c Conn) wipe_protection_states() {
-	c.s_hsk_protection.wipe()
-	c.c_hsk_protection.wipe()
-	c.s_app_protection.wipe()
-	c.c_app_protection.wipe()
-}
-
 // destroy_all is the single terminal teardown, run with guard held: it drops the core's
 // live traffic secrets (the whole key schedule unless the handshake reached .connected),
-// wipes this adapter's four record protection states, and scrubs the read-side staging
+// wipes the record facade's four protection states, and scrubs the read-side staging
 // buffers, so no close or abort path can wipe one layer and forget another
 // (RFC 8446 §1.3.1/§7.5). It never locks itself, so the read-origin abort, handle_alert,
 // close() and the dial() teardown all share one body without a recursive acquisition;
@@ -1140,11 +1047,11 @@ fn (mut c Conn) destroy_all() ! {
 	} else {
 		c.hs.fail_and_zeroize_secrets()
 	}
-	c.wipe_protection_states()
+	c.rec.wipe_protection_states()
 	// Scrub undelivered plaintext and any partial post-handshake message staged for the
 	// reader (§7.5 spirit: no decrypted or framed bytes left behind in freed memory).
 	c.wipe_app_buf()
-	c.wipe_post_hsk_buf()
+	c.rec.wipe_post_hsk_buf()
 }
 
 // send_failure_alert emits the fatal alert for a dead handshake (RFC 8446 §6),
@@ -1162,13 +1069,13 @@ fn (mut c Conn) send_failure_alert() {
 	desc := c.fail_alert or { c.hs.failure_alert() }
 	payload := handshake.new_alert(desc).encode()
 	// A protection state is initialized exactly when its IV is the full nonce base.
-	if c.c_app_protection.iv.len == aead_nonce_len {
-		enc := c.c_app_protection.encrypt_record(.alert, payload) or { return }
+	if c.rec.c_app_protection.iv.len == aead_nonce_len {
+		enc := c.rec.c_app_protection.encrypt_record(.alert, payload) or { return }
 		c.write_records([enc]) or {}
 		return
 	}
-	if c.c_hsk_protection.iv.len == aead_nonce_len {
-		enc := c.c_hsk_protection.encrypt_record(.alert, payload) or { return }
+	if c.rec.c_hsk_protection.iv.len == aead_nonce_len {
+		enc := c.rec.c_hsk_protection.encrypt_record(.alert, payload) or { return }
 		c.write_records([enc]) or {}
 		return
 	}
@@ -1217,7 +1124,7 @@ fn (mut c Conn) send_close_notify() {
 		return
 	}
 	notify := handshake.new_alert(.close_notify)
-	enc := c.c_app_protection.encrypt_record(.alert, notify.encode()) or {
+	enc := c.rec.c_app_protection.encrypt_record(.alert, notify.encode()) or {
 		return
 	}
 	c.write_records([enc]) or {}
@@ -1231,23 +1138,17 @@ fn (mut c Conn) wipe_app_buf() {
 	c.app_pos = 0
 }
 
-// wipe_post_hsk_buf zeroes then drops staged post-handshake bytes so freed memory
-// retains no partial handshake message (RFC 8446 §5.2; §7.5 spirit).
-fn (mut c Conn) wipe_post_hsk_buf() {
-	zero_bytes(mut c.post_hsk_buf)
-	c.post_hsk_buf = []u8{}
-}
-
 // Helpers (utility)
 
-// tls_record_protection builds one direction's protection state from its opaque key pair
-// and drains the pair: the AEAD backend keeps its own key and the protection state clones
-// its IV, so both values are scrubbed here before returning (§7.5). The takes empty this
-// by-value copy's fields; the caller's handle keeps the zeroed bytes at their original
-// length, which its own wipe() covers. Which slot the result lands in is the caller's
-// choice, made by name off the generation (`take_client_keypair()` / `take_server_keypair()`).
+// tls_record_protection builds one direction's protection state from its opaque key
+// material and drains the key-and-IV slots it needs: the AEAD backend keeps its own key
+// and the protection state clones its IV, so both values are scrubbed here before
+// returning (§7.5). The takes empty this by-value copy's fields; the caller's handle
+// keeps the remaining bytes (the always-empty TLS `hp` slot included) for its own
+// wipe() to cover. Which slot the result lands in is the caller's choice, made by name
+// off the generation (`take_client_material()` / `take_server_material()`).
 // Sequence numbers restart at 0 per generation (§5.3).
-fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyPair) !TLSProtection {
+fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyMaterial) !TLSProtection {
 	mut key := keys.take_key()
 	mut iv := keys.take_iv()
 	defer {

@@ -489,7 +489,7 @@ fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
 	for m in produced {
 		e.queue_outbound(m)!
 	}
-	e.install_exported_keys()!
+	e.install_packet_keys()!
 }
 
 // feed_crypto routes one complete CRYPTO message to the core phase selected by
@@ -511,10 +511,11 @@ fn (mut e Conn) queue_outbound(m handshake.HandshakeMessage) ! {
 	}
 }
 
-// install_exported_keys derives packet protection from the handshake core's
-// exported traffic secrets as soon as each level becomes available
-// (RFC 9001 §5.1). It is idempotent: keys are only installed once.
-fn (mut e Conn) install_exported_keys() ! {
+// install_packet_keys derives packet protection from the core's shared traffic-keys
+// accessors as soon as each level becomes available (RFC 9001 §5.1; the core's QUIC
+// mode answers these calls with filled key+iv+hp legs). It is
+// idempotent: keys are only installed once.
+fn (mut e Conn) install_packet_keys() ! {
 	// Readiness comes from the core's secret-phase query, not from decoding
 	// HandshakeState: a phase is true exactly while both directions' traffic secrets
 	// exist, so a .failed handshake (schedule wiped) never reaches these expands with
@@ -528,30 +529,27 @@ fn (mut e Conn) install_exported_keys() ! {
 	}
 }
 
-// install_protection expands one phase's exported traffic secrets into that
-// level's packet protection (RFC 9001 §5.1); is_application selects 1-RTT over
-// Handshake. The exported secrets and the derived packet keys are dead once
-// new_protection has cloned what it needs into its state and
-// the AEAD backend has copied the key, so defer scrubs every local copy on all exit
-// paths (§7.5) — zeroing these inputs cannot disturb the live protection state.
+// install_protection derives one phase's packet protection from the core's shared
+// traffic-keys accessor (RFC 9001 §5.1); is_application selects 1-RTT over Handshake. The core
+// returns an opaque caller-owned generation: draining each leg moves key, iv and hp
+// whole into new_protection(), whose backend copies what it keeps, so the deferred
+// handle wipes and field wipes scrub every local copy on all exit paths (§7.5) —
+// raw traffic secrets never cross into tls.quic at all.
 fn (mut e Conn) install_protection(is_application bool) ! {
-	mut ck := []u8{}
-	mut sk := []u8{}
-	if is_application {
-		ck, sk = e.hs.peer_application_secrets()!
+	mut gen := if is_application {
+		e.hs.application_traffic_keys()!
 	} else {
-		ck, sk = e.hs.peer_handshake_secrets()!
-	}
-	defer {
-		zero_bytes(mut ck)
-		zero_bytes(mut sk)
+		e.hs.handshake_traffic_keys()!
 	}
 	suite := e.hs.negotiated_cipher_suite()
-	chash := handshake.suite_hash_algo(suite)
-	klen := handshake.suite_key_len(suite)
-	mut client_keys := expand_direction(chash, ck, klen)!
-	mut server_keys := expand_direction(chash, sk, klen)!
+	mut client_leg := gen.take_client_material()
+	mut server_leg := gen.take_server_material()
+	mut client_keys := drain_packet_keys(mut client_leg)
+	mut server_keys := drain_packet_keys(mut server_leg)
 	defer {
+		gen.wipe()
+		client_leg.wipe()
+		server_leg.wipe()
 		zero_bytes(mut client_keys.key)
 		zero_bytes(mut client_keys.iv)
 		zero_bytes(mut client_keys.hp)
@@ -568,14 +566,24 @@ fn (mut e Conn) install_protection(is_application bool) ! {
 	}
 }
 
+// drain_packet_keys moves one leg's three material slots out of the core's opaque
+// handle into this module's ProtectionKeys; the handle is left emptied for its wipe().
+fn drain_packet_keys(mut k handshake.KeyMaterial) ProtectionKeys {
+	return ProtectionKeys{
+		key: k.take_key()
+		iv:  k.take_iv()
+		hp:  k.take_hp()
+	}
+}
+
 // install_handshake_protection derives the Handshake-level packet protection from
-// the core's exported handshake traffic secrets.
+// the core's handshake packet keys.
 fn (mut e Conn) install_handshake_protection() ! {
 	e.install_protection(false)!
 }
 
 // install_application_protection derives the 1-RTT packet protection from the
-// core's exported application traffic secrets.
+// core's application packet keys.
 fn (mut e Conn) install_application_protection() ! {
 	e.install_protection(true)!
 }
@@ -587,19 +595,6 @@ fn (mut e Conn) install_application_protection() ! {
 fn zero_bytes(mut buf []u8) {
 	for i in 0 .. buf.len {
 		buf[i] = 0
-	}
-}
-
-// expand_direction runs the RFC 9001 §5.1 per-direction expansions over one
-// traffic secret.
-fn expand_direction(hash handshake.HashAlgorithm, secret []u8, key_len int) !ProtectionKeys {
-	key := handshake.hkdf_expand_label(hash, secret, 'quic key', []u8{}, key_len)!
-	iv := handshake.hkdf_expand_label(hash, secret, 'quic iv', []u8{}, handshake.aead_nonce_len)!
-	hp := handshake.hkdf_expand_label(hash, secret, 'quic hp', []u8{}, key_len)!
-	return ProtectionKeys{
-		key: key
-		iv:  iv
-		hp:  hp
 	}
 }
 

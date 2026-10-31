@@ -16,19 +16,20 @@ There is a single `HandshakeCore` holding the shared TLS semantics and both tran
 It is a private type, but its curated entry points are `pub` directly on it; the two constructors
 fix the transport mode once, at construction:
 
-- **`new_tls_handshake(server_name, options)`** — TLS-over-TCP record mode (`is_quic false`). Also
-  derives the TLS record keys on demand from its retained traffic secrets and implements the TLS KeyUpdate ratchet.
-- **`new_quic_handshake(server_name, options)`** — QUIC mode (`is_quic true`). Exposes raw
-  traffic secrets for RFC 9001 key expansion instead of record keys; QUIC packet types and CRYPTO
+- **`new_tls_handshake(server_name, options)`** — TLS-over-TCP record mode (`is_quic false`). Answers the shared key accessors with record legs (hp empty) and implements the TLS
+  KeyUpdate ratchet, returning the generation it ratcheted to.
+- **`new_quic_handshake(server_name, options)`** — QUIC mode (`is_quic true`). Answers the same
+  accessors with RFC 9001 packet legs — key, iv and hp filled — handed out in the same
+  `TrafficKeys`/`KeyMaterial` handle shape; QUIC packet types and CRYPTO
   reassembly live in the QUIC engine, not here.
 
-A caller still picks its transport at construction, but the mode is now a runtime flag: transport-
-specific methods exist on both modes and guard themselves — a TLS-record-only call on a QUIC-mode
-core (`handshake_traffic_keys()`, `application_traffic_keys()`, `update_traffic_keys()`, the backlog
+A caller still picks its transport at construction, but the mode is now a runtime flag: the
+per-phase key accessors (`handshake_traffic_keys()`, `application_traffic_keys()`) are shared —
+both modes answer them, in their own leg shape. What remains transport-specific guards itself:
+a TLS-record-only call on a QUIC-mode core (`next_application_key_material()`, the backlog
 accessors, `take_buffered_handshake_bytes()`) and a QUIC-only call on a TLS-mode core
-(`peer_handshake_secrets()`, `peer_application_secrets()`, `peer_transport_parameters()`,
-`is_hello_retry_request_received()`) each return a plain error without touching state or keys, the
-same convention as the out-of-phase guards.
+(`peer_transport_parameters()`, `is_hello_retry_request_received()`) each return a plain
+error without touching state or keys, the same convention as the out-of-phase guards.
 
 ```v
 mut hs := new_tls_handshake(server_name, opts)!   // or new_quic_handshake(...)
@@ -54,16 +55,19 @@ state_machine_extra.v the core's intake plumbing + terminal-failure primitives: 
                       classify_failure / fail_with / failure_alert
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
-core_record.v         TLS-record side of the core (is_quic-guarded): backlog accessors,
-                      on-demand record-key derivation, and the KeyUpdate ratchet
-core_quic.v           QUIC side of the core (is_quic-guarded): peer_handshake_secrets and
-                      peer_application_secrets, peer transport params, HRR flag
+core_guarded.v        One-sided surfaces of the core (is_quic-guarded): TLS-record side
+                      — backlog accessors and the KeyUpdate ratchet that
+                      returns the next generation's key material; QUIC side — peer
+                      transport params and the HRR flag (the key accessors are shared)
 client_hello.v        validate options, build the §4.1.2 ClientHello
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
 certificate_verify.v  verify the §4.4.3 CertificateVerify (pure, no state change)
 key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations,
-                      the retained secret holders and their §7.5 lifecycle
+                      the shared KeyMaterial/TrafficKeys handles, the public
+                      handshake/application_traffic_keys() accessors over the
+                      traffic_keys_at() derivation, and the retained
+                      secret holders with their §7.5 lifecycle
 transcript.v          running transcript the schedule and CertificateVerify hash over
 messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + header
 aead.v                cipher-suite → AEAD/hash helpers
@@ -88,8 +92,9 @@ Each `*_test.v` sits beside its source.
   is the `err.msg()`-unwrapping shorthand used by parse sites.
 - **Named phase material.** Handshake and application traffic secrets are stored as flat
   `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the core's
-  TLS-record side derives the record keys on demand, one `KeyPair` handle per direction,
-  returned as a single `TrafficKeys` generation the caller owns. Both
+  TLS-record side derives the record keys on demand, one `KeyMaterial` handle per direction,
+  returned as a single `TrafficKeys` generation the caller owns — the same shape a QUIC-mode
+  core returns for the same calls, with the header-protection slot filled. Both
   phase buffers live in `ReassemblyBuffers`. Per-phase wipe and install helpers take a whole
   phase's two directions (and each key with its nonce base) together, so they cannot be cleared or
   advanced independently — and because the phase is fixed by which accessor produced the

@@ -462,10 +462,10 @@ fn test_dial_key_update_rekeys_and_wipes_superseded_protection() ! {
 
 	// Alias the live read protection state's nonce base before the rekey: V arrays share one
 	// underlying buffer, so `unsafe` here (the compiler's sanctioned opt-out from the
-	// `.clone()` guard) keeps a genuine alias rather than a copy. rebuild_tls_protection's wipe then
-	// zeroes this same buffer in place, which the alias observes; a `.clone()` would instead
-	// snapshot the pre-rekey nonzero bytes and defeat the assertion below.
-	mut old_iv := unsafe { conn.s_app_protection.iv }
+	// `.clone()` guard) keeps a genuine alias rather than a copy. swap_application_leg's
+	// wipe then zeroes this same buffer in place, which the alias observes; a `.clone()`
+	// would instead snapshot the pre-rekey nonzero bytes and defeat the assertion below.
+	mut old_iv := unsafe { conn.rec.s_app_protection.iv }
 	assert old_iv.len == 12 && old_iv[0] != 0
 
 	mut tail := []u8{len: 32}
@@ -479,7 +479,7 @@ fn test_dial_key_update_rekeys_and_wipes_superseded_protection() ! {
 		}
 	}
 	assert !nonzero, 'the superseded read protection state must zero its nonce base (§7.5)'
-	assert conn.s_app_protection.iv.len == 12 // the new generation is live
+	assert conn.rec.s_app_protection.iv.len == 12 // the new generation is live
 
 	conn.close() or {}
 	res := <-res_ch

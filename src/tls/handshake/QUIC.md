@@ -8,8 +8,9 @@ TLS state machine.
 
 The module it describes is `tls.handshake` (`src/tls/handshake/`). Everything
 `pub` in that module is the adapter contract; everything else is private. This
-file is the long-form guide to the QUIC surface of the unified core in
-`core_quic.v` and the shared handshake engine in `state_machine.v`.
+file is the long-form guide to the QUIC surface of the unified core — the shared
+accessors in `key_schedule.v` and the QUIC-only guards in `core_guarded.v`, on top
+of the shared handshake engine in `state_machine.v`.
 
 ---
 
@@ -31,8 +32,8 @@ The core was therefore split so that the carrier is always someone else's job:
    │  Key schedule: key_schedule.v (holders + §7.5 lifecycle)                       │
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
-   │  Record side: core_record.v owns TLS record keys and the KeyUpdate path        │
-   │  QUIC side: core_quic.v exports TLS traffic secrets (both is_quic-guarded)     │
+   │  Key seam: key_schedule.v accessors answer both modes (leg shape by mode)      │
+   │  One-sided: core_guarded.v ratchet/backlog + params/HRR (is_quic-guarded)      │
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
@@ -180,10 +181,9 @@ QUIC derives its **Initial** packet keys from the destination connection ID
 the core's phase vocabulary; the engine derives them itself, below this
 layer. The shared handshake API starts with plaintext ServerHello processing.
 
-### 3.2 Secrets, not record keys, cross the boundary
+### 3.2 Packet keys, not raw secrets, cross the boundary
 
-A QUIC engine needs the raw §7.1 **traffic secrets** so it can run the
-RFC 9001 §5.1 expansions itself:
+RFC 9001 §5.1 expands each traffic secret into per-direction packet keys:
 
 | Label      | Purpose                       |
 |------------|-------------------------------|
@@ -191,13 +191,16 @@ RFC 9001 §5.1 expansions itself:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-`peer_handshake_secrets()` and `peer_application_secrets()` (the QUIC side of
-`HandshakeCore`, core_quic.v) hand out `(client, server)` clones of those
-secrets; the phase is in the method name, never an argument.
-`handshake_traffic_keys()` / `application_traffic_keys()` are the TLS-record side,
-where each call returns a fresh `TrafficKeys` generation the caller owns; on a QUIC-mode core
-they are `is_quic`-guarded and refuse with an error. A QUIC engine uses
-the peer-secret accessors + the public `hkdf_expand_label()`.
+The core runs those expansions: `handshake_traffic_keys()` and
+`application_traffic_keys()` — shared, transport-neutral accessors on `HandshakeCore`
+declared in key_schedule.v over the private `traffic_keys_at()` derivation — return a
+fresh caller-owned `TrafficKeys` generation whose legs on a QUIC-mode core are fully
+filled `KeyMaterial` — key, iv *and* hp; the same calls on a TLS-mode core return
+key-and-IV record legs with the hp slot left empty. The phase is in the
+method name, never an argument, and it is the core's mode — not the accessor name —
+that picks the leg shape.
+Raw §7.1 traffic secrets never leave the core in either mode, so an adapter has no use
+for `hkdf_expand_label()` of its own.
 
 ### 3.3 Handshake keys survive until no longer needed
 
@@ -219,7 +222,7 @@ then zeroizes the core secrets and every remaining packet key (`destroy_on_close
 Over QUIC, TLS KeyUpdate does not exist: an endpoint MUST NOT send one and MUST
 treat a received one as a connection error (RFC 9001 §6). The next generation
 of 1-RTT secrets is derived engine-side with the `quic ku` label
-(§6.1) — **not** via `update_traffic_keys(is_server_leg)`,
+(§6.1) — **not** via `next_application_key_material(is_server_leg)`,
 whose `traffic upd` label is the TLS record path's. The header-protection key
 never updates.
 
@@ -275,15 +278,13 @@ for m in msgs {
     _ = m
 }
 
-// 4. Now derive Handshake keys from the exported secrets and protect Handshake
+// 4. Now derive Handshake packet keys from the core and protect Handshake
 //    packets with them; the server flight (EE, [CertReq], Cert, CV, Finished)
 //    rides Handshake CRYPTO.
-(ck, sk) := hs.peer_handshake_secrets()!
-suite := hs.negotiated_cipher_suite()
-hash := handshake.suite_hash_algo(suite)
-key_len := handshake.suite_key_len(suite)
-qkey := handshake.hkdf_expand_label(hash, ck, 'quic key', []u8{}, key_len)!
-// ... 'quic iv' (12 bytes) and 'quic hp' (key_len) likewise ...
+mut gen := hs.handshake_traffic_keys()!   // TrafficKeys: both legs, key+iv+hp filled
+mut client_leg := gen.take_client_material()
+qkey := client_leg.take_key()
+// ... take_iv() (12 bytes) and take_hp() likewise; wipe() handles when done (§7.5) ...
 
 // 5. Feed the reassembled Handshake CRYPTO stream. The return carries the
 //    client Finished (a handshake-phase message) once the server flight verifies.
@@ -295,9 +296,9 @@ for m in flight {
     }
 }
 
-// 6. Application secrets are live at .connected. Derive 1-RTT packet keys with
-//    the 'quic key'/'quic iv'/'quic hp' labels from peer_application_secrets().
-(cap, sap) := hs.peer_application_secrets()!
+// 6. Application keys are live at .connected. Derive 1-RTT packet keys with
+//    application_traffic_keys() — the same filled KeyMaterial legs.
+mut app_gen := hs.application_traffic_keys()!
 
 // 7. For a custom client adapter, release handshake-stage material after
 //    receiving HANDSHAKE_DONE. Conn does this automatically.
@@ -373,10 +374,8 @@ has to be a transport.
   remaining opportunity to report handshake milestones
   through structured progress results.
 - `src/tls/handshake/state_machine.v` — the unified TLS handshake core.
-- `src/tls/handshake/core_record.v` — the TLS-record side of the core and the
-  record-key lifecycle (is_quic-guarded).
-- `src/tls/handshake/core_quic.v` — the QUIC side of the core and the
-  exported-secret lifecycle (is_quic-guarded).
+- `src/tls/handshake/core_guarded.v` — the core's one-sided methods: the TLS-record
+  ratchet/backlog and the QUIC params/HRR surface (is_quic-guarded).
 - `src/tls/handshake/passthrough.v` — CRYPTO-stream reassembly (RFC 9001 §4).
 - `src/tls/handshake/alert.v` — `AlertDescription` + `quic_connection_error()`.
 - `src/tls/handshake/key_schedule.v` — `hkdf_expand_label`, the §7.1 ladder.

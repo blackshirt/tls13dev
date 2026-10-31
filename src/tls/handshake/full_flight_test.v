@@ -114,8 +114,8 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// asserted by name instead of by tuple position.
 	mut keys := h.application_traffic_keys()!
 	assert keys.is_ready()
-	mut client := keys.take_client_keypair()
-	mut server := keys.take_server_keypair()
+	mut client := keys.take_client_material()
+	mut server := keys.take_server_material()
 	assert client.take_key().len == 16
 	assert client.take_iv().len == 12
 	assert server.take_key().len == 16
@@ -128,8 +128,8 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	h.zeroize_handshake_secrets()!
 	assert expect_no_handshake_keys(&h)
 	mut kept := h.application_traffic_keys()!
-	mut kept_client := kept.take_client_keypair()
-	mut kept_server := kept.take_server_keypair()
+	mut kept_client := kept.take_client_material()
+	mut kept_server := kept.take_server_material()
 	assert kept_client.take_key().len == 16
 	assert kept_server.take_key().len == 16
 	assert kept_server.take_iv().len == 12
@@ -347,8 +347,8 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	assert h.available_secret_phases().application
 	// The record accessor derives the key/iv pair the transport consumes on demand.
 	mut app_keys := h.application_traffic_keys()!
-	mut app_client := app_keys.take_client_keypair()
-	mut app_server := app_keys.take_server_keypair()
+	mut app_client := app_keys.take_client_material()
+	mut app_server := app_keys.take_server_material()
 	assert app_client.take_key().len == 16 && app_client.take_iv().len == 12
 	assert app_server.take_key().len == 16 && app_server.take_iv().len == 12
 	app_keys.wipe()

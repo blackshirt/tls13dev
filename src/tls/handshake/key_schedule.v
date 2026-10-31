@@ -3,9 +3,9 @@
 // key_schedule.v runs the RFC 8446 §7.1 HKDF key-derivation ladder that turns the
 // (EC)DHE secret into every handshake and application key, and owns the §7.5
 // zeroization lifecycle declared on HandshakeCore. The SecretPhases readiness type
-// and the opaque KeyPair / TrafficKeys handles the core's TLS-record side
-// derives on demand (core_record.v) are declared here, beside the derivations that
-// fill them.
+// and the opaque KeyMaterial / TrafficKeys handles — the one generation shape shared
+// by both transport modes — plus the public phase accessors over the shared
+// traffic_keys_at() derivation are declared here, beside the derivations that fill them.
 module handshake
 
 import crypto.hmac
@@ -205,6 +205,30 @@ fn derive_traffic_iv(hash HashAlgorithm, secret []u8, iv_len int) ![]u8 {
 	return hkdf_expand_label(hash, secret, 'iv', []u8{}, iv_len)!
 }
 
+// derive_key_material expands one traffic secret into a direction's key material. It
+// is the ONLY constructor of KeyMaterial, shared by both transports: they hand over
+// the same handle shape, and the is_quic flag (the same mode bit HandshakeCore guards
+// on) selects only the label vocabulary:
+//   - TLS record: 'key', 'iv' (RFC 8446 §7.1), with the hp slot set explicitly empty —
+//     KeyMaterial is @[noinit], so an omitted field would be garbage, not zeros, and
+//     record headers are unprotected.
+//   - QUIC: 'quic key', 'quic iv', 'quic hp' (RFC 9001 §5.1), filling every slot.
+@[direct_array_access]
+fn derive_key_material(hash HashAlgorithm, secret []u8, key_len int, is_quic bool) !KeyMaterial {
+	if is_quic {
+		return KeyMaterial{
+			key: hkdf_expand_label(hash, secret, 'quic key', []u8{}, key_len)!
+			iv:  hkdf_expand_label(hash, secret, 'quic iv', []u8{}, aead_nonce_len)!
+			hp:  hkdf_expand_label(hash, secret, 'quic hp', []u8{}, key_len)!
+		}
+	}
+	return KeyMaterial{
+		key: derive_traffic_key(hash, secret, key_len)!
+		iv:  derive_traffic_iv(hash, secret, aead_nonce_len)!
+		hp:  []u8{}
+	}
+}
+
 // derive_finished_key computes the finished_key = HKDF-Expand-Label(BaseKey, "finished",
 // "", Hash.length) MAC key RFC 8446 §4.4.4 binds to a Finished message.
 @[direct_array_access]
@@ -224,71 +248,86 @@ fn compute_finished_verify_data(hash HashAlgorithm, base_key []u8, transcript_ha
 	return hash.compute_hmac(finished_key, transcript_hash)
 }
 
-// KeyPair is one direction's record material: the AEAD key and the nonce base it must
-// always travel with. The fields are private, which makes the handle opaque:
+// KeyMaterial is one direction's protection material: the AEAD key, the nonce base it
+// must always travel with, and — for a transport that protects headers — the
+// header-protection key. The fields are private, which makes the handle opaque:
 // tls.handshake constructs it, and a caller outside the module can only take values out
-// of it or wipe it, so a key can never be installed without its IV. The direction is
-// carried by the field name it is stored under (`client` / `server`), not by the type.
+// of it or wipe it, so a key can never be installed without the material that travels
+// with it. The direction is carried by the field name it is stored under (`client` /
+// `server`), not by the type. TLS record legs leave `hp` empty (RFC 8446 §5.2 protects
+// only the record body); QUIC packet legs fill all three slots (RFC 9001 §5.1).
 @[noinit]
-pub struct KeyPair {
+pub struct KeyMaterial {
 mut:
 	key []u8 // AEAD key
 	iv  []u8 // nonce base
+	hp  []u8 // header-protection key; empty on TLS record legs
 }
 
 // take_key moves the AEAD key out and leaves the field empty, so the bytes have exactly
 // one owner and that owner can prove it scrubbed them (§7.5). Moving instead of cloning
 // keeps the key copy count across the module boundary at one per generation.
-pub fn (mut k KeyPair) take_key() []u8 {
+pub fn (mut k KeyMaterial) take_key() []u8 {
 	bytes := k.key
 	k.key = []u8{}
 	return bytes
 }
 
-// take_iv moves the nonce base out on the same terms as take_key: a leg is drained a pair
-// at a time, never a half of it, so no key can reach the record layer without its IV.
-pub fn (mut k KeyPair) take_iv() []u8 {
+// take_iv moves the nonce base out on the same terms as take_key: a leg is drained whole,
+// never a half of it, so no key reaches a protection state without the material beside it.
+pub fn (mut k KeyMaterial) take_iv() []u8 {
 	bytes := k.iv
 	k.iv = []u8{}
 	return bytes
 }
 
+// take_hp moves the header-protection key out on the same terms. A TLS record leg hands
+// over an empty slice: the slot exists for QUIC, whose new_protection() refuses an empty
+// hp, so record material can never masquerade as packet material.
+pub fn (mut k KeyMaterial) take_hp() []u8 {
+	bytes := k.hp
+	k.hp = []u8{}
+	return bytes
+}
+
 // wipe zeroes every value the handle still owns and drops them; idempotent, so it is
 // safe as a deferred safety net after a partial drain.
-pub fn (mut k KeyPair) wipe() {
+pub fn (mut k KeyMaterial) wipe() {
 	wipe_secret(mut k.key)
 	wipe_secret(mut k.iv)
+	wipe_secret(mut k.hp)
 }
 
 // is_ready reports whether this handle holds a key. Module-private: presence is an internal
 // precondition of the phase accessor, whose error says more than a bool.
-fn (k &KeyPair) is_ready() bool {
+fn (k &KeyMaterial) is_ready() bool {
 	return k.key.len > 0
 }
 
-// TrafficKeys is an opaque handle to one generation of TLS record keys,
-// holding one KeyPair per direction (client and server).
+// TrafficKeys is an opaque handle to one generation of protection keys, holding one
+// KeyMaterial per direction (client and server). It is the shared cross-boundary shape:
+// the record accessors fill key+iv per leg, the QUIC packet accessors fill key+iv+hp.
 @[noinit]
 pub struct TrafficKeys {
 mut:
-	client KeyPair // client-direction key and nonce base
-	server KeyPair // server-direction key and nonce base
+	client KeyMaterial // client-direction material
+	server KeyMaterial // server-direction material
 }
 
-// take_client_keypair moves the client-direction pair out of the generation, leaving an empty
-// handle behind; take_server_keypair does the same for the server direction. The pair travels
-// whole, which is the reason a leg has no separate take method of its own.
-pub fn (mut k TrafficKeys) take_client_keypair() KeyPair {
+// take_client_material moves the client-direction material out of the generation, leaving
+// an empty handle behind; take_server_material does the same for the server direction. The
+// material travels whole, which is the reason a leg has no separate take method of its own.
+pub fn (mut k TrafficKeys) take_client_material() KeyMaterial {
 	leg := k.client
-	k.client = KeyPair{}
+	k.client = KeyMaterial{}
 	return leg
 }
 
-// take_server_keypair moves the server-direction pair out of the generation; take_client_keypair is
-// its client-side mirror.
-pub fn (mut k TrafficKeys) take_server_keypair() KeyPair {
+// take_server_material moves the server-direction material out of the generation;
+// take_client_material is its client-side mirror.
+pub fn (mut k TrafficKeys) take_server_material() KeyMaterial {
 	leg := k.server
-	k.server = KeyPair{}
+	k.server = KeyMaterial{}
 	return leg
 }
 
@@ -331,10 +370,64 @@ fn (mut h HandshakeCore) release_ephemeral_keys() {
 	h.priv_p256 = none
 }
 
+// traffic_keys_at is the shared derivation behind the two public accessors below:
+// it guards that one level's retained traffic secrets are present, then derives both
+// directions' KeyMaterial legs from them — the core's is_quic mode bit selects the
+// label vocabulary (RFC 8446 §7.1 'key'/'iv' vs RFC 9001 §5.1 'quic key/iv/hp') and
+// with it the leg shape: record legs leave hp empty, packet legs fill it. The initial
+// level has no traffic secrets in either mode (QUIC Initial keys derive from the DCID,
+// RFC 9001 §5.2), so it is refused here even though no public accessor names it.
+fn (h &HandshakeCore) traffic_keys_at(level EncryptionLevel) !TrafficKeys {
+	match level {
+		.initial {
+			return error('handshake: initial level has no traffic secrets (Initial keys derive from the DCID, RFC 9001 §5.2)')
+		}
+		.handshake {
+			if h.c_hsk_tsec.len == 0 || h.s_hsk_tsec.len == 0 {
+				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_secrets())')
+			}
+			return TrafficKeys{
+				client: derive_key_material(h.hash_algo, h.c_hsk_tsec, h.key_len, h.is_quic)!
+				server: derive_key_material(h.hash_algo, h.s_hsk_tsec, h.key_len, h.is_quic)!
+			}
+		}
+		.application {
+			if h.c_app_tsec.len == 0 || h.s_app_tsec.len == 0 {
+				return error('handshake: application traffic keys unavailable before the server Finished')
+			}
+			return TrafficKeys{
+				client: derive_key_material(h.hash_algo, h.c_app_tsec, h.key_len, h.is_quic)!
+				server: derive_key_material(h.hash_algo, h.s_app_tsec, h.key_len, h.is_quic)!
+			}
+		}
+	}
+}
+
+// handshake_traffic_keys returns the handshake-phase key generation for the calling
+// transport to install, derived on demand through traffic_keys_at(): record legs (hp
+// empty) on a TLS-mode core, packet legs (key+iv+hp) on a QUIC-mode core. Each call
+// yields a fresh, caller-owned generation — drain it with take_client_material() /
+// take_server_material() and wipe() the rest, so no copy escapes unscrubbed (§7.5).
+// The initial phase has no accessor at all, so asking for it is not expressible rather
+// than refused.
+pub fn (h &HandshakeCore) handshake_traffic_keys() !TrafficKeys {
+	return h.traffic_keys_at(.handshake)
+}
+
+// application_traffic_keys returns the application-phase key generation, derived
+// through the same shared seam and shaped by the same mode bit; the record layer
+// installs this once the server Finished verifies, the QUIC engine at .connected.
+// TLS rekeying does not come through here — next_application_key_material() (a
+// KeyUpdate concept; QUIC key updates live in the packet layer) ratchets and derives
+// in one step so a generation can never be skipped.
+pub fn (h &HandshakeCore) application_traffic_keys() !TrafficKeys {
+	return h.traffic_keys_at(.application)
+}
+
 // wipe_traffic_secrets_at is the unguarded per-level wipe: it zeroes the client and
 // server traffic secrets for one encryption level; the initial level has no TLS
-// traffic secrets. It mirrors the QUIC-side peer_traffic_secrets_at() accessor
-// (core_quic.v) so reads and wipes share the same phase vocabulary.
+// traffic secrets. It is the write-side counterpart of traffic_keys_at() above, so
+// reads and wipes share the same level-keyed vocabulary.
 fn (mut h HandshakeCore) wipe_traffic_secrets_at(level EncryptionLevel) {
 	match level {
 		.initial {}

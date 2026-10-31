@@ -6,9 +6,9 @@
 // encrypted-flight phase transitions that advance the machine to .connected. Its
 // methods attach to HandshakeCore; the inbound reassembly buffers, receive/dispatch
 // routing and terminal-failure primitives live in state_machine_extra.v, ECDHE and the
-// derived-secret lifecycle in key_exchange.v and key_schedule.v, and the transport-
-// specific surfaces guarded by is_quic live in core_record.v (TLS record) and
-// core_quic.v (QUIC), as HandshakeCore methods too — V keeps one struct's methods
+// derived-secret lifecycle in key_exchange.v and key_schedule.v, and the one-sided
+// surfaces guarded by is_quic live in core_guarded.v (TLS-record-only and QUIC-only
+// methods together), as HandshakeCore methods too — V keeps one struct's methods
 // in its declaring module, not one file.
 module handshake
 
@@ -119,11 +119,13 @@ pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOpt
 }
 
 // HandshakeCore owns shared TLS 1.3 handshake state and behavior, plus both transport
-// surfaces guarded by is_quic: the TLS-record side derives record keys on demand from the
-// retained traffic secrets (core_record.v), while QUIC exports the raw secrets (core_quic.v).
+// surfaces: the key accessors are shared and answer in the core's mode (record or
+// packet legs, derived in-module from the retained traffic secrets), while the
+// one-sided methods guard themselves with is_quic (core_guarded.v).
 @[noinit]
 struct HandshakeCore {
-	// is_quic (guards the transport entry points; mismatched calls are refused at run time)
+	// is_quic (selects the derivation vocabulary and guards the one-sided entry points,
+	// which are refused at run time on the wrong-mode core)
 	// and validator (cert policy) are core identity, fixed at construction: flipping either
 	// mid-handshake would void the guards and any material derived against the originals.
 	is_quic   bool
