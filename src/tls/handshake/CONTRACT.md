@@ -5,7 +5,7 @@ TLS 1.3 semantics *and* both transport surfaces. The transport mode is chosen at
 construction and stored as the `is_quic` flag:
 
 - `new_tls_handshake(...)` — record mode (`is_quic false`) for the TLS record adapter (`tls.Conn`).
-- `new_quic_handshake(...)` — QUIC mode (`is_quic true`) for the QUIC adapter (`tls.quic.Conn`).
+- `new_quic_handshake(...)` — QUIC mode (`is_quic true`) for the QUIC adapter (`tls.quic.Engine`, driven through the socket-owning `tls.quic.Conn` facade).
 
 The mode does not split the type: transport-specific entry points exist on both
 modes and guard themselves. A TLS-record-only call on a QUIC-mode core, and a
@@ -200,6 +200,12 @@ QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 exist on the type but are runtime-rejected on a QUIC-mode core by the `is_quic`
 guards, which change no state and zeroize nothing.
 
+The core is unaware of packet acknowledgments: emitting ACK frames, retaining the
+handshake flight for retransmission on a probe timeout, and fragmenting outbound
+CRYPTO to the datagram MTU are all QUIC-adapter responsibilities (`tls.quic.Engine`)
+built on top of the message seam above (RFC 9000 §13.2, §6.2.1, §14). The core still
+exposes no record or stream semantics to the adapter.
+
 ## Supporting protocol helpers
 
 The module also exposes lower-level helpers used by adapters that implement
@@ -213,13 +219,15 @@ to the core's phase-checked handshake entry points.
 
 The core owns TLS handshake ordering, transcript updates, certificate
 validation, the TLS key schedule, shared traffic secrets, and per-phase TLS
-message reassembly buffers. `HandshakeCore` in record mode derives TLS record keys on
-demand from its retained traffic secrets; in QUIC mode it only exposes traffic secrets for QUIC key
-derivation. The record adapter owns
+message reassembly buffers. `HandshakeCore` derives key material on demand in both
+modes from its retained traffic secrets, and hands it out through the same shared
+accessors — record legs on a TLS-mode core, packet legs on a QUIC-mode core. Raw
+traffic secrets never leave the core in either mode. The record adapter owns
 TLS records and record protection — in this stack the `RecordLayer` facade
 (`tls/record_layer.v`) holds the four protection states and the KeyUpdate policy built
 on them. The QUIC adapter owns CRYPTO offset
-reassembly, packets, packet protection, and QUIC key updates. The core does not
+reassembly, packets, packet protection, ACK emission, handshake retransmission, and
+QUIC key updates. The core does not
 frame or encrypt transport records or packets.
 
 ## Future API work

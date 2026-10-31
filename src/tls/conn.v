@@ -258,10 +258,9 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	// The single handshake-phase teardown choke-point: every do_handshake() failure —
-	// whether it pinned an alert via classify_failure or is an internal `!` surfacing the
-	// core's default — funnels here to send the classified fatal alert (RFC 8446 §6),
-	// destroy secrets, and close the socket. It stays a safety net even though the
-	// classified sites already pinned fail_alert, so no future `return` path can leak material.
+	// whether it pinned an alert via classify_failure or is an internal `!` — funnels here
+	// to send the classified fatal alert (§6), destroy secrets and close the socket. It stays
+	// a safety net so no future `return` path can leak material.
 	conn.do_handshake() or {
 		// do_handshake released guard on return, and the Conn is not shared yet, so this
 		// teardown runs single-threaded with no lock held.
@@ -430,13 +429,10 @@ pub fn (mut c Conn) write(data []u8) !int {
 
 // close sends a close_notify alert and closes the underlying TCP connection.
 pub fn (mut c Conn) close() ! {
-	// Single-phase teardown under guard: emit close_notify at most once (it needs the
-	// write keys alive, so it runs before destroy_all wipes them), mark closed, destroy
-	// every secret and buffer, then release the socket. A reader parked in sock.read()
-	// is not holding guard, so this acquires it; the parked read surfaces the close on
-	// its own (see the Conn lock discipline) and re-checks the terminal flags after
-	// reacquiring. A short-circuit here after a peer close_notify is correct: the
-	// §6.1 reply already went out from handle_alert while the keys existed.
+	// Single-phase teardown under guard: emit close_notify at most once (it needs the write
+	// keys alive, so it runs before destroy_all wipes them), mark closed, destroy every
+	// secret and buffer, then release the socket. A parked reader holds no guard, so this
+	// acquires it; the parked read surfaces the close itself (see the lock discipline).
 	c.guard.lock()
 	defer {
 		c.guard.unlock()
@@ -577,11 +573,10 @@ fn validate_compat_ccs(payload []u8, seen int) !int {
 // send_plaintext_flight emits one handshake flight — the initial or a retry
 // ClientHello — as a plaintext record followed by the dummy CCS (§5/App. D.4).
 fn (mut c Conn) send_plaintext_flight(msg []u8) ! {
-	// RFC 8446 §5.1: every plaintext flight — the initial ClientHello or a retry —
-	// must fit exactly one record. serialize_into encodes the length in two bytes
-	// without a re-check, so an oversized locally built message would silently
-	// mis-frame. Pin internal_error and fail before framing; dial()'s teardown
-	// wrapper then emits the pinned alert (the handshake-phase convention).
+	// §5.1: every plaintext flight (initial ClientHello or retry) must fit one record.
+	// serialize_into encodes the length in two bytes without re-checking, so an oversized
+	// local message would silently mis-frame. Pin internal_error and fail before framing;
+	// dial()'s teardown wrapper then emits the pinned alert (the handshake-phase convention).
 	if msg.len > max_plaintext_record_len {
 		return c.classify_failure(.internal_error, 'tls: ClientHello exceeds one record (${msg.len} > ${max_plaintext_record_len} bytes)')
 	}
@@ -699,20 +694,16 @@ fn (mut c Conn) read_raw_record() !Record {
 			// dribble never completes one, so this fill loop is where the stall lives.
 			c.handshake_read_timeleft()!
 		}
-		// Never hold guard across the indefinite blocking socket read: releasing it here
-		// is what lets a concurrent close() acquire guard. Register as a parked reader
-		// first — under guard, atomically with the sock_closed check above — so close()
-		// defers the fd close rather than recycling the descriptor under this recv();
-		// the close still surfaces to us via this read's own socket timeout plus the
-		// post-reacquire terminal-flag re-check. Reacquire before touching state.
+		// Never hold guard across the indefinite blocking socket read: releasing it lets a
+		// concurrent close() acquire guard. Register as a parked reader first — under guard,
+		// atomically with the sock_closed check — so close() defers the fd close instead of
+		// recycling it under this recv(); the close still surfaces via the read's own timeout.
 		c.readers++
 		c.guard.unlock()
-		// Classify socket-level failures: a mundane I/O condition — the per-op
-		// timeout, an interrupt, EAGAIN — is returned as a non-sticky transport tag
-		// (is_transport_error recognises it) so read() can retry; EOF/reset stays a
-		// plain terminal error because the stream is truncated, which §6.1 makes
-		// a truncation-attack boundary. Every branch returns, so the or-block
-		// never falls through with an unbound n.
+		// Classify socket-level failures: a mundane I/O condition (per-op timeout, EINTR,
+		// EAGAIN) returns as a non-sticky transport tag (is_transport_error) so read() can
+		// retry; EOF/reset stays terminal because a truncated stream is a §6.1
+		// truncation-attack boundary. Every branch returns, so the or-block never falls through.
 		n := c.sock.read(mut c.sock_buf) or {
 			c.guard.lock()
 			c.finish_parked_read()
@@ -728,11 +719,10 @@ fn (mut c Conn) read_raw_record() !Record {
 			if msg.contains('timed out') || msg.contains('timeout') || msg.contains('eagain') || msg.contains('would block') || msg.contains('interrupted') {
 				return error('tls: socket read timed out or interrupted')
 			}
-			// EOF, connection reset, broken pipe, aborted: the peer ended the stream
-			// without a close_notify. V surfaces a clean FIN as an `EOF` read error, not
-			// `n == 0`, so truncation lands here rather than at the `n == 0` re-check.
-			// RFC 8446 §6.1 makes it terminal and sticky (a silent clean EOF would hide a
-			// truncation attack), so classify it with the same 'connection closed' wording.
+			// EOF, reset, broken pipe, aborted: the peer ended the stream without a
+			// close_notify. V surfaces a clean FIN as an `EOF` read error, not `n == 0`, so
+			// truncation lands here. §6.1 makes it terminal and sticky (a silent clean EOF
+			// would hide a truncation attack), so reuse the 'connection closed' wording.
 			return error('tls: connection closed while reading record')
 		}
 		c.guard.lock()

@@ -17,30 +17,93 @@ const param_initial_scid = u64(0x0f)
 // server-only parameter, so this stack reads it but never sends it.
 const param_original_dcid = u64(0x00)
 
-// TransportParameters is the subset of RFC 9000 §7.3 parameters this stack
-// advertises and reads back from a peer. A client declares only
-// initial_source_connection_id; original_dcid is filled in from a server's
-// declaration, which §7.3 requires a server to make.
+// Numeric transport-parameter ids a client advertises (RFC 9000 §18.2 table).
+const param_max_idle_timeout = u64(0x01)
+const param_max_udp_payload_size = u64(0x03)
+const param_initial_max_data = u64(0x04)
+const param_initial_max_stream_data_bidi_local = u64(0x05)
+const param_initial_max_stream_data_bidi_remote = u64(0x06)
+const param_initial_max_stream_data_uni = u64(0x07)
+const param_initial_max_streams_bidi = u64(0x08)
+const param_initial_max_streams_uni = u64(0x09)
+const param_ack_delay_exponent = u64(0x0a)
+const param_max_ack_delay = u64(0x0b)
+
+// TransportParameters is the subset of RFC 9000 §18.2 parameters this stack
+// advertises and reads back from a peer. A client declares the numeric limits plus
+// initial_source_connection_id; original_dcid is filled in only from a server's
+// declaration, which §7.3 requires a server to make. The numeric fields carry the
+// values the encoder emits and the decoder skips past (unrecognized ids are ignored
+// per §7.3), so they round-trip without the adapter interpreting flow control.
 struct TransportParameters {
-	original_dcid []u8
-	initial_scid  []u8
+	original_dcid                       []u8
+	initial_scid                        []u8
+	max_idle_timeout                    u64
+	max_udp_payload_size                u64
+	initial_max_data                    u64
+	initial_max_stream_data_bidi_local  u64
+	initial_max_stream_data_bidi_remote u64
+	initial_max_stream_data_uni         u64
+	initial_max_streams_bidi            u64
+	initial_max_streams_uni             u64
+	ack_delay_exponent                  u64
+	max_ack_delay                       u64
+}
+
+// client_transport_parameters builds the handshake-only parameter set a client
+// advertises. The flow-control numbers are placeholders for a stack that implements
+// no stream data plane yet - they need only be legal, non-zero defaults (RFC 9000
+// §18.2); a strict server treats an absent/undersized set as illegal_parameter, so
+// a full set is sent even though these values are never acted on here.
+fn client_transport_parameters(scid []u8) TransportParameters {
+	return TransportParameters{
+		max_idle_timeout:                    30000
+		max_udp_payload_size:                1472
+		initial_max_data:                    1048576
+		initial_max_stream_data_bidi_local:  1048576
+		initial_max_stream_data_bidi_remote: 1048576
+		initial_max_stream_data_uni:         1048576
+		initial_max_streams_bidi:            128
+		initial_max_streams_uni:             3
+		ack_delay_exponent:                  3
+		max_ack_delay:                       25
+		initial_scid:                        scid
+	}
+}
+
+// encode_numeric_param frames one numeric transport parameter as its id/length/value
+// triplet, the value itself a varint and the length that varint's byte count
+// (RFC 9000 §7.3, §18).
+fn encode_numeric_param(id u64, val u64) ![]u8 {
+	value := encode_varint(val)!
+	mut out := encode_varint(id)!
+	out << encode_varint(u64(value.len))!
+	out << value
+	return out
 }
 
 // encode_transport_parameters serializes this endpoint's advertised parameters as
-// a single id/length/value triplet: the initial_source_connection_id code, the
-// length of the connection ID, then its raw bytes. RFC 9000 §5.1 caps a
-// connection ID at max_cid_len bytes, enforced here.
-//
-// Only that one parameter is written. original_destination_connection_id,
-// preferred_address, retry_source_connection_id and stateless_reset_token are
-// server-only, and §7.3 makes sending any of them from a client a
-// TRANSPORT_PARAMETER_ERROR the peer must refuse - so a client-shaped encoder must
-// not grow those fields without also growing a server-shaped one.
+// ascending id/length/value triplets, the client's full §18.2 set. original_dcid,
+// stateless_reset_token (0x02) and retry_source_connection_id (0x10) are server-only,
+// and §7.3 makes a client sending any of them a TRANSPORT_PARAMETER_ERROR, so this
+// encoder never emits them; the connection-ID-valued initial_source_connection_id is
+// written as raw octets, not a varint (RFC 9000 §18.2).
 fn encode_transport_parameters(params TransportParameters) ![]u8 {
 	if params.initial_scid.len > max_cid_len {
 		return error('quic: initial_source_connection_id exceeds ${max_cid_len} bytes')
 	}
-	mut out := encode_varint(param_initial_scid)!
+	mut out := []u8{cap: 96}
+	out << encode_numeric_param(param_max_idle_timeout, params.max_idle_timeout)!
+	out << encode_numeric_param(param_max_udp_payload_size, params.max_udp_payload_size)!
+	out << encode_numeric_param(param_initial_max_data, params.initial_max_data)!
+	out << encode_numeric_param(param_initial_max_stream_data_bidi_local, params.initial_max_stream_data_bidi_local)!
+	out << encode_numeric_param(param_initial_max_stream_data_bidi_remote, params.initial_max_stream_data_bidi_remote)!
+	out << encode_numeric_param(param_initial_max_stream_data_uni, params.initial_max_stream_data_uni)!
+	out << encode_numeric_param(param_initial_max_streams_bidi, params.initial_max_streams_bidi)!
+	out << encode_numeric_param(param_initial_max_streams_uni, params.initial_max_streams_uni)!
+	out << encode_numeric_param(param_ack_delay_exponent, params.ack_delay_exponent)!
+	out << encode_numeric_param(param_max_ack_delay, params.max_ack_delay)!
+	out << encode_varint(param_initial_scid)!
 	out << encode_varint(u64(params.initial_scid.len))!
 	out << params.initial_scid
 	return out

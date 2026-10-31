@@ -64,7 +64,7 @@ src/
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation
     wire/           module `tls.wire`: bounds-checked byte reader/writer
-    quic/           module `tls.quic`: QUIC client engine over the same core
+    quic/           module `tls.quic`: QUIC engine + socket-owning dial() facade
     fakeserver/     module `tls.fakeserver`: test-only fake TLS 1.3 server
 ```
 
@@ -116,11 +116,17 @@ relative to the executable's own directory.
   out-of-band pattern.
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A full **QUIC transport stack** (RFC 9000/9001). The in-repo `tls.quic`
-  module is a handshake *engine*, not a transport: it runs the full RFC 9001
-  handshake — packet (de)serialization, packet-number spaces, header
-  protection, and CRYPTO reassembly — needing only `tls.handshake` + `tls.pki`
-  and never importing `tls`, but leaves out ACK-based loss recovery, congestion
-  control, streams, flow control, migration, Retry/0-RTT, and the 1-RTT Key
+  module completes the RFC 9001 handshake and now survives a lossy path: the
+  transport-agnostic `Engine` runs packet (de)serialization, packet-number
+  spaces, header protection, and CRYPTO reassembly, and additionally emits ACK
+  frames, retransmits the handshake flight on a probe timeout, and fragments
+  outbound CRYPTO to `Config.max_packet_size`; a socket-owning `quic.dial()`
+  facade (`Conn`) drives that loop over a `net.UdpConn` to confirmation. The
+  client advertises a complete RFC 9000 §18.2 transport-parameter set (its
+  flow-control values are handshake-only placeholders). It
+  needs only `tls.handshake` + `tls.pki` and never imports `tls`. What remains
+  out is the *data plane*: streams, flow control, loss recovery and congestion
+  control for application data, migration, Retry/0-RTT, and the 1-RTT Key
   Phase update. The engine loop is walked through in
   [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md) and the core's seam
   in [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md).

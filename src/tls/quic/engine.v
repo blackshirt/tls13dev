@@ -13,6 +13,7 @@
 module quic
 
 import crypto.rand
+import time
 import tls.handshake
 
 // quic_version_1 is the RFC 9000 version number this engine speaks.
@@ -21,23 +22,44 @@ pub const quic_version_1 = u32(0x00000001)
 // max_datagram_size bounds reassembly buffers defensively.
 const max_crypto_buffer = 1 << 20
 
+// default_max_packet_size is the RFC 9000 §14.1 Internet datagram floor; outbound
+// CRYPTO is fragmented so no single sealed packet exceeds it.
+const default_max_packet_size = 1200
+
+// initial_pto_ms and max_pto_ms bound the handshake probe-timeout backoff: the
+// first retransmit fires after 300ms and doubles up to the 4s cap (RFC 9000 §6.2.1).
+const initial_pto_ms = i64(300)
+const max_pto_ms = i64(4000)
+
 // LevelKeys holds one level's packet-number-space state and its inbound CRYPTO
 // reassembly. Protection state lives in the per-direction option fields on
-// Conn.
+// Engine.
 struct LevelKeys {
 mut:
-	next_pn    u64         // Next packet number to send in this space.
-	tx_offset  u64         // Next outbound CRYPTO stream offset for this level.
-	largest_rx u64         // Largest received packet number, used for reconstruction.
-	any_rx     bool        // Whether any packet has been received in this space.
-	reasm      CryptoReasm // Contiguous inbound CRYPTO stream and pending fragments.
+	next_pn     u64         // Next packet number to send in this space.
+	tx_offset   u64         // Next outbound CRYPTO stream offset for this level.
+	largest_rx  u64         // Largest received packet number, used for reconstruction.
+	any_rx      bool        // Whether any packet has been received in this space.
+	reasm       CryptoReasm // Contiguous inbound CRYPTO stream and pending fragments.
+	rx_ranges   []RxRange   // Ascending, coalesced spans of received packet numbers to acknowledge (RFC 9000 §19.3.1).
+	ack_pending bool        // Whether rx_ranges holds numbers not yet carried in an ACK.
 }
 
-// Conn is a QUIC client handshake. It wraps a `handshake.HandshakeCore`
+// UnackedFrame is a sent-but-unacknowledged handshake CRYPTO frame, held so a
+// probe-timeout firing can re-seal the identical bytes under a fresh packet number
+// (RFC 9000 §6.2.1). A byte-identical resend is safe: the receiver dedups the
+// overlapping offset instead of rejecting it as a conflict (§19.6).
+struct UnackedFrame {
+mut:
+	ptype PacketType
+	frame []u8
+}
+
+// Engine is the transport-agnostic QUIC client handshake. It wraps a `handshake.HandshakeCore`
 // in QUIC mode and the packet layer around it. Construct it with new_client_engine,
 // feed it datagrams, and take the datagrams it returns to send.
 @[noinit]
-pub struct Conn {
+struct Engine {
 mut:
 	// TLS handshake state and negotiated parameters.
 	hs handshake.HandshakeCore // Unified handshake core in QUIC mode (is_quic true).
@@ -73,6 +95,15 @@ mut:
 
 	// Current 1-RTT Key Phase bit; key updates are not implemented yet.
 	key_phase bool
+
+	// Handshake retransmission state: frames awaiting acknowledgment and the probe-
+	// timeout clock the caller drives with a monotonic millisecond value (§6.2.1).
+	unacked     []UnackedFrame // Sent handshake CRYPTO frames not yet acknowledged.
+	pto_ms      i64            // Current probe timeout, doubling on each firing.
+	next_pto_ms i64            // Absolute millisecond mark at which the flight is retransmitted (0 = unarmed).
+
+	// Packetization limit; no sealed outbound packet exceeds this many bytes (§14.1).
+	max_packet_size int
 }
 
 // Config holds options consumed when creating a QUIC client connection.
@@ -81,6 +112,12 @@ pub struct Config {
 pub:
 	// hsk_options configures certificate validation, ALPN, and ClientHello preferences.
 	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
+	// server_name is the TLS SNI value; dial() derives it from the address host when empty.
+	server_name string
+	// timeout bounds the whole handshake when dialed through the socket-owning facade.
+	timeout time.Duration = 30 * time.second
+	// max_packet_size caps each sealed outbound packet; 0 selects the RFC 9000 §14.1 default.
+	max_packet_size int = default_max_packet_size
 }
 
 // max_cid_len is the longest connection ID a peer may carry (RFC 9000 §5.1).
@@ -97,29 +134,33 @@ fn random_cid(n int) ![]u8 {
 // new_client_engine constructs a QUIC client connection for server_name.
 // Configure TLS behavior through Config; connection IDs are generated
 // automatically, and Initial keys are derived from the original DCID (§5.2).
-pub fn new_client_engine(server_name string, config Config) !Conn {
-	return new_client_engine_with_ids(server_name, config.hsk_options,
+pub fn new_client_engine(server_name string, config Config) !Engine {
+	mut eng := new_client_engine_with_ids(server_name, config.hsk_options,
 		random_cid(8)!, random_cid(8)!)!
+	if config.max_packet_size > 0 {
+		eng.max_packet_size = config.max_packet_size
+	}
+	return eng
 }
 
 // state exposes the handshake state (handshake.HandshakeState) for polling.
-pub fn (e &Conn) state() handshake.HandshakeState {
+pub fn (e &Engine) state() handshake.HandshakeState {
 	return e.hs.state()
 }
 
 // negotiated_alpn returns the server's ALPN pick ('' if none).
-pub fn (e &Conn) negotiated_alpn() string {
+pub fn (e &Engine) negotiated_alpn() string {
 	return e.hs.negotiated_alpn()
 }
 
 // negotiated_cipher_suite returns the negotiated suite.
-pub fn (e &Conn) negotiated_cipher_suite() handshake.CipherSuite {
+pub fn (e &Engine) negotiated_cipher_suite() handshake.CipherSuite {
 	return e.hs.negotiated_cipher_suite()
 }
 
 // is_confirmed reports whether the engine has processed HANDSHAKE_DONE and released
 // the handshake-stage material.
-pub fn (e &Conn) is_confirmed() bool {
+pub fn (e &Engine) is_confirmed() bool {
 	return e.confirmed
 }
 
@@ -128,30 +169,30 @@ pub fn (e &Conn) is_confirmed() bool {
 // until a HelloRetryRequest changes the destination ID, after which both peers
 // re-derive from the server-chosen ID (§5.5); a peer still keyed on this value
 // cannot open the retry flight.
-pub fn (e &Conn) original_dcid() []u8 {
+pub fn (e &Engine) original_dcid() []u8 {
 	return e.orig_dcid
 }
 
 // source_cid returns the engine's Source Connection ID (the server echoes it).
-pub fn (e &Conn) source_cid() []u8 {
+pub fn (e &Engine) source_cid() []u8 {
 	return e.scid
 }
 
 // failure_alert returns the alert the handshake core classified on failure.
-pub fn (e &Conn) failure_alert() handshake.AlertDescription {
+pub fn (e &Engine) failure_alert() handshake.AlertDescription {
 	return e.hs.failure_alert()
 }
 
 // close_error_code returns the QUIC transport error code the engine last closed
 // with (a CRYPTO_ERROR, 0x100 + alert, on a handshake failure).
-pub fn (e &Conn) close_error_code() u64 {
+pub fn (e &Engine) close_error_code() u64 {
 	return e.close_error
 }
 
 // start returns the initial outbound datagram carrying the first ClientHello in
 // an Initial packet. It must be called once after construction, before any input
 // is fed (RFC 9000 §7).
-pub fn (mut e Conn) start() ![]u8 {
+pub fn (mut e Engine) start() ![]u8 {
 	ch := e.hs.create_client_hello()!
 	e.tx_crypto_initial << ch
 	return e.flush()!
@@ -162,7 +203,7 @@ pub fn (mut e Conn) start() ![]u8 {
 // matching level's stream, drives the handshake core with newly-completed
 // messages, installs handshake/application keys as the core exports them, and
 // flushes any outbound handshake bytes into fresh packets.
-pub fn (mut e Conn) receive(datagram []u8) ![]u8 {
+pub fn (mut e Engine) receive(datagram []u8) ![]u8 {
 	if e.closed {
 		return error('quic: engine is closed')
 	}
@@ -199,14 +240,23 @@ pub fn (mut e Conn) receive(datagram []u8) ![]u8 {
 			return error('quic: server original_destination_connection_id does not match the original Destination Connection ID')
 		}
 	}
-	return e.flush()!
+	mut out := e.flush()!
+	// flush_level already carries an ACK in any packet it sends; when there was no
+	// CRYPTO to send, emit the still-owed acknowledgments as bare ACK packets so the
+	// server stops retransmitting its flight (RFC 9000 §13.2).
+	if out.len == 0 {
+		for pt in [PacketType.initial, .handshake, .one_rtt] {
+			out << e.ack_only(pt)!
+		}
+	}
+	return out
 }
 
 // flush turns all pending outbound CRYPTO bytes into protected packets. Each
 // level's bytes are sent in as many packets as needed; the datagrams are
 // concatenated in level order (Initial, Handshake, 1-RTT), as the coalescing
 // rules require (RFC 9000 §12.2).
-pub fn (mut e Conn) flush() ![]u8 {
+pub fn (mut e Engine) flush() ![]u8 {
 	mut out := []u8{}
 	initial := e.flush_level(.initial)!
 	out << initial
@@ -221,7 +271,7 @@ pub fn (mut e Conn) flush() ![]u8 {
 // reason, for the caller to send (RFC 9000 §19.19). It uses 1-RTT protection if
 // the handshake got far enough to install application keys, otherwise Initial
 // protection.
-pub fn (mut e Conn) close(error_code u32, reason string) ![]u8 {
+pub fn (mut e Engine) close(error_code u32, reason string) ![]u8 {
 	e.closed = true
 	e.close_error = error_code
 	frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
@@ -240,21 +290,21 @@ pub fn (mut e Conn) close(error_code u32, reason string) ![]u8 {
 
 // new_client_engine_with_ids constructs an engine with caller-chosen connection
 // IDs. It is private because fixed IDs are only needed by package tests.
-fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOptions, dcid []u8, scid []u8) !Conn {
+fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOptions, dcid []u8, scid []u8) !Engine {
 	mut hs_options := options
 	// TLS carries these bytes verbatim into the quic_transport_parameters
 	// extension (RFC 9001 §8.2) and never reads them, so encoding them is the
 	// adapter's job. This assignment overrides any caller-supplied value: the
-	// advertised parameter must be this engine's own source connection ID.
-	hs_options.quic_transport_params = encode_transport_parameters(TransportParameters{
-		initial_scid: scid.clone()
-	})!
+	// advertised parameters are this engine's own limits, keyed to its source CID.
+	hs_options.quic_transport_params = encode_transport_parameters(client_transport_parameters(scid.clone()))!
 	hs := handshake.new_quic_handshake(server_name, hs_options)!
-	mut eng := Conn{
-		hs:        hs
-		dcid:      dcid.clone()
-		scid:      scid.clone()
-		orig_dcid: dcid.clone()
+	mut eng := Engine{
+		hs:              hs
+		dcid:            dcid.clone()
+		scid:            scid.clone()
+		orig_dcid:       dcid.clone()
+		max_packet_size: default_max_packet_size
+		pto_ms:          initial_pto_ms
 	}
 	eng.install_initial_keys(dcid)!
 	return eng
@@ -264,7 +314,7 @@ fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOpt
 // directions from the destination connection ID the client's Current Initial
 // packet carries: the original DCID for the first ClientHello (RFC 9001 §5.2), or
 // the server-chosen one for the retry after a HelloRetryRequest (§5.5).
-fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
+fn (mut e Engine) install_initial_keys(client_dcid []u8) ! {
 	ck, sk := derive_initial_keys(client_dcid)!
 	e.initial_tx = new_initial_protection(ck)!
 	e.initial_rx = new_initial_protection(sk)!
@@ -281,7 +331,7 @@ fn (mut e Conn) install_initial_keys(client_dcid []u8) ! {
 // What does NOT reset is the CRYPTO stream at this level: offsets within a level
 // are absolute and monotonic (§19.6), which is what lets the retry ClientHello
 // continue past the original instead of rewriting offset 0.
-fn (mut e Conn) rederive_initial_keys_after_retry() ! {
+fn (mut e Engine) rederive_initial_keys_after_retry() ! {
 	if e.initial_rekeyed || !e.hs.is_hello_retry_request_received()! {
 		return
 	}
@@ -289,12 +339,14 @@ fn (mut e Conn) rederive_initial_keys_after_retry() ! {
 	e.initial_ns.next_pn = 0
 	e.initial_ns.largest_rx = 0
 	e.initial_ns.any_rx = false
+	e.initial_ns.rx_ranges = []RxRange{}
+	e.initial_ns.ack_pending = false
 	e.initial_rekeyed = true
 }
 
 // receive_packet handles one coalesced packet at the front of `buf`, returning
 // how many bytes it consumed (RFC 9000 §12.2).
-fn (mut e Conn) receive_packet(buf []u8) !int {
+fn (mut e Engine) receive_packet(buf []u8) !int {
 	if buf.len == 0 {
 		return 0
 	}
@@ -305,7 +357,7 @@ fn (mut e Conn) receive_packet(buf []u8) !int {
 }
 
 // receive_long_packet parses, deprotects and handles a long-header packet.
-fn (mut e Conn) receive_long_packet(buf []u8) !int {
+fn (mut e Engine) receive_long_packet(buf []u8) !int {
 	// Parse the protection-independent framing: the connection IDs, token and
 	// length field are all readable before header protection is removed.
 	meta := long_packet_meta(buf)!
@@ -334,7 +386,7 @@ fn (mut e Conn) receive_long_packet(buf []u8) !int {
 }
 
 // receive_short_packet parses, deprotects and handles a 1-RTT packet.
-fn (mut e Conn) receive_short_packet(buf []u8) !int {
+fn (mut e Engine) receive_short_packet(buf []u8) !int {
 	if e.app_rx == none {
 		return error('quic: received a 1-RTT packet before application keys exist')
 	}
@@ -367,7 +419,7 @@ fn read_truncated_pn(packet []u8, pn_offset int, pn_len int) u64 {
 }
 
 // store_rx writes a possibly-advanced receive protection state back.
-fn (mut e Conn) store_rx(ptype PacketType, state ProtectionState) {
+fn (mut e Engine) store_rx(ptype PacketType, state ProtectionState) {
 	match ptype {
 		.initial { e.initial_rx = state }
 		.handshake { e.handshake_rx = state }
@@ -377,7 +429,7 @@ fn (mut e Conn) store_rx(ptype PacketType, state ProtectionState) {
 }
 
 // rx_state_for returns the receive ProtectionState for a parsed packet type.
-fn (e &Conn) rx_state_for(ptype PacketType) !ProtectionState {
+fn (e &Engine) rx_state_for(ptype PacketType) !ProtectionState {
 	return match ptype {
 		.initial { e.initial_rx or { return error('quic: no Initial receive keys') } }
 		.handshake { e.handshake_rx or { return error('quic: no Handshake receive keys') } }
@@ -388,7 +440,7 @@ fn (e &Conn) rx_state_for(ptype PacketType) !ProtectionState {
 
 // handle_frames walks the frame list in a decrypted packet payload and applies
 // each frame that matters to the handshake (RFC 9000 §12.4).
-fn (mut e Conn) handle_frames(ptype PacketType, payload []u8) ! {
+fn (mut e Engine) handle_frames(ptype PacketType, payload []u8) ! {
 	mut off := 0
 	for off < payload.len {
 		frame_type := payload[off]
@@ -426,6 +478,7 @@ fn (mut e Conn) handle_frames(ptype PacketType, payload []u8) ! {
 			}
 			frame_handshake_done {
 				e.confirmed = true
+				e.clear_unacked()
 				e.release_handshake_keys()!
 				off++
 			}
@@ -457,9 +510,12 @@ fn describe_connection_error(code u64) string {
 
 // deliver_crypto inserts a CRYPTO frame's bytes into the level's reassembler
 // and drives the handshake core with any newly-complete messages.
-fn (mut e Conn) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
+fn (mut e Engine) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
 	mut ns := e.ns_mut(ptype)
 	ns.reasm.insert(cf.offset, cf.data)!
+	// Inbound CRYPTO means the peer is making progress and has taken our outstanding
+	// flight, so stop holding it for retransmission (RFC 9000 §6.2.1).
+	e.clear_unacked()
 	e.drain_contiguous(ptype)!
 }
 
@@ -467,7 +523,7 @@ fn (mut e Conn) deliver_crypto(ptype PacketType, cf CryptoFrame) ! {
 // level's CRYPTO stream to the core, then installs any new keys the core exposes.
 // Delivery goes through reasm.next_message(), which advances the reassembler's
 // absolute offset so a peer may keep appending to the stream past what we took.
-fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
+fn (mut e Engine) drain_contiguous(ptype PacketType) ! {
 	// The packet type settles which core phase to feed, and is rejected outright
 	// before anything is consumed from the reassembler.
 	is_initial := crypto_is_initial(ptype)!
@@ -494,7 +550,7 @@ fn (mut e Conn) drain_contiguous(ptype PacketType) ! {
 
 // feed_crypto routes one complete CRYPTO message to the core phase selected by
 // is_initial and returns the outbound messages it triggers.
-fn (mut e Conn) feed_crypto(is_initial bool, msg []u8) ![]handshake.HandshakeMessage {
+fn (mut e Engine) feed_crypto(is_initial bool, msg []u8) ![]handshake.HandshakeMessage {
 	if is_initial {
 		return e.hs.receive_initial_bytes(msg)!
 	}
@@ -503,7 +559,7 @@ fn (mut e Conn) feed_crypto(is_initial bool, msg []u8) ![]handshake.HandshakeMes
 
 // queue_outbound places an outbound handshake message into the right level's
 // outbound CRYPTO buffer.
-fn (mut e Conn) queue_outbound(m handshake.HandshakeMessage) ! {
+fn (mut e Engine) queue_outbound(m handshake.HandshakeMessage) ! {
 	if m.is_initial() {
 		e.tx_crypto_initial << m.msg()
 	} else {
@@ -515,7 +571,7 @@ fn (mut e Conn) queue_outbound(m handshake.HandshakeMessage) ! {
 // accessors as soon as each level becomes available (RFC 9001 §5.1; the core's QUIC
 // mode answers these calls with filled key+iv+hp legs). It is
 // idempotent: keys are only installed once.
-fn (mut e Conn) install_packet_keys() ! {
+fn (mut e Engine) install_packet_keys() ! {
 	// Readiness comes from the core's secret-phase query, not from decoding
 	// HandshakeState: a phase is true exactly while both directions' traffic secrets
 	// exist, so a .failed handshake (schedule wiped) never reaches these expands with
@@ -535,7 +591,7 @@ fn (mut e Conn) install_packet_keys() ! {
 // whole into new_protection(), whose backend copies what it keeps, so the deferred
 // handle wipes and field wipes scrub every local copy on all exit paths (§7.5) —
 // raw traffic secrets never cross into tls.quic at all.
-fn (mut e Conn) install_protection(is_application bool) ! {
+fn (mut e Engine) install_protection(is_application bool) ! {
 	mut gen := if is_application {
 		e.hs.application_traffic_keys()!
 	} else {
@@ -578,13 +634,13 @@ fn drain_packet_keys(mut k handshake.KeyMaterial) ProtectionKeys {
 
 // install_handshake_protection derives the Handshake-level packet protection from
 // the core's handshake packet keys.
-fn (mut e Conn) install_handshake_protection() ! {
+fn (mut e Engine) install_handshake_protection() ! {
 	e.install_protection(false)!
 }
 
 // install_application_protection derives the 1-RTT packet protection from the
 // core's application packet keys.
-fn (mut e Conn) install_application_protection() ! {
+fn (mut e Engine) install_application_protection() ! {
 	e.install_protection(true)!
 }
 
@@ -599,8 +655,9 @@ fn zero_bytes(mut buf []u8) {
 }
 
 // flush_level emits the pending CRYPTO bytes for one level as one or more
-// protected packets.
-fn (mut e Conn) flush_level(ptype PacketType) ![]u8 {
+// protected packets, fragmenting so no sealed packet exceeds max_packet_size
+// (RFC 9000 §14, §18.2) and retaining each CRYPTO frame for handshake retransmit.
+fn (mut e Engine) flush_level(ptype PacketType) ![]u8 {
 	// If the key isn't installed, this level has nothing to send.
 	mut tx := match ptype {
 		.initial { e.initial_tx or { return []u8{} } }
@@ -612,31 +669,83 @@ fn (mut e Conn) flush_level(ptype PacketType) ![]u8 {
 	if pending.len == 0 {
 		return []u8{}
 	}
-	// One CRYPTO frame per level for the handshake (flights are small); a real
-	// stack fragments against the datagram MTU. The offset advances by the bytes
-	// already emitted on this level's CRYPTO stream, so a retry ClientHello after
-	// a HelloRetryRequest continues past the original ClientHello instead of
-	// rewriting offset 0 (RFC 9000 §7.5, §19.6; the receiver rejects conflicting
-	// overlap). The first flush of a level still starts at offset 0.
-	crypto_offset := e.ns_mut(ptype).tx_offset
-	frame := encode_crypto_frame(crypto_offset, pending)!
-	pn := e.next_pn(ptype)
-	pn_len := packet_number_len(pn, 0)
-	mut payload := frame.clone()
-	// Every client Initial datagram must reach 1200 bytes (RFC 9000 §14.1).
-	if ptype == .initial {
-		payload = pad_datagram(payload, 30)
+	// An ACK for this level's newly received packets rides at the front of the first
+	// packet, so the peer can stop retransmitting while the datagram count stays low
+	// (RFC 9000 §13.2).
+	mut ack := []u8{}
+	mut ns := e.ns_mut(ptype)
+	if ns.ack_pending && ns.rx_ranges.len > 0 {
+		ack = encode_ack_frame(ns.rx_ranges, 0)!
+		ns.ack_pending = false
 	}
-	packet := e.seal(ptype, mut tx, pn, pn_len, payload)!
-	e.store_tx(ptype, tx)
-	e.bump_pn(ptype)
-	e.ns_mut(ptype).tx_offset += u64(pending.len)
-	return packet
+	tag := tx.overhead()
+	mut out := []u8{cap: pending.len + 64}
+	mut idx := 0
+	mut first := true
+	for idx < pending.len {
+		pn := e.next_pn(ptype)
+		pn_len := packet_number_len(pn, 0)
+		overhead := e.packet_overhead(ptype, pn_len, tag)
+		// The offset advances by the bytes already emitted on this level's CRYPTO
+		// stream, so a retry ClientHello after a HelloRetryRequest continues past the
+		// original instead of rewriting offset 0 (RFC 9000 §7.5, §19.6).
+		crypto_offset := e.ns_mut(ptype).tx_offset
+		// CRYPTO frame cost: type byte, offset varint, and a length varint (2 bytes
+		// for any fragment under 2^14, which the MTU guarantees).
+		frame_hdr := 1 + encode_varint(crypto_offset)!.len + 2
+		mut budget := e.max_packet_size - overhead - frame_hdr - ack.len
+		if budget < 1 {
+			budget = 1 // never emit an empty CRYPTO fragment, even over the MTU
+		}
+		mut take := pending.len - idx
+		if take > budget {
+			take = budget
+		}
+		frame := encode_crypto_frame(crypto_offset, pending[idx..idx + take])!
+		mut payload := ack.clone()
+		payload << frame
+		// Every client Initial datagram must reach 1200 bytes (RFC 9000 §14.1).
+		if ptype == .initial && first {
+			payload = pad_datagram(payload, overhead)
+		}
+		packet := e.seal(ptype, mut tx, pn, pn_len, payload)!
+		e.store_tx(ptype, tx)
+		e.bump_pn(ptype)
+		e.ns_mut(ptype).tx_offset += u64(take)
+		idx += take
+		out << packet
+		// Retain the CRYPTO frame so a lost packet is re-sealed under a fresh number;
+		// 1-RTT handshake traffic is not retransmitted here.
+		if ptype == .initial || ptype == .handshake {
+			e.unacked << UnackedFrame{
+				ptype: ptype
+				frame: frame
+			}
+		}
+		ack = []u8{}
+		first = false
+	}
+	return out
+}
+
+// packet_overhead returns the bytes a sealed packet costs beyond its plaintext
+// payload: the cleartext header through the length field, the packet number, and
+// the AEAD tag. The length field is assumed to encode in two varint bytes, which
+// holds for every packet under the MTU this engine targets.
+fn (e &Engine) packet_overhead(ptype PacketType, pn_len int, tag int) int {
+	if ptype == .one_rtt {
+		return 1 + e.dcid.len + pn_len + tag // short header: first byte + DCID
+	}
+	mut n := 1 + 4 + 1 + e.dcid.len + 1 + e.scid.len // first, version, DCID, SCID
+	if ptype == .initial {
+		n += 1 // zero-length token varint
+	}
+	return n + 2 + pn_len + tag // length varint + packet number + tag
 }
 
 // seal builds and protects one packet at a level with the (possibly updated)
 // protection state.
-fn (mut e Conn) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len int, payload []u8) ![]u8 {
+fn (mut e Engine) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len int, payload []u8) ![]u8 {
 	tag := tx.overhead()
 	match ptype {
 		.initial {
@@ -659,7 +768,7 @@ fn (mut e Conn) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len in
 
 // seal_raw seals an arbitrary frame payload (not CRYPTO) into one packet at the
 // chosen level. It is used for CONNECTION_CLOSE, which no CRYPTO buffer holds.
-fn (mut e Conn) seal_raw(ptype PacketType, payload []u8) ![]u8 {
+fn (mut e Engine) seal_raw(ptype PacketType, payload []u8) ![]u8 {
 	mut tx := match ptype {
 		.initial { e.initial_tx or { return error('quic: no Initial send keys') } }
 		.handshake { e.handshake_tx or { return error('quic: no Handshake send keys') } }
@@ -674,13 +783,123 @@ fn (mut e Conn) seal_raw(ptype PacketType, payload []u8) ![]u8 {
 	return packet
 }
 
+// ack_only seals a bare ACK packet for a level that has newly received packets
+// but no CRYPTO to send, so the peer's flight is acknowledged even when this engine
+// has nothing new to emit (RFC 9000 §13.2). Returns no bytes when there is nothing
+// owed or the level has no send keys yet.
+fn (mut e Engine) ack_only(ptype PacketType) ![]u8 {
+	mut ns := e.ns_mut(ptype)
+	if !ns.ack_pending || ns.rx_ranges.len == 0 {
+		return []u8{}
+	}
+	if !e.tx_keys_present(ptype) {
+		return []u8{}
+	}
+	payload := encode_ack_frame(ns.rx_ranges, 0)!
+	ns.ack_pending = false
+	return e.seal_raw(ptype, payload)!
+}
+
+// tx_keys_present reports whether a level's send protection has been installed.
+fn (e &Engine) tx_keys_present(ptype PacketType) bool {
+	return match ptype {
+		.initial { e.initial_tx != none }
+		.handshake { e.handshake_tx != none }
+		.one_rtt { e.app_tx != none }
+		.retry, .zero_rtt { false }
+	}
+}
+
+// tx_state_for returns a level's send ProtectionState, erroring if it is not yet
+// installed. It mirrors seal_raw's key lookup for the retransmit path.
+fn (e &Engine) tx_state_for(ptype PacketType) !ProtectionState {
+	return match ptype {
+		.initial { e.initial_tx or { return error('quic: no Initial send keys') } }
+		.handshake { e.handshake_tx or { return error('quic: no Handshake send keys') } }
+		.one_rtt { e.app_tx or { return error('quic: no application send keys') } }
+		.retry, .zero_rtt { return error('quic: cannot seal ${ptype}') }
+	}
+}
+
+// retransmit_expired re-emits the outstanding handshake flight once the probe
+// timeout elapses, doubling the timeout on each firing (RFC 9000 §6.2.1, §A.4). The
+// engine keeps no clock of its own: the caller passes a monotonic `now_ms` on every
+// timer tick, and the first call after a send arms the initial timeout. Retransmits
+// reuse the stored CRYPTO bytes under fresh packet numbers, so a peer that already
+// has them simply dedups the offset.
+pub fn (mut e Engine) retransmit_expired(now_ms i64) ![]u8 {
+	if e.closed || e.unacked.len == 0 {
+		return []u8{}
+	}
+	if e.next_pto_ms == 0 {
+		e.next_pto_ms = now_ms + e.pto_ms
+		return []u8{}
+	}
+	if now_ms < e.next_pto_ms {
+		return []u8{}
+	}
+	mut out := []u8{}
+	unacked := e.unacked.clone()
+	for rec in unacked {
+		if !e.tx_keys_present(rec.ptype) {
+			continue
+		}
+		mut tx := e.tx_state_for(rec.ptype)!
+		pn := e.next_pn(rec.ptype)
+		pn_len := packet_number_len(pn, 0)
+		packet := e.seal(rec.ptype, mut tx, pn, pn_len, rec.frame)!
+		e.store_tx(rec.ptype, tx)
+		e.bump_pn(rec.ptype)
+		out << packet
+	}
+	if e.pto_ms < max_pto_ms {
+		e.pto_ms *= 2
+		if e.pto_ms > max_pto_ms {
+			e.pto_ms = max_pto_ms
+		}
+	}
+	e.next_pto_ms = now_ms + e.pto_ms
+	return out
+}
+
+// probe_wait_ms tells the socket-owning facade how long to block on a read before
+// consulting retransmit_expired: a full PTO while the clock is not yet armed, else the
+// time remaining until it fires. It returns -1 when no handshake flight is outstanding
+// (or the engine is closed), so the caller falls back to its own socket timeout
+// (RFC 9000 §6.2.1, §A.4).
+pub fn (e &Engine) probe_wait_ms(now_ms i64) i64 {
+	if e.closed || e.unacked.len == 0 {
+		return -1
+	}
+	if e.next_pto_ms == 0 {
+		return e.pto_ms
+	}
+	mut d := e.next_pto_ms - now_ms
+	if d < 0 {
+		d = 0
+	}
+	return d
+}
+
+// clear_unacked drops the retransmit queue and resets the probe-timeout backoff.
+// It runs whenever the peer delivers new handshake bytes or confirms, since that
+// progress proves it received the flight we were holding (§6.2.1).
+fn (mut e Engine) clear_unacked() {
+	if e.unacked.len == 0 {
+		return
+	}
+	e.unacked = []UnackedFrame{}
+	e.pto_ms = initial_pto_ms
+	e.next_pto_ms = 0
+}
+
 // fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
 // records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
 // §7.5). The record adapter wipes its core secrets on failure (its dial-time
 // destroy_on_close); the QUIC adapter must do the same, or a dead handshake
 // leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
 // The caller emits a CONNECTION_CLOSE with the recorded code.
-fn (mut e Conn) fail_close() ! {
+fn (mut e Engine) fail_close() ! {
 	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
 	e.hs.fail_and_zeroize_secrets()
 	e.closed = true
@@ -700,7 +919,7 @@ fn wipe_protection_state(mut slot ?ProtectionState) {
 // handshake traffic secrets together after HANDSHAKE_DONE, so an adapter cannot wipe
 // one half and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
 // handshake protection states before releasing them, and is idempotent.
-fn (mut e Conn) release_handshake_keys() ! {
+fn (mut e Engine) release_handshake_keys() ! {
 	e.hs.zeroize_handshake_secrets()!
 	wipe_protection_state(mut e.handshake_tx)
 	wipe_protection_state(mut e.handshake_rx)
@@ -709,7 +928,7 @@ fn (mut e Conn) release_handshake_keys() ! {
 // wipe_packet_keys zeroes and releases every packet-protection state this engine
 // owns, so a dead or closed connection leaves no AEAD key, IV, or header-protection
 // key behind (RFC 8446 §7.5, RFC 9001 §4.9.2). Idempotent.
-fn (mut e Conn) wipe_packet_keys() {
+fn (mut e Engine) wipe_packet_keys() {
 	wipe_protection_state(mut e.initial_tx)
 	wipe_protection_state(mut e.initial_rx)
 	wipe_protection_state(mut e.handshake_tx)
@@ -724,7 +943,7 @@ fn (mut e Conn) wipe_packet_keys() {
 // can wipe one layer and forget the other (RFC 8446 §1.3.1/§7.5, RFC 9001 §4.9.2).
 // It runs only after the final CONNECTION_CLOSE has been sealed, since sealing still
 // needs the packet keys; that is why the failure path (fail_close) does not call it.
-fn (mut e Conn) destroy_on_close() ! {
+fn (mut e Engine) destroy_on_close() ! {
 	if e.hs.state() == .connected {
 		e.hs.zeroize_application_secrets()!
 	} else {
@@ -736,7 +955,7 @@ fn (mut e Conn) destroy_on_close() ! {
 }
 
 // ns_mut returns the LevelKeys for a parsed packet type.
-fn (mut e Conn) ns_mut(ptype PacketType) &LevelKeys {
+fn (mut e Engine) ns_mut(ptype PacketType) &LevelKeys {
 	return match ptype {
 		.initial { &e.initial_ns }
 		.handshake { &e.handshake_ns }
@@ -746,7 +965,7 @@ fn (mut e Conn) ns_mut(ptype PacketType) &LevelKeys {
 }
 
 // largest_rx returns the largest received packet number at a level.
-fn (e &Conn) largest_rx(ptype PacketType) u64 {
+fn (e &Engine) largest_rx(ptype PacketType) u64 {
 	return match ptype {
 		.initial { e.initial_ns.largest_rx }
 		.handshake { e.handshake_ns.largest_rx }
@@ -755,13 +974,16 @@ fn (e &Conn) largest_rx(ptype PacketType) u64 {
 	}
 }
 
-// note_rx records a received packet number for PN reconstruction.
-fn (mut e Conn) note_rx(ptype PacketType, pn u64) {
+// note_rx records a received packet number for PN reconstruction and for the
+// level's ACK range list, marking that a fresh acknowledgment is owed to the peer.
+fn (mut e Engine) note_rx(ptype PacketType, pn u64) {
 	mut ns := e.ns_mut(ptype)
 	if !ns.any_rx || pn > ns.largest_rx {
 		ns.largest_rx = pn
 	}
 	ns.any_rx = true
+	ns.rx_ranges = add_rx_range(ns.rx_ranges, pn)
+	ns.ack_pending = true
 }
 
 // crypto_is_initial validates that a packet type may carry handshake CRYPTO and
@@ -780,7 +1002,7 @@ fn crypto_is_initial(ptype PacketType) !bool {
 }
 
 // take_pending returns and clears the outbound CRYPTO bytes for a level.
-fn (mut e Conn) take_pending(ptype PacketType) []u8 {
+fn (mut e Engine) take_pending(ptype PacketType) []u8 {
 	mut buf := match ptype {
 		.initial { e.tx_crypto_initial }
 		.handshake { e.tx_crypto_hands }
@@ -798,7 +1020,7 @@ fn (mut e Conn) take_pending(ptype PacketType) []u8 {
 }
 
 // next_pn returns the next packet number to send at a level.
-fn (e &Conn) next_pn(ptype PacketType) u64 {
+fn (e &Engine) next_pn(ptype PacketType) u64 {
 	return match ptype {
 		.initial { e.initial_ns.next_pn }
 		.handshake { e.handshake_ns.next_pn }
@@ -808,13 +1030,13 @@ fn (e &Conn) next_pn(ptype PacketType) u64 {
 }
 
 // bump_pn advances a level's send packet number.
-fn (mut e Conn) bump_pn(ptype PacketType) {
+fn (mut e Engine) bump_pn(ptype PacketType) {
 	mut ns := e.ns_mut(ptype)
 	ns.next_pn++
 }
 
 // store_tx writes a possibly-updated protection state back to the engine.
-fn (mut e Conn) store_tx(ptype PacketType, tx ProtectionState) {
+fn (mut e Engine) store_tx(ptype PacketType, tx ProtectionState) {
 	match ptype {
 		.initial { e.initial_tx = tx }
 		.handshake { e.handshake_tx = tx }

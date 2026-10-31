@@ -2,9 +2,10 @@
 //
 // frame.v implements the small set of QUIC frames the handshake uses (RFC 9000 §19):
 // CRYPTO (§19.6) carries the handshake stream, offset across packets; ACK (§19.3) is
-// parsed but never emitted; PADDING (§19.1) inflates the Initial to the 1200-byte
-// minimum; CONNECTION_CLOSE (§19.19) carries a failure's alert code; and
-// HANDSHAKE_DONE (§19.20) is the engine's cue to release the handshake keys.
+// both parsed and emitted (RFC 9000 §13.2 requires a receiver to acknowledge); PADDING
+// (§19.1) inflates the Initial to the 1200-byte minimum; CONNECTION_CLOSE (§19.19)
+// carries a failure's alert code; and HANDSHAKE_DONE (§19.20) is the engine's cue to
+// release the handshake keys.
 //
 // Other frames (STREAM, flow control, Retry, NEW_TOKEN, etc.) are out of scope.
 module quic
@@ -65,6 +66,81 @@ fn parse_ack_frame(body []u8, with_ecn bool) !int {
 		o += n_ce
 	}
 	return o
+}
+
+// RxRange is an inclusive [lo, hi] span of received packet numbers — the unit an ACK
+// frame's range list encodes (RFC 9000 §19.3.1).
+struct RxRange {
+mut:
+	lo u64
+	hi u64
+}
+
+// max_ack_ranges bounds the received-range list so hostile reordering cannot grow it
+// without bound; past the cap the oldest (lowest) spans are dropped.
+const max_ack_ranges = 100
+
+// add_rx_range records a received packet number into an ascending, coalesced range
+// list and returns the new list. A number already covered leaves the list unchanged;
+// otherwise pn is folded in by rebuilding: append it as a singleton, sort, then merge
+// any adjacent/overlapping spans (RFC 9000 §19.3.1). Returning a fresh []RxRange (via
+// the caller's field assignment) avoids mutating a `&[]RxRange` in place, which trips
+// a V code-generation fault on `insert`/`delete` through the reference.
+fn add_rx_range(ranges []RxRange, pn u64) []RxRange {
+	for r in ranges {
+		if pn >= r.lo && pn <= r.hi {
+			return ranges.clone()
+		}
+	}
+	mut items := ranges.clone()
+	items << RxRange{
+		lo: pn
+		hi: pn
+	}
+	items.sort(a.lo < b.lo)
+	mut merged := []RxRange{cap: items.len}
+	for it in items {
+		if merged.len > 0 && it.lo <= merged[merged.len - 1].hi + 1 {
+			mut last := merged[merged.len - 1]
+			if it.hi > last.hi {
+				last.hi = it.hi
+			}
+			merged[merged.len - 1] = last
+		} else {
+			merged << it
+		}
+	}
+	// Keep only the newest (highest) spans past the cap, so hostile reordering cannot
+	// grow the list without bound; the low end is the least useful to acknowledge.
+	if merged.len > max_ack_ranges {
+		return merged[merged.len - max_ack_ranges..]
+	}
+	return merged
+}
+
+// encode_ack_frame serializes an ACK frame (§19.3) over an ascending, coalesced,
+// non-empty range list. ack_delay is 0 here: the handshake client does not measure
+// RTT. Largest Acknowledged and First ACK Range are derived from the top span.
+fn encode_ack_frame(ranges []RxRange, ack_delay u64) ![]u8 {
+	if ranges.len == 0 {
+		return error('quic: cannot encode an ACK frame with no ranges')
+	}
+	mut out := []u8{cap: 1 + (ranges.len + 2) * 8}
+	top := ranges.len - 1
+	out << frame_ack
+	out << encode_varint(ranges[top].hi)! // Largest Acknowledged
+	out << encode_varint(ack_delay)! // ACK Delay
+	out << encode_varint(u64(top))! // ACK Range Count (number of additional ranges)
+	out << encode_varint(ranges[top].hi - ranges[top].lo)! // First ACK Range
+	mut j := top
+	for j > 0 {
+		// Gap is the count of un-ACKed packets between the higher span's smallest
+		// and this span's largest; spans are coalesced, so it is never negative.
+		out << encode_varint(ranges[j].lo - ranges[j - 1].hi - 1)!
+		out << encode_varint(ranges[j - 1].hi - ranges[j - 1].lo)!
+		j--
+	}
+	return out
 }
 
 // parse_crypto_frame parses a CRYPTO frame body (after the type byte),

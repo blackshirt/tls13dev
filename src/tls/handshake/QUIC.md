@@ -85,12 +85,22 @@ QUIC handshakes include the TLS `quic_transport_parameters` extension
 placement — required when the connection is QUIC, rejected on a record transport
 — and carries the value out and back in untouched. Encoding this endpoint's own
 parameters and decoding a peer's id/length/value triplets lives above the
-handshake, in `tls.quic` (`transport_params.v`): the engine advertises
-`initial_source_connection_id` from its source connection ID, and requires a
-server to declare both `initial_source_connection_id` and
-`original_destination_connection_id`, checking each against the connection IDs
-it actually saw on the wire (RFC 9000 §7.3). Parameters outside that set reach
-the adapter intact and are ignored there.
+handshake, in `tls.quic` (`transport_params.v`): a client advertises a complete
+RFC 9000 §18.2 parameter set — `max_idle_timeout` (0x01), `max_udp_payload_size`
+(0x03), `initial_max_data` (0x04), the three stream-data limits (0x05/0x06/0x07),
+`initial_max_streams_bidi`/`_uni` (0x08/0x09), `ack_delay_exponent` (0x0a),
+`max_ack_delay` (0x0b), and `initial_source_connection_id` (0x0f) — in ascending
+id order, so a strict server does not reject an undersized set as
+`illegal_parameter`. The flow-control numbers are handshake-only placeholders:
+this stack implements no stream data plane, so they are legal defaults that are
+never acted on. On the receive side the engine requires a server to declare both
+`initial_source_connection_id` (0x0f) and `original_destination_connection_id`
+(0x00), checking each against the connection IDs it actually saw on the wire (RFC
+9000 §7.3). The server-only ids a client must never send —
+`original_destination_connection_id` (0x00), `stateless_reset_token` (0x02), and
+`retry_source_connection_id` (0x10) — are read but never emitted (§7.3 makes a
+client sending any of them a TRANSPORT_PARAMETER_ERROR). Parameters outside the
+known set reach the adapter intact and are ignored there.
 
 ---
 
@@ -343,23 +353,57 @@ mut conn := quic.new_client_engine('example.com', quic.Config{
 })!
 ```
 
+`new_client_engine` returns a transport-agnostic `quic.Engine` — it builds and
+protects packets in memory but owns no socket, so the caller pumps datagrams
+through `start()` / `receive()` / `retransmit_expired()` by hand. For a
+ready-to-use client, `quic.dial(address, quic.Config)` wraps that engine in a
+socket-owning `quic.Conn` facade: it opens the UDP socket, derives `server_name`
+from the address host when unset, runs the handshake loop to confirmation under
+`Config.timeout`, retransmits the flight on a probe timeout, and returns a
+confirmed connection exposing `is_confirmed()`, `negotiated_alpn()`,
+`negotiated_cipher_suite()`, `serve(idle)` and `close()`:
+
+```v
+mut conn := quic.dial('example.com:443', quic.Config{
+	hsk_options: handshake.HandshakeOptions{ alpn: ['h3'] }
+})!
+defer {
+	conn.close() or {}
+}
+println(conn.negotiated_alpn())
+```
+
 ---
 
 ## 6. What this module does *not* give you
 
-The handshake core is complete, but a QUIC stack is more than the handshake.
-The following are outside `tls.handshake`; some packet-level handshake
-functionality is provided separately by this repository's
-`tls.quic.Conn`:
+The handshake core is complete, and `tls.quic` now carries a handshake robust
+enough to finish against a real server. The following are still outside
+`tls.handshake`, and `tls.quic` does not provide them either:
 
-- **General packet handling** — the engine builds and parses packets for its
-  handshake flow, but does not provide a complete QUIC packet stack.
 - **Key Phase** — the 1-RTT key update mechanism that replaces TLS KeyUpdate
   (RFC 9001 §6); the engine does not implement key updates.
-- **Full connection machinery** — streams, flow control, loss recovery,
-  congestion control, migration, and Retry/0-RTT. The engine handles ACK and
-  CONNECTION_CLOSE frames during its handshake flow; it parses ACKs but does
-  not track acknowledgments or provide loss recovery.
+- **Full connection machinery** — streams, flow control, loss recovery for
+  application data, congestion control, connection migration, and Retry/0-RTT.
+  The engine retransmits only the handshake flight, not a general data plane.
+
+What `tls.quic` *does* give you at the packet layer, on top of the core:
+
+- **General handshake packet handling** — it builds and parses Initial and
+  Handshake packets with real RFC 9001 protection, and fragments outbound CRYPTO
+  so no sealed packet exceeds `Config.max_packet_size` (RFC 9000 §14, §18.2).
+- **ACK emission** — the engine acknowledges the peer's handshake packets, both
+  piggybacked on CRYPTO it sends and as bare ACK datagrams when it has nothing
+  new to emit (RFC 9000 §13.2, §19.3).
+- **Handshake retransmission** — sent-but-unacknowledged handshake CRYPTO is
+  retained and re-sent under fresh packet numbers on a probe-timeout clock the
+  caller drives, so lossy paths still complete (RFC 9000 §6.2.1, §A.4).
+- A socket-owning `quic.dial()` facade (`quic.Conn`) that runs the whole loop to
+  confirmation.
+- **A complete client transport-parameter advertisement** — the ClientHello carries
+  the full RFC 9000 §18.2 numeric set (§1 above), though the flow-control values are
+  handshake-only placeholders: there is still no stream/flow-control data plane behind
+  them.
 
 What the module *does* give you: the entire TLS 1.3 state machine, transcript,
 key schedule, certificate validation hook, alert vocabulary, and the

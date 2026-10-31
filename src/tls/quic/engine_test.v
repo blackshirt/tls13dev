@@ -96,6 +96,10 @@ mut:
 	// agree with a non-compliant engine and hide the defect, so the HRR test pins
 	// this flag on the ferry and `initial_rekeyed` on the engine.
 	rekeyed bool
+	// ACK frames the ferry has decoded from client packets. The engine is required to
+	// acknowledge the server's flight (RFC 9000 §13.2); counting them here lets the
+	// handshake test assert an ACK actually reaches the wire.
+	ack_frames int
 }
 
 // new_ferry_server builds a server endpoint keyed from the client's original
@@ -181,6 +185,7 @@ fn (mut f FerryServer) handle_frames(ptype PacketType, payload []u8) ! {
 			}
 			frame_ack {
 				used := parse_ack_frame(body, false)!
+				f.ack_frames++
 				off += 1 + used
 			}
 			else {
@@ -396,6 +401,9 @@ fn test_engine_completes_quic_handshake() ! {
 	// HANDSHAKE_DONE, which is what confirms the handshake (RFC 9001 §4.9.2).
 	done := ferry.exchange(client_finished)!
 	assert done.len > 0
+	// The client's flight back to the server must acknowledge the server packets it
+	// received, not just carry CRYPTO (RFC 9000 §13.2).
+	assert ferry.ack_frames > 0, 'client emitted no ACK frame for the server flight'
 
 	// Round 3: the client processes HANDSHAKE_DONE and confirms.
 	_ = eng.receive(done)!
@@ -522,4 +530,110 @@ fn test_engine_hello_retry_request_reassembles_retry_at_correct_offset() ! {
 	assert eng.is_confirmed(), 'HANDSHAKE_DONE must confirm the handshake after a HelloRetryRequest'
 	assert eng.negotiated_alpn() == 'h3'
 	assert eng.negotiated_cipher_suite() == .tls_aes_128_gcm_sha256
+}
+
+// feed_initial_crypto decrypts a concatenation of the client's own Initial packets
+// using the Initial keys derived from its DCID (RFC 9001 §5.2) and inserts their
+// CRYPTO frames into `peer`, the way a spec-compliant server reassembles the stream
+// (§19.6). It returns the number of packets parsed, and errors on a conflicting
+// overlap — so feeding a retransmit into a peer that already holds the bytes proves
+// the dedup path.
+fn feed_initial_crypto(mut peer &CryptoReasm, client_dcid []u8, blob []u8) !int {
+	ck, _ := derive_initial_keys(client_dcid)!
+	mut rx := new_initial_protection(ck)!
+	mut off := 0
+	mut packets := 0
+	for off < blob.len {
+		meta := long_packet_meta(blob[off..])!
+		mut packet := blob[off..off + meta.total_len].clone()
+		pn_len := rx.unprotect(mut packet, meta.pn_offset)!
+		truncated := read_truncated_pn(packet, meta.pn_offset, pn_len)
+		pn := decode_packet_number(truncated, pn_len, 0)
+		payload := rx.decrypt_payload(packet, meta.pn_offset, pn_len, pn)!
+		mut f := 0
+		for f < payload.len {
+			match payload[f] {
+				frame_padding {
+					f++
+				}
+				frame_crypto {
+					cf, used := parse_crypto_frame(payload[f + 1..])!
+					peer.insert(cf.offset, cf.data)!
+					f += 1 + used
+				}
+				else {
+					return error('test: unexpected Initial frame 0x${payload[f]:02x}')
+				}
+			}
+		}
+		packets++
+		off += meta.total_len
+	}
+	return packets
+}
+
+fn test_engine_flush_fragments_large_crypto() ! {
+	// A ClientHello far larger than one 1200-byte packet must be split into several
+	// Initial packets, each within max_packet_size, whose CRYPTO a peer reassembles
+	// back to the original bytes (RFC 9000 §14, §18.2).
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		hsk_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
+	big := []u8{len: 4000, init: u8(0xaa)}
+	eng.tx_crypto_initial = big.clone()
+	out := eng.flush()!
+	assert eng.initial_ns.tx_offset == u64(4000)
+
+	// Walk the coalesced datagram and bound every sealed packet by the MTU.
+	mut packets := 0
+	mut off := 0
+	for off < out.len {
+		meta := long_packet_meta(out[off..])!
+		assert meta.ptype == .initial
+		assert meta.total_len <= eng.max_packet_size, 'Initial packet ${meta.total_len} exceeds MTU ${eng.max_packet_size}'
+		packets++
+		off += meta.total_len
+	}
+	assert packets >= 2, 'a >MTU ClientHello must fragment into multiple Initial packets, got ${packets}'
+
+	// A fresh peer reassembles the fragments into the exact original stream.
+	mut peer := CryptoReasm{}
+	_ = feed_initial_crypto(mut peer, eng.original_dcid(), out)!
+	assert peer.ready.len == 4000, 'reassembled ${peer.ready.len} bytes, want 4000'
+	assert peer.ready == big, 'reassembled CRYPTO does not match the source bytes'
+}
+
+fn test_engine_retransmit_replays_identical_crypto() ! {
+	// Driving the probe-timeout clock past pto_ms must re-emit the outstanding flight
+	// under fresh packet numbers with byte-identical CRYPTO, which a peer that already
+	// holds those offsets dedups rather than rejecting as a conflict (RFC 9000 §6.2.1,
+	// §19.6).
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		hsk_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
+	big := []u8{len: 3000, init: u8(0xbb)}
+	eng.tx_crypto_initial = big.clone()
+	original := eng.flush()!
+	assert eng.unacked.len >= 2, 'each fragmented Initial frame should be retained for retransmit'
+
+	// The first call arms the timeout at 300ms; before it is due nothing is sent.
+	_ = eng.retransmit_expired(0)!
+	assert eng.retransmit_expired(100)!.len == 0, 'a probe must not fire before its timeout'
+
+	replay := eng.retransmit_expired(400)!
+	assert replay.len > 0, 'the probe timeout firing must retransmit the outstanding flight'
+
+	// A peer holding the original accepts the byte-identical replay without a
+	// conflicting-overlap error, and its stream does not grow (the retransmit dedups).
+	mut peer := CryptoReasm{}
+	_ = feed_initial_crypto(mut peer, eng.original_dcid(), original)!
+	assert peer.ready.len == 3000
+	_ = feed_initial_crypto(mut peer, eng.original_dcid(), replay)!
+	assert peer.ready.len == 3000, 'retransmitted CRYPTO must dedup, not extend the stream'
 }
