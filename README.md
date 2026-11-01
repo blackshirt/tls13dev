@@ -20,7 +20,7 @@ v test .                                # unit tests across all modules
 v run src/example/simple_example.v      # minimal client: HTTPS GET
 v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
 v run src/example/trust_store_example.v # client supplying its own root_cas
-v run src/example/quic_dial_example.v   # QUIC handshake attempt with test.privateoctopus.com:4433
+v run src/example/quic_dial_example.v   # QUIC handshake with cloudflare-quic.com:443
 ```
 
 ```v
@@ -59,7 +59,7 @@ src/
     simple_example.v      minimal client (handshake + HTTPS GET, no flags)
     trust_store_example.v minimal client with its own Config.root_cas
     dial_example.v        fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
-    quic_dial_example.v   QUIC handshake attempt with test.privateoctopus.com:4433
+    quic_dial_example.v   QUIC handshake with cloudflare-quic.com:443
   tls/              module `tls`: record layer + public TCP client API
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation

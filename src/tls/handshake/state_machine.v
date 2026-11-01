@@ -174,8 +174,15 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 		pki.default_validator()!
 	}
 	// Pin random/session id at construction so HRR reuses them byte-identically (§4.1.4).
-	// session_id.len has been checked in validate_handshake_options
-	session_id := if options.legacy_session_id.len > 0 {
+	// session_id.len has been checked in validate_handshake_options. QUIC MUST NOT use
+	// middlebox compatibility mode, so its legacy_session_id is always empty
+	// (RFC 9001 §8.4); a caller-supplied value would be an illegal parameter to a peer.
+	if is_quic && options.legacy_session_id.len > 0 {
+		return error('handshake: QUIC forbids a non-empty legacy_session_id (RFC 9001 §8.4)')
+	}
+	session_id := if is_quic {
+		[]u8{}
+	} else if options.legacy_session_id.len > 0 {
 		options.legacy_session_id.clone()
 	} else {
 		rand.bytes(legacy_session_id_len)!

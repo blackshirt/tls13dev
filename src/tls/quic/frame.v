@@ -16,9 +16,112 @@ const frame_ping = u8(0x01)
 const frame_ack = u8(0x02)
 const frame_ack_ecn = u8(0x03)
 const frame_crypto = u8(0x06)
+const frame_reset_stream = u8(0x04)
+const frame_stop_sending = u8(0x05)
+const frame_new_token = u8(0x07)
+const frame_max_data = u8(0x10)
+const frame_max_stream_data = u8(0x11)
+const frame_max_streams_bidi = u8(0x12)
+const frame_max_streams_uni = u8(0x13)
+const frame_data_blocked = u8(0x14)
+const frame_stream_data_blocked = u8(0x15)
+const frame_streams_blocked_bidi = u8(0x16)
+const frame_streams_blocked_uni = u8(0x17)
+const frame_new_connection_id = u8(0x18)
+const frame_retire_connection_id = u8(0x19)
+const frame_path_challenge = u8(0x1a)
+const frame_path_response = u8(0x1b)
 const frame_connection_close_transport = u8(0x1c)
 const frame_connection_close_application = u8(0x1d)
 const frame_handshake_done = u8(0x1e)
+
+// skip_varint advances past one varint at off, returning the new offset.
+fn skip_varint(body []u8, off int) !int {
+	_, n := decode_varint(body[off..])!
+	return off + n
+}
+
+// parse_ignored_frame_len returns the body length of a frame this handshake-only
+// engine does not act on, so the frame walker can skip it without losing alignment
+// (RFC 9000 §19). A server sends several of these during a real handshake - notably
+// NEW_CONNECTION_ID, NEW_TOKEN and PING - even though no data plane is implemented.
+fn parse_ignored_frame_len(frame_type u8, body []u8) !int {
+	mut off := 0
+	if frame_type >= 0x08 && frame_type <= 0x0f {
+		// STREAM: id, optional offset, optional length, then data. The LEN bit is
+		// 0x02 and the OFF bit 0x04; without LEN the frame runs to the packet end.
+		off = skip_varint(body, off)!
+		if frame_type & 0x04 != 0 {
+			off = skip_varint(body, off)!
+		}
+		mut data_len := body.len - off
+		if frame_type & 0x02 != 0 {
+			length, n := decode_varint(body[off..])!
+			off += n
+			data_len = int(length)
+		}
+		if off + data_len > body.len {
+			return error('quic: STREAM frame length ${data_len} exceeds remaining ${body.len - off} bytes')
+		}
+		return off + data_len
+	}
+	match frame_type {
+		frame_reset_stream {
+			off = skip_varint(body, off)!
+			off = skip_varint(body, off)!
+			off = skip_varint(body, off)!
+		}
+		frame_stop_sending {
+			off = skip_varint(body, off)!
+			off = skip_varint(body, off)!
+		}
+		frame_new_token {
+			token_len, n := decode_varint(body[off..])!
+			off += n
+			if off + int(token_len) > body.len {
+				return error('quic: NEW_TOKEN length ${token_len} exceeds remaining ${body.len - off} bytes')
+			}
+			off += int(token_len)
+		}
+		frame_max_data, frame_max_streams_bidi, frame_max_streams_uni, frame_data_blocked,
+		frame_streams_blocked_bidi, frame_streams_blocked_uni {
+			off = skip_varint(body, off)!
+		}
+		frame_max_stream_data, frame_stream_data_blocked {
+			off = skip_varint(body, off)!
+			off = skip_varint(body, off)!
+		}
+		frame_new_connection_id {
+			off = skip_varint(body, off)!
+			off = skip_varint(body, off)!
+			if off >= body.len {
+				return error('quic: NEW_CONNECTION_ID missing connection ID length')
+			}
+			cid_len := int(body[off])
+			off++
+			if cid_len < 1 || cid_len > max_cid_len {
+				return error('quic: NEW_CONNECTION_ID length ${cid_len} invalid')
+			}
+			if off + cid_len + 16 > body.len {
+				return error('quic: NEW_CONNECTION_ID truncated')
+			}
+			off += cid_len + 16
+		}
+		frame_retire_connection_id {
+			off = skip_varint(body, off)!
+		}
+		frame_path_challenge, frame_path_response {
+			if body.len < 8 {
+				return error('quic: PATH_CHALLENGE/PATH_RESPONSE needs 8 bytes')
+			}
+			off = 8
+		}
+		else {
+			return error('quic: unsupported frame type 0x${frame_type:02x} during handshake')
+		}
+	}
+	return off
+}
 
 // CryptoFrame is a parsed CRYPTO frame: the handshake bytes it carries and the
 // stream offset they sit at (RFC 9000 §19.6).

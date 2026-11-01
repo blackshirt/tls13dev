@@ -53,3 +53,33 @@ fn test_encode_ack_rejects_empty_ranges() ! {
 	}
 	assert false, 'encode_ack_frame should reject an empty range list'
 }
+
+// test_parse_ignored_frame_len_skips_known_frames checks that frames a real server
+// sends around the handshake (NEW_CONNECTION_ID, NEW_TOKEN, STREAM) are measured
+// exactly, so the frame walker stays aligned without acting on them (RFC 9000 §19).
+fn test_parse_ignored_frame_len_skips_known_frames() ! {
+	// NEW_CONNECTION_ID: sequence 1, retire-prior-to 0, 4-byte CID, 16-byte token.
+	mut nc := [u8(1), 0, 4, 0xaa, 0xbb, 0xcc, 0xdd]
+	nc << []u8{len: 16, init: 0x11}
+	assert parse_ignored_frame_len(frame_new_connection_id, nc)! == nc.len
+
+	// NEW_TOKEN: a length-prefixed opaque token.
+	token := [u8(3), 0x01, 0x02, 0x03]
+	assert parse_ignored_frame_len(frame_new_token, token)! == token.len
+
+	// STREAM with both OFF (0x04) and LEN (0x02): id, offset, length, data.
+	stream := [u8(0), 10, 3, 0xde, 0xad, 0xbe]
+	assert parse_ignored_frame_len(u8(0x0e), stream)! == stream.len
+}
+
+// test_parse_ignored_frame_len_rejects_truncation keeps the skip path strict: a
+// frame whose declared body overruns the packet is malformed, not silently ignored.
+fn test_parse_ignored_frame_len_rejects_truncation() {
+	// NEW_CONNECTION_ID claims a 4-byte CID but supplies no 16-byte reset token.
+	nc := [u8(1), 0, 4, 0xaa, 0xbb, 0xcc, 0xdd]
+	parse_ignored_frame_len(frame_new_connection_id, nc) or {
+		assert err.msg().contains('NEW_CONNECTION_ID truncated')
+		return
+	}
+	assert false, 'a truncated NEW_CONNECTION_ID must be refused'
+}

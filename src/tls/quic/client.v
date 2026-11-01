@@ -113,6 +113,9 @@ pub fn dial(address string, config Config) !&Conn {
 fn (mut c Conn) do_handshake() ! {
 	start := c.engine.start()!
 	if c.debug {
+		ch := c.engine.client_hello_trace()
+		eprintln('[quic] plaintext ClientHello: ${ch.len} bytes')
+		eprintln('[quic] ClientHello hex: ${debug_hex(ch, ch.len)}')
 		eprintln('[quic] first flight: ${start.len} bytes (first Initial datagram must pad to >=1200, RFC 9000 §14.1)')
 		eprintln('[quic] first flight head: ${debug_hex(start, 48)}')
 	}

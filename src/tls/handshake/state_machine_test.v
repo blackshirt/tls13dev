@@ -226,6 +226,28 @@ fn test_handshake_options_keeps_legacy_session_id_verbatim() ! {
 	assert h2.config.session_id == short
 }
 
+// test_quic_handshake_uses_empty_legacy_session_id pins RFC 9001 §8.4 at the
+// constructor too: a QUIC core must never reuse the record path's generated session
+// id, and an explicitly configured one is a caller error.
+fn test_quic_handshake_uses_empty_legacy_session_id() ! {
+	h := new_quic_handshake('example.com', HandshakeOptions{
+		validator:             fixture_validator()
+		quic_transport_params: [u8(0)]
+	})!
+	assert h.config.session_id.len == 0, 'QUIC must not generate a legacy_session_id'
+	assert h.config.is_quic
+
+	new_quic_handshake('example.com', HandshakeOptions{
+		legacy_session_id:     [u8(0x55)]
+		validator:             fixture_validator()
+		quic_transport_params: [u8(0)]
+	}) or {
+		assert err.msg().contains('QUIC forbids a non-empty legacy_session_id')
+		return
+	}
+	assert false, 'a QUIC handshake with a configured legacy_session_id must be refused'
+}
+
 // test_handshake_options_reject_unsupported_cipher_suite closes the raw-cast hole:
 // an unsafe CipherSuite(0x1399) cast is constructible in V, would be advertised on
 // the wire, and an echoed server choice would match it against the offered list.

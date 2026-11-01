@@ -76,6 +76,31 @@ fn test_build_client_hello_enforces_legacy_field_sizes() ! {
 	assert full[39] == u8(0x11)
 }
 
+// test_build_client_hello_quic_uses_empty_session_id pins RFC 9001 §8.4: QUIC
+// disables middlebox compatibility mode, so legacy_session_id is empty and must not
+// be auto-generated the way the record path does. A direct builder supplying a
+// non-empty value is refused rather than emitting an illegal parameter.
+fn test_build_client_hello_quic_uses_empty_session_id() ! {
+	cfg := ClientHelloConfig{
+		server_name:           'example.com'
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0xaa}
+		}
+		is_quic:               true
+		quic_transport_params: []u8{len: 1, init: 0x01}
+	}
+	_, full := build_client_hello(cfg)!
+	// Layout: 4-byte handshake header + legacy_version(2) + random(32) puts the
+	// legacy_session_id length byte at offset 38.
+	assert full[38] == 0, 'QUIC ClientHello must carry an empty legacy_session_id'
+
+	mut bad := cfg
+	bad.session_id = [u8(0x11)]
+	msg := client_hello_error(bad)
+	assert msg.contains('legacy_session_id must be empty'), 'got: ${msg}'
+}
+
 // test_build_client_hello_rejects_malformed_key_share mirrors the peer-side share
 // gates onto the client's own key_share: wrong size, a missing uncompressed-point
 // marker, or a group absent from supported_groups must be refused at build time,

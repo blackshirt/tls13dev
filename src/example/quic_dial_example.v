@@ -1,6 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// Attempts a QUIC TLS handshake with test.privateoctopus.com:4433. Run with
+// Runs a QUIC TLS handshake against cloudflare-quic.com:443 and prints the
+// negotiated ALPN and cipher suite. Run with
 // `v run src/example/quic_dial_example.v`.
 //
 // quic.dial owns the socket and drives the handshake to confirmation internally, so
@@ -11,8 +12,8 @@ module main
 import tls.handshake
 import tls.quic
 
-const server_name = 'test.privateoctopus.com'
-const server_address = '${server_name}:4433'
+const server_name = 'cloudflare-quic.com'
+const server_address = '${server_name}:443'
 
 fn main() {
 	run() or {

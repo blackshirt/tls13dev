@@ -92,6 +92,7 @@ mut:
 	confirmed   bool // Whether HANDSHAKE_DONE was received.
 	closed      bool // Whether the engine has entered its terminal closed state.
 	close_error u64  // Last QUIC error code set when closing, if any.
+	ch_trace    []u8 // Plaintext first ClientHello, retained for the QUIC_DEBUG dump only.
 
 	// Current 1-RTT Key Phase bit; key updates are not implemented yet.
 	key_phase bool
@@ -194,8 +195,17 @@ pub fn (e &Engine) close_error_code() u64 {
 // is fed (RFC 9000 §7).
 pub fn (mut e Engine) start() ![]u8 {
 	ch := e.hs.create_client_hello()!
+	e.ch_trace = ch.clone()
 	e.tx_crypto_initial << ch
 	return e.flush()!
+}
+
+// client_hello_trace returns the plaintext bytes of the first ClientHello the
+// engine put on the wire. It exists so the socket facade can dump, under
+// QUIC_DEBUG, the exact ClientHello a peer rejected - the sealed Initial only
+// shows ciphertext, and the transport-agnostic engine must not import I/O itself.
+pub fn (e &Engine) client_hello_trace() []u8 {
+	return e.ch_trace.clone()
 }
 
 // receive processes one received datagram and returns the datagrams to send in
@@ -209,6 +219,11 @@ pub fn (mut e Engine) receive(datagram []u8) ![]u8 {
 	}
 	mut off := 0
 	for off < datagram.len {
+		// A datagram may be padded after its last packet (RFC 9000 §12.2); every
+		// valid QUIC packet has the fixed bit set, so a zero byte starts only padding.
+		if datagram[off] == 0 {
+			break
+		}
 		consumed := e.receive_packet(datagram[off..])!
 		if consumed == 0 {
 			break
@@ -305,6 +320,7 @@ fn new_client_engine_with_ids(server_name string, options handshake.HandshakeOpt
 		orig_dcid:       dcid.clone()
 		max_packet_size: default_max_packet_size
 		pto_ms:          initial_pto_ms
+		ch_trace:        []u8{}
 	}
 	eng.install_initial_keys(dcid)!
 	return eng
@@ -367,6 +383,13 @@ fn (mut e Engine) receive_long_packet(buf []u8) !int {
 	}
 	mut packet := buf[..total].clone()
 	pn_offset := meta.pn_offset
+	// A Handshake packet can arrive before the ServerHello that installs its keys
+	// (datagram reordering), or after HANDSHAKE_DONE released them. Either way it
+	// cannot be opened and is discarded, not treated as a connection error
+	// (RFC 9001 §4.9.2, §5.7); the peer retransmits if it is still needed.
+	if meta.ptype == .handshake && e.handshake_rx == none {
+		return total
+	}
 	mut state := e.rx_state_for(meta.ptype)!
 	pn_len := state.unprotect(mut packet, pn_offset)!
 	truncated := read_truncated_pn(packet, pn_offset, pn_len)
@@ -388,7 +411,11 @@ fn (mut e Engine) receive_long_packet(buf []u8) !int {
 // receive_short_packet parses, deprotects and handles a 1-RTT packet.
 fn (mut e Engine) receive_short_packet(buf []u8) !int {
 	if e.app_rx == none {
-		return error('quic: received a 1-RTT packet before application keys exist')
+		// A short-header packet can be reordered ahead of the server's Finished, so
+		// the 1-RTT keys may not exist yet. Such a packet cannot be decrypted and is
+		// discarded, not treated as a connection error (RFC 9001 §5.7). A short
+		// header has no length field, so it consumes the rest of the datagram.
+		return buf.len
 	}
 	// Short headers have no length field: the packet runs to the end of the
 	// datagram. A client's 1-RTT packets are not coalesced here.
@@ -473,7 +500,13 @@ fn (mut e Engine) handle_frames(ptype PacketType, payload []u8) ! {
 				cf, used := parse_crypto_frame(body) or {
 					return error('quic: invalid CRYPTO frame: ${err.msg()}')
 				}
-				e.deliver_crypto(ptype, cf)!
+				// 1-RTT CRYPTO is post-handshake traffic (NewSessionTicket), which
+				// this handshake-only engine does not consume. Discarding it keeps a
+				// server's ticket flight from blocking the HANDSHAKE_DONE that
+				// confirms the connection (RFC 9001 §4.1.4).
+				if ptype != .one_rtt {
+					e.deliver_crypto(ptype, cf)!
+				}
 				off += 1 + used
 			}
 			frame_handshake_done {
@@ -495,7 +528,13 @@ fn (mut e Engine) handle_frames(ptype PacketType, payload []u8) ! {
 				return error('quic: peer closed the connection (${describe_connection_error(cc.error_code)}) during ${e.hs.state()}: ${cc.reason.bytestr()}')
 			}
 			else {
-				return error('quic: unsupported frame type 0x${frame_type:02x} during handshake')
+				// Frames outside the handshake's needs are parsed only to keep the
+				// walker aligned: a real server still sends NEW_CONNECTION_ID,
+				// NEW_TOKEN and PING around HANDSHAKE_DONE.
+				used := parse_ignored_frame_len(frame_type, body) or {
+					return error('quic: invalid frame 0x${frame_type:02x}: ${err.msg()}')
+				}
+				off += 1 + used
 			}
 		}
 	}

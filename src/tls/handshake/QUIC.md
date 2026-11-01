@@ -74,8 +74,8 @@ enum EncryptionLevel { // module-private — no public signature names it
 Here the initial phase names the pre-ServerHello TLS handshake stage, not QUIC
 Initial packet protection. The QUIC engine routes Initial packet CRYPTO to
 `receive_initial_bytes()` and Handshake packet CRYPTO to
-`receive_handshake_bytes()`; it rejects 1-RTT CRYPTO because
-post-handshake messages are handled separately. The TCP adapter routes plaintext
+`receive_handshake_bytes()`; it discards 1-RTT CRYPTO because a handshake-only
+engine does not consume post-handshake messages such as NewSessionTicket. The TCP adapter routes plaintext
 handshake records to `receive_initial_bytes()` and decrypted handshake records to
 `receive_handshake_bytes()`. QUIC packet levels and packet-number spaces remain
 adapter-side.
@@ -325,9 +325,11 @@ hs.zeroize_handshake_secrets()!
   in the [handshake adapter contract](./CONTRACT.md). For QUIC, queue every
   returned message by phase — `m.is_initial()` is the only phase fact the public
   seam exposes: true means Initial CRYPTO, false means Handshake CRYPTO.
-- The QUIC engine rejects CRYPTO data carried in 1-RTT packets. Handle
-  post-handshake CRYPTO separately with `next_recordless_message()` and
-  `parse_new_session_ticket()`.
+- The QUIC engine discards CRYPTO data carried in 1-RTT packets: it is
+  post-handshake traffic, and an engine that does not implement resumption must
+  not let a NewSessionTicket flight block the HANDSHAKE_DONE that confirms the
+  connection. Handle post-handshake CRYPTO separately with
+  `next_recordless_message()` and `parse_new_session_ticket()` if needed.
 - `negotiated_alpn()` returns the server's selection (`''` if none); the shared
   core verifies that any selection was offered (RFC 7301 §3.1).
 

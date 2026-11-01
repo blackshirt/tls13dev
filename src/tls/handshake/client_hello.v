@@ -173,6 +173,11 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	if cfg.random.len != 0 && cfg.random.len != client_hello_random_len {
 		return error('handshake: ClientHello random must be exactly ${client_hello_random_len} bytes')
 	}
+	// QUIC does not use middlebox compatibility mode, so its legacy_session_id is
+	// empty and is never generated here (RFC 9001 §8.4).
+	if cfg.is_quic && cfg.session_id.len > 0 {
+		return error('handshake: QUIC ClientHello legacy_session_id must be empty (RFC 9001 §8.4)')
+	}
 	mut body := wire.new_writer(512)
 
 	// Legacy version 0x0303 (TLS 1.2) pinned for middleboxes; the real version
@@ -189,7 +194,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 	// Legacy session id for middlebox compatibility (App. D.4); echoed in
 	// ServerHello for the legacy_session_id_echo check.
-	session_id := if cfg.session_id.len > 0 {
+	session_id := if cfg.is_quic || cfg.session_id.len > 0 {
 		cfg.session_id.clone()
 	} else {
 		rand.bytes(legacy_session_id_len)!

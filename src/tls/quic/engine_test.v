@@ -413,6 +413,67 @@ fn test_engine_completes_quic_handshake() ! {
 	assert eng.negotiated_cipher_suite() == .tls_aes_128_gcm_sha256
 }
 
+// test_engine_ignores_trailing_datagram_padding covers servers that pad a
+// datagram after its last long-header packet with zero bytes (RFC 9000 §12.2).
+// Every valid QUIC packet has the fixed bit set, so the zero tail is not a packet
+// and must be ignored rather than parsed as a 1-RTT short header.
+fn test_engine_ignores_trailing_datagram_padding() ! {
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		hsk_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
+	start := eng.start()!
+	mut ferry := new_ferry_server(eng.original_dcid(), .none)!
+	mut flight := ferry.exchange(start)!
+	flight << []u8{len: 64, init: frame_padding}
+
+	client_finished := eng.receive(flight)!
+	assert eng.state() == .connected, 'trailing padding must not disturb the server flight'
+
+	done := ferry.exchange(client_finished)!
+	_ = eng.receive(done)!
+	assert eng.is_confirmed(), 'HANDSHAKE_DONE must still confirm after padded datagrams'
+}
+
+// test_handle_frames_discards_one_rtt_crypto covers a real server's post-handshake
+// NewSessionTicket, which rides 1-RTT CRYPTO before HANDSHAKE_DONE. A handshake-only
+// engine does not consume it, but it must not fail the connection either (RFC 9001
+// §4.1.4).
+fn test_handle_frames_discards_one_rtt_crypto() ! {
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		hsk_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
+	// A minimal NewSessionTicket-shaped message: type 0x04 plus a three-byte length.
+	payload := encode_crypto_frame(0, [u8(0x04), 0, 0, 0])!
+	eng.handle_frames(.one_rtt, payload)!
+}
+
+// test_receive_discards_handshake_before_keys covers datagram reordering: a
+// Handshake packet can arrive before the Initial that installs its keys. It cannot
+// be opened, so it is dropped rather than failing the handshake; the peer will
+// retransmit it (RFC 9001 §5.7).
+fn test_receive_discards_handshake_before_keys() ! {
+	mut eng := new_client_engine(fakeserver.server_name, Config{
+		hsk_options: handshake.HandshakeOptions{
+			alpn:      ['h3']
+			validator: trusted_validator()
+		}
+	})!
+	payload_len := 32
+	header, _ := build_long_header(.handshake, quic_version_1, [u8(1), 2], [u8(3), 4, 5],
+		[]u8{}, payload_len, 1, 16)!
+	mut datagram := header.clone()
+	datagram << []u8{len: payload_len + 1 + 16} // PN + ciphertext + tag, never opened
+	out := eng.receive(datagram)!
+	assert out.len == 0, 'an undecryptable Handshake packet must not produce a response'
+	assert eng.state() == .start, 'dropping it must not advance the handshake'
+}
+
 fn test_engine_initial_keys_match_appendix_a() ! {
 	// A fixed-DCID engine must derive the RFC 9001 Appendix A Initial keys; this
 	// ties the engine's wiring to the published vectors.
