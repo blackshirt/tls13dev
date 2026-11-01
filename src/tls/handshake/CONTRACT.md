@@ -178,9 +178,8 @@ with a plain error:
 - `zeroize_traffic_secrets()` destroys all traffic secrets once the adapter no
 longer needs them; valid only after `.connected`. Because the record keys derive
 from those secrets, wiping them retires the keys too. Handshake cleanup is not a
-handshake-confirmation signal.
-  signal. The initial
-  phase has no secrets, so the entry point behind this pair refuses it.
+handshake-confirmation signal: the entry point behind this pair refuses the
+initial phase, which has no secrets.
 
 ## QUIC-only operations
 

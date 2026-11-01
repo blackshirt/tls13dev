@@ -8,9 +8,8 @@
 // and the reassembly_len hook; the QUIC side holds the opaque server transport
 // parameters and the HelloRetryRequest flag the QUIC adapter needs for Initial
 // re-keying. The per-phase key generations are not in this file at all — the
-// shared traffic_keys() accessor in
-// key_schedule.v answer in the core's mode, and raw traffic secrets never
-// leave the core in either mode.
+// shared traffic_keys() accessor in key_schedule.v answers in the core's mode,
+// and raw traffic secrets never leave the core in either mode.
 module handshake
 
 // reassembly_len reports bytes the reassembly buffer retained across both phases —

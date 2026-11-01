@@ -263,9 +263,8 @@ The public seam names the phase in the entry point — `receive_initial_bytes()`
 - **Lifecycle and framing stay explicit.** Both modes share failure cleanup
   and handshake-secret zeroization. `zeroize_traffic_secrets()` wipes both
   directions' traffic secrets *and* the reassembly buffer at `.connected`, so nothing
-  survives past handshake completion. The record adapter needs for the TLS
-  ServerHello record-boundary rule are the core's record-side
-  `reassembly_len()` — it and
+  survives past handshake completion. The record adapter uses `reassembly_len()` for
+  the TLS ServerHello record-boundary rule; it and
   `take_buffered_handshake_bytes()` refuse a QUIC-mode core; QUIC maps alert
   descriptions to QUIC connection errors.
 

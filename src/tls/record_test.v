@@ -4,7 +4,7 @@
 // protection state advances in sequence-number lockstep, a flipped ciphertext byte
 // fails the tag check, and the §5.5 per-key record limit plus the §5.2
 // inner-plaintext shape are refused. The QUIC CRYPTO recordless framing is
-// tested in tls.handshake's passthrough_test.v.
+// tested in tls.handshake's state_machine_test.v.
 module tls
 
 import crypto.aes
