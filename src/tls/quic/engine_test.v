@@ -711,7 +711,7 @@ fn test_quic_reassembly_len_reports_buffered_tls_message_bytes() ! {
 	assert hs.reassembly_len()! == 0
 
 	// Feed a partial ServerHello header (type 0x02 + partial length) — not a
-// complete message, so all 4 bytes stay in reassembly.
+	// complete message, so all 4 bytes stay in reassembly.
 	hs.receive_initial_bytes([u8(0x02), 0x00, 0x00, 0x04])!
 	assert hs.reassembly_len()! == 4
 
