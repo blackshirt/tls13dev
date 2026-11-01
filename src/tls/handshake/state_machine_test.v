@@ -482,11 +482,11 @@ fn test_class_a_failure_scrubs_transcript_and_certs() ! {
 	assert false, 'an out-of-order Certificate must abort the handshake'
 }
 
-// test_generate_key_share_clears_old_ephemeral_on_group_change checks that the HRR
+// test_reset_key_share_clears_old_ephemeral_on_group_change checks that the HRR
 // group-change path releases the old private key before deriving the new one (§7.5).
 // vlib key types expose no in-place wipe, so releasing the handle is the available
 // destruction — both slots are nulled before the new key is created.
-fn test_generate_key_share_clears_old_ephemeral_on_group_change() ! {
+fn test_reset_key_share_clears_old_ephemeral_on_group_change() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{
 		validator:        fixture_validator()
 		key_share_group:  .x25519
@@ -496,7 +496,7 @@ fn test_generate_key_share_clears_old_ephemeral_on_group_change() ! {
 	assert h.priv_x25519 != unsafe { nil }
 	assert h.priv_p256 == none
 	// Retry with a different group: the X25519 handle must be released first.
-	h.generate_key_share(.secp256r1)!
+	h.reset_key_share(.secp256r1)!
 	assert h.priv_x25519 == unsafe { nil }
 	assert h.priv_p256 != none
 }

@@ -10,17 +10,18 @@ import crypto.ecdsa
 import crypto.subtle
 import x.crypto.curve25519
 
-// expected_share_len is the §4.2.8.2 key_exchange size per group (x25519 32;
+// key_exchange_len is the §4.2.8.2 key_exchange size per group (x25519 32;
 // secp256r1 65 = 0x04||X||Y): one source for the peer gate and ClientHello builder.
-fn expected_share_len(g NamedGroup) int {
+fn key_exchange_len(g NamedGroup) int {
 	return match g {
 		.x25519 { 32 }
 		.secp256r1 { 65 }
 	}
 }
 
-// generate_key_share creates a fresh ephemeral private key for the requested group.
-fn (mut h HandshakeCore) generate_key_share(group NamedGroup) ! {
+// reset_key_share creates a fresh ephemeral private key for the requested group,
+// zeroing any previous share first.
+fn (mut h HandshakeCore) reset_key_share(group NamedGroup) ! {
 	h.ecdhe_group = group
 	// Only the key for the selected group stays live.
 	h.priv_x25519 = unsafe { nil }
@@ -35,9 +36,9 @@ fn (mut h HandshakeCore) generate_key_share(group NamedGroup) ! {
 	}
 }
 
-// public_share_bytes serializes the public half of the current ephemeral key in
+// public_key_bytes serializes the public half of the current ephemeral key in
 // the wire form its group mandates (RFC 8446 §4.2.8.2).
-fn (mut h HandshakeCore) public_share_bytes() ![]u8 {
+fn (mut h HandshakeCore) public_key_bytes() ![]u8 {
 	match h.ecdhe_group {
 		.x25519 {
 			// Same explicit guard as the P-256 leg: calling through a nil reference
@@ -144,7 +145,7 @@ fn is_x25519_small_order(secret []u8) bool {
 fn (mut h HandshakeCore) compute_shared_secret(server_share KeyShareEntry) ![]u8 {
 	// §4.2.8.2 fixes key_exchange size per group; gate it here so a wrong size
 	// yields a named protocol error.
-	expected_len := expected_share_len(server_share.group)
+	expected_len := key_exchange_len(server_share.group)
 	if server_share.key_exchange.len != expected_len {
 		return h.classify_failure(.illegal_parameter, 'handshake: ${server_share.group} key_share is ${server_share.key_exchange.len} bytes, expected ${expected_len}')
 	}

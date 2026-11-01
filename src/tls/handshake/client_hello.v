@@ -268,8 +268,8 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		if cfg.client_share.group !in offered_groups(&cfg) {
 			return error('handshake: ClientHello key_share group ${cfg.client_share.group} is not in supported_groups')
 		}
-		if cfg.client_share.key_exchange.len != expected_share_len(cfg.client_share.group) {
-			return error('handshake: ClientHello ${cfg.client_share.group} key_share is ${cfg.client_share.key_exchange.len} bytes, expected ${expected_share_len(cfg.client_share.group)}')
+		if cfg.client_share.key_exchange.len != key_exchange_len(cfg.client_share.group) {
+			return error('handshake: ClientHello ${cfg.client_share.group} key_share is ${cfg.client_share.key_exchange.len} bytes, expected ${key_exchange_len(cfg.client_share.group)}')
 		}
 		if cfg.client_share.group == .secp256r1 && cfg.client_share.key_exchange[0] != 0x04 {
 			return error('handshake: ClientHello secp256r1 key_share is not a 0x04-prefixed uncompressed point')

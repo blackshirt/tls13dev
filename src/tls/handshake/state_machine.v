@@ -207,10 +207,10 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 		validator:  validator
 		reassembly: []u8{cap: reassembly_buf_cap}
 	}
-	core.generate_key_share(options.key_share_group)!
+	core.reset_key_share(options.key_share_group)!
 	core.config.client_share = KeyShareEntry{
 		group:        options.key_share_group
-		key_exchange: core.public_share_bytes()!
+		key_exchange: core.public_key_bytes()!
 	}
 	return core
 }
@@ -418,10 +418,10 @@ fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg 
 // (RFC 8446 §4.1.2).
 fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]HandshakeMessage {
 	if change_group {
-		h.generate_key_share(group)!
+		h.reset_key_share(group)!
 		h.config.client_share = KeyShareEntry{
 			group:        group
-			key_exchange: h.public_share_bytes()!
+			key_exchange: h.public_key_bytes()!
 		}
 	}
 	// A cookie-only HelloRetryRequest keeps the original key share; the cookie is

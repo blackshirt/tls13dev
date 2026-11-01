@@ -479,9 +479,9 @@ fn (mut c Conn) do_handshake() ! {
 		c.guard.unlock()
 	}
 	ch := c.hs.create_client_hello()!
-	// The one-record bound (§5.1) is enforced inside send_plaintext_flight, the single
+	// The one-record bound (§5.1) is enforced inside send_plaintext_handshake_flight, the single
 	// choke point shared with the retry ClientHello below.
-	c.send_plaintext_flight(ch)!
+	c.send_plaintext_handshake_flight(ch)!
 
 	mut ccs_seen := 0
 	mut flight_records := 0
@@ -497,7 +497,7 @@ fn (mut c Conn) do_handshake() ! {
 		match rec.content_type {
 			.change_cipher_spec {
 				// The peer's dummy CCS carries no meaning in TLS 1.3 — drop it (RFC 8446 §5).
-				ccs_seen = validate_compat_ccs(rec.payload, ccs_seen) or {
+				ccs_seen = validate_ccs_record(rec.payload, ccs_seen) or {
 					return c.classify_failure(.unexpected_message, err.msg())
 				}
 				continue
@@ -537,11 +537,11 @@ fn (mut c Conn) do_handshake() ! {
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
-					c.send_plaintext_flight(m.msg())!
+					c.send_plaintext_handshake_flight(m.msg())!
 				}
 			}
 			.application_data {
-				c.handle_flight_record(rec)!
+				c.handle_encrypted_flight_record(rec)!
 			}
 			else {
 				return c.classify_failure(.unexpected_message, 'tls: unexpected record type ${rec.content_type} during handshake')
@@ -564,8 +564,8 @@ fn (mut c Conn) do_handshake() ! {
 	// are zeroized together at close via zeroize_traffic_secrets().
 }
 
-// validate_compat_ccs checks one dummy ChangeCipherSpec record and enforces max_compat_ccs_records.
-fn validate_compat_ccs(payload []u8, seen int) !int {
+// validate_ccs_record checks one dummy ChangeCipherSpec record and enforces max_compat_ccs_records.
+fn validate_ccs_record(payload []u8, seen int) !int {
 	mut total := seen + 1
 	if total > max_compat_ccs_records {
 		return error('tls: too many change_cipher_spec records during handshake (unexpected_message)')
@@ -577,9 +577,9 @@ fn validate_compat_ccs(payload []u8, seen int) !int {
 	return total
 }
 
-// send_plaintext_flight emits one handshake flight — the initial or a retry
+// send_plaintext_handshake_flight emits one handshake flight — the initial or a retry
 // ClientHello — as a plaintext record followed by the dummy CCS (§5/App. D.4).
-fn (mut c Conn) send_plaintext_flight(msg []u8) ! {
+fn (mut c Conn) send_plaintext_handshake_flight(msg []u8) ! {
 	// §5.1: every plaintext flight (initial ClientHello or retry) must fit one record.
 	// serialize_into encodes the length in two bytes without re-checking, so an oversized
 	// local message would silently mis-frame. Pin internal_error and fail before framing;
@@ -604,10 +604,10 @@ fn (mut c Conn) handshake_read_timeleft() !i64 {
 	return remaining_ms
 }
 
-// handle_flight_record decrypts one handshake-phase encrypted record and routes its
+// handle_encrypted_flight_record decrypts one handshake-phase encrypted record and routes its
 // inner content type: handshake bytes feed the core and the client Finished travels
 // under the client handshake keys; alerts are terminal peer faults (§5.1/§6).
-fn (mut c Conn) handle_flight_record(rec Record) ! {
+fn (mut c Conn) handle_encrypted_flight_record(rec Record) ! {
 	// Everything under the server's handshake keys has outer type application_data (RFC 8446 §5.1/§5.2).
 	if c.hs.state() == .start || c.hs.state() == .wait_sh {
 		return c.classify_failure(.unexpected_message, 'tls: unexpected encrypted record before ServerHello (unexpected_message)')
@@ -618,7 +618,7 @@ fn (mut c Conn) handle_flight_record(rec Record) ! {
 		return c.classify_failure(decrypt_failure_alert(err.msg()), err.msg())
 	}
 	// §7.5: scrub this handshake record's decrypted staging copy on every exit
-	// (function-scope defer is safe here — handle_flight_record is not a loop); the
+	// (function-scope defer is safe here — handle_encrypted_flight_record is not a loop); the
 	// body below consumes dec.plaintext synchronously before the defer fires.
 	defer {
 		zero_bytes(mut dec.plaintext)

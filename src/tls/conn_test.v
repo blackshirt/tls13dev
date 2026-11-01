@@ -114,25 +114,25 @@ fn test_conn_nil_safety() ! {
 	assert c.read(mut empty_buf)! == 0
 }
 
-// test_validate_compat_ccs_framing checks that a CCS body other than the single
+// test_validate_ccs_record_framing checks that a CCS body other than the single
 // byte 0x01 is framing garbage and must be refused, not silently dropped.
-fn test_validate_compat_ccs_framing() ! {
-	validate_compat_ccs([u8(0x02)], 0) or {
+fn test_validate_ccs_record_framing() ! {
+	validate_ccs_record([u8(0x02)], 0) or {
 		assert err.msg().contains('malformed change_cipher_spec')
 		return
 	}
 	assert false
 }
 
-// test_validate_compat_ccs_bounds_stream checks that exactly
+// test_validate_ccs_record_bounds_stream checks that exactly
 // max_compat_ccs_records dummy CCS records pass and the next one aborts.
-fn test_validate_compat_ccs_bounds_stream() ! {
+fn test_validate_ccs_record_bounds_stream() ! {
 	mut seen := 0
 	for i in 0 .. max_compat_ccs_records {
-		seen = validate_compat_ccs([u8(0x01)], seen)!
+		seen = validate_ccs_record([u8(0x01)], seen)!
 		assert seen == i + 1
 	}
-	validate_compat_ccs([u8(0x01)], seen) or {
+	validate_ccs_record([u8(0x01)], seen) or {
 		assert err.msg().contains('too many change_cipher_spec')
 		return
 	}
