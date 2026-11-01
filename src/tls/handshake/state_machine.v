@@ -467,7 +467,7 @@ fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![
 
 	// The empty Certificate-response (§4.4.2) enters the transcript BEFORE the
 	// server's flight is verified, so the server Finished covers our response.
-	response := build_empty_certificate(req.request_context)
+	response := build_empty_certificate_message(req.request_context)
 	h.update_transcript(response)!
 	return [new_handshake_message(response)!]
 }

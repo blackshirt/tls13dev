@@ -120,9 +120,9 @@ fn parse_certificate_request(body []u8) !CertificateRequest {
 	}
 }
 
-// build_empty_certificate creates an empty Certificate message (RFC 8446 §4.4.2),
+// build_empty_certificate_message creates an empty Certificate message (RFC 8446 §4.4.2),
 // echoing the request context verbatim and framing certificate_list as u24 zero.
-fn build_empty_certificate(request_context []u8) []u8 {
+fn build_empty_certificate_message(request_context []u8) []u8 {
 	mut body := []u8{cap: 1 + request_context.len + 3}
 	body << u8(request_context.len)
 	body << request_context

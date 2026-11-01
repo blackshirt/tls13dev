@@ -59,11 +59,11 @@ fn (mut r RecordLayer) install_traffic_protection(mut h handshake.HandshakeCore)
 		server.wipe()
 	}
 	if h.state() == .connected {
-		r.c_app_protection = tls_record_protection(suite, mut client)!
-		r.s_app_protection = tls_record_protection(suite, mut server)!
+		r.c_app_protection = new_tls_protection_from_keys(suite, mut client)!
+		r.s_app_protection = new_tls_protection_from_keys(suite, mut server)!
 	} else {
-		r.c_hsk_protection = tls_record_protection(suite, mut client)!
-		r.s_hsk_protection = tls_record_protection(suite, mut server)!
+		r.c_hsk_protection = new_tls_protection_from_keys(suite, mut client)!
+		r.s_hsk_protection = new_tls_protection_from_keys(suite, mut server)!
 	}
 }
 
@@ -123,7 +123,7 @@ fn (mut r RecordLayer) clear_key_update_run() {
 fn (mut r RecordLayer) swap_application_leg(mut h handshake.HandshakeCore, is_server_leg bool) ! {
 	mut keys := h.next_application_key_material(is_server_leg)!
 	suite := h.negotiated_cipher_suite()
-	// tls_record_protection() drains the material it installs; the wipe is the safety net
+	// new_tls_protection_from_keys() drains the material it installs; the wipe is the safety net
 	// for a failure part-way through, so no key material escapes unscrubbed (§7.5).
 	defer {
 		keys.wipe()
@@ -133,11 +133,11 @@ fn (mut r RecordLayer) swap_application_leg(mut h handshake.HandshakeCore, is_se
 	// documented platform limit) and idempotent, so it is safe even if never installed.
 	if is_server_leg {
 		mut old := r.s_app_protection
-		r.s_app_protection = tls_record_protection(suite, mut keys)!
+		r.s_app_protection = new_tls_protection_from_keys(suite, mut keys)!
 		old.wipe()
 	} else {
 		mut old := r.c_app_protection
-		r.c_app_protection = tls_record_protection(suite, mut keys)!
+		r.c_app_protection = new_tls_protection_from_keys(suite, mut keys)!
 		old.wipe()
 	}
 }

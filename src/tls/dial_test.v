@@ -264,7 +264,7 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 
 // test_dial_chacha20_end_to_end negotiates TLS_CHACHA20_POLY1305_SHA256 alone and
 // completes the full handshake plus one application read over it. This is the
-// regression guard for the §7.5 key-ownership bug: tls_record_protection scrubs the
+// regression guard for the §7.5 key-ownership bug: new_tls_protection_from_keys scrubs the
 // key bytes it takes from the core's generation
 // only after building the ChaCha cipher, which used to zero the AEAD's aliased
 // key and fail every record with an 'unmatching tag' that no AES suite exhibits and

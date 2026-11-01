@@ -43,7 +43,7 @@ pub fn (mut h HandshakeCore) take_buffered_handshake_bytes() ![]u8 {
 // record layer's installed protection always name the same generation. is_server_leg
 // selects the server→client read leg (true, after receiving) vs the client→server write
 // leg (false, before sending) — the same direction vocabulary the record layer swaps by.
-// The leg is caller-owned: tls_record_protection() drains it through take_key()/take_iv()
+// The leg is caller-owned: new_tls_protection_from_keys() drains it through take_key()/take_iv()
 // (take_hp() hands over the empty TLS slot), and wipe() scrubs whatever a failed install
 // left behind (§7.5). The legs built here leave KeyMaterial.hp empty: TLS protects
 // record bodies, not record headers.

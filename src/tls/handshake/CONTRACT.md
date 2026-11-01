@@ -30,7 +30,7 @@ The implementation is split by ownership:
   validation and secret derivation.
 - [`core_guarded.v`](./core_guarded.v) defines and implements the core's one-sided
   methods — each guarded by `is_quic` and refusing the wrong-mode core with a plain
-  error. TLS-record side: the backlog accessors and the TLS KeyUpdate ratchet —
+  error. TLS-record side: the reassembly_len accessor and the TLS KeyUpdate ratchet —
   which returns the very generation it just derived, so a secret can never advance
   without its keys coming along. QUIC side: the opaque transport parameters and the
   HelloRetryRequest flag. The per-phase key accessors are not here; they are shared
@@ -67,6 +67,16 @@ secrets; it does not close a socket or QUIC connection. The record keys are deri
 from those secrets on demand, so wiping the secrets retires them. `zeroize_traffic_secrets()` wipes all traffic secrets plus the reassembly buffer once the adapter no
 longer needs them; valid only after `.connected`, so an out-of-phase call
 cannot discard traffic material needed to finish a handshake.
+
+### Wipe scope by entry point
+
+| Entry point | Wipes | Called when |
+|-------------|-------|-------------|
+| `wipe_key_schedule_secrets()` | `handshake_secret`, `c_hsk_tsec`/`s_hsk_tsec`, ephemeral ECDHE private keys | At `.connected`, once handshake traffic secrets are dead |
+| `zeroize_traffic_secrets()` | `c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`, reassembly buffer | At connection close (`destroy_all` → `zeroize_traffic_secrets()`), both TLS and QUIC paths |
+| `fail_and_zeroize_secrets()` | Everything above + `transcript.messages`, `server_certs` byte fields (raw/tbs/public key/DN/serial) | On terminal handshake failure (`classify_failure` → terminal state) |
+
+Each tier is a superset of the one above: `fail_and_zeroize_secrets()` composes `wipe_key_schedule_secrets()` plus the plaintext-history scrub. Handshake traffic secrets are wiped at `.connected` (both TLS `handle_finished` and QUIC `release_handshake_keys`), so they do not survive to connection close. Application traffic secrets live until close.
 Adapters call these lifecycle operations when aborting or tearing down; callers
 driving a handshake normally need only construct, send the ClientHello, feed
 peer messages, and observe the resulting state.
@@ -206,7 +216,7 @@ exposes no record or stream semantics to the adapter.
 ## Supporting protocol helpers
 
 The module also exposes lower-level helpers used by adapters that implement
-post-handshake handling or transport key setup: `next_recordless_message()`,
+post-handshake handling or transport key setup: `next_unframed_message()`,
 `parse_new_session_ticket()`, `parse_key_update()`, `quic_connection_error()`,
 `hkdf_expand_label()`, `suite_hash_algo()`, `suite_key_len()`, and
 `new_aead_for_suite()`. These are protocol building blocks, not alternatives

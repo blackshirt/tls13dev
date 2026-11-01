@@ -1153,7 +1153,7 @@ fn (mut c Conn) wipe_app_buf() {
 
 // Helpers (utility)
 
-// tls_record_protection builds one direction's protection state from its opaque key
+// new_tls_protection_from_keys builds one direction's protection state from its opaque key
 // material and drains the key-and-IV slots it needs: the AEAD backend keeps its own key
 // and the protection state clones its IV, so both values are scrubbed here before
 // returning (§7.5). The takes empty this by-value copy's fields; the caller's handle
@@ -1161,7 +1161,7 @@ fn (mut c Conn) wipe_app_buf() {
 // wipe() to cover. Which slot the result lands in is the caller's choice, made by name
 // off the generation (`take_client_material()` / `take_server_material()`).
 // Sequence numbers restart at 0 per generation (§5.3).
-fn tls_record_protection(suite handshake.CipherSuite, mut keys handshake.KeyMaterial) !TLSProtection {
+fn new_tls_protection_from_keys(suite handshake.CipherSuite, mut keys handshake.KeyMaterial) !TLSProtection {
 	mut key := keys.take_key()
 	mut iv := keys.take_iv()
 	defer {

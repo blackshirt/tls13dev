@@ -271,7 +271,7 @@ fn test_tls_protection_wipe_clears_state() ! {
 }
 
 // check_aead_key_not_aliased builds one suite's AEAD from a caller-owned key buffer,
-// then scrubs that buffer AFTER installation — exactly what tls_record_protection's
+// then scrubs that buffer AFTER installation — exactly what new_tls_protection_from_keys's
 // §7.5 defer does to the traffic key. That is safe only because new_aead_for_suite
 // must NOT retain a reference to the caller's bytes (AES expands into its own round
 // schedule; ChaCha20-Poly1305 clones first — see aead.v). If either leg ever aliases
