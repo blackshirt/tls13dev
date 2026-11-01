@@ -520,6 +520,11 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.state() != .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: unencrypted handshake record after ServerHello (unexpected_message)')
 				}
+				// Feed the plaintext record into the core's initial-phase reassembly.
+				// It parses one complete ServerHello (or, on a retry path, a HelloRetryRequest
+				// and synthesizes the outbound retry ClientHello). `msgs` holds those
+				// outbound messages — empty when this record only advanced state,
+				// non-empty when a retry ClientHello must be sent below.
 				msgs := c.hs.receive_initial_bytes(rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
 				backlog := c.hs.reassembly_len()!
@@ -536,6 +541,11 @@ fn (mut c Conn) do_handshake() ! {
 					c.rec.install_traffic_protection(mut c.hs)!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
+				// `msgs` is not the HRR we just received: receive_initial_bytes routed
+				// the HRR to handle_hello_retry_request, which produced this newly
+				// generated ClientHello (echoing the HRR cookie, possibly with a new
+				// key-share group) and already hashed it into the transcript. We send
+				// that outbound retry, never echo back the server's HRR.
 				for m in msgs {
 					c.send_plaintext_handshake_flight(m.msg())!
 				}
