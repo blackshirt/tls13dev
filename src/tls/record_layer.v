@@ -40,12 +40,13 @@ fn new_record_layer() RecordLayer {
 	}
 }
 
-// install_handshake_protection builds both protection states of the handshake generation,
-// called once after the ServerHello is fed. The core hands the generation over as an
-// opaque TrafficKeys handle, with the phase fixed by the accessor that produced it,
-// and each direction is taken by name out of the bundle it belongs to.
-fn (mut r RecordLayer) install_handshake_protection(mut h handshake.HandshakeCore) ! {
-	mut keys := h.handshake_traffic_keys()!
+// install_traffic_protection builds both protection states for the current
+// traffic-key generation, called once after ServerHello (handshake keys) or once
+// the server Finished verifies (application keys). The core's traffic_keys()
+// derives the right secret set from HandshakeState, and this builder installs it
+// into the matching protection slots.
+fn (mut r RecordLayer) install_traffic_protection(mut h handshake.HandshakeCore) ! {
+	mut keys := h.traffic_keys()!
 	suite := h.negotiated_cipher_suite()
 	mut client := keys.take_client_material()
 	mut server := keys.take_server_material()
@@ -57,25 +58,13 @@ fn (mut r RecordLayer) install_handshake_protection(mut h handshake.HandshakeCor
 		client.wipe()
 		server.wipe()
 	}
-	r.c_hsk_protection = tls_record_protection(suite, mut client)!
-	r.s_hsk_protection = tls_record_protection(suite, mut server)!
-}
-
-// install_application_protection builds both protection states of the application
-// generation, called once the server Finished is verified.
-fn (mut r RecordLayer) install_application_protection(mut h handshake.HandshakeCore) ! {
-	mut keys := h.application_traffic_keys()!
-	suite := h.negotiated_cipher_suite()
-	mut client := keys.take_client_material()
-	mut server := keys.take_server_material()
-	// Same one-owner-per-byte discipline as install_handshake_protection (§7.5).
-	defer {
-		keys.wipe()
-		client.wipe()
-		server.wipe()
+	if h.state() == .connected {
+		r.c_app_protection = tls_record_protection(suite, mut client)!
+		r.s_app_protection = tls_record_protection(suite, mut server)!
+	} else {
+		r.c_hsk_protection = tls_record_protection(suite, mut client)!
+		r.s_hsk_protection = tls_record_protection(suite, mut server)!
 	}
-	r.c_app_protection = tls_record_protection(suite, mut client)!
-	r.s_app_protection = tls_record_protection(suite, mut server)!
 }
 
 // needs_rekey reports whether the current write generation has reached the §5.5 rekey

@@ -8,7 +8,7 @@
 // and the backlog hooks; the QUIC side holds the opaque server transport
 // parameters and the HelloRetryRequest flag the QUIC adapter needs for Initial
 // re-keying. The per-phase key generations are not in this file at all — the
-// shared handshake_traffic_keys() / application_traffic_keys() accessors in
+// shared traffic_keys() accessor in
 // key_schedule.v answer in the core's mode, and raw traffic secrets never
 // leave the core in either mode.
 module handshake
@@ -33,9 +33,9 @@ pub fn (h &HandshakeCore) handshake_backlog() !int {
 	return h.buffers.handshake.len
 }
 
-// take_buffered_handshake_bytes moves whatever consume_msgs_at() left buffered at
-// .connected (legal only per RFC 8446 §4.6.1 coalescing) to the record adapter,
-// zeroizing the core's copy (§7.5).
+// take_buffered_handshake_bytes moves whatever the handshake receive path left
+// buffered at .connected (legal only per RFC 8446 §4.6.1 coalescing) to the record
+// adapter, zeroizing the core's copy (§7.5).
 pub fn (mut h HandshakeCore) take_buffered_handshake_bytes() ![]u8 {
 	if h.is_quic {
 		return error('handshake: take_buffered_handshake_bytes() is TLS-record-only (QUIC reassembles its own CRYPTO stream)')
@@ -65,7 +65,7 @@ pub fn (mut h HandshakeCore) next_application_key_material(is_server_leg bool) !
 	}
 	secret := if is_server_leg { h.s_app_tsec } else { h.c_app_tsec }
 	if secret.len == 0 {
-		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_application_secrets())')
+		return error('handshake: cannot update the ${side} application traffic secret (unavailable before the server Finished, destroyed by zeroize_traffic_secrets())')
 	}
 	next_secret := derive_updated_traffic_secret(h.hash_algo, secret) or {
 		h.fail_and_zeroize_secrets()

@@ -70,7 +70,8 @@ fn test_packet_key_legs_fill_hp_where_record_legs_do_not() ! {
 	_ = q.create_client_hello()!
 	q.c_hsk_tsec = []u8{len: 32, init: 1}
 	q.s_hsk_tsec = []u8{len: 32, init: 2}
-	mut gen := q.handshake_traffic_keys()!
+	q.state = HandshakeState.wait_ee
+	mut gen := q.traffic_keys()!
 	assert gen.is_ready()
 	mut client := gen.take_client_material()
 	assert client.key.len == q.key_len && client.iv.len == aead_nonce_len && client.hp.len == q.key_len
@@ -85,7 +86,8 @@ fn test_packet_key_legs_fill_hp_where_record_legs_do_not() ! {
 	_ = t.create_client_hello()!
 	t.c_hsk_tsec = []u8{len: 32, init: 1}
 	t.s_hsk_tsec = []u8{len: 32, init: 2}
-	mut rec_gen := t.handshake_traffic_keys()!
+	t.state = HandshakeState.wait_ee
+	mut rec_gen := t.traffic_keys()!
 	mut rec_client := rec_gen.take_client_material()
 	assert rec_client.key.len == t.key_len && rec_client.iv.len == aead_nonce_len
 	assert rec_client.take_hp().len == 0
@@ -162,13 +164,13 @@ fn test_tls_mode_zeroize_and_failure_retire_record_keys() ! {
 	h.c_app_tsec = [u8(11), 12]
 	h.s_app_tsec = [u8(13), 14]
 	// While both secrets live the accessor derives; the guard is presence, not a cache.
-	h.application_traffic_keys() or {
+	h.traffic_keys() or {
 		assert false, 'record keys should derive while the application secrets live'
 	}
-	h.zeroize_application_secrets()!
+	h.zeroize_traffic_secrets()!
 	assert h.c_app_tsec.len == 0
 	assert h.s_app_tsec.len == 0
-	h.application_traffic_keys() or {
+	h.traffic_keys() or {
 		assert err.msg().contains('application traffic keys unavailable')
 	}
 

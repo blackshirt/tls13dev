@@ -146,7 +146,7 @@ fn test_hkdf_expand_rejects_nonpositive_length() ! {
 
 // test_record_key_expansion pins the per-phase client/server record-key expansion
 // to the RFC 8448 §3 handshake keys: the derive_traffic_key and derive_traffic_iv
-// calls that handshake_traffic_keys()/application_traffic_keys() now run on demand must
+// calls that traffic_keys() now runs on demand must reproduce these known answers.
 // reproduce these known answers.
 fn test_record_key_expansion() ! {
 	hash := HashAlgorithm.sha256

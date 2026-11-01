@@ -57,19 +57,17 @@ Two properties make this work:
 
 2. **The public boundary is a small, phase-named seam.** The unit the adapter
    exchanges with the core is a `HandshakeMessage` — a complete handshake
-   message (4-byte header included) whose TLS protection phase is a
-   module-private tag. Framing (records vs. CRYPTO frames) and protection (AEAD
-   records vs. QUIC packet protection) are entirely adapter-side.
+   message (4-byte header included). Its TLS protection phase is carried by the
+   entry point that produced it, not stored as a tag on the message. Framing
+   (records vs. CRYPTO frames) and protection (AEAD records vs. QUIC packet
+   protection) are entirely adapter-side.
 
-The phase vocabulary is transport-neutral but stays inside the module:
-
-```v
-enum EncryptionLevel { // module-private — no public signature names it
-    initial      // initial TLS handshake messages before handshake keys are installed
-    handshake    // messages protected with handshake traffic keys
-    application  // application traffic keys/secrets
-}
-```
+The phase vocabulary is transport-neutral and lives in the method names, not in a
+level value: `receive_initial_bytes()` / `receive_handshake_bytes()`,
+`traffic_keys()` (which dispatches on `HandshakeState`), and
+`zeroize_traffic_secrets()`. A `HandshakeMessage` does not store its phase; the
+QUIC engine knows it from the packet type whose CRYPTO frame completed the message
+(Initial → initial, Handshake → handshake).
 
 Here the initial phase names the pre-ServerHello TLS handshake stage, not QUIC
 Initial packet protection. The QUIC engine routes Initial packet CRYPTO to
@@ -136,8 +134,9 @@ start
 `state()` reports the exact cursor position and rejects an out-of-order
 encrypted-flight message, advancing only as each message is handled; adapters may
 poll any of these states — `conn.v` keys its record routing on `wait_sh`,
-`connected`, and `failed` — while key-material readiness comes from
-`available_secret_phases()`. `failed` is terminal: once reached,
+`connected`, and `failed` — while key-material readiness follows the same cursor:
+handshake keys once the core leaves `wait_sh`, application keys at `connected`.
+`failed` is terminal: once reached,
 the phase-named receives refuse further input. A protocol violation moves the
 machine to `failed` and wipes all derived material (see
 `fail_and_zeroize_secrets()` in [CONTRACT.md](./CONTRACT.md)). The public
@@ -201,14 +200,13 @@ RFC 9001 §5.1 expands each traffic secret into per-direction packet keys:
 | `quic iv`  | packet-number nonce base       |
 | `quic hp`  | header-protection key          |
 
-The core runs those expansions: `handshake_traffic_keys()` and
-`application_traffic_keys()` — shared, transport-neutral accessors on `HandshakeCore`
-declared in key_schedule.v over the private `traffic_keys_at()` derivation — return a
-fresh caller-owned `TrafficKeys` generation whose legs on a QUIC-mode core are fully
-filled `KeyMaterial` — key, iv *and* hp; the same calls on a TLS-mode core return
-key-and-IV record legs with the hp slot left empty. The phase is in the
-method name, never an argument, and it is the core's mode — not the accessor name —
-that picks the leg shape.
+The core runs those expansions through `traffic_keys()` — the shared,
+transport-neutral accessor on `HandshakeCore` declared in key_schedule.v — which
+returns a fresh caller-owned `TrafficKeys` generation whose legs on a QUIC-mode core
+are fully filled `KeyMaterial` — key, iv *and* hp; the same call on a TLS-mode core
+returns key-and-IV record legs with the hp slot left empty. The phase is implied by
+`HandshakeState`, never an argument, and it is the core's mode — not the accessor
+name — that picks the leg shape.
 Raw §7.1 traffic secrets never leave the core in either mode, so an adapter has no use
 for `hkdf_expand_label()` of its own.
 
@@ -221,10 +219,10 @@ handshake traffic secrets past `.connected`; the engine owns its derived packet
 keys and, when it processes `HANDSHAKE_DONE` (§4.9.2), calls `release_handshake_keys()`
 — a single step that zeroizes the core's `.handshake` traffic secrets *and* zeroes
 the Handshake packet-protection states together, so neither half can be forgotten.
-The TCP adapter reaches the same `zeroize_handshake_secrets()` after sending
-its Finished because record-based TLS has no such window; **a QUIC engine must not**
-release them before it has finished using the Handshake packet keys. Terminal cleanup
-is centralized in `close()`, which seals the final `CONNECTION_CLOSE` first and only
+The TCP adapter zeroizes all traffic secrets together at close time through
+`zeroize_traffic_secrets()`; **a QUIC engine must not** release handshake keys
+before it has finished using the Handshake packet keys. Terminal cleanup is
+centralized in `close()`, which seals the final `CONNECTION_CLOSE` first and only
 then zeroizes the core secrets and every remaining packet key (`destroy_on_close()`).
 
 ### 3.4 KeyUpdate is replaced by Key Phase
@@ -291,7 +289,7 @@ for m in msgs {
 // 4. Now derive Handshake packet keys from the core and protect Handshake
 //    packets with them; the server flight (EE, [CertReq], Cert, CV, Finished)
 //    rides Handshake CRYPTO.
-mut gen := hs.handshake_traffic_keys()!   // TrafficKeys: both legs, key+iv+hp filled
+mut gen := hs.traffic_keys()!   // TrafficKeys: both legs, key+iv+hp filled (phase from HandshakeState)
 mut client_leg := gen.take_client_material()
 qkey := client_leg.take_key()
 // ... take_iv() (12 bytes) and take_hp() likewise; wipe() handles when done (§7.5) ...
@@ -300,19 +298,18 @@ qkey := client_leg.take_key()
 //    client Finished (a handshake-phase message) once the server flight verifies.
 flight := hs.receive_handshake_bytes(handshake_stream)!
 for m in flight {
-    if !m.is_initial() {
-        // Send m.msg in a Handshake CRYPTO frame, protected with the client
-        // Handshake keys. (The TCP adapter sends a dummy CCS here; QUIC does not.)
-    }
+    // Every message here is handshake-key protected: send m.msg in a Handshake
+    // CRYPTO frame. (The TCP adapter sends a dummy CCS here; QUIC does not.)
+    _ = m
 }
 
 // 6. Application keys are live at .connected. Derive 1-RTT packet keys with
-//    application_traffic_keys() — the same filled KeyMaterial legs.
-mut app_gen := hs.application_traffic_keys()!
+//    traffic_keys() — the same filled KeyMaterial legs (phase from HandshakeState).
+mut app_gen := hs.traffic_keys()!
 
-// 7. For a custom client adapter, release handshake-stage material after
-//    receiving HANDSHAKE_DONE. Conn does this automatically.
-hs.zeroize_handshake_secrets()!
+// 7. For a custom client adapter, release all traffic secrets after
+//    receiving HANDSHAKE_DONE. Conn does this automatically at close().
+hs.zeroize_traffic_secrets()!
 
 // 8. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
 //    with next_recordless_message and decode with parse_new_session_ticket.
@@ -323,8 +320,10 @@ hs.zeroize_handshake_secrets()!
 
 - The shared API sequence, phase guards, and TLS-only operations are specified
   in the [handshake adapter contract](./CONTRACT.md). For QUIC, queue every
-  returned message by phase — `m.is_initial()` is the only phase fact the public
-  seam exposes: true means Initial CRYPTO, false means Handshake CRYPTO.
+  returned message by the entry point that produced it: output of
+  `receive_initial_bytes()` and `create_client_hello()` is Initial CRYPTO, output
+  of `receive_handshake_bytes()` is Handshake CRYPTO. `HandshakeMessage` carries
+  no level tag.
 - The QUIC engine discards CRYPTO data carried in 1-RTT packets: it is
   post-handshake traffic, and an engine that does not implement resumption must
   not let a NewSessionTicket flight block the HANDSHAKE_DONE that confirms the

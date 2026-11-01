@@ -24,8 +24,8 @@ fix the transport mode once, at construction:
   reassembly live in the QUIC engine, not here.
 
 A caller still picks its transport at construction, but the mode is now a runtime flag: the
-per-phase key accessors (`handshake_traffic_keys()`, `application_traffic_keys()`) are shared —
-both modes answer them, in their own leg shape. What remains transport-specific guards itself:
+key accessor (`traffic_keys()`) is shared — both modes answer it, in their own leg shape.
+What remains transport-specific guards itself:
 a TLS-record-only call on a QUIC-mode core (`next_application_key_material()`, the backlog
 accessors, `take_buffered_handshake_bytes()`) and a QUIC-only call on a TLS-mode core
 (`peer_transport_parameters()`, `is_hello_retry_request_received()`) each return a plain
@@ -46,11 +46,11 @@ CA bundle.
 ## File map
 
 ```
-state_machine.v       the unified core vocabulary + HandshakeCore: states, the private
-                      EncryptionLevel, HandshakeOptions, the struct + constructors, the state
-                      cursor, create_client_hello, the receive lifecycle, and the ServerHello/HRR
+state_machine.v       the unified core vocabulary + HandshakeCore: states,
+                      HandshakeOptions, the struct + constructors, the state cursor,
+                      create_client_hello, the receive lifecycle, and the ServerHello/HRR
                       and encrypted-flight phase transitions
-state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the per-level
+state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the per-phase
                       reassembly buffers (ReassemblyBuffers), the receive/dispatch routing, and
                       classify_failure / fail_with / failure_alert
 key_exchange.v        the core's ECDHE methods: key share, public share,
@@ -65,9 +65,8 @@ server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/F
 certificate_verify.v  verify the §4.4.3 CertificateVerify (pure, no state change)
 key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations,
                       the shared KeyMaterial/TrafficKeys handles, the public
-                      handshake/application_traffic_keys() accessors over the
-                      traffic_keys_at() derivation, and the retained
-                      secret holders with their §7.5 lifecycle
+                      traffic_keys() accessor, and the
+                      retained secret holders with their §7.5 lifecycle
 transcript.v          running transcript the schedule and CertificateVerify hash over
 messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + header
 aead.v                cipher-suite → AEAD/hash helpers
@@ -105,13 +104,14 @@ Each `*_test.v` sits beside its source.
   ordering cursor: `is_handshake_message_accepted()` gates the encrypted flight — EncryptedExtensions,
   optional CertificateRequest, Certificate, CertificateVerify, Finished — so handlers only parse and
   transition, and `state()` returns the cursor directly.
-- **Key-material readiness** is queried via `available_secret_phases()` rather than inferred from
-  `state()`, so a `.failed` handshake (schedule wiped) never presents stale readiness.
+- **Key-material readiness** is inferred from `state()`: handshake keys are installable once the
+  core leaves `start`/`wait_sh`, and application keys at `connected`. A `.failed` handshake has
+  already wiped its schedule, so it never presents stale readiness.
 - **Phase-checked input.** `receive_initial_bytes()` accepts input only in
   `wait_sh` and `receive_handshake_bytes()` only while the flight is in progress (`wait_ee` through
   `wait_finished`); out-of-phase calls are rejected without consuming input or discarding usable
-  keys. The phase itself is a module-private `EncryptionLevel`, so the entry points carry it in
-  their names rather than as an argument.
+  keys. The entry points carry the phase in their names rather than as an argument, and the
+  returned `HandshakeMessage` does not store it.
 - **Transcript bound.** `transcript.v` caps the running transcript (`max_transcript_len`) so a peer
   cannot grow the buffer indefinitely with legal-size records that never complete the flight.
 

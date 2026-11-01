@@ -230,7 +230,7 @@ pub fn (h &HandshakeCore) state() HandshakeState {
 }
 
 // is_in_flight reports whether the current state lies inside the encrypted server
-// flight, the window in which handshake-level bytes are legal.
+// flight, the window in which handshake-phase bytes are legal.
 fn (h &HandshakeCore) is_in_flight() bool {
 	return match h.state {
 		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cv, .wait_finished { true }
@@ -296,7 +296,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 	}
 }
 
-// handle_server_hello_message consumes one complete initial-level ServerHello
+// handle_server_hello_message consumes one complete initial-phase ServerHello
 // or HelloRetryRequest and returns the follow-up messages (RFC 8446 §4.1.3).
 fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMessage {
 	if h.state != .wait_sh {
@@ -410,7 +410,7 @@ fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg 
 
 // build_second_client_hello builds the ClientHello retried after a
 // HelloRetryRequest: identical to the first except key_share and cookie
-// (RFC 8446 §4.1.2), level-tagged .initial.
+// (RFC 8446 §4.1.2).
 fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group NamedGroup, cookie []u8) ![]HandshakeMessage {
 	if change_group {
 		h.generate_key_share(group)!
@@ -578,24 +578,15 @@ pub fn (mut h HandshakeCore) receive_handshake_bytes(bytes []u8) ![]HandshakeMes
 	return h.core_receive_handshake_bytes(bytes)!
 }
 
-// zeroize_handshake_secrets destroys the handshake traffic secrets once the adapter no
-// longer needs them — and with them the handshake record keys, which derive from those
-// secrets on demand (RFC 8446 §7.5, RFC 9001 §4.9.2); valid only after .connected.
-pub fn (mut h HandshakeCore) zeroize_handshake_secrets() ! {
+// zeroize_traffic_secrets destroys all traffic secrets (handshake and application)
+// once the connection is closed — retiring the record keys that derive from them
+// (§7.5). Valid only after .connected.
+pub fn (mut h HandshakeCore) zeroize_traffic_secrets() ! {
 	if h.state != .connected {
-		return error('handshake: zeroizing handshake traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
+		return error('handshake: zeroizing traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
 	}
 	wipe_secret(mut h.c_hsk_tsec)
 	wipe_secret(mut h.s_hsk_tsec)
-}
-
-// zeroize_application_secrets destroys the application traffic secrets — the terminal
-// teardown at close() — retiring the application record keys that derive from them
-// (§7.5); valid only after .connected.
-pub fn (mut h HandshakeCore) zeroize_application_secrets() ! {
-	if h.state != .connected {
-		return error('handshake: zeroizing application traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
-	}
 	wipe_secret(mut h.c_app_tsec)
 	wipe_secret(mut h.s_app_tsec)
 }

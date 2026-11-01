@@ -23,8 +23,8 @@ The implementation is split by ownership:
   byte reassembly, the receive/dispatch routing and the terminal-failure primitives in
   [`state_machine_extra.v`](./state_machine_extra.v).
 - [`key_schedule.v`](./key_schedule.v) runs the §7.1 HKDF ladder and holds the
-  core's flat derived-secret fields (`c_hsk_tsec`/`s_hsk_tsec`/`c_app_tsec`/`s_app_tsec`) and the
-  `SecretPhases` readiness type, with the §7.5 wiping and zeroization lifecycle methods.
+  core's flat derived-secret fields (`c_hsk_tsec`/`s_hsk_tsec`/`c_app_tsec`/`s_app_tsec`), with
+  the §7.5 wiping and zeroization lifecycle methods.
 - [`key_exchange.v`](./key_exchange.v) implements the core's ephemeral ECDHE
   methods: per-group key generation, the public share, and the peer-share
   validation and secret derivation.
@@ -50,23 +50,23 @@ alpn := hs.negotiated_alpn()
 suite := hs.negotiated_cipher_suite()
 alert := hs.failure_alert()
 hs.fail_and_zeroize_secrets()
-hs.zeroize_application_secrets()!
+hs.zeroize_traffic_secrets()!
 ```
 
 `state()` reports the client's position in a single `HandshakeState` enum that
 mirrors the client state machine of RFC 8446 Appendix A.1 (`start`, `wait_sh`,
 `wait_ee`, `wait_cert_cr`, `wait_cert`, `wait_cv`, `wait_finished`, `connected`,
 plus an implementation `failed`). Encrypted-flight ordering is enforced by that
-same public state; key-material readiness is still polled via
-`available_secret_phases()` rather than inferred from `state()`, so a `.failed`
-handshake never presents stale readiness.
+same public state; key-material readiness follows it too: handshake keys are
+installable once the core leaves `start`/`wait_sh`, application keys at
+`connected`, and a `.failed` handshake has already wiped its schedule, so it never
+presents stale readiness.
 
 `fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
 secrets; it does not close a socket or QUIC connection. The record keys are derived
-from those secrets on demand, so wiping the secrets retires them. `zeroize_handshake_secrets()`
-and `zeroize_application_secrets()` are fallible teardown operations, accepted only
-after `.connected`, so an out-of-phase call cannot discard traffic material needed
-to finish a handshake.
+from those secrets on demand, so wiping the secrets retires them. `zeroize_traffic_secrets()` wipes all traffic secrets once the adapter no
+longer needs them; valid only after `.connected`, so an out-of-phase call
+cannot discard traffic material needed to finish a handshake.
 Adapters call these lifecycle operations when aborting or tearing down; callers
 driving a handshake normally need only construct, send the ClientHello, feed
 peer messages, and observe the resulting state.
@@ -90,9 +90,10 @@ surface, calls `fail_and_zeroize_secrets()` to zeroize the derived secrets and p
 the machine in `.failed`, and returns the `IError` to propagate. No call site can
 produce one of those steps without the others, so a peer-triggered decode error both
 tears down and reports the RFC-correct alert (e.g. `decode_error` for a malformed
-message) rather than a stale default. Every handshake-level and ServerHello-path
-parse/framing failure routes through it; `append_and_consume_msgs_at()` keeps an
-`or { fail_and_zeroize_secrets() }` safety net for any non-classified internal error
+message) rather than a stale default. Every handshake-phase and ServerHello-path
+parse/framing failure routes through it; `append_and_consume_initial()` and
+`append_and_consume_handshake()` keep an `or { fail_and_zeroize_secrets() }` safety
+net for any non-classified internal error
 (teardown is idempotent, so the belt-and-suspenders call is harmless). The record
 keys need no separate wipe because they are derived from the secrets these calls
 already clear.
@@ -115,13 +116,13 @@ deterministic test vectors.
 The two receive entry points name the phase instead of taking a phase argument:
 `receive_initial_bytes()` takes the pre-ServerHello bytes and
 `receive_handshake_bytes()` the bytes protected by handshake keys. Each reassembles
-complete messages and returns outbound `HandshakeMessage` values tagged internally
-with that TLS phase. The phase itself is a module-private `EncryptionLevel` — no
-public signature names it, and QUIC packet types are mapped to these entry points
-by the QUIC engine. `HandshakeMessage.is_initial()` is the only phase fact adapters
-may read, and only to choose a transmit queue. The same phase names select
-TLS-derived secrets for key export; the initial phase has none. Here `initial`
-denotes the initial TLS handshake phase, not QUIC Initial packet protection.
+complete messages and returns outbound `HandshakeMessage` values. The phase is
+carried by the entry point, not stored on the message: everything returned by
+`receive_initial_bytes()` is pre-ServerHello and everything returned by
+`receive_handshake_bytes()` is handshake-key protected. QUIC packet types are
+mapped to these entry points by the QUIC engine. The phase is implied by
+`HandshakeState`; the same phase names select TLS-derived secrets for key export,
+and the initial phase has none.
 Initial-phase input is accepted only while awaiting ServerHello; handshake-phase
 input is accepted only after ServerHello and before Finished. Out-of-phase API
 calls are rejected without consuming input or changing handshake state.
@@ -129,29 +130,27 @@ Each handshake core owns its phase-specific reassembly buffers and
 consumes complete TLS messages. An empty result can mean that input is
 incomplete or that a message advanced the state without producing output;
 adapters use `state()` to observe progress and errors to detect invalid input.
-Key-material readiness, however, is queried through `available_secret_phases()`
-rather than inferred from `state()`: it reports which traffic-secret phases the
-core currently holds (`handshake`, `application`), returning false for a phase
-whose secrets are absent or already zeroized. Both the record and QUIC adapters
-call it to decide when to install transport keys, so that decision lives in one
-place and a `.failed` handshake (whose schedule is wiped) never presents stale
-readiness.
+Key-material readiness is inferred from `state()`: handshake traffic secrets
+exist once the core leaves `wait_sh`, application secrets once it reaches
+`connected`. Both the record and QUIC adapters key their key-install decisions on
+that cursor, and a `.failed` handshake has already wiped its schedule, so it never
+presents stale readiness.
 
 ## Key generation accessors (shared by both modes)
 
-`handshake_traffic_keys()` and `application_traffic_keys()` are transport-neutral:
-each derives its phase's key generation on demand from the retained traffic secrets
-and returns it as an opaque `TrafficKeys` handle holding one `KeyMaterial` per
-direction. The core's mode — not the accessor name — selects the leg shape: record
-legs leave the handle's header-protection slot empty (TLS protects record bodies, not
-record headers), packet legs fill all three slots (RFC 9001 §5.1). The accessor names
-the phase and the field names the direction, so the values never travel as a
-positional `(client_key, client_iv, server_key, server_iv)` tuple.
+`traffic_keys()` is transport-neutral: it derives its phase's key generation on
+demand from the retained traffic secrets and returns it as an opaque `TrafficKeys`
+handle holding one `KeyMaterial` per direction. The core's mode — not the accessor
+name — selects the leg shape: record legs leave the handle's header-protection slot
+empty (TLS protects record bodies, not record headers), packet legs fill all three
+slots (RFC 9001 §5.1). The phase is implied by `HandshakeState` — handshake secrets
+after ServerHello, application secrets at `.connected` — and the field names the
+direction, so the values never travel as a positional
+`(client_key, client_iv, server_key, server_iv)` tuple.
 Each call derives a fresh generation the caller owns: `take_client_material()` /
 `take_server_material()` move one direction's material out of it, and `wipe()` scrubs
-whatever is left, so no copy of the material escapes unscrubbed. The initial phase has
-no keys and no accessor either — asking for them is not expressible, rather
-than refused at run time.
+whatever is left, so no copy of the material escapes unscrubbed. The initial phase
+has no keys — asking for them before ServerHello is refused at run time.
 
 ## Record-only operations
 
@@ -164,7 +163,7 @@ with a plain error:
   drain check. They and `take_buffered_handshake_bytes()` are fallible, partly
   for the `is_quic` guard: only the record layer feeds through TLS record
   framing, so the trio has no QUIC caller.
-- `take_buffered_handshake_bytes()` moves any handshake-level bytes the core
+- `take_buffered_handshake_bytes()` moves any handshake-phase bytes the core
   still held at `.connected` (a server ticket coalesced after its `Finished`,
   §4.6.1) into the record adapter's post-handshake reassembler and wipes the
   core copy.
@@ -172,13 +171,13 @@ with a plain error:
   ratchet — the read leg (`true`, server keys, after receiving) and the write leg
   (`false`, client keys, before sending) — and is valid only after the handshake reaches
   `.connected`. It ratchets the selected leg's secret and returns that leg's next
-  `KeyMaterial` in one call, so the adapter cannot install a generation that does not match
-  the stored secret. `application_traffic_keys()` stays the initial-install accessor;
-  rekeying never goes through it.
-- `zeroize_handshake_secrets()` and `zeroize_application_secrets()` destroy the
-  traffic secrets for one phase once the adapter no longer needs them; valid only
-  after `.connected`. Because the record keys derive from those secrets, wiping a
-  phase's secrets retires its keys too. Handshake cleanup is not a handshake-confirmation
+   `KeyMaterial` in one call, so the adapter cannot install a generation that does not match
+   the stored secret. `traffic_keys()` is the initial-install accessor; rekeying never
+   goes through it.
+- `zeroize_traffic_secrets()` destroys all traffic secrets once the adapter no
+longer needs them; valid only after `.connected`. Because the record keys derive
+from those secrets, wiping them retires the keys too. Handshake cleanup is not a
+handshake-confirmation signal.
   signal. The initial
   phase has no secrets, so the entry point behind this pair refuses it.
 
@@ -191,10 +190,8 @@ whether a retry occurred. Packet protection comes from the shared accessors abov
 on a QUIC-mode core they run the RFC 9001 `quic key`, `quic iv`, and `quic hp`
 expansions inside the core and hand out filled legs — raw traffic secrets never
 leave the core in either mode (the earlier QUIC-only secret export was retired when
-the derivation moved in). The QUIC adapter calls `zeroize_handshake_secrets()` only
-when it no longer needs the handshake keys, which may be after the handshake is
-confirmed. Application teardown calls `zeroize_application_secrets()`, shared by
-both modes through the core's phase-named entry points.
+the derivation moved in). The QUIC adapter calls `zeroize_traffic_secrets()` only when it no longer needs
+the traffic keys, which may be after the handshake is confirmed.
 
 QUIC has no record-boundary accessor or TLS KeyUpdate operations. Those methods
 exist on the type but are runtime-rejected on a QUIC-mode core by the `is_quic`
@@ -233,8 +230,7 @@ frame or encrypt transport records or packets.
 ## Future API work
 
 The phase-named receive methods still return only outbound messages. Handshake-key
-readiness is no longer inferred from `state()` — both adapters now use the
-centralized `available_secret_phases()` query — but a full structured progress
+readiness is inferred from `state()` in both adapters, but a full structured progress
 *return value* (naming milestones such as ServerHello-done or connected as part of
 each receive) remains future work, to be added only if both adapters can migrate
 without changing message ordering, alert classification, or secret lifetimes.

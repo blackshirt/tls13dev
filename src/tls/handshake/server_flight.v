@@ -196,7 +196,7 @@ fn parse_encrypted_extensions_for_transport(body []u8, is_quic bool) !(string, ?
 	if is_quic && transport_parameters == none {
 		// RFC 9001 §4.3/§8.2: a QUIC server must advertise transport parameters here;
 		// their contents are the adapter's concern, but omitting them entirely is a
-		// handshake-level violation and fails closed.
+		// handshake-phase violation and fails closed.
 		return error('handshake: server omitted QUIC transport parameters')
 	}
 

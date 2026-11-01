@@ -527,8 +527,8 @@ fn (mut c Conn) do_handshake() ! {
 				if c.hs.state() != .start && c.hs.state() != .wait_sh && c.hs.state() != .failed {
 					// Install once the core actually holds handshake secrets, keyed on
 					// the same readiness the QUIC engine derives from HandshakeState,
-					// not on a separate SecretPhases query.
-					c.rec.install_handshake_protection(mut c.hs)!
+					// not on a separate readiness query.
+					c.rec.install_traffic_protection(mut c.hs)!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).
 				for m in msgs {
@@ -544,9 +544,10 @@ fn (mut c Conn) do_handshake() ! {
 		}
 	}
 	// The core verified the server Finished; install this adapter's post-handshake protection.
-	c.rec.install_application_protection(mut c.hs)!
+	c.rec.install_traffic_protection(mut c.hs)!
 	// §4.6.1 lets the server coalesce a NewSessionTicket behind its Finished; the
-	// core's consume_msgs_at() stops at .connected, so take (and scrub) its buffered bytes.
+	// core stops consuming handshake messages at .connected, so take (and scrub) its
+	// buffered bytes.
 	coalesced := c.hs.take_buffered_handshake_bytes()!
 	if coalesced.len > 0 {
 		// handle_post_handshake failures already run abort_connection (which latches
@@ -554,8 +555,8 @@ fn (mut c Conn) do_handshake() ! {
 		c.handle_post_handshake(coalesced)!
 	}
 	// Nothing may protect or decrypt in the handshake phase now, so the core may
-	// destroy its secrets (RFC 8446 §7.5).
-	c.hs.zeroize_handshake_secrets()!
+	// destroy its secrets (RFC 8446 §7.5). Handshake and application traffic secrets
+	// are zeroized together at close via zeroize_traffic_secrets().
 }
 
 // validate_compat_ccs checks one dummy ChangeCipherSpec record and enforces max_compat_ccs_records.
@@ -1033,8 +1034,7 @@ fn (mut c Conn) destroy_all() ! {
 		// The core reaches .connected before do_handshake's explicit handshake zeroize
 		// runs, so a failure in that tail window must wipe both levels; the handshake
 		// zeroize is idempotent, making the normal double call after it is a no-op.
-		c.hs.zeroize_handshake_secrets() or {}
-		c.hs.zeroize_application_secrets()!
+		c.hs.zeroize_traffic_secrets()!
 	} else {
 		c.hs.fail_and_zeroize_secrets()
 	}

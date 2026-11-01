@@ -619,25 +619,23 @@ fn (mut e Engine) install_packet_keys() ! {
 	// keeps its own install-once flags.
 	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none
 		&& e.hs.state() != .start && e.hs.state() != .wait_sh && e.hs.state() != .failed {
-		e.install_handshake_protection()!
+		e.install_traffic_protection()!
 	}
 	if e.hs.state() == .connected && e.app_tx == none && e.app_rx == none {
-		e.install_application_protection()!
+		e.install_traffic_protection()!
 	}
 }
 
-// install_protection derives one phase's packet protection from the core's shared
-// traffic-keys accessor (RFC 9001 §5.1); is_application selects 1-RTT over Handshake. The core
-// returns an opaque caller-owned generation: draining each leg moves key, iv and hp
-// whole into new_protection(), whose backend copies what it keeps, so the deferred
-// handle wipes and field wipes scrub every local copy on all exit paths (§7.5) —
-// raw traffic secrets never cross into tls.quic at all.
-fn (mut e Engine) install_protection(is_application bool) ! {
-	mut gen := if is_application {
-		e.hs.application_traffic_keys()!
-	} else {
-		e.hs.handshake_traffic_keys()!
-	}
+// install_traffic_protection derives one generation's packet protection from the
+// core's shared traffic-keys accessor (RFC 9001 §5.1). Which secret set is used is
+// implied by HandshakeState: handshake secrets before .connected, application
+// secrets at .connected. The core returns an opaque caller-owned generation:
+// draining each leg moves key, iv and hp whole into new_protection(), whose backend
+// copies what it keeps, so the deferred handle wipes and field wipes scrub every
+// local copy on all exit paths (§7.5) — raw traffic secrets never cross into
+// tls.quic at all.
+fn (mut e Engine) install_traffic_protection() ! {
+	mut gen := e.hs.traffic_keys()!
 	suite := e.hs.negotiated_cipher_suite()
 	mut client_leg := gen.take_client_material()
 	mut server_leg := gen.take_server_material()
@@ -654,12 +652,12 @@ fn (mut e Engine) install_protection(is_application bool) ! {
 		zero_bytes(mut server_keys.iv)
 		zero_bytes(mut server_keys.hp)
 	}
-	if !is_application {
-		e.handshake_tx = new_protection(client_keys, suite)!
-		e.handshake_rx = new_protection(server_keys, suite)!
-	} else {
+	if e.hs.state() == .connected {
 		e.app_tx = new_protection(client_keys, suite)!
 		e.app_rx = new_protection(server_keys, suite)!
+	} else {
+		e.handshake_tx = new_protection(client_keys, suite)!
+		e.handshake_rx = new_protection(server_keys, suite)!
 	}
 }
 
@@ -671,18 +669,6 @@ fn drain_packet_keys(mut k handshake.KeyMaterial) ProtectionKeys {
 		iv:  k.take_iv()
 		hp:  k.take_hp()
 	}
-}
-
-// install_handshake_protection derives the Handshake-level packet protection from
-// the core's handshake packet keys.
-fn (mut e Engine) install_handshake_protection() ! {
-	e.install_protection(false)!
-}
-
-// install_application_protection derives the 1-RTT packet protection from the
-// core's application packet keys.
-fn (mut e Engine) install_application_protection() ! {
-	e.install_protection(true)!
 }
 
 // zero_bytes overwrites a buffer in place, the §7.5 scrub for dead QUIC key material
@@ -961,7 +947,6 @@ fn wipe_protection_state(mut slot ?ProtectionState) {
 // one half and forget the other (RFC 9001 §4.9.2, RFC 8446 §7.5). It zeroes the
 // handshake protection states before releasing them, and is idempotent.
 fn (mut e Engine) release_handshake_keys() ! {
-	e.hs.zeroize_handshake_secrets()!
 	wipe_protection_state(mut e.handshake_tx)
 	wipe_protection_state(mut e.handshake_rx)
 }
@@ -986,7 +971,7 @@ fn (mut e Engine) wipe_packet_keys() {
 // needs the packet keys; that is why the failure path (fail_close) does not call it.
 fn (mut e Engine) destroy_on_close() ! {
 	if e.hs.state() == .connected {
-		e.hs.zeroize_application_secrets()!
+		e.hs.zeroize_traffic_secrets()!
 	} else {
 		e.hs.fail_and_zeroize_secrets()
 	}

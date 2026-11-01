@@ -15,12 +15,12 @@ fn fixture_trusted_validator() pki.Validator {
 	return pki.new_validator(ts)
 }
 
-// expect_no_handshake_keys reports whether handshake_traffic_keys() refuses —
-// the expected state once zeroize_handshake_secrets() dropped the handshake material.
+// expect_no_traffic_keys reports whether traffic_keys() refuses — the expected
+// state once zeroize_traffic_secrets() dropped all traffic material.
 // Only the error is inspected: a refused generation must not leak a handle.
-fn expect_no_handshake_keys(h &HandshakeCore) bool {
+fn expect_no_traffic_keys(h &HandshakeCore) bool {
 	mut refused := false
-	h.handshake_traffic_keys() or {
+	h.traffic_keys() or {
 		refused = true
 	}
 	return refused
@@ -36,7 +36,7 @@ fn expect_no_exported_handshake_secrets(h &HandshakeCore) bool {
 // failed feed the machine is .failed and every derived secret is gone (RFC 8446 §7.5).
 fn assert_handshake_material_destroyed(h &HandshakeCore) {
 	assert h.state() == .failed
-	assert expect_no_handshake_keys(h), 'handshake record keys survived a failed feed'
+	assert expect_no_traffic_keys(h), 'traffic keys survived a failed feed'
 	assert expect_no_exported_handshake_secrets(h), 'handshake traffic secrets survived a failed feed'
 }
 
@@ -110,7 +110,7 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// Application traffic keys are the reusable post-handshake state (§7.1). The
 	// generation arrives as one opaque handle per direction, so every length is
 	// asserted by name instead of by tuple position.
-	mut keys := h.application_traffic_keys()!
+	mut keys := h.traffic_keys()!
 	assert keys.is_ready()
 	mut client := keys.take_client_material()
 	mut server := keys.take_server_material()
@@ -122,18 +122,9 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	client.wipe()
 	server.wipe()
 
-	// Handshake-stage material is dropped while application material remains (RFC 8446 §7.5).
-	h.zeroize_handshake_secrets()!
-	assert expect_no_handshake_keys(&h)
-	mut kept := h.application_traffic_keys()!
-	mut kept_client := kept.take_client_material()
-	mut kept_server := kept.take_server_material()
-	assert kept_client.take_key().len == 16
-	assert kept_server.take_key().len == 16
-	assert kept_server.take_iv().len == 12
-	kept.wipe()
-	kept_client.wipe()
-	kept_server.wipe()
+	// All traffic secrets are dropped at teardown (RFC 8446 §7.5).
+	h.zeroize_traffic_secrets()!
+	assert expect_no_traffic_keys(&h)
 }
 
 // test_hello_retry_request_change_group_reaches_connected checks that the
@@ -292,7 +283,7 @@ fn test_fail_before_secrets_is_safe() ! {
 	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{ validator: fixture_trusted_validator() })!
 	h.fail_and_zeroize_secrets()
 	assert h.state() == .failed
-	assert expect_no_handshake_keys(h)
+	assert expect_no_traffic_keys(h)
 	assert expect_no_exported_handshake_secrets(h)
 }
 
@@ -304,7 +295,7 @@ fn test_malformed_server_hello_aborts_and_destroys() ! {
 	// A complete ServerHello header with an empty body: parse fails before the key schedule ran.
 	h.receive_initial_bytes([u8(0x02), 0x00, 0x00, 0x00]) or {
 		assert h.state() == .failed
-		assert expect_no_handshake_keys(h)
+		assert expect_no_traffic_keys(h)
 		return
 	}
 	assert false, 'a malformed ServerHello must abort the handshake'
@@ -339,11 +330,11 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	// Master Secret was derived from the retained Handshake Secret before destruction.
 	assert h.handshake_secret.len == 0
 	// The application traffic secrets the split derivers produced from the caller-owned
-	// Master Secret survive, and readiness reports them.
+	// Master Secret survive.
 	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
 	assert h.state() == .connected
 	// The record accessor derives the key/iv pair the transport consumes on demand.
-	mut app_keys := h.application_traffic_keys()!
+	mut app_keys := h.traffic_keys()!
 	mut app_client := app_keys.take_client_material()
 	mut app_server := app_keys.take_server_material()
 	assert app_client.take_key().len == 16 && app_client.take_iv().len == 12

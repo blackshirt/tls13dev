@@ -2,10 +2,10 @@
 //
 // key_schedule.v runs the RFC 8446 §7.1 HKDF key-derivation ladder that turns the
 // (EC)DHE secret into every handshake and application key, and owns the §7.5
-// zeroization lifecycle declared on HandshakeCore. The SecretPhases readiness type
-// and the opaque KeyMaterial / TrafficKeys handles — the one generation shape shared
-// by both transport modes — plus the public phase accessors over the shared
-// traffic_keys_at() derivation are declared here, beside the derivations that fill them.
+// zeroization lifecycle declared on HandshakeCore. The opaque KeyMaterial /
+// TrafficKeys handles — the one generation shape shared by both transport modes —
+// plus the public phase accessors and the retained secret holders are declared
+// here, beside the derivations that fill them.
 module handshake
 
 import crypto.hmac
@@ -352,40 +352,43 @@ fn (mut h HandshakeCore) release_ephemeral_keys() {
 	h.priv_p256 = none
 }
 
-// handshake_traffic_keys returns the handshake-phase key generation for the calling
-// transport to install, derived on demand: record legs (hp empty) on a TLS-mode core,
-// packet legs (key+iv+hp) on a QUIC-mode core. Each call yields a fresh, caller-owned
-// generation — drain it with take_client_material() / take_server_material() and wipe()
-// the rest, so no copy escapes unscrubbed (§7.5). The handshake phase has no traffic
-// secrets before the ServerHello and none after zeroize_handshake_secrets().
-pub fn (h &HandshakeCore) handshake_traffic_keys() !TrafficKeys {
-	if h.c_hsk_tsec.len == 0 || h.s_hsk_tsec.len == 0 {
-		return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_secrets())')
-	}
-	return TrafficKeys{
-		client: derive_key_material(h.hash_algo, h.c_hsk_tsec, h.key_len, h.is_quic)!
-		server: derive_key_material(h.hash_algo, h.s_hsk_tsec, h.key_len, h.is_quic)!
-	}
-}
-
-// application_traffic_keys returns the application-phase key generation, derived
-// through the same shared seam and shaped by the same mode bit; the record layer
-// installs this once the server Finished verifies, the QUIC engine at .connected.
-// TLS rekeying does not come through here — next_application_key_material() (a
-// KeyUpdate concept; QUIC key updates live in the packet layer) ratchets and derives
-// in one step so a generation can never be skipped.
-pub fn (h &HandshakeCore) application_traffic_keys() !TrafficKeys {
-	if h.c_app_tsec.len == 0 || h.s_app_tsec.len == 0 {
-		return error('handshake: application traffic keys unavailable before the server Finished')
-	}
-	return TrafficKeys{
-		client: derive_key_material(h.hash_algo, h.c_app_tsec, h.key_len, h.is_quic)!
-		server: derive_key_material(h.hash_algo, h.s_app_tsec, h.key_len, h.is_quic)!
+// traffic_keys returns the current traffic-key generation for the calling transport,
+// derived on demand: record legs (hp empty) on a TLS-mode core, packet legs (key+iv+hp)
+// on a QUIC-mode core. Which secret set is used is implied by HandshakeState:
+//   - .wait_ee … .wait_finished: handshake traffic secrets (after ServerHello)
+//   - .connected: application traffic secrets (after server Finished)
+//   - .start, .wait_sh, .failed: no traffic keys available
+// Each call yields a fresh, caller-owned generation — drain it with
+// take_client_material() / take_server_material() and wipe() the rest, so no copy
+// escapes unscrubbed (§7.5).
+pub fn (h &HandshakeCore) traffic_keys() !TrafficKeys {
+	match h.state {
+		.start, .wait_sh, .failed {
+			return error('handshake: traffic keys unavailable (handshake secrets after ServerHello, application secrets at .connected)')
+		}
+		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cv, .wait_finished {
+			if h.c_hsk_tsec.len == 0 || h.s_hsk_tsec.len == 0 {
+				return error('handshake: handshake traffic keys unavailable (available after ServerHello)')
+			}
+			return TrafficKeys{
+				client: derive_key_material(h.hash_algo, h.c_hsk_tsec, h.key_len, h.is_quic)!
+				server: derive_key_material(h.hash_algo, h.s_hsk_tsec, h.key_len, h.is_quic)!
+			}
+		}
+		.connected {
+			if h.c_app_tsec.len == 0 || h.s_app_tsec.len == 0 {
+				return error('handshake: application traffic keys unavailable before the server Finished')
+			}
+			return TrafficKeys{
+				client: derive_key_material(h.hash_algo, h.c_app_tsec, h.key_len, h.is_quic)!
+				server: derive_key_material(h.hash_algo, h.s_app_tsec, h.key_len, h.is_quic)!
+			}
+		}
 	}
 }
 
 // fail_and_zeroize_secrets is the unguarded terminal entry: it composes every wipe
-// above — key-schedule intermediate, ephemeral halves, both traffic-secret levels —
+// above — key-schedule intermediate, ephemeral halves, both traffic-secret phases —
 // releases the reassembly buffers, and parks the machine in .failed (RFC 8446
 // §1.3.1/§7.5). Wiping the traffic secrets also retires the record keys, since they are
 // derived from those secrets on demand. It bypasses the zeroize_* lifecycle guard: a
