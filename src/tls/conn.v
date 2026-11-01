@@ -420,6 +420,11 @@ pub fn (mut c Conn) write(data []u8) !int {
 	if c.closed {
 		return error('tls: connection closed')
 	}
+	// A sticky fatal error must surface at the public boundary too, not only
+	// inside write_application_data(): a future caller could bypass it.
+	if c.fatal_error != '' {
+		return error(c.fatal_error)
+	}
 	// Application keys exist only once connected.
 	if c.hs.state() != .connected {
 		return error('tls: handshake not complete')
@@ -688,7 +693,7 @@ fn (mut c Conn) read_raw_record() !Record {
 				return error('record: ${avail} unconsumed bytes exceed the handshake framing bound ${max_handshake_recv_buf_len}')
 			}
 		}
-		if c.sock_closed || c.sock == unsafe { nil } {
+		if c.sock_closed {
 			return error('tls: connection closed (no socket available to read further records)')
 		}
 		if c.deadline_ms != 0 {
@@ -771,10 +776,14 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 	// Any alert is terminal: mark closed before decoding, even a malformed body.
 	c.closed = true
 	peer_alert := handshake.parse_alert(payload) or {
-		// A malformed alert body is fatal: destroy everything, then pin a sticky error
-		// so later reads re-report it.
+		// A malformed alert body is fatal: destroy everything, close the socket,
+		// then pin a sticky error so later reads re-report it.
 		c.fatal_error = 'tls: received malformed alert'
-		c.destroy_all()!
+		c.destroy_all() or {
+			c.close_tcp_socket()
+			return err
+		}
+		c.close_tcp_socket()
 		return error(c.fatal_error)
 	}
 	// close_notify is the one clean-shutdown signal: return 0 like a normal EOF read.
@@ -791,12 +800,20 @@ fn (mut c Conn) handle_alert(payload []u8) !int {
 		// ran while the keys existed, and setting the latch keeps dial()'s teardown
 		// wrapper from emitting a stray alert if a later path reuses this Conn.
 		c.peer_terminated = true
-		c.destroy_all()!
+		c.destroy_all() or {
+			c.close_tcp_socket()
+			return err
+		}
+		c.close_tcp_socket()
 		return 0
 	}
 	// A fatal (or illegal warning) alert needs no reply — §6 forbids alerting back —
 	// but our own keys must die with it (§7.5).
-	c.destroy_all()!
+	c.destroy_all() or {
+		c.close_tcp_socket()
+		return err
+	}
+	c.close_tcp_socket()
 	// Warning level is prohibited in TLS 1.3 except close_notify (§6.2): a peer
 	// dressing a non-close_notify alert as a warning is non-conforming, so refuse
 	// it as a sticky unexpected_message — never a clean shutdown — so a truncated
