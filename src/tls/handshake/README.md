@@ -26,8 +26,8 @@ fix the transport mode once, at construction:
 A caller still picks its transport at construction, but the mode is now a runtime flag: the
 key accessor (`traffic_keys()`) is shared — both modes answer it, in their own leg shape.
 What remains transport-specific guards itself:
-a TLS-record-only call on a QUIC-mode core (`next_application_key_material()`, the backlog
-accessors, `take_buffered_handshake_bytes()`) and a QUIC-only call on a TLS-mode core
+a TLS-record-only call on a QUIC-mode core (`next_application_key_material()`,
+`take_buffered_handshake_bytes()`) and a QUIC-only call on a TLS-mode core
 (`peer_transport_parameters()`, `is_hello_retry_request_received()`) each return a plain
 error without touching state or keys, the same convention as the out-of-phase guards.
 
@@ -56,7 +56,7 @@ state_machine_extra.v the core's intake plumbing + terminal-failure primitives: 
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
 core_guarded.v        One-sided surfaces of the core (is_quic-guarded): TLS-record side
-                      — backlog accessors and the KeyUpdate ratchet that
+                      — reassembly_len accessor and the KeyUpdate ratchet that
                       returns the next generation's key material; QUIC side — peer
                       transport params and the HRR flag (the key accessors are shared)
 client_hello.v        validate options, build the §4.1.2 ClientHello

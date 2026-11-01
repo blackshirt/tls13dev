@@ -2,7 +2,7 @@
 //
 // Core-contract suite for the transport-neutral handshake: phase-named
 // receive_initial_bytes()/receive_handshake_bytes() reassembly across adversarial
-// splits, the backlog accessors, the confirm/zeroize secret lifecycle, and the
+// splits, reassembly_len accessor, the confirm/zeroize secret lifecycle, and the
 // record-key guards.
 module handshake
 
@@ -67,11 +67,11 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 
 	first := h.receive_initial_bytes(full[..split])!
 	assert first.len == 0
-	assert h.initial_backlog()! == split
+	assert h.reassembly_len()! == split
 
 	// Completing the frame consumes it; the garbage body then fails to parse.
 	h.receive_initial_bytes(full[split..]) or {
-		assert h.initial_backlog()! == 0
+		assert h.reassembly_len()! == 0
 		return
 	}
 	assert false // a garbage ServerHello body must never parse cleanly
@@ -81,13 +81,13 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 // empty and the accessor tracks a parked fragment.
 fn test_backlog_tracks_parked_fragment() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	assert h.handshake_backlog()! == 0
-	assert h.initial_backlog()! == 0
+	assert h.reassembly_len()! == 0
+	assert h.reassembly_len()! == 0
 	_ = h.create_client_hello()!
 	h.state = .wait_ee
 	// A 2-byte fragment parked at the Handshake level is buffered, not dropped.
 	_ = h.receive_handshake_bytes([u8(2), 0x00])!
-	assert h.handshake_backlog()! == 2
+	assert h.reassembly_len()! == 2
 }
 
 // ---- state machine accessor ----
@@ -348,9 +348,9 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 
 	assert record.reassembly.len == 2
 	assert quic.reassembly.len == 1
-	assert record.initial_backlog()! == 2
+	assert record.reassembly_len()! == 2
 	record.fail_and_zeroize_secrets()
-	assert record.initial_backlog()! == 0
+	assert record.reassembly_len()! == 0
 	assert quic.reassembly.len == 1
 }
 
@@ -371,7 +371,7 @@ fn test_feed_rejects_out_of_order_message() ! {
 	cert := wrap_hsk(.certificate, []u8{len: 4, init: 0x01})
 	h.receive_handshake_bytes(cert) or {
 		assert err.msg().contains('only expected after ServerHello')
-		assert h.handshake_backlog()! == 0
+		assert h.reassembly_len()! == 0
 		assert h.state() == .wait_sh
 		return
 	}
@@ -461,6 +461,46 @@ fn test_class_a_failure_zeroizes_and_parks_failed() ! {
 	assert false, 'an out-of-order Certificate must abort the handshake'
 }
 
+// test_class_a_failure_scrubs_transcript_and_certs checks that classify_failure's
+// zeroization also scrubs plaintext handshake history — transcript messages — so
+// SNI/ALPN material does not survive on the heap after a terminal failure.
+fn test_class_a_failure_scrubs_transcript_and_certs() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
+	_ = h.create_client_hello()!
+	// Plant plaintext transcript history.
+	h.transcript.messages = [u8(0xAA), 0xBB, 0xCC, 0xDD]
+	assert h.server_certs.len == 0
+	h.state = .wait_ee
+	// Class A: a Certificate is illegal while EncryptedExtensions is awaited.
+	h.receive_handshake_bytes(wrap_hsk(.certificate, []u8{len: 4, init: 0x01})) or {
+		assert h.state() == .failed
+		assert h.transcript.messages.len == 0
+		assert h.server_certs.len == 0
+		assert h.reassembly.len == 0
+		return
+	}
+	assert false, 'an out-of-order Certificate must abort the handshake'
+}
+
+// test_generate_key_share_clears_old_ephemeral_on_group_change checks that the HRR
+// group-change path releases the old private key before deriving the new one (§7.5).
+// vlib key types expose no in-place wipe, so releasing the handle is the available
+// destruction — both slots are nulled before the new key is created.
+fn test_generate_key_share_clears_old_ephemeral_on_group_change() ! {
+	mut h := new_tls_handshake('example.com', HandshakeOptions{
+		validator:        fixture_validator()
+		key_share_group:  .x25519
+		supported_groups: [.x25519]
+	})!
+	_ = h.create_client_hello()!
+	assert h.priv_x25519 != unsafe { nil }
+	assert h.priv_p256 == none
+	// Retry with a different group: the X25519 handle must be released first.
+	h.generate_key_share(.secp256r1)!
+	assert h.priv_x25519 == unsafe { nil }
+	assert h.priv_p256 != none
+}
+
 // test_class_b_parse_failure_zeroizes_and_reports_decode_error locks the Phase-2
 // classification fix: a Class B internal error (a peer-triggered parse that uses `!`)
 // now routes through classify_failure, so it BOTH tears down and surfaces the
@@ -506,7 +546,7 @@ fn test_feed_handshake_level_after_connected_refused() ! {
 	h.receive_handshake_bytes(wrap_hsk(.new_session_ticket, [u8(0)])) or {
 		assert err.msg().contains('only expected after ServerHello')
 		assert h.state() == .connected
-		assert h.handshake_backlog()! == 0
+		assert h.reassembly_len()! == 0
 		return
 	}
 	assert false
@@ -747,7 +787,7 @@ fn test_next_recordless_splits_one_byte_cadence() ! {
 	mut got := 0
 	for b in full {
 		buf << b
-		msg := next_recordless_message(mut buf)!
+		msg := next_unframed_message(mut buf)!
 		if msg.len > 0 {
 			got += 1
 			assert msg == full
@@ -763,9 +803,9 @@ fn test_next_recordless_two_messages_sequential() ! {
 	// `+` cannot join []u8 in V, so the second frame is appended with `<<`.
 	mut buf := wrap_hsk(.encrypted_extensions, [u8(0x00)])
 	buf << wrap_hsk(.certificate, [u8(0x01), 0x02])
-	m1 := next_recordless_message(mut buf)!
+	m1 := next_unframed_message(mut buf)!
 	assert m1.len == 5 // 4-byte header + 1-byte body
-	m2 := next_recordless_message(mut buf)!
+	m2 := next_unframed_message(mut buf)!
 	assert m2.len == 6
 	assert buf.len == 0
 }
@@ -777,7 +817,7 @@ fn test_next_recordless_rejects_oversize_length() ! {
 	w.write_u8(u8(HandshakeType.certificate))
 	w.write_u24(u32(max_handshake_message_len + 1))
 	mut buf := w.bytes()
-	next_recordless_message(mut buf) or {
+	next_unframed_message(mut buf) or {
 		return
 	}
 	assert false

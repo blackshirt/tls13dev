@@ -4,6 +4,14 @@
 // Unlike a TLS record stream, QUIC CRYPTO bytes can arrive out of order (each
 // packet carries a (offset, length) pair), so the engine buffers the contiguous
 // prefix and stashes any higher-offset chunk until the gap fills.
+//
+// Layer split: CryptoReasm owns the QUIC *packet-level* stream — (offset, length)
+// chunks, ACK ranges, probe-timeout retransmission, deduplication. tls.handshake's
+// HandshakeCore.reassembly owns the *TLS-message-level* stream — 4-byte handshake
+// header framing and complete-message extraction. The two are complementary, not
+// redundant: QUIC delivers bytes through CryptoReasm, then hands complete chunks
+// to HandshakeCore.receive_handshake_bytes(), which parses TLS messages out of
+// its own buffer.
 module quic
 
 import tls.handshake
@@ -34,7 +42,7 @@ mut:
 // It returns an empty slice while the header or body is still incomplete, and
 // rejects a declared length past the handshake-message cap.
 fn (mut r CryptoReasm) next_message() ![]u8 {
-	msg := handshake.next_recordless_message(mut r.ready)!
+	msg := handshake.next_unframed_message(mut r.ready)!
 	r.base += u64(msg.len)
 	return msg
 }

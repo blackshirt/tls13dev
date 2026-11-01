@@ -5,7 +5,7 @@
 // wrong-mode core refuses it with a plain error — no state change, no key
 // material touched — mirroring the out-of-phase guards. The TLS-record side
 // holds the KeyUpdate ratchet (which returns the generation it just derived)
-// and the backlog hooks; the QUIC side holds the opaque server transport
+// and the reassembly_len hook; the QUIC side holds the opaque server transport
 // parameters and the HelloRetryRequest flag the QUIC adapter needs for Initial
 // re-keying. The per-phase key generations are not in this file at all — the
 // shared traffic_keys() accessor in
@@ -13,23 +13,14 @@
 // leave the core in either mode.
 module handshake
 
-// initial_backlog reports bytes the reassembly buffer retained after complete TLS
-// messages were consumed while awaiting ServerHello. TLS-record scope: only the record
-// adapter enforces the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO
-// stream, so the accessor refuses a QUIC-mode core.
-pub fn (h &HandshakeCore) initial_backlog() !int {
-	if h.is_quic {
-		return error('handshake: initial_backlog() is TLS-record-only (QUIC frames its own CRYPTO stream)')
-	}
-	return h.reassembly.len
-}
-
-// handshake_backlog reports bytes the reassembly buffer retained — the drain check the
-// record adapter runs once the encrypted flight is consumed.
-pub fn (h &HandshakeCore) handshake_backlog() !int {
-	if h.is_quic {
-		return error('handshake: handshake_backlog() is TLS-record-only (QUIC frames its own CRYPTO stream)')
-	}
+// reassembly_len reports bytes the reassembly buffer retained across both phases —
+// pre-ServerHello plaintext fragments and coalesced handshake-flight bytes alike.
+// TLS-record and QUIC-mode cores share one reassembly buffer (state_machine_extra.v),
+// so there is no per-phase count to split. TLS-record scope: only the record
+// adapter enforces the §5.1 ServerHello record-boundary rule and the coalesced-flight
+// drain check; QUIC frames its own CRYPTO stream but may still query this byte count
+// for observability or its own drain checks before HANDSHAKE_DONE.
+pub fn (h &HandshakeCore) reassembly_len() !int {
 	return h.reassembly.len
 }
 

@@ -517,7 +517,7 @@ fn (mut c Conn) do_handshake() ! {
 				}
 				msgs := c.hs.receive_initial_bytes(rec.payload)!
 				// The record must have yielded exactly one complete message (§5.1).
-				backlog := c.hs.initial_backlog()!
+				backlog := c.hs.reassembly_len()!
 				if backlog != 0 {
 					return c.classify_failure(.unexpected_message, 'tls: misframed ServerHello record: ${backlog} leftover byte(s) (unexpected_message)')
 				}
@@ -822,7 +822,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 	c.rec.post_hsk_buf << data
 	mut messages_seen := 0
 	for {
-		msg := handshake.next_recordless_message(mut c.rec.post_hsk_buf) or {
+		msg := handshake.next_unframed_message(mut c.rec.post_hsk_buf) or {
 			return c.abort_connection(.decode_error, err.msg())
 		}
 		if msg.len == 0 {

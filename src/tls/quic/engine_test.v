@@ -698,3 +698,24 @@ fn test_engine_retransmit_replays_identical_crypto() ! {
 	_ = feed_initial_crypto(mut peer, eng.original_dcid(), replay)!
 	assert peer.ready.len == 3000, 'retransmitted CRYPTO must dedup, not extend the stream'
 }
+
+// test_quic_reassembly_len_reports_buffered_tls_message_bytes pins that
+// reassembly_len() is mode-agnostic: a QUIC-mode core reports its reassembly byte
+// count without refusing on is_quic, and it rises/falls with incomplete/complete
+// message input.
+fn test_quic_reassembly_len_reports_buffered_tls_message_bytes() ! {
+	mut hs := handshake.new_quic_handshake('example.com', handshake.HandshakeOptions{ validator: trusted_validator() })!
+	_ = hs.create_client_hello()!
+
+	// Empty core: nothing buffered yet.
+	assert hs.reassembly_len()! == 0
+
+	// Feed a partial ServerHello header (type 0x02 + partial length) — not a
+// complete message, so all 4 bytes stay in reassembly.
+	hs.receive_initial_bytes([u8(0x02), 0x00, 0x00, 0x04])!
+	assert hs.reassembly_len()! == 4
+
+	// A terminal failure wipes reassembly too: reassembly_len reports 0 afterward.
+	hs.classify_failure(handshake.AlertDescription.internal_error, 'test')
+	assert hs.reassembly_len()! == 0
+}

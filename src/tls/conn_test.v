@@ -236,7 +236,7 @@ fn test_post_handshake_reassembly_is_bounded() ! {
 	bound := record_header_len + handshake.max_handshake_message_len
 
 	// Header declares a 1 MiB body that never completes: every chunk stays
-	// reassembly-exempt from next_recordless_message's own oversized-declared
+	// reassembly-exempt from next_unframed_message's own oversized-declared
 	// check, so only the running bound can stop it.
 	mut chunk := [u8(0x0b), 0x0f, 0xff, 0xf8] // Certificate; declared len 1048568
 	chunk << []u8{len: 512, init: 0xbb}

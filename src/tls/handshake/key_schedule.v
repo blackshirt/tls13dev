@@ -11,6 +11,7 @@ module handshake
 import crypto.hmac
 import crypto.sha256
 import crypto.sha512
+import tls.pki
 
 // HashAlgorithm specifies the hash function used by the negotiated cipher suite.
 // Pub because hkdf_expand_label needs it, and a QUIC engine names the suite's
@@ -392,21 +393,36 @@ pub fn (h &HandshakeCore) traffic_keys() !TrafficKeys {
 // releases the reassembly buffer, and parks the machine in .failed (RFC 8446
 // §1.3.1/§7.5). Wiping the traffic secrets also retires the record keys, since they are
 // derived from those secrets on demand. It bypasses the zeroize_* lifecycle guard: a
-// failure can land before .connected ever held.
+// failure can land before .connected ever held. Plaintext handshake history
+// (transcript) and the server certificate chain are also scrubbed: they survive
+// failure otherwise and would leak SNI/ALPN/certificate material on the heap.
 pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_key_schedule_secrets()
-	wipe_secret(mut h.c_hsk_tsec)
-	wipe_secret(mut h.s_hsk_tsec)
-	wipe_secret(mut h.c_app_tsec)
-	wipe_secret(mut h.s_app_tsec)
+	// Scrub plaintext handshake history: every message exchanged so far.
+	wipe_secret(mut h.transcript.messages)
+	h.transcript.messages = []u8{}
+	// Scrub the server certificate chain: raw DER and every parsed byte field.
+	for i in 0 .. h.server_certs.len {
+		wipe_secret(mut h.server_certs[i].raw)
+		wipe_secret(mut h.server_certs[i].tbs_raw)
+		wipe_secret(mut h.server_certs[i].public_key_raw)
+		wipe_secret(mut h.server_certs[i].issuer_dn)
+		wipe_secret(mut h.server_certs[i].subject_dn)
+		wipe_secret(mut h.server_certs[i].serial_number)
+	}
+	h.server_certs = []pki.Certificate{}
 	h.reassembly = []u8{}
 	h.state = .failed
 }
 
-// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
-// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
-// handshake traffic secrets.
-fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
+// wipe_key_schedule_secrets destroys the key-schedule intermediate, both
+// handshake traffic secrets, and the dead ephemeral ECDHE halves at .connected
+// (RFC 8446 §1.3.1/§7.5). Handshake traffic secrets are dead once the client
+// Finished is sent / server Finished verified, so they are wiped here rather
+// than surviving until connection close.
+pub fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
 	wipe_secret(mut h.handshake_secret)
+	wipe_secret(mut h.c_hsk_tsec)
+	wipe_secret(mut h.s_hsk_tsec)
 	h.release_ephemeral_keys()
 }

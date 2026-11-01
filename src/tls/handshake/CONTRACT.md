@@ -64,7 +64,7 @@ presents stale readiness.
 
 `fail_and_zeroize_secrets()` marks the handshake failed and zeroizes its derived
 secrets; it does not close a socket or QUIC connection. The record keys are derived
-from those secrets on demand, so wiping the secrets retires them. `zeroize_traffic_secrets()` wipes all traffic secrets once the adapter no
+from those secrets on demand, so wiping the secrets retires them. `zeroize_traffic_secrets()` wipes all traffic secrets plus the reassembly buffer once the adapter no
 longer needs them; valid only after `.connected`, so an out-of-phase call
 cannot discard traffic material needed to finish a handshake.
 Adapters call these lifecycle operations when aborting or tearing down; callers
@@ -156,16 +156,18 @@ has no keys — asking for them before ServerHello is refused at run time.
 The TLS-record entry points below serve `tls.Conn` and refuse a QUIC-mode core
 with a plain error:
 
-- `initial_backlog()` and `handshake_backlog()` report the unconsumed byte count
-  parked at each phase — `initial_backlog()` lets the record adapter enforce the
-  ServerHello record-boundary rule, `handshake_backlog()` the coalesced-flight
-  drain check. They and `take_buffered_handshake_bytes()` are fallible, partly
-  for the `is_quic` guard: only the record layer feeds through TLS record
-  framing, so the trio has no QUIC caller.
+- `reassembly_len()` reports the unconsumed byte count parked in the core's single
+  reassembly buffer, shared by the initial (pre-ServerHello) and handshake
+  (encrypted-flight) phases — available on both TLS-record and QUIC-mode cores.
+  The record adapter uses it to enforce the ServerHello record-boundary rule and
+  the coalesced-flight drain check; QUIC may query it for its own drain checks
+  before HANDSHAKE_DONE. QUIC's separate offset-ordered CRYPTO reassembly lives in
+  `tls.quic.reasm.CryptoReasm` (packet level), while this is the TLS-message level.
 - `take_buffered_handshake_bytes()` moves any handshake-phase bytes the core
   still held at `.connected` (a server ticket coalesced after its `Finished`,
   §4.6.1) into the record adapter's post-handshake reassembler and wipes the
-  core copy.
+  core copy. TLS-record-only: QUIC tickets arrive as separate 1-RTT CRYPTO frames,
+  handled by the QUIC engine's post-handshake path.
 - `next_application_key_material(is_server_leg)` implements the TLS KeyUpdate
   ratchet — the read leg (`true`, server keys, after receiving) and the write leg
   (`false`, client keys, before sending) — and is valid only after the handshake reaches

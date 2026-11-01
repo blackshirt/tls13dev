@@ -96,7 +96,7 @@ fn test_packet_key_legs_fill_hp_where_record_legs_do_not() ! {
 }
 
 // test_quic_mode_refuses_tls_only_calls covers the TLS-record surface on a
-// QUIC-mode core: KeyUpdate, the backlog accessors, and the
+// QUIC-mode core: KeyUpdate, reassembly_len accessor, and the
 // coalesced-bytes handoff. The key accessors are absent: they answer in QUIC mode
 // instead of refusing.
 fn test_quic_mode_refuses_tls_only_calls() ! {
@@ -114,21 +114,29 @@ fn test_quic_mode_refuses_tls_only_calls() ! {
 	}
 	assert rejected
 	rejected = false
-	h.initial_backlog() or {
-		rejected = err.msg().contains('TLS-record-only')
-	}
-	assert rejected
-	rejected = false
-	h.handshake_backlog() or {
-		rejected = err.msg().contains('TLS-record-only')
-	}
-	assert rejected
-	rejected = false
 	h.take_buffered_handshake_bytes() or {
 		rejected = err.msg().contains('TLS-record-only')
 	}
 	assert rejected
 
+	assert h.state() == .wait_sh
+	assert h.failure_alert() == .internal_error
+}
+
+// test_quic_reassembly_len_is_mode_agnostic locks that reassembly_len() now works
+// on QUIC-mode cores: it reports reassembly byte count without an is_quic refusal,
+// while take_buffered_handshake_bytes() remains TLS-record-only.
+fn test_quic_reassembly_len_is_mode_agnostic() ! {
+	mut h := quic_mode_core()!
+	_ = h.create_client_hello()!
+
+	// reassembly_len() answers on QUIC mode — a plain byte count, no is_quic refusal.
+	assert h.reassembly_len()! == 0
+
+	// take_buffered_handshake_bytes() still refuses QUIC mode.
+	h.take_buffered_handshake_bytes() or {
+		assert err.msg().contains('TLS-record-only')
+	}
 	assert h.state() == .wait_sh
 	assert h.failure_alert() == .internal_error
 }

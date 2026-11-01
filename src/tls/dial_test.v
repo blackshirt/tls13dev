@@ -339,7 +339,7 @@ fn test_dial_accepts_ticket_coalesced_after_finished() ! {
 
 	assert conn.session_tickets.len == 1 // handled inside do_handshake itself
 	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
-	assert conn.hs.handshake_backlog()! == 0 // drained, not orphaned
+	assert conn.hs.reassembly_len()! == 0 // drained, not orphaned
 
 	mut buf := []u8{len: 64}
 	n := conn.read(mut buf)!

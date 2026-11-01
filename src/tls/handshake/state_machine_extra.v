@@ -36,12 +36,12 @@ enum ReceivePhase {
 	handshake // handshake-key-protected bytes
 }
 
-// core_receive_bytes guards and dispatches inbound handshake bytes for one phase:
+// receive_bytes guards and dispatches inbound handshake bytes for one phase:
 // pre-ServerHello bytes are accepted only while awaiting ServerHello (state == .wait_sh),
 // handshake-key-protected bytes only inside the encrypted server flight (is_in_flight()).
 // Misuse is rejected without consuming bytes or changing state; legal bytes append then
 // consume.
-fn (mut h HandshakeCore) core_receive_bytes(bytes []u8, phase ReceivePhase) ![]HandshakeMessage {
+fn (mut h HandshakeCore) receive_bytes(bytes []u8, phase ReceivePhase) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
 	}
@@ -120,7 +120,7 @@ fn (mut h HandshakeCore) dispatch_handshake_message(full_msg []u8) ![]HandshakeM
 fn (mut h HandshakeCore) consume_msgs() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.is_consuming_phase() {
-		msg := next_recordless_message(mut h.reassembly) or {
+		msg := next_unframed_message(mut h.reassembly) or {
 			return h.fail_with(.decode_error, err)
 		}
 		if msg.len == 0 {
@@ -148,9 +148,9 @@ fn (h &HandshakeCore) is_handshake_message_accepted(msg_type HandshakeType) bool
 	}
 }
 
-// unexpected_handshake_message preserves the per-message wording adapters and
+// unexpected_error_hsk_message preserves the per-message wording adapters and
 // tests rely on when ordering rejects a message.
-fn unexpected_handshake_message(msg_type HandshakeType) string {
+fn unexpected_error_hsk_message(msg_type HandshakeType) string {
 	return match msg_type {
 		.encrypted_extensions { 'handshake: unexpected EncryptedExtensions' }
 		.certificate_request { 'handshake: unexpected CertificateRequest' }
@@ -160,8 +160,3 @@ fn unexpected_handshake_message(msg_type HandshakeType) string {
 		else { 'handshake: unexpected handshake message ${msg_type}' }
 	}
 }
-
-// reassembly_buf_cap is the initial reassembly allocation, not a limit: the hard bound
-// a hostile peer must never exceed is enforced against max_handshake_message_len in the
-// append-and-consume paths and next_recordless_message.
-const reassembly_buf_cap = 4096

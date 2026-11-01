@@ -149,6 +149,11 @@ mut:
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
 }
 
+// reassembly_buf_cap is the initial reassembly allocation, not a limit: the hard bound
+// a hostile peer must never exceed is enforced against max_handshake_message_len in the
+// append-and-consume paths and next_unframed_message.
+const reassembly_buf_cap = 4096
+
 // new_handshake_core creates the unified handshake state from the server name, full
 // HandshakeOptions (ALPN, cert validation) and the transport mode; new_tls_handshake() and
 // new_quic_handshake() are the public wrappers fixing is_quic to false / true.
@@ -281,7 +286,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 		return h.fail_with(.decode_error, err)
 	}
 	if !h.is_handshake_message_accepted(msg_type) {
-		return h.classify_failure(.unexpected_message, unexpected_handshake_message(msg_type))
+		return h.classify_failure(.unexpected_message, unexpected_error_hsk_message(msg_type))
 	}
 
 	match msg_type {
@@ -291,7 +296,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 		.certificate_verify { return h.handle_certificate_verify(full_msg, body) }
 		.finished { return h.handle_finished(full_msg, body) }
 		else {
-			return h.classify_failure(.unexpected_message, unexpected_handshake_message(msg_type))
+			return h.classify_failure(.unexpected_message, unexpected_error_hsk_message(msg_type))
 		}
 	}
 }
@@ -570,13 +575,13 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 // receive_initial_bytes feeds pre-ServerHello (plaintext) handshake bytes —
 // TLS records or Initial-packet CRYPTO bytes alike.
 pub fn (mut h HandshakeCore) receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
-	return h.core_receive_bytes(bytes, .initial)!
+	return h.receive_bytes(bytes, .initial)!
 }
 
 // receive_handshake_bytes feeds bytes protected by the handshake traffic keys —
 // TLS records or Handshake-packet CRYPTO bytes alike.
 pub fn (mut h HandshakeCore) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
-	return h.core_receive_bytes(bytes, .handshake)!
+	return h.receive_bytes(bytes, .handshake)!
 }
 
 // zeroize_traffic_secrets destroys all traffic secrets (handshake and application)
@@ -590,6 +595,11 @@ pub fn (mut h HandshakeCore) zeroize_traffic_secrets() ! {
 	wipe_secret(mut h.s_hsk_tsec)
 	wipe_secret(mut h.c_app_tsec)
 	wipe_secret(mut h.s_app_tsec)
+	// Scrub any leftover reassembly bytes so nothing survives past handshake
+	// completion. take_buffered_handshake_bytes() (TLS-record-only) already drains
+	// reassembly on the TLS path, but QUIC has no equivalent, so this covers both.
+	wipe_secret(mut h.reassembly)
+	h.reassembly = []u8{}
 }
 
 // set_hash_algo adopts the negotiated suite's hash, rebuilding the transcript

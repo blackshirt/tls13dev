@@ -237,7 +237,7 @@ new_quic_handshake(server_name string, options HandshakeOptions) !HandshakeCore 
      (h) traffic_keys() !TrafficKeys        // opaque KeyMaterial legs, client and server; phase implied by HandshakeState — handshake secrets after ServerHello, application secrets at .connected; hp slot empty on TLS record legs, filled on QUIC packet legs
 
 // TLS record path (is_quic-guarded: refuses a QUIC-mode core with an error)
-     (h) initial_backlog() !int   /   (h) handshake_backlog() !int   // §5.1 ServerHello record-boundary hook
+     (h) reassembly_len() !int   // §5.1 ServerHello record-boundary hook; single reassembly buffer shared by initial and handshake phases
 (mut h) next_application_key_material(is_server_leg bool) !KeyMaterial   // §7.2 key update: true = server→client read leg, false = client→server write leg
 (mut h) take_buffered_handshake_bytes() ![]u8   // hand off bytes coalesced behind the server Finished (§4.6.1)
 
@@ -261,9 +261,11 @@ The public seam names the phase in the entry point — `receive_initial_bytes()`
   core in either mode; the QUIC engine still owns packet protection state and QUIC
   key updates.
 - **Lifecycle and framing stay explicit.** Both modes share failure cleanup
-  and handshake-secret zeroization. The reassembly counts the record adapter
-  needs for the TLS ServerHello record-boundary rule are the core's record-side
-  `initial_backlog()` / `handshake_backlog()` — they and
+  and handshake-secret zeroization. `zeroize_traffic_secrets()` wipes both
+  directions' traffic secrets *and* the reassembly buffer at `.connected`, so nothing
+  survives past handshake completion. The record adapter needs for the TLS
+  ServerHello record-boundary rule are the core's record-side
+  `reassembly_len()` — it and
   `take_buffered_handshake_bytes()` refuse a QUIC-mode core; QUIC maps alert
   descriptions to QUIC connection errors.
 

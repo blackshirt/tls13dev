@@ -949,6 +949,7 @@ fn wipe_protection_state(mut slot ?ProtectionState) {
 fn (mut e Engine) release_handshake_keys() ! {
 	wipe_protection_state(mut e.handshake_tx)
 	wipe_protection_state(mut e.handshake_rx)
+	e.hs.wipe_key_schedule_secrets()
 }
 
 // wipe_packet_keys zeroes and releases every packet-protection state this engine

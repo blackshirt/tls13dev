@@ -33,7 +33,7 @@ The core was therefore split so that the carrier is always someone else's job:
    │  Codecs: messages.v / client_hello.v / server_hello.v / server_flight.v        │
    │          post_handshake.v / transcript.v                                       │
    │  Key seam: key_schedule.v accessors answer both modes (leg shape by mode)      │
-   │  One-sided: core_guarded.v ratchet/backlog + params/HRR (is_quic-guarded)      │
+   │  One-sided: core_guarded.v ratchet/reassembly_len + params/HRR (is_quic-guarded)      │
    │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
@@ -436,7 +436,7 @@ protection, and the alert alone rarely shows which parameter was at fault.
   through structured progress results.
 - `src/tls/handshake/state_machine.v` — the unified TLS handshake core.
 - `src/tls/handshake/core_guarded.v` — the core's one-sided methods: the TLS-record
-  ratchet/backlog and the QUIC params/HRR surface (is_quic-guarded).
+  ratchet/reassembly_len and the QUIC params/HRR surface (is_quic-guarded).
 - `src/tls/handshake/passthrough.v` — CRYPTO-stream reassembly (RFC 9001 §4).
 - `src/tls/handshake/alert.v` — `AlertDescription` + `quic_connection_error()`.
 - `src/tls/handshake/key_schedule.v` — `hkdf_expand_label`, the §7.1 ladder.
