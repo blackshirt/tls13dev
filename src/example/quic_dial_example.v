@@ -4,6 +4,10 @@
 // negotiated ALPN and cipher suite. Run with
 // `v run src/example/quic_dial_example.v`.
 //
+// Set QUIC_DEBUG=1 to trace the handshake on stderr (the plaintext ClientHello,
+// datagram sizes, and first-flight bytes):
+// `QUIC_DEBUG=1 v run src/example/quic_dial_example.v`.
+//
 // quic.dial owns the socket and drives the handshake to confirmation internally, so
 // the caller no longer hand-pumps datagrams through the engine. It still stops at a
 // confirmed handshake: there are no streams, flow control, or loss recovery yet.

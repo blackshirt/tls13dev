@@ -66,7 +66,6 @@ fn test_client_auth_request_answered_with_empty_certificate() ! {
 	assert fl.rest.len == 2
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
 	assert produced.len == 1
-	assert produced[0].level == .handshake
 	assert h.state() == .wait_cert
 
 	// The server validates the echo and returns the deferred Cert/CV/Fin tail.
@@ -100,7 +99,6 @@ fn test_full_handshake_reaches_connected_byte_by_byte() ! {
 	// The encrypted flight, one byte at a time, across every reassembly boundary.
 	produced := feed_encrypted_flight(mut h, fakeserver.flatten(fl.rest))!
 	assert produced.len == 1
-	assert produced[0].level == .handshake
 	assert h.state() == .connected
 
 	// The server must accept the exact client Finished the core produced.
@@ -151,7 +149,6 @@ fn test_hello_retry_request_change_group_reaches_connected() ! {
 	// The HRR arrives at Initial level; the core answers with the retry ClientHello.
 	out := h.receive_initial_bytes(fl1.server_hello)!
 	assert out.len == 1
-	assert out[0].level == .initial
 	assert h.state() == .wait_sh
 
 	fl2 := srv.handle_client_hello(out[0].msg)!
@@ -344,7 +341,7 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	// The application traffic secrets the split derivers produced from the caller-owned
 	// Master Secret survive, and readiness reports them.
 	assert h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
-	assert h.available_secret_phases().application
+	assert h.state() == .connected
 	// The record accessor derives the key/iv pair the transport consumes on demand.
 	mut app_keys := h.application_traffic_keys()!
 	mut app_client := app_keys.take_client_material()

@@ -25,47 +25,10 @@ fn wrap_hsk(typ HandshakeType, body []u8) []u8 {
 	return w.bytes()
 }
 
-// ---- TLS encryption-level contract ----
-
-fn test_encryption_level_order() ! {
-	assert u8(EncryptionLevel.initial) == 0
-	assert u8(EncryptionLevel.handshake) == 1
-	assert u8(EncryptionLevel.application) == 2
-}
-
-// test_encryption_level_rejects_unsupported_operation checks that a shared
-// level value is rejected when it does not apply to the selected API operation. The
-// TLS record accessor is not one of the refusal sites any more: its return names the
-// phase, so an initial-phase request cannot be written down at all. Wrong-transport
-// guards have their own suite (transport_guard_test.v).
-fn test_encryption_level_rejects_unsupported_operation() ! {
-	mut record := new_tls_handshake('example.com', HandshakeOptions{
-		validator: fixture_validator()
-	})!
-	_ = record.create_client_hello()!
-	mut rejected := false
-	record.receive_msgs_at_level(.application, []u8{}) or {
-		assert err.msg().contains('does not accept application-level bytes')
-		rejected = true
-	}
-	assert rejected
-
-	quic := new_quic_handshake('example.com', HandshakeOptions{
-		validator: fixture_validator()
-	})!
-	rejected = false
-	quic.traffic_keys_at(.initial) or {
-		assert err.msg().contains('initial level has no traffic secrets')
-		rejected = true
-	}
-	assert rejected
-}
-
 // test_handshake_message_carries_level_and_bytes checks that a message carries
 // its level tag and the full framed bytes.
 fn test_handshake_message_carries_level_and_bytes() ! {
-	m := new_handshake_message(.handshake, [u8(0x14), 0x00, 0x00, 0x01, 0xff])!
-	assert m.level == .handshake
+	m := new_handshake_message([u8(0x14), 0x00, 0x00, 0x01, 0xff])!
 	assert m.msg.len == 5
 }
 
@@ -74,7 +37,7 @@ fn test_handshake_message_carries_level_and_bytes() ! {
 fn test_new_handshake_message_rejects_length_mismatch() ! {
 	// Finished header declaring a 5-byte body, message carrying only 1.
 	bad := [u8(0x14), 0x00, 0x00, 0x05, 0xff]
-	new_handshake_message(.handshake, bad) or {
+	new_handshake_message(bad) or {
 		assert err.msg().contains('declares 5 body bytes, message carries 1')
 		return
 	}
@@ -84,7 +47,7 @@ fn test_new_handshake_message_rejects_length_mismatch() ! {
 // test_new_handshake_message_rejects_truncated_header checks that a message
 // shorter than its own header surfaces the header error.
 fn test_new_handshake_message_rejects_truncated_header() ! {
-	new_handshake_message(.initial, [u8(0x01), 0x00]) or {
+	new_handshake_message([u8(0x01), 0x00]) or {
 		assert err.msg().contains('header truncated')
 		return
 	}
@@ -651,18 +614,6 @@ fn test_zeroize_application_secrets_refuses_before_connected() ! {
 	assert false
 }
 
-// test_zeroize_traffic_secrets_at_refuses_initial checks the initial level, which has
-// no TLS traffic secrets, is refused rather than silently accepted.
-fn test_zeroize_traffic_secrets_at_refuses_initial() ! {
-	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	h.state = HandshakeState.connected
-	h.zeroize_traffic_secrets_at(.initial) or {
-		assert err.msg().contains('initial level has no traffic secrets')
-		return
-	}
-	assert false
-}
-
 // test_next_application_key_material_refuse_missing_secrets checks that a key
 // update refuses while the application traffic secrets are still empty.
 fn test_next_application_key_material_refuse_missing_secrets() ! {
@@ -878,29 +829,4 @@ fn test_next_application_key_material_wipes_superseded_secret() ! {
 	// The handed-back pair came from the surviving secret, not the zeroed alias.
 	assert keys.key.len == h.key_len
 	keys.wipe()
-}
-
-// test_available_secret_phases_tracks_derivation locks the transport-neutral
-// readiness query the adapters now rely on instead of decoding HandshakeState:
-// each phase flips true only once both directions' secrets exist, and a terminal
-// failure that wipes the schedule drops readiness back to none.
-fn test_available_secret_phases_tracks_derivation() ! {
-	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
-	_ = h.create_client_hello()!
-	// Before ServerHello: no phase material yet.
-	assert h.available_secret_phases().handshake == false
-	assert h.available_secret_phases().application == false
-	// Plant handshake secrets (as the ServerHello derivation would).
-	h.c_hsk_tsec = [u8(1), 2, 3]
-	h.s_hsk_tsec = [u8(4), 5, 6]
-	assert h.available_secret_phases().handshake
-	assert h.available_secret_phases().application == false
-	// Plant application secrets (as the server Finished derivation would).
-	h.c_app_tsec = [u8(7)]
-	h.s_app_tsec = [u8(8)]
-	assert h.available_secret_phases().application
-	// A terminal failure wipes the whole schedule: readiness drops to none.
-	h.fail_and_zeroize_secrets()
-	assert h.available_secret_phases().handshake == false
-	assert h.available_secret_phases().application == false
 }

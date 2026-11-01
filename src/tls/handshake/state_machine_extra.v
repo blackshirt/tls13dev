@@ -29,49 +29,54 @@ fn (mut h HandshakeCore) fail_with(alert AlertDescription, err IError) IError {
 	return h.classify_failure(alert, err.msg())
 }
 
-// core_receive_msgs_at_level guards and dispatches inbound bytes: a level is accepted only
-// while phase-legal (initial until ServerHello, handshake until Finished), and misuse is
-// rejected without consuming bytes or changing state; legal bytes append then consume.
-fn (mut h HandshakeCore) core_receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+// core_receive_initial_bytes guards and dispatches inbound pre-ServerHello bytes:
+// accepted only while awaiting ServerHello (state == .wait_sh). Misuse is rejected
+// without consuming bytes or changing state; legal bytes append then consume.
+fn (mut h HandshakeCore) core_receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
 	}
 	if h.state == .failed {
 		return error('handshake: state machine has failed; further handshake bytes are refused')
 	}
-	if level == .application {
-		return error('handshake: the handshake core does not accept application-level bytes')
+	if h.state != .wait_sh {
+		return error('handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state()})')
 	}
-	if !h.is_level_open(level) {
-		msg := if level == .handshake {
-			'handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state()})'
-		} else {
-			'handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state()})'
-		}
-		return error(msg)
-	}
-	return h.append_and_consume_msgs_at(level, bytes)
+	return h.append_and_consume_initial(bytes)
 }
 
-// append_and_consume_msgs_at bounds each append before allocating, while letting one
-// call deliver several complete messages. Inner failures tear down via classify_failure;
-// the fail_and_zeroize_secrets() nets below catch the rest (teardown is idempotent).
-fn (mut h HandshakeCore) append_and_consume_msgs_at(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
+// core_receive_handshake_bytes guards and dispatches inbound handshake-key-protected
+// bytes: accepted only while inside the encrypted server flight (is_in_flight()).
+fn (mut h HandshakeCore) core_receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
+	if h.state == .start {
+		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
+	}
+	if h.state == .failed {
+		return error('handshake: state machine has failed; further handshake bytes are refused')
+	}
+	if !h.is_in_flight() {
+		return error('handshake: handshake-level bytes are only expected after ServerHello and before Finished (state: ${h.state()})')
+	}
+	return h.append_and_consume_handshake(bytes)
+}
+
+// append_and_consume_initial bounds each append of pre-ServerHello bytes before
+// allocating, then consumes complete initial-level messages from the initial buffer.
+fn (mut h HandshakeCore) append_and_consume_initial(bytes []u8) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	mut offset := 0
 	limit := handshake_header_len + max_handshake_message_len
 	for {
-		available := limit - h.buffers.len(level)
+		available := limit - h.buffers.initial.len
 		if offset < bytes.len && available == 0 {
-			alert := if level == .initial { 'initial-level' } else { 'handshake-level' }
-			return h.classify_failure(.decode_error, 'handshake: ${alert} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
+			return h.classify_failure(.decode_error, 'handshake: initial-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 		}
 		take := if bytes.len - offset > available { available } else { bytes.len - offset }
 		if take > 0 {
-			h.buffers.append(level, bytes[offset..offset + take])
+			h.buffers.initial << bytes[offset..offset + take]
 			offset += take
 		}
-		messages := h.consume_msgs_at(level) or {
+		messages := h.consume_initial_msgs() or {
 			h.fail_and_zeroize_secrets()
 			return err
 		}
@@ -83,33 +88,73 @@ fn (mut h HandshakeCore) append_and_consume_msgs_at(level EncryptionLevel, bytes
 	return out
 }
 
-// is_level_open reports whether one level's buffer is legal for the current state;
-// core_receive_msgs_at_level and consume_msgs_at() share it as the single phase-legality rule.
-fn (h &HandshakeCore) is_level_open(level EncryptionLevel) bool {
-	return match level {
-		.initial { h.state == .wait_sh }
-		.handshake { h.is_in_flight() }
-		.application { false }
+// append_and_consume_handshake bounds each append of handshake-key-protected bytes
+// before allocating, then consumes complete handshake-level messages from the handshake buffer.
+fn (mut h HandshakeCore) append_and_consume_handshake(bytes []u8) ![]HandshakeMessage {
+	mut out := []HandshakeMessage{}
+	mut offset := 0
+	limit := handshake_header_len + max_handshake_message_len
+	for {
+		available := limit - h.buffers.handshake.len
+		if offset < bytes.len && available == 0 {
+			return h.classify_failure(.decode_error, 'handshake: handshake-level reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
+		}
+		take := if bytes.len - offset > available { available } else { bytes.len - offset }
+		if take > 0 {
+			h.buffers.handshake << bytes[offset..offset + take]
+			offset += take
+		}
+		messages := h.consume_handshake_msgs() or {
+			h.fail_and_zeroize_secrets()
+			return err
+		}
+		out << messages
+		if offset == bytes.len {
+			break
+		}
 	}
+	return out
 }
 
-// consume_msgs_at consumes the complete messages one level's buffer currently holds,
-// dispatching each through the state machine and returning the messages it produces.
-// Framing-boundary checks remain adapter policy.
-fn (mut h HandshakeCore) consume_msgs_at(level EncryptionLevel) ![]HandshakeMessage {
+// is_initial_phase reports whether the initial-phase buffer is legal for the current state.
+fn (h &HandshakeCore) is_initial_phase() bool {
+	return h.state == .wait_sh
+}
+
+// is_handshake_phase reports whether the handshake-phase buffer is legal for the current state.
+fn (h &HandshakeCore) is_handshake_phase() bool {
+	return h.is_in_flight()
+}
+
+// consume_initial_msgs consumes the complete messages the initial buffer currently
+// holds, dispatching each through handle_server_hello_message.
+fn (mut h HandshakeCore) consume_initial_msgs() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
-	for h.is_level_open(level) {
-		msg := h.buffers.next_message(level) or {
+	for h.state == .wait_sh {
+		msg := h.buffers.next_initial_message() or {
 			return h.fail_with(.decode_error, err)
 		}
 		if msg.len == 0 {
 			break // header or body still incomplete
 		}
-		out_msgs := if level == .initial {
-			h.handle_server_hello_message(msg) or { return err }
-		} else {
-			h.handle_handshake_message(msg) or { return err }
+		out_msgs := h.handle_server_hello_message(msg) or { return err }
+		out << out_msgs
+	}
+	return out
+}
+
+// consume_handshake_msgs consumes the complete messages the handshake buffer currently
+// holds, dispatching each through handle_handshake_message.
+fn (mut h HandshakeCore) consume_handshake_msgs() ![]HandshakeMessage {
+	mut out := []HandshakeMessage{}
+	for h.is_in_flight() {
+		msg := h.buffers.next_handshake_message() or {
+			return h.fail_with(.decode_error, err)
 		}
+		if msg.len == 0 {
+			break // header or body still incomplete
+		}
+		out_msgs := h.handle_handshake_message(msg) or { return err }
 		out << out_msgs
 	}
 	return out
@@ -165,22 +210,14 @@ fn new_reassembly_buffers() ReassemblyBuffers {
 	}
 }
 
-// len reports the unconsumed byte count at one level.
-fn (b &ReassemblyBuffers) len(level EncryptionLevel) int {
-	return match level {
-		.initial { b.initial.len }
-		.handshake { b.handshake.len }
-		.application { 0 }
-	}
+// next_initial_message extracts one complete framed message from the initial buffer.
+fn (mut b ReassemblyBuffers) next_initial_message() ![]u8 {
+	return next_recordless_message(mut b.initial)
 }
 
-// append adds bytes to one level's reassembly buffer.
-fn (mut b ReassemblyBuffers) append(level EncryptionLevel, bytes []u8) {
-	match level {
-		.initial { b.initial << bytes }
-		.handshake { b.handshake << bytes }
-		.application {}
-	}
+// next_handshake_message extracts one complete framed message from the handshake buffer.
+fn (mut b ReassemblyBuffers) next_handshake_message() ![]u8 {
+	return next_recordless_message(mut b.handshake)
 }
 
 // handshake_leading_byte returns the first buffered handshake-level byte, if any.
@@ -189,15 +226,6 @@ fn (b &ReassemblyBuffers) handshake_leading_byte() ?u8 {
 		return none
 	}
 	return b.handshake[0]
-}
-
-// next_message extracts one complete framed message from one level's buffer.
-fn (mut b ReassemblyBuffers) next_message(level EncryptionLevel) ![]u8 {
-	match level {
-		.initial { return next_recordless_message(mut b.initial) }
-		.handshake { return next_recordless_message(mut b.handshake) }
-		.application { return []u8{} }
-	}
 }
 
 // take_handshake hands back a copy of the handshake-level buffer and scrubs the

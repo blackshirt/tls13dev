@@ -21,7 +21,7 @@ pub fn (h &HandshakeCore) initial_backlog() !int {
 	if h.is_quic {
 		return error('handshake: initial_backlog() is TLS-record-only (QUIC frames its own CRYPTO stream)')
 	}
-	return h.buffers.len(.initial)
+	return h.buffers.initial.len
 }
 
 // handshake_backlog reports bytes the handshake-phase reassembly retained — the
@@ -30,7 +30,7 @@ pub fn (h &HandshakeCore) handshake_backlog() !int {
 	if h.is_quic {
 		return error('handshake: handshake_backlog() is TLS-record-only (QUIC frames its own CRYPTO stream)')
 	}
-	return h.buffers.len(.handshake)
+	return h.buffers.handshake.len
 }
 
 // take_buffered_handshake_bytes moves whatever consume_msgs_at() left buffered at

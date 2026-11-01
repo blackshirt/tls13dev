@@ -414,7 +414,23 @@ has to be a transport.
 
 ---
 
-## 7. See also
+## 7. Debugging the bundled example
+
+Run the example with `QUIC_DEBUG=1` to trace the handshake on stderr:
+
+```bash
+QUIC_DEBUG=1 v run src/example/quic_dial_example.v
+```
+
+The trace prints the plaintext ClientHello (length and hex), the size of the
+sealed first flight, and its leading bytes. The negotiated ALPN and cipher suite
+still go to stdout, so the trace can be redirected independently. This matters
+when a peer rejects a ClientHello — the wire bytes are sealed by Initial
+protection, and the alert alone rarely shows which parameter was at fault.
+
+---
+
+## 8. See also
 
 - `src/tls/handshake/CONTRACT.md` — the unified-core contract, including the
   remaining opportunity to report handshake milestones

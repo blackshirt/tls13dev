@@ -524,9 +524,10 @@ fn (mut c Conn) do_handshake() ! {
 				if msgs.len == 0 && c.hs.state() == .wait_sh {
 					return c.classify_failure(.unexpected_message, 'tls: incomplete ServerHello at record boundary (unexpected_message)')
 				}
-				if c.hs.available_secret_phases().handshake {
-					// Install once the core actually holds handshake secrets, keyed on the
-					// same readiness query the QUIC adapter uses, not on state().
+				if c.hs.state() != .start && c.hs.state() != .wait_sh && c.hs.state() != .failed {
+					// Install once the core actually holds handshake secrets, keyed on
+					// the same readiness the QUIC engine derives from HandshakeState,
+					// not on a separate SecretPhases query.
 					c.rec.install_handshake_protection(mut c.hs)!
 				}
 				// A retry ClientHello travels plaintext plus a fresh dummy CCS (App. D.4).

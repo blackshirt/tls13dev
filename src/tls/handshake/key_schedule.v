@@ -343,24 +343,6 @@ fn (k &TrafficKeys) is_ready() bool {
 	return k.client.is_ready() && k.server.is_ready()
 }
 
-// SecretPhases reports which traffic-secret phases the core currently holds
-// (derived, not yet zeroized, both directions present). Transport-neutral: it lets
-// adapters install record or packet keys when the material actually exists instead
-// of re-deriving readiness from HandshakeState.
-pub struct SecretPhases {
-pub:
-	handshake   bool // client+server handshake traffic secrets available
-	application bool // client+server application traffic secrets available
-}
-
-// available_secret_phases reports the current key-material readiness.
-pub fn (h &HandshakeCore) available_secret_phases() SecretPhases {
-	return SecretPhases{
-		handshake:   h.c_hsk_tsec.len > 0 && h.s_hsk_tsec.len > 0
-		application: h.c_app_tsec.len > 0 && h.s_app_tsec.len > 0
-	}
-}
-
 // release_ephemeral_keys drops both ephemeral ECDHE private halves: the vlib key
 // types expose no in-place wipe, so releasing the handles is the available
 // destruction (§7.5). Sole caller is wipe_key_schedule_secrets(), reached from both
@@ -370,48 +352,20 @@ fn (mut h HandshakeCore) release_ephemeral_keys() {
 	h.priv_p256 = none
 }
 
-// traffic_keys_at is the shared derivation behind the two public accessors below:
-// it guards that one level's retained traffic secrets are present, then derives both
-// directions' KeyMaterial legs from them — the core's is_quic mode bit selects the
-// label vocabulary (RFC 8446 §7.1 'key'/'iv' vs RFC 9001 §5.1 'quic key/iv/hp') and
-// with it the leg shape: record legs leave hp empty, packet legs fill it. The initial
-// level has no traffic secrets in either mode (QUIC Initial keys derive from the DCID,
-// RFC 9001 §5.2), so it is refused here even though no public accessor names it.
-fn (h &HandshakeCore) traffic_keys_at(level EncryptionLevel) !TrafficKeys {
-	match level {
-		.initial {
-			return error('handshake: initial level has no traffic secrets (Initial keys derive from the DCID, RFC 9001 §5.2)')
-		}
-		.handshake {
-			if h.c_hsk_tsec.len == 0 || h.s_hsk_tsec.len == 0 {
-				return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_secrets())')
-			}
-			return TrafficKeys{
-				client: derive_key_material(h.hash_algo, h.c_hsk_tsec, h.key_len, h.is_quic)!
-				server: derive_key_material(h.hash_algo, h.s_hsk_tsec, h.key_len, h.is_quic)!
-			}
-		}
-		.application {
-			if h.c_app_tsec.len == 0 || h.s_app_tsec.len == 0 {
-				return error('handshake: application traffic keys unavailable before the server Finished')
-			}
-			return TrafficKeys{
-				client: derive_key_material(h.hash_algo, h.c_app_tsec, h.key_len, h.is_quic)!
-				server: derive_key_material(h.hash_algo, h.s_app_tsec, h.key_len, h.is_quic)!
-			}
-		}
-	}
-}
-
 // handshake_traffic_keys returns the handshake-phase key generation for the calling
-// transport to install, derived on demand through traffic_keys_at(): record legs (hp
-// empty) on a TLS-mode core, packet legs (key+iv+hp) on a QUIC-mode core. Each call
-// yields a fresh, caller-owned generation — drain it with take_client_material() /
-// take_server_material() and wipe() the rest, so no copy escapes unscrubbed (§7.5).
-// The initial phase has no accessor at all, so asking for it is not expressible rather
-// than refused.
+// transport to install, derived on demand: record legs (hp empty) on a TLS-mode core,
+// packet legs (key+iv+hp) on a QUIC-mode core. Each call yields a fresh, caller-owned
+// generation — drain it with take_client_material() / take_server_material() and wipe()
+// the rest, so no copy escapes unscrubbed (§7.5). The handshake phase has no traffic
+// secrets before the ServerHello and none after zeroize_handshake_secrets().
 pub fn (h &HandshakeCore) handshake_traffic_keys() !TrafficKeys {
-	return h.traffic_keys_at(.handshake)
+	if h.c_hsk_tsec.len == 0 || h.s_hsk_tsec.len == 0 {
+		return error('handshake: handshake traffic keys unavailable (available after ServerHello, dropped by zeroize_handshake_secrets())')
+	}
+	return TrafficKeys{
+		client: derive_key_material(h.hash_algo, h.c_hsk_tsec, h.key_len, h.is_quic)!
+		server: derive_key_material(h.hash_algo, h.s_hsk_tsec, h.key_len, h.is_quic)!
+	}
 }
 
 // application_traffic_keys returns the application-phase key generation, derived
@@ -421,53 +375,12 @@ pub fn (h &HandshakeCore) handshake_traffic_keys() !TrafficKeys {
 // KeyUpdate concept; QUIC key updates live in the packet layer) ratchets and derives
 // in one step so a generation can never be skipped.
 pub fn (h &HandshakeCore) application_traffic_keys() !TrafficKeys {
-	return h.traffic_keys_at(.application)
-}
-
-// wipe_traffic_secrets_at is the unguarded per-level wipe: it zeroes the client and
-// server traffic secrets for one encryption level; the initial level has no TLS
-// traffic secrets. It is the write-side counterpart of traffic_keys_at() above, so
-// reads and wipes share the same level-keyed vocabulary.
-fn (mut h HandshakeCore) wipe_traffic_secrets_at(level EncryptionLevel) {
-	match level {
-		.initial {}
-		.handshake {
-			wipe_secret(mut h.c_hsk_tsec)
-			wipe_secret(mut h.s_hsk_tsec)
-		}
-		.application {
-			wipe_secret(mut h.c_app_tsec)
-			wipe_secret(mut h.s_app_tsec)
-		}
+	if h.c_app_tsec.len == 0 || h.s_app_tsec.len == 0 {
+		return error('handshake: application traffic keys unavailable before the server Finished')
 	}
-}
-
-// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
-// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
-// handshake traffic secrets.
-fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
-	wipe_secret(mut h.handshake_secret)
-	h.release_ephemeral_keys()
-}
-
-// zeroize_traffic_secrets_at is the guarded lifecycle entry, normal teardown's only
-// route to the per-level wipe: it destroys one level's client and server traffic
-// secrets once the adapter no longer needs them. The record keys are derived from those
-// secrets on demand, so wiping the secrets is the single truth — there is no separate
-// cached generation to scrub. Valid only after .connected; the initial level is refused
-// (RFC 8446 §7.5). Public wrappers: the phase-named zeroize_handshake_secrets() /
-// zeroize_application_secrets() entry points.
-pub fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) ! {
-	match level {
-		.initial {
-			return error('handshake: initial level has no traffic secrets to zeroize')
-		}
-		.handshake, .application {
-			if h.state != .connected {
-				return error('handshake: zeroizing ${level} traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
-			}
-			h.wipe_traffic_secrets_at(level)
-		}
+	return TrafficKeys{
+		client: derive_key_material(h.hash_algo, h.c_app_tsec, h.key_len, h.is_quic)!
+		server: derive_key_material(h.hash_algo, h.s_app_tsec, h.key_len, h.is_quic)!
 	}
 }
 
@@ -479,8 +392,18 @@ pub fn (mut h HandshakeCore) zeroize_traffic_secrets_at(level EncryptionLevel) !
 // failure can land before .connected ever held.
 pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_key_schedule_secrets()
-	h.wipe_traffic_secrets_at(.handshake)
-	h.wipe_traffic_secrets_at(.application)
+	wipe_secret(mut h.c_hsk_tsec)
+	wipe_secret(mut h.s_hsk_tsec)
+	wipe_secret(mut h.c_app_tsec)
+	wipe_secret(mut h.s_app_tsec)
 	h.buffers.release_buffers()
 	h.state = .failed
+}
+
+// wipe_key_schedule_secrets destroys the key-schedule intermediate and the dead
+// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5); it spares the
+// handshake traffic secrets.
+fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
+	wipe_secret(mut h.handshake_secret)
+	h.release_ephemeral_keys()
 }

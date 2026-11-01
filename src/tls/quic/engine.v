@@ -597,9 +597,10 @@ fn (mut e Engine) feed_crypto(is_initial bool, msg []u8) ![]handshake.HandshakeM
 }
 
 // queue_outbound places an outbound handshake message into the right level's
-// outbound CRYPTO buffer.
+// outbound CRYPTO buffer. The phase is determined by the core's current state:
+// .wait_sh means initial (plaintext ClientHello), anything else means handshake.
 fn (mut e Engine) queue_outbound(m handshake.HandshakeMessage) ! {
-	if m.is_initial() {
+	if e.hs.state() == .wait_sh {
 		e.tx_crypto_initial << m.msg()
 	} else {
 		e.tx_crypto_hands << m.msg()
@@ -611,15 +612,16 @@ fn (mut e Engine) queue_outbound(m handshake.HandshakeMessage) ! {
 // mode answers these calls with filled key+iv+hp legs). It is
 // idempotent: keys are only installed once.
 fn (mut e Engine) install_packet_keys() ! {
-	// Readiness comes from the core's secret-phase query, not from decoding
-	// HandshakeState: a phase is true exactly while both directions' traffic secrets
-	// exist, so a .failed handshake (schedule wiped) never reaches these expands with
-	// live secrets. The adapter keeps its own install-once flags.
-	phases := e.hs.available_secret_phases()
-	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none && phases.handshake {
+	// Readiness comes from HandshakeState: handshake secrets exist from .wait_ee
+	// (after ServerHello) and application secrets exist at .connected. A .failed
+	// handshake (schedule wiped) never reaches these expands with live secrets
+	// because fail_and_zeroize_secrets parks .failed and wipes both. The adapter
+	// keeps its own install-once flags.
+	if !e.confirmed && e.handshake_tx == none && e.handshake_rx == none
+		&& e.hs.state() != .start && e.hs.state() != .wait_sh && e.hs.state() != .failed {
 		e.install_handshake_protection()!
 	}
-	if phases.application && e.app_tx == none && e.app_rx == none {
+	if e.hs.state() == .connected && e.app_tx == none && e.app_rx == none {
 		e.install_application_protection()!
 	}
 }

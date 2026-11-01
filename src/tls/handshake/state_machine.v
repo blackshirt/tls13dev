@@ -33,42 +33,26 @@ pub enum HandshakeState {
 	failed        // implementation terminal; no further handshake messages are accepted
 }
 
-// HandshakeMessage is one outbound handshake message, unframed: level tags its
-// TLS protection phase, and msg holds the wire bytes, header included.
+// HandshakeMessage is one outbound handshake message, unframed: msg holds the wire
+// bytes, header included. Its protection phase is implied by the core's current
+// HandshakeState, not stored per-message.
 @[noinit]
 pub struct HandshakeMessage {
-	level EncryptionLevel // protection phase for the message
-	msg   []u8            // complete handshake message bytes, including the header
+	msg []u8 // complete handshake message bytes, including the header
 }
 
-// new_handshake_message builds a validated outbound message for the core.
-fn new_handshake_message(level EncryptionLevel, msg []u8) !HandshakeMessage {
+// new_handshake_message builds a validated outbound message for the core. Its
+// protection phase is the core's current HandshakeState.
+fn new_handshake_message(msg []u8) !HandshakeMessage {
 	_, _ := split_handshake_message(msg)!
 	return HandshakeMessage{
-		level: level
-		msg:   msg
+		msg: msg
 	}
-}
-
-// is_initial reports whether this outbound message is in the pre-ServerHello (plaintext)
-// phase; false means it is protected by handshake keys. It is the only phase fact adapters
-// need to pick a transmit queue, so the module-private EncryptionLevel stays unexposed.
-pub fn (m &HandshakeMessage) is_initial() bool {
-	return m.level == .initial
 }
 
 // msg returns the complete handshake message bytes (4-byte header included).
 pub fn (m &HandshakeMessage) msg() []u8 {
 	return m.msg
-}
-
-// EncryptionLevel names the TLS protection phases shared by handshake messages and
-// traffic-secret access, independent of transport packet/record levels. Module-private:
-// adapters reach each phase through the core's phase-named methods instead.
-enum EncryptionLevel {
-	initial     // handshake messages sent before handshake keys are available
-	handshake   // messages protected with handshake traffic keys
-	application // data protected with application traffic keys
 }
 
 // HandshakeOptions configures the shared TLS handshake, including peer
@@ -444,7 +428,7 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	h.update_transcript(full_ch2)!
 
 	h.state = .wait_sh // rearm: the server now answers with the real ServerHello
-	return [new_handshake_message(.initial, full_ch2)!]
+	return [new_handshake_message(full_ch2)!]
 }
 
 // handle_encrypted_extensions records ALPN and QUIC transport parameters.
@@ -480,7 +464,7 @@ fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![
 	// server's flight is verified, so the server Finished covers our response.
 	response := build_empty_certificate(req.request_context)
 	h.update_transcript(response)!
-	return [new_handshake_message(.handshake, response)!]
+	return [new_handshake_message(response)!]
 }
 
 // handle_certificate parses and validates the server certificate chain.
@@ -579,40 +563,41 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	h.wipe_key_schedule_secrets()
 	// Hand the raw client Finished to the transport, which encrypts it under the
 	// still-active handshake keys.
-	return [new_handshake_message(.handshake, client_fin_msg)!]
-}
-
-// receive_msgs_at_level processes bytes through the reassembly buffers, returning the
-// messages they complete. Transport-neutral (record keys derive on demand), so the receive
-// path has no record-side branch; adapters use the phase-named entry points below.
-fn (mut h HandshakeCore) receive_msgs_at_level(level EncryptionLevel, bytes []u8) ![]HandshakeMessage {
-	return h.core_receive_msgs_at_level(level, bytes)
+	return [new_handshake_message(client_fin_msg)!]
 }
 
 // receive_initial_bytes feeds pre-ServerHello (plaintext) handshake bytes —
 // TLS records or Initial-packet CRYPTO bytes alike.
 pub fn (mut h HandshakeCore) receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
-	return h.receive_msgs_at_level(.initial, bytes)!
+	return h.core_receive_initial_bytes(bytes)!
 }
 
 // receive_handshake_bytes feeds bytes protected by the handshake traffic keys —
 // TLS records or Handshake-packet CRYPTO bytes alike.
 pub fn (mut h HandshakeCore) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
-	return h.receive_msgs_at_level(.handshake, bytes)!
+	return h.core_receive_handshake_bytes(bytes)!
 }
 
 // zeroize_handshake_secrets destroys the handshake traffic secrets once the adapter no
 // longer needs them — and with them the handshake record keys, which derive from those
 // secrets on demand (RFC 8446 §7.5, RFC 9001 §4.9.2); valid only after .connected.
 pub fn (mut h HandshakeCore) zeroize_handshake_secrets() ! {
-	h.zeroize_traffic_secrets_at(.handshake)!
+	if h.state != .connected {
+		return error('handshake: zeroizing handshake traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
+	}
+	wipe_secret(mut h.c_hsk_tsec)
+	wipe_secret(mut h.s_hsk_tsec)
 }
 
 // zeroize_application_secrets destroys the application traffic secrets — the terminal
 // teardown at close() — retiring the application record keys that derive from them
 // (§7.5); valid only after .connected.
 pub fn (mut h HandshakeCore) zeroize_application_secrets() ! {
-	h.zeroize_traffic_secrets_at(.application)!
+	if h.state != .connected {
+		return error('handshake: zeroizing application traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
+	}
+	wipe_secret(mut h.c_app_tsec)
+	wipe_secret(mut h.s_app_tsec)
 }
 
 // set_hash_algo adopts the negotiated suite's hash, rebuilding the transcript

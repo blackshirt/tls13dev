@@ -31,6 +31,13 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 // conn.read(mut buf), conn.negotiated_alpn(), conn.close() ...
 ```
 
+Set `QUIC_DEBUG=1` to trace the QUIC handshake on stderr (the plaintext
+ClientHello, datagram sizes, and first-flight bytes):
+
+```bash
+QUIC_DEBUG=1 v run src/example/quic_dial_example.v
+```
+
 `Conn.close()` sends `close_notify` when possible, then releases the TCP
 socket; after a peer `close_notify`, `read()` returns clean EOF but `close()`
 is still needed to release the socket.
