@@ -389,7 +389,7 @@ pub fn (h &HandshakeCore) traffic_keys() !TrafficKeys {
 
 // fail_and_zeroize_secrets is the unguarded terminal entry: it composes every wipe
 // above — key-schedule intermediate, ephemeral halves, both traffic-secret phases —
-// releases the reassembly buffers, and parks the machine in .failed (RFC 8446
+// releases the reassembly buffer, and parks the machine in .failed (RFC 8446
 // §1.3.1/§7.5). Wiping the traffic secrets also retires the record keys, since they are
 // derived from those secrets on demand. It bypasses the zeroize_* lifecycle guard: a
 // failure can land before .connected ever held.
@@ -399,7 +399,7 @@ pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	wipe_secret(mut h.s_hsk_tsec)
 	wipe_secret(mut h.c_app_tsec)
 	wipe_secret(mut h.s_app_tsec)
-	h.buffers.release_buffers()
+	h.reassembly = []u8{}
 	h.state = .failed
 }
 

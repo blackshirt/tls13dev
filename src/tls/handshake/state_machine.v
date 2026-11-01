@@ -136,7 +136,7 @@ mut:
 	s_app_tsec       []u8 // server application traffic secret
 
 	// Incoming handshake bytes that do not yet form complete messages.
-	buffers ReassemblyBuffers // the initial- and handshake-phase streams, keyed by phase
+	reassembly []u8 // inbound bytes pending a complete message, across both phases
 
 	// Certificate chain received from the server, leaf first; validated against the
 	// immutable validator declared above.
@@ -200,7 +200,7 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 		hash_algo:  .sha256
 		key_len:    16
 		validator:  validator
-		buffers:    new_reassembly_buffers()
+		reassembly: []u8{cap: reassembly_buf_cap}
 	}
 	core.generate_key_share(options.key_share_group)!
 	core.config.client_share = KeyShareEntry{
@@ -551,7 +551,8 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
 	// adapter's take_buffered_handshake_bytes. Any other leading byte is flight garbage.
-	if leading := h.buffers.handshake_leading_byte() {
+	if h.reassembly.len > 0 {
+		leading := h.reassembly[0]
 		if leading != u8(4) && leading != u8(24) {
 			return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
 		}
@@ -569,13 +570,13 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 // receive_initial_bytes feeds pre-ServerHello (plaintext) handshake bytes —
 // TLS records or Initial-packet CRYPTO bytes alike.
 pub fn (mut h HandshakeCore) receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
-	return h.core_receive_initial_bytes(bytes)!
+	return h.core_receive_bytes(bytes, .initial)!
 }
 
 // receive_handshake_bytes feeds bytes protected by the handshake traffic keys —
 // TLS records or Handshake-packet CRYPTO bytes alike.
 pub fn (mut h HandshakeCore) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
-	return h.core_receive_handshake_bytes(bytes)!
+	return h.core_receive_bytes(bytes, .handshake)!
 }
 
 // zeroize_traffic_secrets destroys all traffic secrets (handshake and application)

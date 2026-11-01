@@ -50,8 +50,8 @@ state_machine.v       the unified core vocabulary + HandshakeCore: states,
                       HandshakeOptions, the struct + constructors, the state cursor,
                       create_client_hello, the receive lifecycle, and the ServerHello/HRR
                       and encrypted-flight phase transitions
-state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the per-phase
-                      reassembly buffers (ReassemblyBuffers), the receive/dispatch routing, and
+state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the
+                      reassembly buffer, the receive/dispatch routing, and
                       classify_failure / fail_with / failure_alert
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
@@ -93,8 +93,8 @@ Each `*_test.v` sits beside its source.
   `[]u8` fields on the core keyed by direction and phase (`c_hsk_tsec`/`s_hsk_tsec`, `c_app_tsec`/`s_app_tsec`); the core's
   TLS-record side derives the record keys on demand, one `KeyMaterial` handle per direction,
   returned as a single `TrafficKeys` generation the caller owns — the same shape a QUIC-mode
-  core returns for the same calls, with the header-protection slot filled. Both
-  phase buffers live in `ReassemblyBuffers`. Per-phase wipe and install helpers take a whole
+  core returns for the same calls, with the header-protection slot filled. Inbound bytes
+  share one reassembly buffer across both phases. Per-phase wipe and install helpers take a whole
   phase's two directions (and each key with its nonce base) together, so they cannot be cleared or
   advanced independently — and because the phase is fixed by which accessor produced the
   generation, a wrong-phase install is not expressible at all.
@@ -116,7 +116,7 @@ Each `*_test.v` sits beside its source.
   cannot grow the buffer indefinitely with legal-size records that never complete the flight.
 
 The core owns handshake ordering, transcript updates, certificate validation (via `tls.pki`), the
-key schedule, and per-phase reassembly buffers. It delegates certificate trust decisions entirely to
+key schedule, and the reassembly buffer. It delegates certificate trust decisions entirely to
 `tls.pki` and never touches records or packets.
 
 ## Testing

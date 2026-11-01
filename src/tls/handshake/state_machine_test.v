@@ -77,8 +77,8 @@ fn test_feed_initial_buffers_incomplete_message() ! {
 	assert false // a garbage ServerHello body must never parse cleanly
 }
 
-// test_backlog_tracks_parked_fragment checks that both handshake
-// reassembly buffers start empty and the accessor tracks a parked fragment.
+// test_backlog_tracks_parked_fragment checks that the reassembly buffer starts
+// empty and the accessor tracks a parked fragment.
 fn test_backlog_tracks_parked_fragment() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: fixture_validator() })!
 	assert h.handshake_backlog()! == 0
@@ -346,12 +346,12 @@ fn test_reassembly_is_owned_by_each_handshake_core() ! {
 	_ = record.receive_initial_bytes([u8(2), 0])!
 	_ = quic.receive_initial_bytes([u8(2)])!
 
-	assert record.buffers.initial.len == 2
-	assert quic.buffers.initial.len == 1
+	assert record.reassembly.len == 2
+	assert quic.reassembly.len == 1
 	assert record.initial_backlog()! == 2
 	record.fail_and_zeroize_secrets()
 	assert record.initial_backlog()! == 0
-	assert quic.buffers.initial.len == 1
+	assert quic.reassembly.len == 1
 }
 
 // test_state_progression_to_wait_sh checks that the machine starts at

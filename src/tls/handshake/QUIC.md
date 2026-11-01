@@ -251,7 +251,7 @@ record layer's parser — extracts one complete message from the front of a byte
 buffer, capping the declared length at `max_handshake_message_len` (1 MiB) from
 the header alone so a hostile peer cannot make the adapter buffer indefinitely.
 It is public precisely so an engine can reuse it engine-side. The shared core
-owns the initial- and handshake-phase reassembly buffers for each handshake instance.
+owns one reassembly buffer for each handshake instance.
 
 ---
 

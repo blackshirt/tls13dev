@@ -13,24 +13,24 @@
 // leave the core in either mode.
 module handshake
 
-// initial_backlog reports bytes the initial-phase reassembly retained after
-// complete TLS messages were consumed. TLS-record scope: only the record adapter
-// enforces the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO
+// initial_backlog reports bytes the reassembly buffer retained after complete TLS
+// messages were consumed while awaiting ServerHello. TLS-record scope: only the record
+// adapter enforces the §5.1 ServerHello record-boundary rule; QUIC frames its own CRYPTO
 // stream, so the accessor refuses a QUIC-mode core.
 pub fn (h &HandshakeCore) initial_backlog() !int {
 	if h.is_quic {
 		return error('handshake: initial_backlog() is TLS-record-only (QUIC frames its own CRYPTO stream)')
 	}
-	return h.buffers.initial.len
+	return h.reassembly.len
 }
 
-// handshake_backlog reports bytes the handshake-phase reassembly retained — the
-// drain check the record adapter runs once the encrypted flight is consumed.
+// handshake_backlog reports bytes the reassembly buffer retained — the drain check the
+// record adapter runs once the encrypted flight is consumed.
 pub fn (h &HandshakeCore) handshake_backlog() !int {
 	if h.is_quic {
 		return error('handshake: handshake_backlog() is TLS-record-only (QUIC frames its own CRYPTO stream)')
 	}
-	return h.buffers.handshake.len
+	return h.reassembly.len
 }
 
 // take_buffered_handshake_bytes moves whatever the handshake receive path left
@@ -40,7 +40,9 @@ pub fn (mut h HandshakeCore) take_buffered_handshake_bytes() ![]u8 {
 	if h.is_quic {
 		return error('handshake: take_buffered_handshake_bytes() is TLS-record-only (QUIC reassembles its own CRYPTO stream)')
 	}
-	return h.buffers.take_handshake()
+	taken := h.reassembly.clone()
+	wipe_secret(mut h.reassembly)
+	return taken
 }
 
 // next_application_key_material ratchets one direction's application traffic secret

@@ -77,8 +77,8 @@ engine zeroes each `ProtectionState` (AEAD key, IV, header-protection key) befor
 releasing it. Both use the same module-private, idempotent `holder.wipe()` mechanism;
 users never call it — the only public terminal action is the adapter's `close()` or
 failure handling. Clearing verbs form four tiers: `release_*` drops a whole handle,
-slot, or buffer that is not individually scrubbed (`release_ephemeral_keys`,
-`ReassemblyBuffers.release_buffers`); `wipe_*` / `.wipe()` zeroes bytes then drops
+slot, or buffer that is not individually scrubbed (`release_ephemeral_keys`);
+`wipe_*` / `.wipe()` zeroes bytes then drops
 them (secret material and decrypted plaintext, e.g. `Conn.wipe_app_buf`);
 `zeroize_*` clears secret material under lifecycle guard rules (RFC 8446 §7.5);
 and `destroy_*` tears down a whole adapter connection. `take_*` is orthogonal to
@@ -125,7 +125,7 @@ and the initial phase has none.
 Initial-phase input is accepted only while awaiting ServerHello; handshake-phase
 input is accepted only after ServerHello and before Finished. Out-of-phase API
 calls are rejected without consuming input or changing handshake state.
-Each handshake core owns its phase-specific reassembly buffers and
+Each handshake core owns its reassembly buffer and
 consumes complete TLS messages. An empty result can mean that input is
 incomplete or that a message advanced the state without producing output;
 adapters use `state()` to observe progress and errors to detect invalid input.
@@ -214,8 +214,8 @@ to the core's phase-checked handshake entry points.
 ## Ownership boundary
 
 The core owns TLS handshake ordering, transcript updates, certificate
-validation, the TLS key schedule, shared traffic secrets, and per-phase TLS
-message reassembly buffers. `HandshakeCore` derives key material on demand in both
+validation, the TLS key schedule, shared traffic secrets, and the TLS message
+reassembly buffer. `HandshakeCore` derives key material on demand in both
 modes from its retained traffic secrets, and hands it out through the same shared
 accessors — record legs on a TLS-mode core, packet legs on a QUIC-mode core. Raw
 traffic secrets never leave the core in either mode. The record adapter owns

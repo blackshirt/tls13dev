@@ -1,9 +1,9 @@
 // Copyright (c) 2026 blackshirt.
 //
 // state_machine_extra.v holds the core's intake plumbing and terminal-failure
-// primitives: the per-phase reassembly buffers that hold inbound bytes until they frame
-// into a complete message, the receive/dispatch routing that bounds, frames and gates
-// those bytes against the state machine's ordering, and the failure-classification
+// primitives: the reassembly buffer that holds inbound bytes until they frame into a
+// complete message, the receive/dispatch routing that bounds, frames and gates those
+// bytes against the state machine's ordering, and the failure-classification
 // primitives every error path funnels through. The phase transitions themselves —
 // ServerHello/HelloRetryRequest and the encrypted flight — are state_machine.v's.
 module handshake
@@ -29,57 +29,61 @@ fn (mut h HandshakeCore) fail_with(alert AlertDescription, err IError) IError {
 	return h.classify_failure(alert, err.msg())
 }
 
-// core_receive_initial_bytes guards and dispatches inbound pre-ServerHello bytes:
-// accepted only while awaiting ServerHello (state == .wait_sh). Misuse is rejected
-// without consuming bytes or changing state; legal bytes append then consume.
-fn (mut h HandshakeCore) core_receive_initial_bytes(bytes []u8) ![]HandshakeMessage {
+// ReceivePhase names which inbound reassembly stream bytes belong to. Module-private:
+// adapters reach each phase through the core's phase-named receive entry points.
+enum ReceivePhase {
+	initial   // pre-ServerHello (plaintext) bytes
+	handshake // handshake-key-protected bytes
+}
+
+// core_receive_bytes guards and dispatches inbound handshake bytes for one phase:
+// pre-ServerHello bytes are accepted only while awaiting ServerHello (state == .wait_sh),
+// handshake-key-protected bytes only inside the encrypted server flight (is_in_flight()).
+// Misuse is rejected without consuming bytes or changing state; legal bytes append then
+// consume.
+fn (mut h HandshakeCore) core_receive_bytes(bytes []u8, phase ReceivePhase) ![]HandshakeMessage {
 	if h.state == .start {
 		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
 	}
 	if h.state == .failed {
 		return error('handshake: state machine has failed; further handshake bytes are refused')
 	}
-	if h.state != .wait_sh {
-		return error('handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state()})')
+	match phase {
+		.initial {
+			if h.state != .wait_sh {
+				return error('handshake: initial handshake bytes are only expected while awaiting ServerHello (state: ${h.state()})')
+			}
+			return h.append_and_consume(bytes, 'initial-phase')
+		}
+		.handshake {
+			if !h.is_in_flight() {
+				return error('handshake: handshake-phase bytes are only expected after ServerHello and before Finished (state: ${h.state()})')
+			}
+			return h.append_and_consume(bytes, 'handshake-phase')
+		}
 	}
-	return h.append_and_consume(bytes, mut h.buffers.initial, 'initial-phase')
 }
 
-// core_receive_handshake_bytes guards and dispatches inbound handshake-key-protected
-// bytes: accepted only while inside the encrypted server flight (is_in_flight()).
-fn (mut h HandshakeCore) core_receive_handshake_bytes(bytes []u8) ![]HandshakeMessage {
-	if h.state == .start {
-		return error('handshake: handshake bytes fed before create_client_hello() — no ClientHello has been sent yet')
-	}
-	if h.state == .failed {
-		return error('handshake: state machine has failed; further handshake bytes are refused')
-	}
-	if !h.is_in_flight() {
-		return error('handshake: handshake-phase bytes are only expected after ServerHello and before Finished (state: ${h.state()})')
-	}
-	return h.append_and_consume(bytes, mut h.buffers.handshake, 'handshake-phase')
-}
-
-// append_and_consume bounds each append of `bytes` to the phase reassembly buffer
-// before allocating, then drains complete phase messages. `phase` names the phase for
-// the over-limit alert. The hard cap is max_handshake_message_len; exceeding it is a
-// terminal decode_error. One reassembly loop serves both the initial (pre-ServerHello)
-// and handshake (encrypted-flight) phases, keyed by the buffer passed in.
-fn (mut h HandshakeCore) append_and_consume(bytes []u8, mut buf []u8, phase string) ![]HandshakeMessage {
+// append_and_consume bounds each append of `bytes` to the reassembly buffer before
+// allocating, then drains complete messages. `phase` names the phase for the over-limit
+// alert. The hard cap is max_handshake_message_len; exceeding it is a terminal
+// decode_error. One reassembly loop serves both the initial (pre-ServerHello) and
+// handshake (encrypted-flight) phases.
+fn (mut h HandshakeCore) append_and_consume(bytes []u8, phase string) ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	mut offset := 0
 	limit := handshake_header_len + max_handshake_message_len
 	for {
-		available := limit - buf.len
+		available := limit - h.reassembly.len
 		if offset < bytes.len && available == 0 {
 			return h.classify_failure(.decode_error, 'handshake: ${phase} reassembly exceeds ${max_handshake_message_len} bytes without completing a message')
 		}
 		take := if bytes.len - offset > available { available } else { bytes.len - offset }
 		if take > 0 {
-			buf << bytes[offset..offset + take]
+			h.reassembly << bytes[offset..offset + take]
 			offset += take
 		}
-		messages := h.consume_msgs(mut buf) or {
+		messages := h.consume_msgs() or {
 			h.fail_and_zeroize_secrets()
 			return err
 		}
@@ -109,14 +113,14 @@ fn (mut h HandshakeCore) dispatch_handshake_message(full_msg []u8) ![]HandshakeM
 	return h.handle_handshake_message(full_msg)
 }
 
-// consume_msgs drains complete framed messages from `buf`, dispatching each through
-// dispatch_handshake_message. It stops when the buffer holds an incomplete header or
-// body, or when the core leaves a consuming phase (ServerHello moves out of .wait_sh;
-// Finished moves to .connected).
-fn (mut h HandshakeCore) consume_msgs(mut buf []u8) ![]HandshakeMessage {
+// consume_msgs drains complete framed messages from the reassembly buffer, dispatching
+// each through dispatch_handshake_message. It stops when the buffer holds an incomplete
+// header or body, or when the core leaves a consuming phase (ServerHello moves out of
+// .wait_sh; Finished moves to .connected).
+fn (mut h HandshakeCore) consume_msgs() ![]HandshakeMessage {
 	mut out := []HandshakeMessage{}
 	for h.is_consuming_phase() {
-		msg := next_recordless_message(mut buf) or {
+		msg := next_recordless_message(mut h.reassembly) or {
 			return h.fail_with(.decode_error, err)
 		}
 		if msg.len == 0 {
@@ -157,47 +161,7 @@ fn unexpected_handshake_message(msg_type HandshakeType) string {
 	}
 }
 
-// reassembly_buf_cap is the initial per-phase reassembly allocation, not a limit: the
-// hard bound a hostile peer must never exceed is enforced against
-// max_handshake_message_len in the append-and-consume paths and
-// next_recordless_message.
+// reassembly_buf_cap is the initial reassembly allocation, not a limit: the hard bound
+// a hostile peer must never exceed is enforced against max_handshake_message_len in the
+// append-and-consume paths and next_recordless_message.
 const reassembly_buf_cap = 4096
-
-// ReassemblyBuffers holds the initial- and handshake-phase byte streams that do
-// not yet form complete messages. Application-phase bytes never reach the core.
-struct ReassemblyBuffers {
-mut:
-	initial   []u8 // pre-ServerHello bytes, pending a complete message
-	handshake []u8 // handshake-key-protected bytes, pending a complete message
-}
-
-// new_reassembly_buffers allocates both phase buffers with the standard capacity.
-fn new_reassembly_buffers() ReassemblyBuffers {
-	return ReassemblyBuffers{
-		initial:   []u8{cap: reassembly_buf_cap}
-		handshake: []u8{cap: reassembly_buf_cap}
-	}
-}
-
-// handshake_leading_byte returns the first buffered handshake-phase byte, if any.
-fn (b &ReassemblyBuffers) handshake_leading_byte() ?u8 {
-	if b.handshake.len == 0 {
-		return none
-	}
-	return b.handshake[0]
-}
-
-// take_handshake hands back a copy of the handshake-phase buffer and scrubs the
-// original, because those bytes were decrypted under handshake keys.
-fn (mut b ReassemblyBuffers) take_handshake() []u8 {
-	taken := b.handshake.clone()
-	wipe_secret(mut b.handshake)
-	return taken
-}
-
-// release_buffers drops both phase buffers on terminal failure. Their contents are
-// framing bytes, not key material, so no scrub is owed (§7.5 applies to secrets).
-fn (mut b ReassemblyBuffers) release_buffers() {
-	b.initial = []u8{}
-	b.handshake = []u8{}
-}
