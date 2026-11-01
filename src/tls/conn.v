@@ -917,6 +917,11 @@ fn (mut c Conn) write_records(recs []Record) ! {
 // may already have advanced, so it aborts the connection in place.
 @[direct_array_access]
 fn (mut c Conn) write_application_data(data []u8) !int {
+	// A fatal error is sticky: refuse to write application data on a dead
+	// connection, mirroring read()'s guard (§6.1).
+	if c.fatal_error != '' {
+		return error(c.fatal_error)
+	}
 	return c.write_application_data_inner(data) or {
 		alert := if err.msg().contains('sequence limit') {
 			handshake.AlertDescription.record_overflow
