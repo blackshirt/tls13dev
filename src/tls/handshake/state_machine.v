@@ -408,7 +408,7 @@ fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg 
 	h.hrr_cipher_suite = sh.cipher_suite
 	// §4.4.1: the message_hash uses the HRR suite's hash, so switch before applying the HRR.
 	h.set_hash_algo(suite_hash_algo(sh.cipher_suite))
-	h.transcript.apply_hello_retry_request(full_sh_msg)
+	h.transcript.apply_hello_retry_request(full_sh_msg)!
 
 	return h.build_second_client_hello(sh.has_key_share, sh.server_share.group, sh.cookie)!
 }
@@ -602,17 +602,16 @@ pub fn (mut h HandshakeCore) zeroize_traffic_secrets() ! {
 	h.reassembly = []u8{}
 }
 
-// set_hash_algo adopts the negotiated suite's hash, rebuilding the transcript
-// around it while keeping accumulated messages. A no-op when already matching.
+// set_hash_algo adopts the negotiated suite's hash, re-seeding the running digest
+// from the replayed transcript on a change. A no-op when already matching — the
+// common SHA-256 case, no rebuild.
 fn (mut h HandshakeCore) set_hash_algo(algo HashAlgorithm) {
 	if h.hash_algo == algo {
-		return // already on the target digest — the common SHA-256 case, no rebuild
+		return // already on the target digest, no rebuild
 	}
-	// The Transcript keeps raw messages, not a rolling digest, so a hash change
-	// means reconstructing it around the new hash.
+	// Hash-algo changes happen only at the first ServerHello or a HelloRetryRequest,
+	// where the transcript is just ClientHello1, so re-seeding the new digest from
+	// the replay log is cheap. The running digest itself is never re-scanned.
+	h.transcript.switch_digest(algo)
 	h.hash_algo = algo
-	h.transcript = Transcript{
-		hash_algo: algo
-		messages:  h.transcript.messages.clone()
-	}
 }

@@ -411,9 +411,9 @@ pub fn (h &HandshakeCore) traffic_keys() !TrafficKeys {
 // failure otherwise and would leak SNI/ALPN/certificate material on the heap.
 pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_key_schedule_secrets()
-	// Scrub plaintext handshake history: every message exchanged so far.
-	wipe_secret(mut h.transcript.messages)
-	h.transcript.messages = []u8{}
+	// Scrub plaintext handshake history: every message exchanged so far, plus the
+	// running digest state (its partial block can hold recent plaintext bytes).
+	h.transcript.scrub()
 	// Scrub the server certificate chain: raw DER and every parsed byte field.
 	for i in 0 .. h.server_certs.len {
 		wipe_secret(mut h.server_certs[i].raw)
