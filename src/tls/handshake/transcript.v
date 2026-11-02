@@ -34,10 +34,10 @@ const hs_type_message_hash = u8(0xfe)
 // ServerHello suite to the HRR's suite).
 struct Transcript {
 mut:
-	hash_algo     HashAlgorithm // digest the transcript is hashed with; follows the negotiated suite
+	hash_algo     HashAlgorithm  // digest the transcript is hashed with; follows the negotiated suite
 	sha256_digest &sha256.Digest // running SHA-256 state; active when hash_algo == .sha256
 	sha384_digest &sha512.Digest // running SHA-384 state; active when hash_algo == .sha384
-	messages      []u8          // concatenation of full handshake messages, transport framing excluded
+	messages      []u8           // concatenation of full handshake messages, transport framing excluded
 }
 
 // new_transcript initializes an empty handshake transcript with a live running

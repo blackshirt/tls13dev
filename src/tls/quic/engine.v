@@ -159,10 +159,12 @@ pub fn (e &Engine) negotiated_cipher_suite() handshake.CipherSuite {
 	return e.hs.negotiated_cipher_suite()
 }
 
-// is_confirmed reports whether the engine has processed HANDSHAKE_DONE and released
-// the handshake-stage material.
+// is_confirmed reports whether the handshake completed and the engine processed
+// HANDSHAKE_DONE. Requiring .connected as well as the frame flag keeps a forged
+// HANDSHAKE_DONE in an earlier packet type from making dial() return unauthenticated
+// (RFC 9000 §19.20: HANDSHAKE_DONE is only valid in 1-RTT packets).
 pub fn (e &Engine) is_confirmed() bool {
-	return e.confirmed
+	return e.confirmed && e.hs.state() == .connected
 }
 
 // original_dcid returns the Destination Connection ID the engine used in its
@@ -289,15 +291,15 @@ pub fn (mut e Engine) flush() ![]u8 {
 pub fn (mut e Engine) close(error_code u32, reason string) ![]u8 {
 	e.closed = true
 	e.close_error = error_code
-	frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
+	mut frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
 	// Seal the CONNECTION_CLOSE while the packet keys are still present, then destroy.
 	mut packet := []u8{}
 	if e.app_tx != none {
-		packet = e.seal_raw(.one_rtt, frame)!
+		packet = e.seal_raw(.one_rtt, mut frame)!
 	} else if e.handshake_tx != none {
-		packet = e.seal_raw(.handshake, frame)!
+		packet = e.seal_raw(.handshake, mut frame)!
 	} else {
-		packet = e.seal_raw(.initial, frame)!
+		packet = e.seal_raw(.initial, mut frame)!
 	}
 	e.destroy_on_close()!
 	return packet
@@ -375,11 +377,15 @@ fn (mut e Engine) receive_packet(buf []u8) !int {
 // receive_long_packet parses, deprotects and handles a long-header packet.
 fn (mut e Engine) receive_long_packet(buf []u8) !int {
 	// Parse the protection-independent framing: the connection IDs, token and
-	// length field are all readable before header protection is removed.
-	meta := long_packet_meta(buf)!
+	// length field are all readable before header protection is removed. A packet
+	// whose framing cannot be parsed is discarded rather than treated as a
+	// connection error (RFC 9001 §5.7); without a length field there is nothing
+	// reliable to resynchronize on, so the rest of the datagram is dropped.
+	meta := long_packet_meta(buf) or { return buf.len }
 	total := meta.total_len
 	if total > buf.len {
-		return error('quic: long packet claims ${total} bytes, only ${buf.len} available')
+		// A truncated coalesced packet cannot be opened; discard it (RFC 9001 §5.7).
+		return buf.len
 	}
 	mut packet := buf[..total].clone()
 	pn_offset := meta.pn_offset
@@ -390,11 +396,15 @@ fn (mut e Engine) receive_long_packet(buf []u8) !int {
 	if meta.ptype == .handshake && e.handshake_rx == none {
 		return total
 	}
-	mut state := e.rx_state_for(meta.ptype)!
-	pn_len := state.unprotect(mut packet, pn_offset)!
+	mut state := e.rx_state_for(meta.ptype) or {
+		// No receive keys for this level (or an unsupported packet type): the
+		// packet is undecryptable and must be discarded, not fatal (RFC 9001 §5.7).
+		return if total > 0 { total } else { buf.len }
+	}
+	pn_len := state.unprotect(mut packet, pn_offset) or { return total }
 	truncated := read_truncated_pn(packet, pn_offset, pn_len)
 	pn := decode_packet_number(truncated, pn_len, e.largest_rx(meta.ptype))
-	payload := state.decrypt_payload(packet, pn_offset, pn_len, pn)!
+	payload := state.decrypt_payload(packet, pn_offset, pn_len, pn) or { return total }
 	e.store_rx(meta.ptype, state)
 	e.note_rx(meta.ptype, pn)
 	// RFC 9000 §7.2: the first Initial received from the server fixes the connection ID
@@ -424,11 +434,11 @@ fn (mut e Engine) receive_short_packet(buf []u8) !int {
 	// server's DCID here is the client's own scid; a short header has no length field
 	// (§17.3.1), so that length — not the DCID the client sends — locates the PN.
 	pn_offset := 1 + e.scid.len
-	mut state := e.app_rx or { return error('quic: application receive keys missing') }
-	pn_len := state.unprotect(mut packet, pn_offset)!
+	mut state := e.app_rx or { return buf.len }
+	pn_len := state.unprotect(mut packet, pn_offset) or { return buf.len }
 	truncated := read_truncated_pn(packet, pn_offset, pn_len)
 	pn := decode_packet_number(truncated, pn_len, e.app_ns.largest_rx)
-	payload := state.decrypt_payload(packet, pn_offset, pn_len, pn)!
+	payload := state.decrypt_payload(packet, pn_offset, pn_len, pn) or { return buf.len }
 	e.app_rx = state
 	e.note_rx(.one_rtt, pn)
 	e.handle_frames(.one_rtt, payload)!
@@ -510,6 +520,16 @@ fn (mut e Engine) handle_frames(ptype PacketType, payload []u8) ! {
 				off += 1 + used
 			}
 			frame_handshake_done {
+				// HANDSHAKE_DONE is a 1-RTT-only frame (RFC 9000 §19.20). Rejecting
+				// it elsewhere is what stops an on-path attacker from forging one in
+				// an Initial (whose keys are public, RFC 9001 §5.2) and making the
+				// client report a confirmed, authenticated connection it never had.
+				if ptype != .one_rtt {
+					return error('quic: HANDSHAKE_DONE received in a ${ptype} packet (PROTOCOL_VIOLATION)')
+				}
+				if e.hs.state() != .connected {
+					return error('quic: HANDSHAKE_DONE received before the handshake completed (PROTOCOL_VIOLATION)')
+				}
 				e.confirmed = true
 				e.clear_unacked()
 				e.release_handshake_keys()!
@@ -795,7 +815,7 @@ fn (mut e Engine) seal(ptype PacketType, mut tx ProtectionState, pn u64, pn_len 
 
 // seal_raw seals an arbitrary frame payload (not CRYPTO) into one packet at the
 // chosen level. It is used for CONNECTION_CLOSE, which no CRYPTO buffer holds.
-fn (mut e Engine) seal_raw(ptype PacketType, payload []u8) ![]u8 {
+fn (mut e Engine) seal_raw(ptype PacketType, mut payload []u8) ![]u8 {
 	mut tx := match ptype {
 		.initial { e.initial_tx or { return error('quic: no Initial send keys') } }
 		.handshake { e.handshake_tx or { return error('quic: no Handshake send keys') } }
@@ -804,7 +824,13 @@ fn (mut e Engine) seal_raw(ptype PacketType, payload []u8) ![]u8 {
 	}
 	pn := e.next_pn(ptype)
 	pn_len := packet_number_len(pn, 0)
-	packet := e.seal(ptype, mut tx, pn, pn_len, payload)!
+	mut body := payload
+	// RFC 9000 §14.1: every client Initial datagram, not just one carrying CRYPTO,
+	// must be at least 1200 bytes. This covers ACK-only packets and CONNECTION_CLOSE.
+	if ptype == .initial {
+		body = pad_datagram(payload, e.packet_overhead(ptype, pn_len, tx.overhead()))
+	}
+	packet := e.seal(ptype, mut tx, pn, pn_len, body)!
 	e.store_tx(ptype, tx)
 	e.bump_pn(ptype)
 	return packet
@@ -822,9 +848,9 @@ fn (mut e Engine) ack_only(ptype PacketType) ![]u8 {
 	if !e.tx_keys_present(ptype) {
 		return []u8{}
 	}
-	payload := encode_ack_frame(ns.rx_ranges, 0)!
+	mut payload := encode_ack_frame(ns.rx_ranges, 0)!
 	ns.ack_pending = false
-	return e.seal_raw(ptype, payload)!
+	return e.seal_raw(ptype, mut payload)!
 }
 
 // tx_keys_present reports whether a level's send protection has been installed.
