@@ -778,25 +778,21 @@ fn test_parse_certificate_rejects_malformed_ip_length() ! {
 	assert false
 }
 
-// test_enforce_name_constraints_ip_only_permitted_rejects_dns locks the
-// cross-form fail-open: RFC 5280 §4.2.1.10 treats permittedSubtrees as a single
-// namespace, so a permitted set that lists only an iPAddress subtree must still
-// reject a subordinate dNS name rather than exempt it, while a subordinate whose
-// names fall inside the permitted subtree still passes.
+// test_enforce_name_constraints_ip_only_permitted_rejects_dns: RFC 5280
+// §4.2.1.10 §6.1.4(o) makes permitted subtrees per-name-form. A CA that lists
+// only an iPAddress permitted subtree does not constrain dNSName subjects —
+// DNS names are unconstrained by the IP-only permitted set. A dNS-only
+// subordinate therefore passes, not fails.
 fn test_enforce_name_constraints_ip_only_permitted_rejects_dns() ! {
 	ca := Certificate{
 		name_constraints_present: true
 		permitted_ip:             [[u8(10), 0, 0, 0, 255, 0, 0, 0]]
 	}
-	// A dNS-only subordinate is outside the (IP-only) permitted namespace.
+	// A dNS-only subordinate is NOT constrained by an IP-only permitted set.
 	dns_child := Certificate{
 		sans: ['api.example.com']
 	}
-	enforce_name_constraints(ca, dns_child) or {
-		assert err.msg().contains('outside the permitted subtrees')
-		return
-	}
-	assert false
+	enforce_name_constraints(ca, dns_child)!
 }
 
 fn test_enforce_name_constraints_permitted_ip_accepts_matching_ip() ! {
