@@ -145,8 +145,8 @@ mut:
 	// CertificateRequest echo state: the server asked for client auth; the client
 	// must answer with an (empty) Certificate only after the server flight is
 	// verified, so the server's CertificateVerify and Finished hashes exclude it.
-	certificate_requested     bool      // CertificateRequest was received; client Certificate is due
-	certificate_request_context []u8    // echoed verbatim in the client Certificate (§4.4.2)
+	certificate_requested       bool // CertificateRequest was received; client Certificate is due
+	certificate_request_context []u8 // echoed verbatim in the client Certificate (§4.4.2)
 
 	// Handshake retry and outcome.
 	hrr_cipher_suite ?CipherSuite   // suite from the retry request; presence marks a retry

@@ -617,11 +617,23 @@ fn parse_name_constraints(ext_bytes []u8) !([]string, []string, [][]u8, [][]u8) 
 			mut count := 0
 			mut ok := true
 			for test.remaining() > 0 {
-				gs := read_asn1_element(mut test) or { ok = false; break }
-				if gs.tag != 0x30 { ok = false; break }
+				gs := read_asn1_element(mut test) or {
+					ok = false
+					break
+				}
+				if gs.tag != 0x30 {
+					ok = false
+					break
+				}
 				mut gb := wire.new_reader(gs.data)
-				if gb.remaining() == 0 { ok = false; break }
-				_ = read_asn1_element(mut gb) or { ok = false; break }
+				if gb.remaining() == 0 {
+					ok = false
+					break
+				}
+				_ = read_asn1_element(mut gb) or {
+					ok = false
+					break
+				}
 				count++
 			}
 			if ok && count > 0 {
