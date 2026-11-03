@@ -162,6 +162,9 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		if parent.has_key_usage && !key_usage_bit(parent.key_usage, 5) {
 			return error('pki: CA at chain index ${i + 1} keyUsage does not permit keyCertSign')
 		}
+		if !is_trusted_anchor(parent, v.store.certs, now) && parent.has_eku && !parent.eku_server_auth {
+			return error('pki: CA at chain index ${i + 1} Extended Key Usage does not permit serverAuth')
+		}
 		// pathLenConstraint (RFC 5280 §4.2.1.9): the number of non-CA certs below
 		// this CA must not exceed the limit; a stored -1 means the INTEGER was absent.
 		if parent.max_path_len >= 0 && i > parent.max_path_len {
@@ -186,34 +189,34 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	}
 }
 
+fn is_trusted_anchor(cert Certificate, roots []Certificate, now i64) bool {
+	for root in roots {
+		if now < root.not_before_unix || now > root.not_after_unix {
+			continue
+		}
+		if !root.is_ca {
+			continue
+		}
+		if root.has_key_usage && !key_usage_bit(root.key_usage, 5) {
+			continue
+		}
+		if cert.raw == root.raw {
+			return true
+		}
+		if cert.issuer_dn != root.subject_dn {
+			continue
+		}
+		verify_cert_signature(cert, root) or { continue }
+		return true
+	}
+	return false
+}
+
 // chain_has_trusted_anchor reports whether any certificate in the validated
 // peer chain is trusted directly or verifies under a valid stored root.
 fn chain_has_trusted_anchor(chain []Certificate, roots []Certificate, now i64) bool {
 	for cert in chain {
-		for root in roots {
-			if now < root.not_before_unix || now > root.not_after_unix {
-				continue
-			}
-			// A trust anchor must be a CA. Without this check a leaf that was
-			// misguidedly added to the store via add_der would anchor any chain
-			// it happens to have signed (RFC 5280 §6.1.1 anchors are CA certs).
-			if !root.is_ca {
-				continue
-			}
-			// If the anchor asserts keyUsage it must include keyCertSign (bit 5);
-			// mirrors the same rule applied to intermediates at chain index i+1.
-			// Absent keyUsage is unconstrained, per RFC 5280 §4.2.1.3.
-			if root.has_key_usage && !key_usage_bit(root.key_usage, 5) {
-				continue
-			}
-			if cert.raw == root.raw {
-				return true
-			}
-			if cert.issuer_dn != root.subject_dn {
-				continue
-			}
-			// Failed under this root — another may share the subject.
-			verify_cert_signature(cert, root) or { continue }
+		if is_trusted_anchor(cert, roots, now) {
 			return true
 		}
 	}

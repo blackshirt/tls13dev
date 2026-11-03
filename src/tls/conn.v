@@ -526,13 +526,17 @@ fn (mut c Conn) do_handshake() ! {
 				// outbound messages — empty when this record only advanced state,
 				// non-empty when a retry ClientHello must be sent below.
 				msgs := c.hs.receive_initial_bytes(rec.payload)!
-				// The record must have yielded exactly one complete message (§5.1).
+				// RFC 8446 §5.1 permits a handshake message to span multiple records.
+				// Continue reassembly while awaiting completion (still .wait_sh, no
+				// outbound retry); only enforce the boundary when ServerHello is done.
+				if c.hs.state() == .wait_sh && msgs.len == 0 {
+					continue
+				}
+				// ServerHello complete: bytes left in reassembly are trailing junk
+				// past the message boundary (§5.1).
 				backlog := c.hs.reassembly_len()!
 				if backlog != 0 {
 					return c.classify_failure(.unexpected_message, 'tls: misframed ServerHello record: ${backlog} leftover byte(s) (unexpected_message)')
-				}
-				if msgs.len == 0 && c.hs.state() == .wait_sh {
-					return c.classify_failure(.unexpected_message, 'tls: incomplete ServerHello at record boundary (unexpected_message)')
 				}
 				if c.hs.state() != .start && c.hs.state() != .wait_sh && c.hs.state() != .failed {
 					// Install once the core actually holds handshake secrets, keyed on

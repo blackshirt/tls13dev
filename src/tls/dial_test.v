@@ -109,25 +109,25 @@ fn expect_dial_failure(addr string, want string, res_ch chan string) ! {
 // ---- Full handshake over TCP ----
 // full_handshake_script is the record-layer twin of the fakeserver flight.
 fn full_handshake_script(mut c net.TcpConn) ! {
-	run_full_handshake(mut c, false, false, []u8{})!
+	run_full_handshake(mut c, false, false, []u8{}, false)!
 }
 
 // chacha_handshake_script is the full flight under TLS_CHACHA20_POLY1305_SHA256 —
 // the software-preferred suite every AES-only test never reached, so it drives the
 // record layer's install/rekey §7.5 key-ownership path end to end.
 fn chacha_handshake_script(mut c net.TcpConn) ! {
-	run_flight(mut c, handshake.CipherSuite.tls_chacha20_poly1305_sha256, false, false, []u8{})!
+	run_flight(mut c, handshake.CipherSuite.tls_chacha20_poly1305_sha256, false, false, []u8{}, false)!
 }
 
 // split_ticket_script is run_full_handshake with the NewSessionTicket fragmented.
 fn split_ticket_script(mut c net.TcpConn) ! {
-	run_full_handshake(mut c, true, false, []u8{})!
+	run_full_handshake(mut c, true, false, []u8{}, false)!
 }
 
 // coalesced_ticket_script is run_full_handshake with the NewSessionTicket riding
 // the same handshake-key record as the server Finished (§4.6.1).
 fn coalesced_ticket_script(mut c net.TcpConn) ! {
-	run_full_handshake(mut c, false, true, []u8{})!
+	run_full_handshake(mut c, false, true, []u8{}, false)!
 }
 
 // key_update_pair_script is the standard flight plus two consecutive KeyUpdate
@@ -135,7 +135,14 @@ fn coalesced_ticket_script(mut c net.TcpConn) ! {
 fn key_update_pair_script(mut c net.TcpConn) ! {
 	mut ku_pair := [u8(24), 0, 0, 1, 0] // KeyUpdate(update_not_requested), 1-byte body
 	ku_pair << [u8(24), 0, 0, 1, 0] // second in a row: the violation
-	run_full_handshake(mut c, false, false, ku_pair)!
+	run_full_handshake(mut c, false, false, ku_pair, false)!
+}
+
+// split_server_hello_script splits the plaintext ServerHello across two adjacent
+// handshake records at byte 20; RFC 8446 §5.1 permits a handshake message to span
+// records, so reassembly must complete it and the handshake succeeds.
+fn split_server_hello_script(mut c net.TcpConn) ! {
+	run_full_handshake(mut c, false, false, []u8{}, true)!
 }
 
 // silent_peer_script accepts and immediately closes: the client must fail on its
@@ -147,18 +154,20 @@ fn silent_peer_script(mut c net.TcpConn) ! {
 // run_full_handshake drives the whole server flight under TLS_AES_128_GCM_SHA256,
 // the AEAD the majority of these tests assert; it delegates to run_flight, which
 // also lets a caller select TLS_CHACHA20_POLY1305_SHA256.
-fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8) ! {
-	run_flight(mut c, handshake.CipherSuite.tls_aes_128_gcm_sha256, split_ticket, coalesce_ticket, extra_post_msg)!
+fn run_full_handshake(mut c net.TcpConn, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8, split_server_hello bool) ! {
+	run_flight(mut c, handshake.CipherSuite.tls_aes_128_gcm_sha256, split_ticket, coalesce_ticket, extra_post_msg, split_server_hello)!
 }
 
 // run_flight drives the whole server flight under the given cipher suite; split_ticket
 // fragments the ticket across two app-key records, coalesce_ticket instead rides it
-// behind the server Finished in one handshake-key record (§4.6.1), and extra_post_msg
+// behind the server Finished in one handshake-key record (§4.6.1), extra_post_msg
 // (when non-empty) is appended as one coalesced handshake record under the server
-// application keys, after the app data. The suite selects both the fakeserver's
-// ServerHello choice and the transport's AEAD, so a TLS_CHACHA20_POLY1305_SHA256 run
-// exercises the record layer's §7.5 key-ownership path end to end.
-fn run_flight(mut c net.TcpConn, suite handshake.CipherSuite, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8) ! {
+// application keys, after the app data, and split_server_hello fragments the plaintext
+// ServerHello across two adjacent handshake records at byte 20 (§5.1 permits this).
+// The suite selects both the fakeserver's ServerHello choice and the transport's AEAD,
+// so a TLS_CHACHA20_POLY1305_SHA256 run exercises the record layer's §7.5 key-ownership
+// path end to end.
+fn run_flight(mut c net.TcpConn, suite handshake.CipherSuite, split_ticket bool, coalesce_ticket bool, extra_post_msg []u8, split_server_hello bool) ! {
 	ch_rec := scripted_read_record(mut c)!
 	if ch_rec.content_type != .handshake {
 		return error('expected a handshake record first, got ${ch_rec.content_type}')
@@ -179,8 +188,15 @@ fn run_flight(mut c net.TcpConn, suite handshake.CipherSuite, split_ticket bool,
 	}
 
 	// Plaintext ServerHello plus the server's dummy CCS (App. D.4).
-	sh_rec := new_record(.handshake, fl.server_hello)
-	c.write(sh_rec.serialize()) or { return err }
+	if split_server_hello {
+		// RFC 8446 §5.1 permits a handshake message to span records: split at byte 20.
+		cut := 20
+		c.write(new_record(.handshake, fl.server_hello[..cut]).serialize()) or { return err }
+		c.write(new_record(.handshake, fl.server_hello[cut..]).serialize()) or { return err }
+	} else {
+		sh_rec := new_record(.handshake, fl.server_hello)
+		c.write(sh_rec.serialize()) or { return err }
+	}
 	c.write(change_cipher_spec().serialize()) or { return err }
 
 	// The rest of the flight, one encrypted record per message, under the server handshake keys.
@@ -257,6 +273,33 @@ fn test_dial_completes_full_handshake_and_reads_app_data() ! {
 	assert conn.session_tickets[0].lifetime() == 3600
 	assert conn.session_tickets[0].bytes() == [u8(0xaa), 0xbb, 0xcc, 0xdd]
 
+	conn.close() or {}
+	res := <-res_ch
+	assert res == 'OK'
+}
+
+// test_dial_accepts_split_server_hello checks that a ServerHello fragmented across
+// two adjacent handshake records is reassembled and the handshake completes
+// (RFC 8446 §5.1).
+fn test_dial_accepts_split_server_hello() ! {
+	addr, res_ch := start_scripted_server(split_server_hello_script)
+	if addr.starts_with('ERR') {
+		return error(addr)
+	}
+	ts := fakeserver.test_trust_store()!
+	mut conn := dial(addr,
+		server_name: fakeserver.server_name
+		hsk_options: handshake.HandshakeOptions{
+			alpn: ['h2']
+		}
+		root_cas:    ts
+		timeout:     10 * time.second
+	)!
+	assert conn.negotiated_alpn() == 'h2'
+	mut buf := []u8{len: 64}
+	n := conn.read(mut buf)!
+	assert buf[..n] == 'hello from fakeserver'.bytes()
+	assert conn.session_tickets.len == 1
 	conn.close() or {}
 	res := <-res_ch
 	assert res == 'OK'
@@ -896,8 +939,9 @@ fn test_dial_sends_plaintext_fatal_alert_before_server_hello() ! {
 
 // ---- Client authentication (CertificateRequest) over TCP ----
 
-// client_auth_script sends a CertificateRequest, reads the client's encrypted
-// empty Certificate, then streams the deferred Cert/CV/Fin tail.
+// client_auth_script sends a CertificateRequest with the full server tail
+// (Cert/CV/Fin), reads the client's encrypted empty Certificate, then reads the
+// client Finished.
 fn client_auth_script(mut c net.TcpConn) ! {
 	ch_rec := scripted_read_record(mut c)!
 	if ch_rec.content_type != .handshake {
@@ -915,7 +959,9 @@ fn client_auth_script(mut c net.TcpConn) ! {
 	skey, siv := srv.server_handshake_keys() or { return error('fakeserver keys: ${err.msg()}') }
 	aead := handshake.new_aead_for_suite(.tls_aes_128_gcm_sha256, skey) or { return err }
 	mut senc := new_tls_protection(aead, siv)!
-	// fl.rest is [EncryptedExtensions, CertificateRequest].
+	// fl.rest is [EncryptedExtensions, CertificateRequest, Certificate,
+	// CertificateVerify, Finished] — the full server flight before the client
+	// responds (§4.4.1).
 	for m in fl.rest {
 		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
 	}
@@ -929,13 +975,8 @@ fn client_auth_script(mut c net.TcpConn) ! {
 	if ccert.content_type != .handshake {
 		return error('client Certificate inner type ${ccert.content_type}, expected handshake')
 	}
-	tail := srv.handle_client_certificate(ccert.plaintext) or {
+	srv.handle_client_certificate(ccert.plaintext) or {
 		return error('fakeserver client Certificate: ${err.msg()}')
-	}
-
-	// The deferred tail continues under the same server handshake key generation.
-	for m in tail {
-		c.write(senc.encrypt_record(.handshake, m)!.serialize()) or { return err }
 	}
 
 	cfin_rec := scripted_read_record(mut c)!

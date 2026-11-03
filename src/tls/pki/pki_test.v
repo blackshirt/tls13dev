@@ -191,6 +191,46 @@ fn test_chain_trust_anchor_can_precede_cross_signed_tail() {
 	assert !chain_has_trusted_anchor([chain[0], chain[2]], [root], 100)
 }
 
+// test_server_auth_eku_required_on_intermediate pins EKU purpose across the path:
+// a clientAuth-only intermediate must not issue a serverAuth leaf this verifier
+// accepts for a TLS server (OpenSSL `-purpose sslserver` rejects at depth 1).
+fn test_server_auth_eku_required_on_intermediate() ! {
+	far_future := i64(4102444800)
+	root := Certificate{
+		is_ca:           true
+		not_before_unix: 0
+		not_after_unix:  far_future
+		subject_dn:      [u8(0x01)]
+		raw:             [u8(0x01)]
+	}
+	intermediate := Certificate{
+		is_ca:           true
+		has_key_usage:   true
+		key_usage:       [u8(0x04)]
+		has_eku:         true
+		eku_server_auth: false
+		not_before_unix: 0
+		not_after_unix:  far_future
+		issuer_dn:       [u8(0x01)]
+		subject_dn:      [u8(0x42)]
+	}
+	leaf := Certificate{
+		has_san:         true
+		sans:            ['example.com']
+		not_before_unix: 0
+		not_after_unix:  far_future
+		issuer_dn:       [u8(0x42)]
+		public_key_algo: .ed25519
+	}
+	mut v := new_validator(new_trust_store())
+	v.store.certs << root
+	v.verify_certificate_chain([leaf, intermediate], 'example.com') or {
+		assert err.msg().contains('serverAuth')
+		return
+	}
+	assert false
+}
+
 // rsa_leaf_of_bits builds a leaf Certificate carrying an RSA public key whose
 // modulus is `bits` long, enough to exercise check_leaf_rsa_floor without a real
 // signed chain.

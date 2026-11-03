@@ -142,6 +142,12 @@ mut:
 	// immutable validator declared above.
 	server_certs []pki.Certificate // certificates received from the server, leaf first
 
+	// CertificateRequest echo state: the server asked for client auth; the client
+	// must answer with an (empty) Certificate only after the server flight is
+	// verified, so the server's CertificateVerify and Finished hashes exclude it.
+	certificate_requested     bool      // CertificateRequest was received; client Certificate is due
+	certificate_request_context []u8    // echoed verbatim in the client Certificate (§4.4.2)
+
 	// Handshake retry and outcome.
 	hrr_cipher_suite ?CipherSuite   // suite from the retry request; presence marks a retry
 	state            HandshakeState // position in the client state machine (RFC 8446 App. A.1)
@@ -456,20 +462,20 @@ fn (mut h HandshakeCore) handle_encrypted_extensions(full_msg []u8, body []u8) !
 }
 
 // handle_certificate_request answers a server request with an empty Certificate.
+// The response is deferred until the server flight is verified (handle_finished),
+// per RFC 8446 §4.4.1: the client Certificate comes after the server's
+// Certificate, CertificateVerify, and Finished. Emitting it earlier inserts our
+// response into the transcript that the server's CertificateVerify signs over,
+// breaking verification.
 fn (mut h HandshakeCore) handle_certificate_request(full_msg []u8, body []u8) ![]HandshakeMessage {
-	// §4.3.2: the server wants client authentication; this client holds no
-	// credential and acknowledges with an empty Certificate (§4.4.2).
 	req := parse_certificate_request(body) or {
 		return h.fail_with(.decode_error, err)
 	}
 	h.update_transcript(full_msg)!
+	h.certificate_requested = true
+	h.certificate_request_context = req.request_context.clone()
 	h.state = .wait_cert
-
-	// The empty Certificate-response (§4.4.2) enters the transcript BEFORE the
-	// server's flight is verified, so the server Finished covers our response.
-	response := build_empty_certificate_message(req.request_context)
-	h.update_transcript(response)!
-	return [new_handshake_message(response)!]
+	return []HandshakeMessage{}
 }
 
 // handle_certificate parses and validates the server certificate chain.
@@ -530,6 +536,17 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	}
 	h.update_transcript(full_msg)!
 
+	// RFC 8446 §4.4.1: emit the client Certificate (possibly empty) after the
+	// server flight is verified, so the server's CertificateVerify and Finished
+	// hashes exclude our response. It is folded into the transcript before the
+	// client Finished is computed, so Finished covers it.
+	mut out := []HandshakeMessage{}
+	if h.certificate_requested {
+		empty_cert := build_empty_certificate_message(h.certificate_request_context)
+		h.update_transcript(empty_cert)!
+		out << new_handshake_message(empty_cert)!
+	}
+
 	// Advance the key schedule to the application phase: Master Secret, then the
 	// application traffic secrets bound to the transcript including server Finished.
 	th_sfin := h.transcript.current_hash()
@@ -552,6 +569,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 		th_sfin)!
 	client_fin_msg := build_finished(client_verify_data)
 	h.update_transcript(client_fin_msg)!
+	out << new_handshake_message(client_fin_msg)!
 
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
@@ -567,9 +585,7 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	// Forward-secrecy cleanup: every ephemeral/handshake secret consumed to reach
 	// this point is now dead (RFC 8446 §7.5 / §1.3.1).
 	h.wipe_key_schedule_secrets()
-	// Hand the raw client Finished to the transport, which encrypts it under the
-	// still-active handshake keys.
-	return [new_handshake_message(client_fin_msg)!]
+	return out
 }
 
 // receive_initial_bytes feeds pre-ServerHello (plaintext) handshake bytes —

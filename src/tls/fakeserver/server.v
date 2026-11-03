@@ -302,14 +302,25 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 	s.transcript.append(ee)
 
 	if s.cfg.client_auth {
-		// §4.3.2: wait for the client's empty Certificate before the server tail.
+		// §4.4.1: the client Certificate comes after the server flight; the
+		// server sends CertificateRequest + Certificate + CertificateVerify +
+		// Finished together, and the client's empty Certificate is folded into
+		// the transcript only when it arrives.
 		creq := build_certificate_request()!
 		s.transcript.append(creq)
-		s.stage = .expect_client_cert
+
+		tail := s.build_server_tail()!
+		s.stage = .expect_client_finished
+		mut rest := [][]u8{cap: 3 + tail.len}
+		rest << ee
+		rest << creq
+		for m in tail {
+			rest << m
+		}
 		return Flight{
 			is_hrr:       false
 			server_hello: sh
-			rest:         [ee, creq]
+			rest:         rest
 		}
 	}
 
@@ -361,10 +372,11 @@ fn (mut s Server) build_server_tail() ![][]u8 {
 	return [cert, cv, fin]
 }
 
-// handle_client_certificate consumes the client's empty Certificate response,
-// folds it into the transcript, and returns the deferred server tail.
-pub fn (mut s Server) handle_client_certificate(msg []u8) ![][]u8 {
-	if s.stage != .expect_client_cert {
+// handle_client_certificate consumes the client's empty Certificate response
+// and folds it into the transcript. The server flight (Cert/CV/Fin) was already
+// sent in finish_flight, so there is no deferred tail to return.
+pub fn (mut s Server) handle_client_certificate(msg []u8) ![]u8 {
+	if s.stage != .expect_client_finished {
 		return error('fakeserver: client Certificate is unexpected in stage ${s.stage}')
 	}
 	mut r := wire.new_reader(msg)
@@ -391,9 +403,7 @@ pub fn (mut s Server) handle_client_certificate(msg []u8) ![][]u8 {
 		return error('fakeserver: trailing bytes in client Certificate body')
 	}
 	s.transcript.append(msg)
-	tail := s.build_server_tail()!
-	s.stage = .expect_client_finished
-	return tail
+	return []u8{}
 }
 
 // handle_client_finished verifies the client Finished against the full transcript,
