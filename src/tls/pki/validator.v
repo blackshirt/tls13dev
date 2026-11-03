@@ -5,7 +5,11 @@
 // (RFC 6125), trust_store.v seeds from system roots.
 module pki
 
+import crypto.ecdsa
 import crypto.ed25519
+import crypto.sha256
+import crypto.sha512
+import hash
 import time
 
 // max_cert_chain_depth bounds the certificates a peer may place in one
@@ -332,6 +336,19 @@ fn ip_within_subtree(ip []u8, subtree []u8) bool {
 	return true
 }
 
+// ecdsa_hasher_for returns a hash.Hash implementing the digest named by
+// `digest_type`, used to make ecdsa.PublicKey.verify honor the signature
+// algorithm OID's hash rather than the key's curve default.
+fn ecdsa_hasher_for(digest_type string) hash.Hash {
+	if digest_type == 'sha256' {
+		return sha256.new()
+	}
+	if digest_type == 'sha384' {
+		return sha512.new384()
+	}
+	return sha512.new()
+}
+
 // verify_cert_signature verifies that `child` was signed by `parent`. Failure
 // is signaled only by an error — no bool for the caller to silently discard.
 fn verify_cert_signature(child Certificate, parent Certificate) ! {
@@ -369,27 +386,38 @@ fn verify_cert_signature(child Certificate, parent Certificate) ! {
 				}
 			}
 
-			hash := digest_bytes(digest_type, child.tbs_raw)!
-
-			// `!` drops rsa.v's bool; an Ok(false) must not pass here.
+			digest := digest_bytes(digest_type, child.tbs_raw)!
 			if is_pss {
-				rsa_key.verify_pss(digest_type, hash, child.signature)!
+				rsa_key.verify_pss(digest_type, digest, child.signature)!
 			} else {
-				rsa_key.verify_pkcs1_v1_5(digest_type, hash, child.signature)!
+				rsa_key.verify_pkcs1_v1_5(digest_type, digest, child.signature)!
 			}
 		}
 		.ecdsa {
 			pubkey := parent.ecdsa_public_key()!
-			// ECDSA carries no hash parameter; the digest is hashed inside verify.
-			match child.signature_algo_oid {
-				'1.2.840.10045.4.3.2', '1.2.840.10045.4.3.3', '1.2.840.10045.4.3.4' {
-					if !pubkey.verify(child.tbs_raw, child.signature)! {
-						return error('pki: ECDSA signature verification failed')
-					}
-				}
+			// Map the signature algorithm OID to the hash the signer used.
+			// RFC 5280 allows any hash with any curve, so the digest must come
+			// from the OID — not the key's curve, which is what
+			// ecdsa.PublicKey.verify defaults to (with_recommended_hash).
+			digest_type := match child.signature_algo_oid {
+				'1.2.840.10045.4.3.2' { 'sha256' } // ecdsa-with-SHA256
+				'1.2.840.10045.4.3.3' { 'sha384' } // ecdsa-with-SHA384
+				'1.2.840.10045.4.3.4' { 'sha512' } // ecdsa-with-SHA512
 				else {
 					return error('pki: unsupported ECDSA signature OID ${child.signature_algo_oid}')
 				}
+			}
+			// Build a custom hasher so verify() hashes with the OID's hash
+			// rather than the curve's default.
+			mut hh := ecdsa_hasher_for(digest_type)
+			opts := ecdsa.SignerOpts{
+				hash_config:     .with_custom_hash,
+				allow_custom_hash: true,
+				allow_smaller_size: true,
+				custom_hash:     &hh
+			}
+			if !pubkey.verify(child.tbs_raw, child.signature, opts)! {
+				return error('pki: ECDSA signature verification failed')
 			}
 		}
 		.ed25519 {

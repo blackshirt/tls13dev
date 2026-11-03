@@ -513,3 +513,21 @@ fn test_match_hostname_rejects_empty_pattern_or_host() ! {
 	// Positive control: ordinary equality still works.
 	assert match_hostname('example.com', 'example.com')
 }
+
+// test_ecdsa_hasher_for_output_size: the OID-to-hash mapper used by
+// verify_cert_signature returns hashers whose output size matches the hash
+// named by each ECDSA signature algorithm OID (RFC 5280 allows any hash with
+// any curve).
+fn test_ecdsa_hasher_for_output_size() ! {
+	// ecdsa-with-SHA256 (1.2.840.10045.4.3.2) → SHA-256, 32-byte digest.
+	mut h256 := ecdsa_hasher_for('sha256')
+	assert h256.size() == 32
+
+	// ecdsa-with-SHA384 (1.2.840.10045.4.3.3) → SHA-384, 48-byte digest.
+	mut h384 := ecdsa_hasher_for('sha384')
+	assert h384.size() == 48
+
+	// ecdsa-with-SHA512 (1.2.840.10045.4.3.4) → SHA-512, 64-byte digest.
+	mut h512 := ecdsa_hasher_for('sha512')
+	assert h512.size() == 64
+}
