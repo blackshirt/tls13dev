@@ -29,8 +29,7 @@ fn test_chacha20_poly1305_sha256_key_and_hash_lengths() ! {
 }
 
 fn test_key_schedule_no_traffic_secrets_before_server_hello_all_suites() ! {
-	for cs in [CipherSuite.tls_aes_128_gcm_sha256,
-		CipherSuite.tls_aes_256_gcm_sha384,
+	for cs in [CipherSuite.tls_aes_128_gcm_sha256, CipherSuite.tls_aes_256_gcm_sha384,
 		CipherSuite.tls_chacha20_poly1305_sha256] {
 		mut h := new_tls_handshake('example.com', HandshakeOptions{
 			validator:     pki.new_validator(pki.new_trust_store())
