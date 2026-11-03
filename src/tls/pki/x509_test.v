@@ -593,6 +593,50 @@ fn test_parse_name_constraints_implicit_tagging() ! {
 	assert c.permitted_dns == ['example.com']
 }
 
+// test_parse_certificate_extracts_pss_hash_oid: a RSASSA-PSS-signed certificate
+// whose [0] hashAlgorithm uses EXPLICIT tagging (param.data wraps the full
+// AlgorithmIdentifier SEQUENCE) must yield the correct hash OID
+// (2.16.840.1.101.3.4.2.1 = id-sha256), not a misparsed OID like
+// 0.6.9.96.... OpenSSL validates such chains.
+fn test_parse_certificate_extracts_pss_hash_oid() ! {
+	// id-sha256 = 2.16.840.1.101.3.4.2.1
+	sha256_oid := [u8(0x06), 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
+	// AlgorithmIdentifier { id-sha256, NULL }
+	sha256_alg_id := der_tlv(0x30, [sha256_oid, der_tlv(0x05, [])])
+	// [0] EXPLICIT hashAlgorithm: context-specific 0xa0 wrapping the full AlgorithmIdentifier
+	hash_alg_field := der_tlv(0xa0, [sha256_alg_id])
+	// RSASSA-PSS-params SEQUENCE with hashAlgorithm [0]
+	pss_params := der_tlv(0x30, [hash_alg_field])
+	// id-RSASSA-PSS = 1.2.840.113549.1.1.10
+	pss_oid := [u8(0x06), 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a]
+	// signatureAlgorithm: SEQUENCE { id-RSASSA-PSS, PSS-params }
+	sig_alg := der_tlv(0x30, [pss_oid, pss_params])
+
+	// Minimal v1 TBSCertificate (no version field): serial, sigAlg, issuer,
+	// validity, subject, SPKI.
+	serial := der_tlv(0x02, [[u8(0x2a)]])
+	empty_name := der_tlv(0x30, [[]])
+	validity := der_tlv(0x30, [der_tlv(0x17, ['200101000000Z'.bytes()]),
+		der_tlv(0x17, ['301231235959Z'.bytes()])])
+	rsa_oid := [u8(0x06), 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]
+	pk_alg := der_tlv(0x30, [rsa_oid, der_tlv(0x05, [])])
+	mut key_bytes := []u8{len: 65, init: 0x01}
+	key_bytes[0] = 0x04
+	mut bits_body := []u8{}
+	bits_body << u8(0x00)
+	bits_body << key_bytes
+	bitstr := der_tlv(0x03, [bits_body])
+	spki := der_tlv(0x30, [pk_alg, bitstr])
+
+	tbs := der_tlv(0x30, [serial, sig_alg, empty_name, validity, empty_name, spki])
+	sig_val := der_tlv(0x03, [[u8(0x00), 0x01, 0x02]])
+	cert := der_tlv(0x30, [tbs, sig_alg, sig_val])
+
+	c := parse_certificate(cert)!
+	assert c.signature_algo_oid == '1.2.840.113549.1.1.10'
+	assert c.signature_hash_oid == '2.16.840.1.101.3.4.2.1'
+}
+
 // ---- Name-constraint subtree matching ----
 
 fn test_dns_within_subtree_matching() {

@@ -184,12 +184,24 @@ pub fn parse_certificate(der []u8) !Certificate {
 		if tbs_sig_algo_oid == '1.2.840.113549.1.1.10' && sig_alg_inner.len >= 2 {
 			pss_params := parse_sequence(sig_alg_inner[1].data) or { []Asn1Element{} }
 			for param in pss_params {
-				// [0] EXPLICIT -- hashAlgorithm: 0xa0 = context-specific class +
-				// constructed bit, & 0x1f == 0 pins the tag to [0].
+				// [0] hashAlgorithm: context-specific constructed tag 0xa0.
+				// With EXPLICIT tagging, param.data wraps the full
+				// AlgorithmIdentifier SEQUENCE; go one level deeper to reach the OID.
 				if (param.tag & 0xe0) == 0xa0 && (param.tag & 0x1f) == 0 {
 					hash_alg_inner := parse_sequence(param.data) or { []Asn1Element{} }
 					if hash_alg_inner.len > 0 {
-						tbs_sig_hash_oid = parse_oid(hash_alg_inner[0].data)
+						oid_elem := hash_alg_inner[0]
+						if oid_elem.tag == 0x30 {
+							// EXPLICIT tagging: [0] wraps the full AlgorithmIdentifier
+							// SEQUENCE; go one level deeper to reach the OID element.
+							deeper := parse_sequence(oid_elem.data) or { []Asn1Element{} }
+							if deeper.len > 0 {
+								tbs_sig_hash_oid = parse_oid(deeper[0].data)
+							}
+						} else {
+							// IMPLICIT tagging: hash_alg_inner[0] IS the OID element.
+							tbs_sig_hash_oid = parse_oid(oid_elem.data)
+						}
 					}
 					break
 				}
