@@ -147,9 +147,9 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut idx := 0
 
 	// 1. Version [0] EXPLICIT, absent for v1 (the default): consume it only when
-	// the first element carries context tag 0.
+	// the first element carries context tag 0 as a constructed (EXPLICIT) field.
 	mut version := 1
-	if (tbs_elements[0].tag & 0x1f) == 0 {
+	if (tbs_elements[0].tag & 0xe0) == 0xa0 && (tbs_elements[0].tag & 0x1f) == 0 {
 		mut version_r := wire.new_reader(tbs_elements[0].data)
 		version_elem := read_asn1_element(mut version_r)!
 		if version_elem.data.len > 0 {
@@ -308,7 +308,9 @@ pub fn parse_certificate(der []u8) !Certificate {
 
 	for i in idx .. tbs_elements.len {
 		el := tbs_elements[i]
-		if (el.tag & 0x1f) == 3 { // [3] Context tag
+		// Extensions [3] EXPLICIT (optional; absent in v1): context-specific
+		// constructed tag 0xa3. IMPLICIT tagging (0x83) is not permitted here.
+		if (el.tag & 0xe0) == 0xa0 && (el.tag & 0x1f) == 3 {
 			ext_seq_wrap := parse_sequence(el.data)!
 			if ext_seq_wrap.len > 0 {
 				ext_list := parse_sequence(ext_seq_wrap[0].data)!

@@ -6,7 +6,9 @@ module handshake
 
 import crypto.ecdsa
 import crypto.ed25519
+import crypto.sha256
 import crypto.sha512
+import hash
 import tls.pki
 
 // LeafKey is the slice of a certificate that CertificateVerify verification consumes:
@@ -48,6 +50,19 @@ fn hash_for_digest(digest_type string, data []u8) []u8 {
 	}
 }
 
+// ecdsa_hasher_for returns a hash.Hash implementing the digest named by
+// `digest_type`, used to make ecdsa.PublicKey.verify honor the signature
+// scheme's hash rather than the key's curve default (with_recommended_hash).
+fn ecdsa_hasher_for(digest_type string) hash.Hash {
+	if digest_type == 'sha256' {
+		return sha256.new()
+	}
+	if digest_type == 'sha384' {
+		return sha512.new384()
+	}
+	return sha512.new()
+}
+
 // verify_certificate_verify checks the server's CertificateVerify signature against
 // the leaf key material over the §4.4.3 signed content (see certificate_verify_signed_content).
 fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_content []u8) ! {
@@ -62,8 +77,8 @@ fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_co
 				.rsa_pss_rsae_sha384 { 'sha384' }
 				else { 'sha512' }
 			}
-			hash := hash_for_digest(digest_type, signed_content)
-			ok := rsa_key.verify_pss(digest_type, hash, cv.signature)!
+			digest := hash_for_digest(digest_type, signed_content)
+			ok := rsa_key.verify_pss(digest_type, digest, cv.signature)!
 			if !ok {
 				return error('handshake: RSA-PSS ${digest_type} CertificateVerify failed')
 			}
@@ -90,8 +105,22 @@ fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_co
 				}
 				else {}
 			}
+			// Map the scheme to its hash so verify() uses the scheme's hash,
+			// not the curve's default (with_recommended_hash).
+			digest_type := match cv.algorithm {
+				.ecdsa_secp256r1_sha256 { 'sha256' }
+				.ecdsa_secp384r1_sha384 { 'sha384' }
+				else { 'sha512' }
+			}
 			pubkey := leaf.ecdsa_public_key()!
-			ok := pubkey.verify(signed_content, cv.signature)!
+			mut hh := ecdsa_hasher_for(digest_type)
+			opts := ecdsa.SignerOpts{
+				hash_config:     .with_custom_hash,
+				allow_custom_hash: true,
+				allow_smaller_size: true,
+				custom_hash:     &hh
+			}
+			ok := pubkey.verify(signed_content, cv.signature, opts)!
 			if !ok {
 				return error('handshake: ECDSA CertificateVerify failed (${cv.algorithm})')
 			}

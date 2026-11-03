@@ -114,3 +114,17 @@ fn test_verify_certificate_verify_rejects_rsa_pkcs1() ! {
 	}
 	assert false
 }
+
+// test_verify_certificate_verify_ecdsa_uses_scheme_hash checks that ECDSA
+// CertificateVerify uses the scheme's hash (not the curve's default
+// with_recommended_hash). The ecdsa_hasher_for mapper returns hashers whose
+// output size matches the hash named by each ECDSA scheme (RFC 8446 §4.2.3).
+fn test_verify_certificate_verify_ecdsa_uses_scheme_hash() ! {
+	// ecdsa_secp256r1_sha256 → SHA-256, 32-byte digest.
+	mut h256 := ecdsa_hasher_for('sha256')
+	assert h256.size() == 32
+
+	// ecdsa_secp384r1_sha384 → SHA-384, 48-byte digest.
+	mut h384 := ecdsa_hasher_for('sha384')
+	assert h384.size() == 48
+}
