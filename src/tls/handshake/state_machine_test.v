@@ -779,9 +779,9 @@ fn test_second_hello_reproduces_pinned_random() ! {
 
 // ---- recordless framing ----
 
-// test_next_recordless_splits_one_byte_cadence checks that a message
+// test_next_unframed_splits_one_byte_cadence checks that a message
 // materializes exactly once, at the final byte (RFC 9001 §4).
-fn test_next_recordless_splits_one_byte_cadence() ! {
+fn test_next_unframed_splits_one_byte_cadence() ! {
 	mut buf := []u8{}
 	full := wrap_hsk(.finished, [u8(0xDE), 0xAD, 0xBE, 0xEF])
 	mut got := 0
@@ -797,9 +797,9 @@ fn test_next_recordless_splits_one_byte_cadence() ! {
 	assert got == 1
 }
 
-// test_next_recordless_two_messages_sequential checks that two coalesced
+// test_next_unframed_two_messages_sequential checks that two coalesced
 // messages are extracted one at a time.
-fn test_next_recordless_two_messages_sequential() ! {
+fn test_next_unframed_two_messages_sequential() ! {
 	// `+` cannot join []u8 in V, so the second frame is appended with `<<`.
 	mut buf := wrap_hsk(.encrypted_extensions, [u8(0x00)])
 	buf << wrap_hsk(.certificate, [u8(0x01), 0x02])
@@ -810,9 +810,9 @@ fn test_next_recordless_two_messages_sequential() ! {
 	assert buf.len == 0
 }
 
-// test_next_recordless_rejects_oversize_length checks that a length above
+// test_next_unframed_rejects_oversize_length checks that a length above
 // max_handshake_message_len aborts at the header.
-fn test_next_recordless_rejects_oversize_length() ! {
+fn test_next_unframed_rejects_oversize_length() ! {
 	mut w := wire.new_writer(4)
 	w.write_u8(u8(HandshakeType.certificate))
 	w.write_u24(u32(max_handshake_message_len + 1))

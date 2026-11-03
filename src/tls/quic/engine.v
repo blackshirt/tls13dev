@@ -17,7 +17,7 @@ import time
 import tls.handshake
 
 // quic_version_1 is the RFC 9000 version number this engine speaks.
-pub const quic_version_1 = u32(0x00000001)
+const quic_version_1 = u32(0x00000001)
 
 // max_datagram_size bounds reassembly buffers defensively.
 const max_crypto_buffer = 1 << 20
@@ -135,7 +135,7 @@ fn random_cid(n int) ![]u8 {
 // new_client_engine constructs a QUIC client connection for server_name.
 // Configure TLS behavior through Config; connection IDs are generated
 // automatically, and Initial keys are derived from the original DCID (§5.2).
-pub fn new_client_engine(server_name string, config Config) !Engine {
+fn new_client_engine(server_name string, config Config) !Engine {
 	mut eng := new_client_engine_with_ids(server_name, config.hsk_options,
 		random_cid(8)!, random_cid(8)!)!
 	if config.max_packet_size > 0 {
@@ -145,17 +145,17 @@ pub fn new_client_engine(server_name string, config Config) !Engine {
 }
 
 // state exposes the handshake state (handshake.HandshakeState) for polling.
-pub fn (e &Engine) state() handshake.HandshakeState {
+fn (e &Engine) state() handshake.HandshakeState {
 	return e.hs.state()
 }
 
 // negotiated_alpn returns the server's ALPN pick ('' if none).
-pub fn (e &Engine) negotiated_alpn() string {
+fn (e &Engine) negotiated_alpn() string {
 	return e.hs.negotiated_alpn()
 }
 
 // negotiated_cipher_suite returns the negotiated suite.
-pub fn (e &Engine) negotiated_cipher_suite() handshake.CipherSuite {
+fn (e &Engine) negotiated_cipher_suite() handshake.CipherSuite {
 	return e.hs.negotiated_cipher_suite()
 }
 
@@ -163,7 +163,7 @@ pub fn (e &Engine) negotiated_cipher_suite() handshake.CipherSuite {
 // HANDSHAKE_DONE. Requiring .connected as well as the frame flag keeps a forged
 // HANDSHAKE_DONE in an earlier packet type from making dial() return unauthenticated
 // (RFC 9000 §19.20: HANDSHAKE_DONE is only valid in 1-RTT packets).
-pub fn (e &Engine) is_confirmed() bool {
+fn (e &Engine) is_confirmed() bool {
 	return e.confirmed && e.hs.state() == .connected
 }
 
@@ -172,30 +172,30 @@ pub fn (e &Engine) is_confirmed() bool {
 // until a HelloRetryRequest changes the destination ID, after which both peers
 // re-derive from the server-chosen ID (§5.5); a peer still keyed on this value
 // cannot open the retry flight.
-pub fn (e &Engine) original_dcid() []u8 {
+fn (e &Engine) original_dcid() []u8 {
 	return e.orig_dcid
 }
 
 // source_cid returns the engine's Source Connection ID (the server echoes it).
-pub fn (e &Engine) source_cid() []u8 {
+fn (e &Engine) source_cid() []u8 {
 	return e.scid
 }
 
 // failure_alert returns the alert the handshake core classified on failure.
-pub fn (e &Engine) failure_alert() handshake.AlertDescription {
+fn (e &Engine) failure_alert() handshake.AlertDescription {
 	return e.hs.failure_alert()
 }
 
 // close_error_code returns the QUIC transport error code the engine last closed
 // with (a CRYPTO_ERROR, 0x100 + alert, on a handshake failure).
-pub fn (e &Engine) close_error_code() u64 {
+fn (e &Engine) close_error_code() u64 {
 	return e.close_error
 }
 
 // start returns the initial outbound datagram carrying the first ClientHello in
 // an Initial packet. It must be called once after construction, before any input
 // is fed (RFC 9000 §7).
-pub fn (mut e Engine) start() ![]u8 {
+fn (mut e Engine) start() ![]u8 {
 	ch := e.hs.create_client_hello()!
 	e.ch_trace = ch.clone()
 	e.tx_crypto_initial << ch
@@ -206,7 +206,7 @@ pub fn (mut e Engine) start() ![]u8 {
 // engine put on the wire. It exists so the socket facade can dump, under
 // QUIC_DEBUG, the exact ClientHello a peer rejected - the sealed Initial only
 // shows ciphertext, and the transport-agnostic engine must not import I/O itself.
-pub fn (e &Engine) client_hello_trace() []u8 {
+fn (e &Engine) client_hello_trace() []u8 {
 	return e.ch_trace.clone()
 }
 
@@ -215,7 +215,7 @@ pub fn (e &Engine) client_hello_trace() []u8 {
 // matching level's stream, drives the handshake core with newly-completed
 // messages, installs handshake/application keys as the core exports them, and
 // flushes any outbound handshake bytes into fresh packets.
-pub fn (mut e Engine) receive(datagram []u8) ![]u8 {
+fn (mut e Engine) receive(datagram []u8) ![]u8 {
 	if e.closed {
 		return error('quic: engine is closed')
 	}
@@ -273,7 +273,7 @@ pub fn (mut e Engine) receive(datagram []u8) ![]u8 {
 // level's bytes are sent in as many packets as needed; the datagrams are
 // concatenated in level order (Initial, Handshake, 1-RTT), as the coalescing
 // rules require (RFC 9000 §12.2).
-pub fn (mut e Engine) flush() ![]u8 {
+fn (mut e Engine) flush() ![]u8 {
 	mut out := []u8{}
 	initial := e.flush_level(.initial)!
 	out << initial
@@ -288,7 +288,7 @@ pub fn (mut e Engine) flush() ![]u8 {
 // reason, for the caller to send (RFC 9000 §19.19). It uses 1-RTT protection if
 // the handshake got far enough to install application keys, otherwise Initial
 // protection.
-pub fn (mut e Engine) close(error_code u32, reason string) ![]u8 {
+fn (mut e Engine) close(error_code u32, reason string) ![]u8 {
 	e.closed = true
 	e.close_error = error_code
 	mut frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
@@ -880,7 +880,7 @@ fn (e &Engine) tx_state_for(ptype PacketType) !ProtectionState {
 // timer tick, and the first call after a send arms the initial timeout. Retransmits
 // reuse the stored CRYPTO bytes under fresh packet numbers, so a peer that already
 // has them simply dedups the offset.
-pub fn (mut e Engine) retransmit_expired(now_ms i64) ![]u8 {
+fn (mut e Engine) retransmit_expired(now_ms i64) ![]u8 {
 	if e.closed || e.unacked.len == 0 {
 		return []u8{}
 	}
@@ -920,7 +920,7 @@ pub fn (mut e Engine) retransmit_expired(now_ms i64) ![]u8 {
 // time remaining until it fires. It returns -1 when no handshake flight is outstanding
 // (or the engine is closed), so the caller falls back to its own socket timeout
 // (RFC 9000 §6.2.1, §A.4).
-pub fn (e &Engine) probe_wait_ms(now_ms i64) i64 {
+fn (e &Engine) probe_wait_ms(now_ms i64) i64 {
 	if e.closed || e.unacked.len == 0 {
 		return -1
 	}

@@ -5,7 +5,7 @@ TLS 1.3 semantics *and* both transport surfaces. The transport mode is chosen at
 construction and stored as the `is_quic` flag:
 
 - `new_tls_handshake(...)` — record mode (`is_quic false`) for the TLS record adapter (`tls.Conn`).
-- `new_quic_handshake(...)` — QUIC mode (`is_quic true`) for the QUIC adapter (`tls.quic.Engine`, driven through the socket-owning `tls.quic.Conn` facade).
+- `new_quic_handshake(...)` — QUIC mode (`is_quic true`) for the QUIC adapter (the module-internal `tls.quic.Engine`, driven externally through the socket-owning `tls.quic.Conn` facade).
 
 The mode does not split the type: transport-specific entry points exist on both
 modes and guard themselves. A TLS-record-only call on a QUIC-mode core, and a
@@ -209,7 +209,8 @@ guards, which change no state and zeroize nothing.
 
 The core is unaware of packet acknowledgments: emitting ACK frames, retaining the
 handshake flight for retransmission on a probe timeout, and fragmenting outbound
-CRYPTO to the datagram MTU are all QUIC-adapter responsibilities (`tls.quic.Engine`)
+CRYPTO to the datagram MTU are all QUIC-adapter responsibilities (the
+module-internal `tls.quic.Engine`)
 built on top of the message seam above (RFC 9000 §13.2, §6.2.1, §14). The core still
 exposes no record or stream semantics to the adapter.
 

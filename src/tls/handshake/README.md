@@ -72,7 +72,7 @@ messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + hea
 aead.v                cipher-suite → AEAD/hash helpers
 alert.v               §6 alert vocabulary; quic_connection_error (§4.8) mapping
 post_handshake.v      NewSessionTicket and KeyUpdate parsing
-passthrough.v         recordless message-framing helper
+state_machine_extra.v     recordless message-framing helper
 ```
 
 Each `*_test.v` sits beside its source.

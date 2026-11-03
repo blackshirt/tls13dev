@@ -34,7 +34,7 @@ The core was therefore split so that the carrier is always someone else's job:
    │          post_handshake.v / transcript.v                                       │
    │  Key seam: key_schedule.v accessors answer both modes (leg shape by mode)      │
    │  One-sided: core_guarded.v ratchet/reassembly_len + params/HRR (is_quic-guarded)      │
-   │  aead.v / certificate_verify.v / alert.v / passthrough.v                       │
+   │  aead.v / certificate_verify.v / alert.v / state_machine_extra.v                       │
    └────────────────────────────────────────────────────────────────────────────────────┘
         ▲                                     ▲                                     ▲
         │ receive_initial_bytes                │ handshake keys / secrets             │ create_client_hello /
@@ -168,7 +168,7 @@ compatibility hack (RFC 8446 App. D.4), and QUIC packets are already opaque
 If the server requests the client's certificate, the core accepts the
 `CertificateRequest` and emits an **empty `Certificate`** (§4.4.2) — this
 library has no client credential to offer, so it declines rather than aborting.
-That empty Certificate is folded into the transcript before the server flight
+That empty Certificate is folded into the transcript after the server flight
 is verified.
 
 ---
@@ -246,7 +246,7 @@ CRYPTO alert path at all.
 ### 3.6 CRYPTO reassembly
 
 Within a phase the CRYPTO stream is self-framed handshake messages
-(type ∥ u24 length). `next_recordless_message()` — the recordless twin of the
+(type ∥ u24 length). `next_unframed_message()` — the recordless twin of the
 record layer's parser — extracts one complete message from the front of a byte
 buffer, capping the declared length at `max_handshake_message_len` (1 MiB) from
 the header alone so a hostile peer cannot make the adapter buffer indefinitely.
@@ -312,7 +312,7 @@ mut app_gen := hs.traffic_keys()!
 hs.zeroize_traffic_secrets()!
 
 // 8. Post-handshake: NewSessionTicket rides the 1-RTT CRYPTO stream. Reassemble
-//    with next_recordless_message and decode with parse_new_session_ticket.
+//    with next_unframed_message and decode with parse_new_session_ticket.
 //    A KeyUpdate here is a connection error (RFC 9001 §6) — do NOT feed keys.
 ```
 
@@ -328,7 +328,7 @@ hs.zeroize_traffic_secrets()!
   post-handshake traffic, and an engine that does not implement resumption must
   not let a NewSessionTicket flight block the HANDSHAKE_DONE that confirms the
   connection. Handle post-handshake CRYPTO separately with
-  `next_recordless_message()` and `parse_new_session_ticket()` if needed.
+  `next_unframed_message()` and `parse_new_session_ticket()` if needed.
 - `negotiated_alpn()` returns the server's selection (`''` if none); the shared
   core verifies that any selection was offered (RFC 7301 §3.1).
 
@@ -346,23 +346,11 @@ The validator in `HandshakeOptions` is optional. If omitted, construction uses
 cannot be loaded. Supply a custom `pki.Validator` to use private trust roots or
 custom validation policy. The QUIC client constructor requires `server_name`;
 its optional TLS settings are supplied through `quic.Config.hsk_options`.
-For example:
-
-```v
-mut conn := quic.new_client_engine('example.com', quic.Config{
-	hsk_options: handshake.HandshakeOptions{ alpn: ['h3'] }
-})!
-```
-
-`new_client_engine` returns a transport-agnostic `quic.Engine` — it builds and
-protects packets in memory but owns no socket, so the caller pumps datagrams
-through `start()` / `receive()` / `retransmit_expired()` by hand. For a
-ready-to-use client, `quic.dial(address, quic.Config)` wraps that engine in a
-socket-owning `quic.Conn` facade: it opens the UDP socket, derives `server_name`
-from the address host when unset, runs the handshake loop to confirmation under
-`Config.timeout`, retransmits the flight on a probe timeout, and returns a
-confirmed connection exposing `is_confirmed()`, `negotiated_alpn()`,
-`negotiated_cipher_suite()`, `serve(idle)` and `close()`:
+The public entry point is `quic.dial()`: it opens a UDP socket, derives
+`server_name` from the address host when unset, runs the handshake loop to
+confirmation under `Config.timeout`, retransmits the flight on a probe timeout,
+and returns a confirmed `quic.Conn` exposing `negotiated_alpn()`,
+`negotiated_cipher_suite()`, and `close()`:
 
 ```v
 mut conn := quic.dial('example.com:443', quic.Config{
@@ -373,6 +361,12 @@ defer {
 }
 println(conn.negotiated_alpn())
 ```
+
+Behind the facade, `quic.Engine` is module-internal: it builds and protects
+packets in memory but owns no socket, so the caller pumps datagrams through
+`start()` / `receive()` / `retransmit_expired()` by hand. It is not part of the
+public API — users who want a non-socket transport should drive the public
+`tls.handshake` core directly instead (see CONTRACT.md).
 
 ---
 
@@ -437,7 +431,7 @@ protection, and the alert alone rarely shows which parameter was at fault.
 - `src/tls/handshake/state_machine.v` — the unified TLS handshake core.
 - `src/tls/handshake/core_guarded.v` — the core's one-sided methods: the TLS-record
   ratchet/reassembly_len and the QUIC params/HRR surface (is_quic-guarded).
-- `src/tls/handshake/passthrough.v` — CRYPTO-stream reassembly (RFC 9001 §4).
+- `src/tls/handshake/state_machine_extra.v` — CRYPTO-stream reassembly (RFC 9001 §4).
 - `src/tls/handshake/alert.v` — `AlertDescription` + `quic_connection_error()`.
 - `src/tls/handshake/key_schedule.v` — `hkdf_expand_label`, the §7.1 ladder.
 - `src/tls/conn.v` — the reference TCP adapter: the

@@ -172,7 +172,7 @@ fn (mut c Conn) do_handshake() ! {
 // application data plane, is the only reason to keep reading). It returns when
 // idle_timeout elapses with no datagram, or once the peer closes the connection. A
 // zero or negative idle_timeout waits indefinitely for the socket's own timeout.
-pub fn (mut c Conn) serve(idle_timeout time.Duration) ! {
+fn (mut c Conn) serve(idle_timeout time.Duration) ! {
 	if idle_timeout > 0 {
 		c.sock.set_read_timeout(idle_timeout)
 	}
@@ -238,12 +238,12 @@ fn (mut c Conn) read_into() !int {
 }
 
 // is_confirmed reports whether the handshake finished (HANDSHAKE_DONE processed).
-pub fn (c &Conn) is_confirmed() bool {
+fn (c &Conn) is_confirmed() bool {
 	return c.engine.is_confirmed()
 }
 
 // state exposes the handshake state for polling.
-pub fn (c &Conn) state() handshake.HandshakeState {
+fn (c &Conn) state() handshake.HandshakeState {
 	return c.engine.state()
 }
 
@@ -258,12 +258,12 @@ pub fn (c &Conn) negotiated_cipher_suite() handshake.CipherSuite {
 }
 
 // original_dcid returns the destination CID used in the first Initial packet.
-pub fn (c &Conn) original_dcid() []u8 {
+fn (c &Conn) original_dcid() []u8 {
 	return c.engine.original_dcid()
 }
 
 // source_cid returns this endpoint's source CID.
-pub fn (c &Conn) source_cid() []u8 {
+fn (c &Conn) source_cid() []u8 {
 	return c.engine.source_cid()
 }
 
