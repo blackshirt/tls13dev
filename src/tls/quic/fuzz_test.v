@@ -1,0 +1,220 @@
+// Copyright (c) 2026 blackshirt.
+//
+// fuzz_test.v — mutation-based fuzzer for tls.quic wire parse entry points.
+//
+// Every target must return an error on malformed input, never panic.
+// Any panic/unrecoverable abort = P1 crash bug, caught as a test failure.
+//
+// Run: v test src/tls/quic/
+module quic
+
+import encoding.hex
+
+// ===== PRNG (xorshift128+) =====
+
+struct FuzzRng {
+mut:
+	s0 u64
+	s1 u64
+}
+
+fn (mut r FuzzRng) next() u64 {
+	mut s0 := r.s0
+	mut s1 := r.s1
+	mut result := s0 + s1
+	s1 ^= s0
+	s0 = rotl64(s0, 55) ^ s1 ^ (s1 << 14)
+	s1 = rotl64(s1, 36)
+	r.s0 = s0
+	r.s1 = s1
+	return result
+}
+
+fn rotl64(x u64, k int) u64 {
+	return (x << k) | (x >> (64 - k))
+}
+
+fn new_fuzz_rng(seed u64) FuzzRng {
+	mut z := seed + 0x9e3779b97f4a7c15
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	z = z ^ (z >> 31)
+	return FuzzRng{ s0: z, s1: z + 0x9e3779b97f4a7c15 }
+}
+
+fn (mut r FuzzRng) u8() u8 {
+	return u8(r.next() & 0xff)
+}
+
+fn (mut r FuzzRng) below(n int) int {
+	return int(r.next() % u64(n))
+}
+
+// ===== Mutation engine =====
+
+fn fuzz_mutate(mut r FuzzRng, input []u8) []u8 {
+	if input.len == 0 {
+		mut n := r.below(64) + 1
+		mut out := []u8{cap: n}
+		for i in 0 .. n {
+			out << r.u8()
+		}
+		return out
+	}
+	mut out := input.clone()
+	mut op := r.below(6)
+	match op {
+		0 { // bitflip
+			mut pos := r.below(out.len)
+			out[pos] = out[pos] ^ r.u8()
+		}
+		1 { // insert byte
+			mut pos := r.below(out.len + 1)
+			out = fuzz_insert_byte(mut out, pos, r.u8())
+		}
+		2 { // delete byte
+			if out.len > 1 {
+				mut pos := r.below(out.len)
+				out = fuzz_delete_byte(mut out, pos)
+			}
+		}
+		3 { // truncate
+			if out.len > 1 {
+				mut new_len := r.below(out.len - 1) + 1
+				out = out[..new_len]
+			}
+		}
+		4 { // overwrite region
+			mut pos := r.below(out.len)
+			mut max_chunk := fuzz_min(8, out.len - pos)
+			mut chunk_len := r.below(max_chunk) + 1
+			for i in 0 .. chunk_len {
+				if pos + i < out.len {
+					out[pos + i] = r.u8()
+				}
+			}
+		}
+		else { // append random bytes
+			mut n := r.below(16) + 1
+			for i in 0 .. n {
+				out << r.u8()
+			}
+		}
+	}
+	return out
+}
+
+fn fuzz_insert_byte(mut s []u8, pos int, b u8) []u8 {
+	mut out := []u8{cap: s.len + 1}
+	out << s[..pos]
+	out << b
+	out << s[pos..]
+	return out
+}
+
+fn fuzz_delete_byte(mut s []u8, pos int) []u8 {
+	mut out := []u8{cap: s.len - 1}
+	out << s[..pos]
+	out << s[pos + 1..]
+	return out
+}
+
+fn fuzz_min(a int, b int) int {
+	if a < b { return a }
+	return b
+}
+
+// ===== Seed corpus =====
+
+fn seed_crypto_frame() []u8 {
+	return [0x06, 0x00, 0x00]
+}
+
+fn seed_ack_frame() []u8 {
+	return [0x02, 0x00, 0x00]
+}
+
+fn seed_varint() []u8 {
+	return [0x00, 0x3f, 0x7f, 0x3fff, 0x3fffffff]
+}
+
+fn seed_packet_number() []u8 {
+	return [0x00, 0x01, 0x7f, 0x80, 0xff]
+}
+
+// ===== Crash dedup hash =====
+
+fn fuzz_crash_hash(data []u8) string {
+	mut h := u64(0xcbf29ce484222325)
+	for b in data {
+		h ^= u64(b)
+		h *= 0x100000001b3
+	}
+	return hex.encode([u8(h), u8(h >> 8), u8(h >> 16), u8(h >> 24)])
+}
+
+fn fuzz_report(target string, input []u8) {
+	h := fuzz_crash_hash(input)
+	print('CRASH in ${target}: ${input.len} bytes hash ${h}')
+	print('  input: ${hex.encode(input)}')
+}
+
+// ===== Target runners =====
+
+fn fuzz_crypto_frame(seed u64, iterations int) {
+	mut r := new_fuzz_rng(seed)
+	mut s := seed_crypto_frame()
+	for _ in 0 .. iterations {
+		input := fuzz_mutate(mut r, s)
+		parse_crypto_frame(input) or {}
+	}
+}
+
+fn fuzz_ack_frame(seed u64, iterations int) {
+	mut r := new_fuzz_rng(seed)
+	mut s := seed_ack_frame()
+	for _ in 0 .. iterations {
+		input := fuzz_mutate(mut r, s)
+		parse_ack_frame(input, false) or {}
+	}
+}
+
+fn fuzz_varint(seed u64, iterations int) {
+	mut r := new_fuzz_rng(seed)
+	mut s := seed_varint()
+	for _ in 0 .. iterations {
+		input := fuzz_mutate(mut r, s)
+		if input.len == 0 { continue }
+		decode_varint(input) or {}
+	}
+}
+
+fn fuzz_packet_number(seed u64, iterations int) {
+	mut r := new_fuzz_rng(seed)
+	mut s := seed_packet_number()
+	for _ in 0 .. iterations {
+		input := fuzz_mutate(mut r, s)
+		if input.len < 2 { continue }
+		truncated := u64(input[0])
+		pn_len := int(input[1]) % 4 + 1
+		decode_packet_number(truncated, pn_len, 0)
+	}
+}
+
+// ===== Test entry points =====
+
+fn test_fuzz_crypto_frame() {
+	fuzz_crypto_frame(0x123456789abcdef0, 10_000)
+}
+
+fn test_fuzz_ack_frame() {
+	fuzz_ack_frame(0x23456789abcdef01, 10_000)
+}
+
+fn test_fuzz_varint() {
+	fuzz_varint(0x3456789abcdef012, 10_000)
+}
+
+fn test_fuzz_packet_number() {
+	fuzz_packet_number(0x456789abcdef0123, 10_000)
+}
