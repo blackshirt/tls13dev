@@ -340,14 +340,18 @@ fn ip_within_subtree(ip []u8, subtree []u8) bool {
 // ecdsa_hasher_for returns a hash.Hash implementing the digest named by
 // `digest_type`, used to make ecdsa.PublicKey.verify honor the signature
 // algorithm OID's hash rather than the key's curve default.
-fn ecdsa_hasher_for(digest_type string) hash.Hash {
+// Rejects unknown digest types instead of falling through to SHA-512 silently.
+fn ecdsa_hasher_for(digest_type string) !hash.Hash {
 	if digest_type == 'sha256' {
 		return sha256.new()
 	}
 	if digest_type == 'sha384' {
 		return sha512.new384()
 	}
-	return sha512.new()
+	if digest_type == 'sha512' {
+		return sha512.new()
+	}
+	return error('pki: unknown digest type ${digest_type}')
 }
 
 // verify_cert_signature verifies that `child` was signed by `parent`. Failure
@@ -410,12 +414,12 @@ fn verify_cert_signature(child Certificate, parent Certificate) ! {
 			}
 			// Build a custom hasher so verify() hashes with the OID's hash
 			// rather than the curve's default.
-			mut hh := ecdsa_hasher_for(digest_type)
+			mut hh := ecdsa_hasher_for(digest_type)!
 			opts := ecdsa.SignerOpts{
-				hash_config:     .with_custom_hash,
-				allow_custom_hash: true,
-				allow_smaller_size: true,
-				custom_hash:     &hh
+				hash_config:        .with_custom_hash
+				allow_custom_hash:  true
+				allow_smaller_size: true
+				custom_hash:        &hh
 			}
 			if !pubkey.verify(child.tbs_raw, child.signature, opts)! {
 				return error('pki: ECDSA signature verification failed')

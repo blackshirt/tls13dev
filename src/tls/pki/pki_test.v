@@ -520,14 +520,24 @@ fn test_match_hostname_rejects_empty_pattern_or_host() ! {
 // any curve).
 fn test_ecdsa_hasher_for_output_size() ! {
 	// ecdsa-with-SHA256 (1.2.840.10045.4.3.2) → SHA-256, 32-byte digest.
-	mut h256 := ecdsa_hasher_for('sha256')
+	mut h256 := ecdsa_hasher_for('sha256')!
 	assert h256.size() == 32
 
 	// ecdsa-with-SHA384 (1.2.840.10045.4.3.3) → SHA-384, 48-byte digest.
-	mut h384 := ecdsa_hasher_for('sha384')
+	mut h384 := ecdsa_hasher_for('sha384')!
 	assert h384.size() == 48
 
 	// ecdsa-with-SHA512 (1.2.840.10045.4.3.4) → SHA-512, 64-byte digest.
-	mut h512 := ecdsa_hasher_for('sha512')
+	mut h512 := ecdsa_hasher_for('sha512')!
 	assert h512.size() == 64
+}
+
+// test_ecdsa_hasher_for_rejects_unknown_digest checks that unknown digest types
+// are refused instead of silently falling through to SHA-512.
+fn test_ecdsa_hasher_for_rejects_unknown_digest() ! {
+	ecdsa_hasher_for('sha1') or {
+		assert err.msg().contains('unknown digest type')
+		return
+	}
+	assert false, 'unknown digest type must be rejected'
 }

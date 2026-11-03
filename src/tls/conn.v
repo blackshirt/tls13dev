@@ -1209,12 +1209,18 @@ fn decrypt_failure_alert(msg string) handshake.AlertDescription {
 
 // zero_bytes wipes a buffer in place before it is dropped or reused, so freed
 // memory retains no plaintext (RFC 8446 §7.5 spirit). It is tls's one zero-fill;
-// the other modules keep their own private equivalents.
+// the other modules keep their own private equivalents. The trailing checksum read
+// is a compiler barrier so the zeroing pass cannot be eliminated as dead store.
 @[direct_array_access]
 fn zero_bytes(mut buf []u8) {
 	for i in 0 .. buf.len {
 		buf[i] = 0
 	}
+	mut checksum := 0
+	for i in 0 .. buf.len {
+		checksum += int(buf[i])
+	}
+	_ = checksum
 }
 
 // mono_ms is the module's monotonic millisecond clock, read from

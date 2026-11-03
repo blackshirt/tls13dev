@@ -41,26 +41,31 @@ fn (k LeafKey) ecdsa_public_key() !ecdsa.PublicKey {
 }
 
 // hash_for_digest returns Hash(data) for the named digest ("sha256"/"sha384"/"sha512").
-// RSA-PSS verifies over a pre-computed digest; the else arm handles sha512.
-fn hash_for_digest(digest_type string, data []u8) []u8 {
+// Rejects unknown digest types instead of falling through to SHA-512 silently.
+fn hash_for_digest(digest_type string, data []u8) ![]u8 {
 	return match digest_type {
 		'sha256' { HashAlgorithm.sha256.compute_hash(data) }
 		'sha384' { HashAlgorithm.sha384.compute_hash(data) }
-		else { sha512.sum512(data) }
+		'sha512' { sha512.sum512(data) }
+		else { error('handshake: unknown digest type ${digest_type}') }
 	}
 }
 
 // ecdsa_hasher_for returns a hash.Hash implementing the digest named by
 // `digest_type`, used to make ecdsa.PublicKey.verify honor the signature
 // scheme's hash rather than the key's curve default (with_recommended_hash).
-fn ecdsa_hasher_for(digest_type string) hash.Hash {
+// Rejects unknown digest types instead of falling through to SHA-512 silently.
+fn ecdsa_hasher_for(digest_type string) !hash.Hash {
 	if digest_type == 'sha256' {
 		return sha256.new()
 	}
 	if digest_type == 'sha384' {
 		return sha512.new384()
 	}
-	return sha512.new()
+	if digest_type == 'sha512' {
+		return sha512.new()
+	}
+	return error('handshake: unknown digest type ${digest_type}')
 }
 
 // verify_certificate_verify checks the server's CertificateVerify signature against
@@ -77,7 +82,7 @@ fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_co
 				.rsa_pss_rsae_sha384 { 'sha384' }
 				else { 'sha512' }
 			}
-			digest := hash_for_digest(digest_type, signed_content)
+			digest := hash_for_digest(digest_type, signed_content)!
 			ok := rsa_key.verify_pss(digest_type, digest, cv.signature)!
 			if !ok {
 				return error('handshake: RSA-PSS ${digest_type} CertificateVerify failed')
@@ -113,12 +118,12 @@ fn verify_certificate_verify(leaf LeafKey, cv ParsedCertificateVerify, signed_co
 				else { 'sha512' }
 			}
 			pubkey := leaf.ecdsa_public_key()!
-			mut hh := ecdsa_hasher_for(digest_type)
+			mut hh := ecdsa_hasher_for(digest_type)!
 			opts := ecdsa.SignerOpts{
-				hash_config:     .with_custom_hash,
-				allow_custom_hash: true,
-				allow_smaller_size: true,
-				custom_hash:     &hh
+				hash_config:        .with_custom_hash
+				allow_custom_hash:  true
+				allow_smaller_size: true
+				custom_hash:        &hh
 			}
 			ok := pubkey.verify(signed_content, cv.signature, opts)!
 			if !ok {

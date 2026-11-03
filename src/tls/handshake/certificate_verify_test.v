@@ -121,10 +121,28 @@ fn test_verify_certificate_verify_rejects_rsa_pkcs1() ! {
 // output size matches the hash named by each ECDSA scheme (RFC 8446 §4.2.3).
 fn test_verify_certificate_verify_ecdsa_uses_scheme_hash() ! {
 	// ecdsa_secp256r1_sha256 → SHA-256, 32-byte digest.
-	mut h256 := ecdsa_hasher_for('sha256')
+	mut h256 := ecdsa_hasher_for('sha256')!
 	assert h256.size() == 32
 
 	// ecdsa_secp384r1_sha384 → SHA-384, 48-byte digest.
-	mut h384 := ecdsa_hasher_for('sha384')
+	mut h384 := ecdsa_hasher_for('sha384')!
 	assert h384.size() == 48
+}
+
+// test_hash_for_digest_rejects_unknown_digest checks that unknown digest types
+// are refused instead of silently falling through to SHA-512.
+fn test_hash_for_digest_rejects_unknown_digest() ! {
+	hash_for_digest('sha1', []u8{}) or {
+		assert err.msg().contains('unknown digest type')
+		return
+	}
+	assert false, 'unknown digest type must be rejected'
+}
+
+fn test_ecdsa_hasher_for_rejects_unknown_digest() ! {
+	ecdsa_hasher_for('sha1') or {
+		assert err.msg().contains('unknown digest type')
+		return
+	}
+	assert false, 'unknown digest type must be rejected'
 }

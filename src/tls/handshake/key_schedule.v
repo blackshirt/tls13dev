@@ -194,14 +194,23 @@ fn derive_server_app_secret(hash_algo HashAlgorithm, master_secret []u8, th_sfin
 }
 
 // wipe_secret overwrites a secret buffer before releasing it. The zeroing loop is
-// the security-relevant step; the rebinding merely clears the local handle. This is
-// tls.handshake's one zero-fill — tls and tls.quic each keep a private zero_bytes
-// (V cannot share a private fn across a module boundary), so the three loops stay
-// byte-identical by convention and every scrub in a module routes through its own.
+// the security-relevant step; the trailing checksum read is a compiler barrier so
+// the zeroing pass cannot be eliminated as dead code. The rebinding merely clears
+// the local handle. This is tls.handshake's one zero-fill — tls and tls.quic each
+// keep a private zero_bytes (V cannot share a private fn across a module boundary),
+// so the three loops stay byte-identical by convention and every scrub in a module
+// routes through its own.
 fn wipe_secret(mut secret []u8) {
 	for i in 0 .. secret.len {
 		secret[i] = 0
 	}
+	// Compiler barrier: force the compiler to believe the zeroing writes are
+	// observable, so it cannot eliminate the loop as dead store.
+	mut checksum := 0
+	for i in 0 .. secret.len {
+		checksum += int(secret[i])
+	}
+	_ = checksum
 	secret = []u8{}
 }
 

@@ -699,6 +699,13 @@ fn zero_bytes(mut buf []u8) {
 	for i in 0 .. buf.len {
 		buf[i] = 0
 	}
+	// Compiler barrier: force the compiler to believe the zeroing writes are
+	// observable, so it cannot eliminate the loop as dead store.
+	mut checksum := 0
+	for i in 0 .. buf.len {
+		checksum += int(buf[i])
+	}
+	_ = checksum
 }
 
 // flush_level emits the pending CRYPTO bytes for one level as one or more
