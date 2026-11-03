@@ -596,21 +596,68 @@ fn parse_name_constraints(ext_bytes []u8) !([]string, []string, [][]u8, [][]u8) 
 		}
 		saw_field = true
 		mut subtrees := wire.new_reader(field.data)
-		// [0]/[1] are implicitly tagged: field.data already holds the individual
-		// GeneralSubtree SEQUENCEs, with no extra GeneralSubtrees wrapper.
 		if subtrees.remaining() == 0 {
 			return error('x509: empty nameConstraints subtree list (SIZE 1..MAX)')
 		}
-		mut entries := subtrees
-		mut entry_count := 0
-		for entries.remaining() > 0 {
-			gs := read_asn1_element(mut entries) or {
-				return error('x509: malformed GeneralSubtree')
+		// Read the first element to determine tagging style:
+		//   EXPLICIT: field.data = SEQUENCE { GeneralSubtree* }  (first consumes all)
+		//   IMPLICIT: field.data = GeneralSubtree [GeneralSubtree*]  (first is entry 1)
+		// OpenSSL accepts both; RFC 5280 defaults to EXPLICIT but real-world CAs use either.
+		first := read_asn1_element(mut subtrees) or {
+			return error('x509: malformed GeneralSubtree')
+		}
+		if first.tag != 0x30 {
+			return error('x509: GeneralSubtree is not a SEQUENCE (0x${first.tag:02x})')
+		}
+		// Detect EXPLICIT: first consumed all of field.data AND first.data parses as
+		// one or more valid GeneralSubtree entries. Otherwise IMPLICIT.
+		mut explicit := false
+		if subtrees.remaining() == 0 {
+			mut test := wire.new_reader(first.data)
+			mut count := 0
+			mut ok := true
+			for test.remaining() > 0 {
+				gs := read_asn1_element(mut test) or { ok = false; break }
+				if gs.tag != 0x30 { ok = false; break }
+				mut gb := wire.new_reader(gs.data)
+				if gb.remaining() == 0 { ok = false; break }
+				_ = read_asn1_element(mut gb) or { ok = false; break }
+				count++
 			}
-			// Each GeneralSubtree is a SEQUENCE whose first element is the base GeneralName.
-			if gs.tag != 0x30 {
-				return error('x509: GeneralSubtree is not a SEQUENCE (0x${gs.tag:02x})')
+			if ok && count > 0 {
+				explicit = true
 			}
+		}
+		// Collect all GeneralSubtree elements into one list for unified processing.
+		mut gs_list := []Asn1Element{}
+		if explicit {
+			mut er := wire.new_reader(first.data)
+			for er.remaining() > 0 {
+				gs := read_asn1_element(mut er) or {
+					return error('x509: malformed GeneralSubtree')
+				}
+				if gs.tag != 0x30 {
+					return error('x509: GeneralSubtree is not a SEQUENCE (0x${gs.tag:02x})')
+				}
+				gs_list << gs
+			}
+		} else {
+			gs_list << first
+			for subtrees.remaining() > 0 {
+				gs := read_asn1_element(mut subtrees) or {
+					return error('x509: malformed GeneralSubtree')
+				}
+				if gs.tag != 0x30 {
+					return error('x509: GeneralSubtree is not a SEQUENCE (0x${gs.tag:02x})')
+				}
+				gs_list << gs
+			}
+		}
+		if gs_list.len == 0 {
+			return error('x509: empty nameConstraints subtree list (SIZE 1..MAX)')
+		}
+		// Process every collected GeneralSubtree with a single body (no duplication).
+		for gs in gs_list {
 			mut gs_body := wire.new_reader(gs.data)
 			if gs_body.remaining() == 0 {
 				return error('x509: GeneralSubtree missing base GeneralName')
@@ -621,7 +668,6 @@ fn parse_name_constraints(ext_bytes []u8) !([]string, []string, [][]u8, [][]u8) 
 			if (base.tag & 0xc0) != 0x80 || (base.tag & 0x20) != 0 {
 				return error('x509: nameConstraints base is not a context-specific primitive GeneralName')
 			}
-			entry_count++
 			match base.tag & 0x1f {
 				2 { // [2] dNSName
 					if base.data.contains(0) {
@@ -653,9 +699,6 @@ fn parse_name_constraints(ext_bytes []u8) !([]string, []string, [][]u8, [][]u8) 
 					return error('x509: unsupported nameConstraints general name form ${base.tag & 0x1f}')
 				}
 			}
-		}
-		if entry_count == 0 {
-			return error('x509: empty nameConstraints subtree list (SIZE 1..MAX)')
 		}
 	}
 	if !saw_field {

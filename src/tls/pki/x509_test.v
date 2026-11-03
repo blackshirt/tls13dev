@@ -574,7 +574,7 @@ fn test_parse_name_constraints() ! {
 	assert c.excluded_ip[0] == [u8(10), 0, 0, 0, 255, 0, 0, 0]
 }
 
-// test_parse_name_constraints_implicit_tagging: real-world CAs encode [0]/[1]
+// test_parse_name_constraints_implicit_tagging: real-world CAs sometimes encode [0]/[1]
 // as IMPLICIT, so field.data holds GeneralSubtree SEQUENCES directly (no extra
 // GeneralSubtrees wrapper). A permitted;DNS:example.com intermediate must parse
 // and enforce for example.com (regression for OpenSSL-compatible chains).
@@ -591,6 +591,51 @@ fn test_parse_name_constraints_implicit_tagging() ! {
 
 	assert c.name_constraints_present
 	assert c.permitted_dns == ['example.com']
+}
+
+// test_parse_name_constraints_explicit_multi_entry: RFC 5280 defaults to EXPLICIT
+// tagging for [0]/[1], where field.data wraps a GeneralSubtrees SEQUENCE. Multiple
+// entries in one [0] field must all parse (OpenSSL produces this encoding).
+fn test_parse_name_constraints_explicit_multi_entry() ! {
+	dns1 := der_tlv(0x82, ['example.com'.bytes()])
+	dns2 := der_tlv(0x82, ['example.org'.bytes()])
+	subtree1 := der_tlv(0x30, [dns1])
+	subtree2 := der_tlv(0x30, [dns2])
+	// EXPLICIT: [0] wraps a SEQUENCE OF GeneralSubtree entries.
+	permitted := der_tlv(0xa0, [der_tlv(0x30, [subtree1, subtree2])])
+	nc_value := der_tlv(0x30, [permitted])
+	nc_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x1e] // 2.5.29.30
+
+	cert := minimal_extension_cert(nc_oid, true, nc_value)
+	c := parse_certificate(cert)!
+
+	assert c.name_constraints_present
+	assert c.permitted_dns == ['example.com', 'example.org']
+}
+
+// test_parse_name_constraints_explicit_and_implicit_mixed: a [0] field that is
+// EXPLICIT with a single entry is byte-identical to an IMPLICIT single entry;
+// both must parse to the same result.
+fn test_parse_name_constraints_single_entry_ambiguity() ! {
+	dns_base := der_tlv(0x82, ['example.com'.bytes()])
+	dns_subtree := der_tlv(0x30, [dns_base])
+	// EXPLICIT single entry: [0] wraps GeneralSubtrees SEQUENCE wrapping one GeneralSubtree.
+	permitted_explicit := der_tlv(0xa0, [der_tlv(0x30, [dns_subtree])])
+	nc_explicit := der_tlv(0x30, [permitted_explicit])
+
+	// IMPLICIT single entry: [0] wraps one GeneralSubtree directly (no outer SEQUENCE).
+	permitted_implicit := der_tlv(0xa0, [dns_subtree])
+	nc_implicit := der_tlv(0x30, [permitted_implicit])
+
+	nc_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x1e] // 2.5.29.30
+
+	ce := parse_certificate(minimal_extension_cert(nc_oid, true, nc_explicit))!
+	assert ce.name_constraints_present
+	assert ce.permitted_dns == ['example.com']
+
+	ci := parse_certificate(minimal_extension_cert(nc_oid, true, nc_implicit))!
+	assert ci.name_constraints_present
+	assert ci.permitted_dns == ['example.com']
 }
 
 // test_parse_certificate_extracts_pss_hash_oid: a RSASSA-PSS-signed certificate
