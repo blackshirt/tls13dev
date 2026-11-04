@@ -46,14 +46,15 @@ Each `*_test.v` sits beside its source. `pki_test.v` holds validator- and helper
 ## Validation rules enforced
 
 - **Path building** to a trusted root (byte-identical anchor or a signature that verifies under
-  a stored root); every issuer name must match the child's subject; the anchor must be a CA
-  (`basicConstraints cA=TRUE`).
+  a stored root); validation stops at the earliest anchor, so unrelated peer-supplied tail
+  certificates do not affect the path. Every issuer name must match the child's subject; the
+  anchor must be a CA (`basicConstraints cA=TRUE`).
 - **Validity windows** on the leaf and every intermediate (RFC 5280 §4.1.2.5).
 - **Key usage**: leaf must permit `digitalSignature`; every CA in the path must permit
   `keyCertSign` when it asserts a `keyUsage` (RFC 5280 §4.2.1.3).
 - **Extended key usage**: when present it must allow `serverAuth`.
-- **pathLenConstraint** (RFC 5280 §4.2.1.9) counted against intermediates below each constrained
-  CA; a malformed INTEGER never maps to the unlimited sentinel.
+- **pathLenConstraint** (RFC 5280 §4.2.1.9) counted against non-self-issued intermediate CAs below
+  each constrained CA (excluding the leaf); a malformed INTEGER never maps to the unlimited sentinel.
 - **Name constraints** (RFC 5280 §4.2.1.10): each CA binds every subordinate beneath it; permitted
   subtrees are one namespace across dNSName and iPAddress.
 - **Hostname matching** (RFC 6125 §6.4.3/§6.4.4): IP literals match iPAddress SANs only; a present

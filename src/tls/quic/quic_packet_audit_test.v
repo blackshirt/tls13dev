@@ -83,7 +83,7 @@ fn test_parse_crypto_frame_bounds() ! {
 
 fn test_parse_crypto_frame_truncated_rejected() ! {
 	// offset=0, length=2 but only 1 byte follows (after type byte stripped)
-	bad := [0x00, 0x02, 0xFF]
+	bad := [u8(0x00), 0x02, 0xFF]
 	parse_crypto_frame(bad) or {
 		assert err.msg().contains('CRYPTO frame length')
 		return

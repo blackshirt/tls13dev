@@ -599,7 +599,7 @@ fn test_engine_hello_retry_request_reassembles_retry_at_correct_offset() ! {
 // (§19.6). It returns the number of packets parsed, and errors on a conflicting
 // overlap — so feeding a retransmit into a peer that already holds the bytes proves
 // the dedup path.
-fn feed_initial_crypto(mut peer &CryptoReasm, client_dcid []u8, blob []u8) !int {
+fn feed_initial_crypto(mut peer CryptoReasm, client_dcid []u8, blob []u8) !int {
 	ck, _ := derive_initial_keys(client_dcid)!
 	mut rx := new_initial_protection(ck)!
 	mut off := 0

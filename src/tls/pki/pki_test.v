@@ -191,6 +191,53 @@ fn test_chain_trust_anchor_can_precede_cross_signed_tail() {
 	assert !chain_has_trusted_anchor([chain[0], chain[2]], [root], 100)
 }
 
+// test_path_len_counts_only_non_self_issued_intermediate_cas follows RFC 5280:
+// pathLenConstraint excludes the leaf and self-issued intermediate CAs.
+fn test_path_len_counts_only_non_self_issued_intermediate_cas() {
+	leaf := Certificate{}
+	self_issued_ca := Certificate{
+		is_ca:      true
+		subject_dn: [u8(0x01)]
+		issuer_dn:  [u8(0x01)]
+	}
+	intermediate_ca := Certificate{
+		is_ca:      true
+		subject_dn: [u8(0x02)]
+		issuer_dn:  [u8(0x01)]
+	}
+	root := Certificate{
+		is_ca:      true
+		subject_dn: [u8(0x03)]
+		issuer_dn:  [u8(0x02)]
+	}
+	assert count_intermediate_cas_below([leaf, self_issued_ca, root], 2) == 0
+	assert count_intermediate_cas_below([leaf, intermediate_ca, root], 2) == 1
+	assert count_intermediate_cas_below([leaf, self_issued_ca, intermediate_ca, root],
+		3) == 1
+}
+
+// test_verify_certificate_chain_ignores_peer_tail_after_anchor ensures that
+// certificates sent after the earliest trusted anchor cannot invalidate the
+// already-established path.
+fn test_verify_certificate_chain_ignores_peer_tail_after_anchor() ! {
+	far_future := i64(4102444800)
+	root_and_leaf := Certificate{
+		raw:             [u8(0x01)]
+		public_key_algo: .ed25519
+		is_ca:           true
+		not_before_unix: 0
+		not_after_unix:  far_future
+		has_san:         true
+		sans:            ['example.com']
+	}
+	mut v := new_validator(new_trust_store())
+	v.store.certs << root_and_leaf
+
+	// This unrelated certificate would fail issuer/subject and signature checks
+	// if the verifier continued past the directly trusted first certificate.
+	v.verify_certificate_chain([root_and_leaf, Certificate{}], 'example.com')!
+}
+
 // test_server_auth_eku_required_on_intermediate pins EKU purpose across the path:
 // a clientAuth-only intermediate must not issue a serverAuth leaf this verifier
 // accepts for a TLS server (OpenSSL `-purpose sslserver` rejects at depth 1).

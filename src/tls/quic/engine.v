@@ -970,8 +970,9 @@ fn (mut e Engine) fail_close() ! {
 // engine's only wipe-then-release sequence, so release_handshake_keys() and
 // wipe_packet_keys() cannot drift apart (RFC 8446 §7.5, RFC 9001 §4.9.2).
 fn wipe_protection_state(mut slot ?ProtectionState) {
-	mut ps := slot or { ProtectionState{ aead: unsafe { nil } } }
-	ps.wipe()
+	if mut ps := slot {
+		ps.wipe()
+	}
 	slot = none
 }
 

@@ -139,10 +139,16 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	// RSA leaf-key strength floor (default 2048 bits); escape hatch: Validator.set_min_rsa_bits.
 	check_leaf_rsa_floor(leaf, v.effective_min_rsa_bits())!
 
+	// A peer may append certificates beyond the point where its path is already
+	// anchored. They are not part of the validated path and must not affect its
+	// result.
+	anchor_index := trusted_anchor_index(chain, v.store.certs, now)
+	validation_end := if anchor_index >= 0 { anchor_index } else { chain.len - 1 }
+
 	// Name constraints (RFC 5280 §4.2.1.10, §6.1.4(o)): a constraining CA binds every
 	// subordinate beneath it, not just the leaf. Apply each CA's constraints to every
 	// certificate it issues directly or indirectly — all chain indices below the CA.
-	for i in 1 .. chain.len {
+	for i in 1 .. validation_end + 1 {
 		for j in 0 .. i {
 			enforce_name_constraints(chain[i], chain[j]) or {
 				return error('pki: certificate at chain index ${i} restricts subordinate at index ${j}: ${err.msg()}')
@@ -153,7 +159,7 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	// Validate signatures along the chain: C_i must be signed by C_{i+1}, whose
 	// issuer name must match the child's subject; every issuer must be a CA
 	// (RFC 5280 §4.2.1.9).
-	for i in 0 .. chain.len - 1 {
+	for i in 0 .. validation_end {
 		child := chain[i]
 		parent := chain[i + 1]
 		if child.issuer_dn != parent.subject_dn {
@@ -169,10 +175,11 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		if !is_trusted_anchor(parent, v.store.certs, now) && parent.has_eku && !parent.eku_server_auth {
 			return error('pki: CA at chain index ${i + 1} Extended Key Usage does not permit serverAuth')
 		}
-		// pathLenConstraint (RFC 5280 §4.2.1.9): the number of non-CA certs below
-		// this CA must not exceed the limit; a stored -1 means the INTEGER was absent.
-		if parent.max_path_len >= 0 && i > parent.max_path_len {
-			return error('pki: CA at chain index ${i + 1} violates pathLenConstraint (${i} intermediate certs below > limit ${parent.max_path_len})')
+		// pathLenConstraint (RFC 5280 §4.2.1.9) counts non-self-issued
+		// intermediate CA certificates, excluding the target leaf.
+		intermediate_cas_below := count_intermediate_cas_below(chain, i + 1)
+		if parent.max_path_len >= 0 && intermediate_cas_below > parent.max_path_len {
+			return error('pki: CA at chain index ${i + 1} violates pathLenConstraint (${intermediate_cas_below} intermediate CAs below > limit ${parent.max_path_len})')
 		}
 		if now < parent.not_before_unix {
 			return error('pki: intermediate certificate not yet valid at chain index ${i + 1}')
@@ -185,10 +192,9 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 		}
 	}
 
-	// Anchor at any validated certificate in the peer chain. Servers may send
-	// cross-signed CA certificates after an intermediate; the trust path can
-	// terminate at that intermediate when its issuer is already trusted.
-	if !chain_has_trusted_anchor(chain, v.store.certs, now) {
+	// Servers may send cross-signed CA certificates after an intermediate; the
+	// trust path terminates at the first certificate already anchored to a root.
+	if anchor_index < 0 {
 		return error('pki: certificate chain cannot be verified up to a trusted root CA')
 	}
 }
@@ -219,12 +225,31 @@ fn is_trusted_anchor(cert Certificate, roots []Certificate, now i64) bool {
 // chain_has_trusted_anchor reports whether any certificate in the validated
 // peer chain is trusted directly or verifies under a valid stored root.
 fn chain_has_trusted_anchor(chain []Certificate, roots []Certificate, now i64) bool {
-	for cert in chain {
-		if is_trusted_anchor(cert, roots, now) {
-			return true
+	return trusted_anchor_index(chain, roots, now) >= 0
+}
+
+// count_intermediate_cas_below returns the number of non-self-issued CA
+// certificates between the target leaf and the certificate at parent_index.
+fn count_intermediate_cas_below(chain []Certificate, parent_index int) int {
+	mut count := 0
+	for i in 1 .. parent_index {
+		cert := chain[i]
+		if cert.is_ca && cert.subject_dn != cert.issuer_dn {
+			count++
 		}
 	}
-	return false
+	return count
+}
+
+// trusted_anchor_index returns the earliest peer certificate that is itself a
+// valid trust anchor or verifies directly under one.
+fn trusted_anchor_index(chain []Certificate, roots []Certificate, now i64) int {
+	for i, cert in chain {
+		if is_trusted_anchor(cert, roots, now) {
+			return i
+		}
+	}
+	return -1
 }
 
 // check_leaf_rsa_floor enforces the minimum RSA modulus size for a leaf

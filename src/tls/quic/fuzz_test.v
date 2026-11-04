@@ -135,7 +135,9 @@ fn seed_ack_frame() []u8 {
 }
 
 fn seed_varint() []u8 {
-	return [0x00, 0x3f, 0x7f, 0x3fff, 0x3fffffff]
+	// Encoded QUIC varint boundaries: 0/63 (1 byte), 16383 (2 bytes),
+	// and 1073741823 (4 bytes).
+	return [u8(0x00), 0x3f, 0x7f, 0xff, 0xbf, 0xff, 0xff, 0xff]
 }
 
 fn seed_packet_number() []u8 {
