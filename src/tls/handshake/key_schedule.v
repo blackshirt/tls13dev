@@ -144,18 +144,55 @@ fn empty_transcript_hash(hash HashAlgorithm) []u8 {
 	}
 }
 
-// derive_handshake_secret runs the §7.1 Early->Handshake ladder: the zero-PSK Early
-// Secret, then the Handshake Secret mixing in the ECDHE shared secret. The early chain
-// is dead once the Handshake extract consumed it (§7.5), so its locals zeroize here.
-fn derive_handshake_secret(hash_algo HashAlgorithm, shared_secret []u8) ![]u8 {
-	// Early Secret = HKDF-Extract(0, 0); without a PSK the IKM is empty but is still mixed in.
-	mut early_secret := hkdf_extract(hash_algo, []u8{}, []u8{len: hash_algo.hash_len()})
+// derive_handshake_secret runs the §7.1 Early->Handshake ladder: the Early
+// Secret (HKDF-Extract over the PSK when one is present, else zeros), then the
+// Handshake Secret mixing in the ECDHE shared secret. The early chain is dead
+// once the Handshake extract consumed it (§7.5), so its locals zeroize here.
+// When psk is none this is the zero-PSK path; when some(psk) the Early Secret
+// binds to the pre-shared key instead of an all-zero IKM.
+fn derive_handshake_secret(hash_algo HashAlgorithm, shared_secret []u8, psk ?[]u8) ![]u8 {
+	// Early Secret = HKDF-Extract(0, psk) or HKDF-Extract(0, 0) without a PSK.
+	mut early_secret := hkdf_extract(hash_algo, []u8{}, psk or { []u8{len: hash_algo.hash_len()} })
 	mut derived_early := derive_secret(hash_algo, early_secret, 'derived', empty_transcript_hash(hash_algo))!
 	wipe_secret(mut early_secret)
 	// Handshake Secret = HKDF-Extract(Derive-Secret(Early, "derived"), ECDHE)
 	handshake_secret := hkdf_extract(hash_algo, derived_early, shared_secret)
 	wipe_secret(mut derived_early)
 	return handshake_secret
+}
+
+// psk_binder_label returns the binder key label for a PSK: external PSKs use
+// "ext binder", resumption PSKs the default "res binder" (RFC 8446 §7.1).
+fn psk_binder_label(psk Psk) string {
+	return if psk.external { 'ext binder' } else { 'res binder' }
+}
+
+// derive_binder_key expands a resumption PSK binder key from the Early Secret
+// (RFC 8446 §7.1, "res binder" label). The returned key is wiped by the caller
+// after use.
+fn derive_binder_key(hash_algo HashAlgorithm, early_secret []u8) ![]u8 {
+	return derive_binder_key_labeled(hash_algo, early_secret, 'res binder')
+}
+
+// derive_binder_key_labeled expands a binder key under either the resumption or
+// external PSK label (RFC 8446 §7.1). The Derive-Secret context is
+// Transcript-Hash("") — the hash of the empty message, not an empty byte string.
+fn derive_binder_key_labeled(hash_algo HashAlgorithm, early_secret []u8, label string) ![]u8 {
+	return derive_secret(hash_algo, early_secret, label, empty_transcript_hash(hash_algo))!
+}
+
+// compute_psk_binder computes one PSK binder over the ClientHello transcript
+// hash (RFC 8446 §4.2.9): bind the PSK into the Early Secret, derive the binder
+// and finished keys, then HMAC the transcript hash. Each intermediate is wiped
+// before returning; the caller owns the binder bytes.
+fn compute_psk_binder(hash_algo HashAlgorithm, psk_key []u8, label string, transcript_hash []u8) ![]u8 {
+	mut early_secret := hkdf_extract(hash_algo, []u8{}, psk_key)
+	defer { wipe_secret(mut early_secret) }
+	mut binder_key := derive_binder_key_labeled(hash_algo, early_secret, label)!
+	defer { wipe_secret(mut binder_key) }
+	mut finished_key := derive_finished_key(hash_algo, binder_key)!
+	defer { wipe_secret(mut finished_key) }
+	return hash_algo.compute_hmac(finished_key, transcript_hash)
 }
 
 // derive_client_hs_secret expands the client handshake traffic secret (RFC 8446
@@ -438,13 +475,14 @@ pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 }
 
 // wipe_key_schedule_secrets destroys the key-schedule intermediate, both
-// handshake traffic secrets, and the dead ephemeral ECDHE halves at .connected
-// (RFC 8446 §1.3.1/§7.5). Handshake traffic secrets are dead once the client
-// Finished is sent / server Finished verified, so they are wiped here rather
-// than surviving until connection close.
+// handshake traffic secrets, the selected PSK key material, and the dead
+// ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5). Handshake
+// traffic secrets are dead once the client Finished is sent / server Finished
+// verified, so they are wiped here rather than surviving until connection close.
 pub fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
 	wipe_secret(mut h.handshake_secret)
 	wipe_secret(mut h.c_hsk_tsec)
 	wipe_secret(mut h.s_hsk_tsec)
+	wipe_secret(mut h.selected_psk_key)
 	h.release_ephemeral_keys()
 }

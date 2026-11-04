@@ -59,8 +59,8 @@ core_guarded.v        One-sided surfaces of the core (is_quic-guarded): TLS-reco
                       — reassembly_len accessor and the KeyUpdate ratchet that
                       returns the next generation's key material; QUIC side — peer
                       transport params and the HRR flag (the key accessors are shared)
-client_hello.v        validate options, build the §4.1.2 ClientHello
-server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks
+client_hello.v        validate options, build the §4.1.2 ClientHello (PSK identities/binders)
+server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks, PSK selection
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
 certificate_verify.v  verify the §4.4.3 CertificateVerify (pure, no state change)
 key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations,

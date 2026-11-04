@@ -55,6 +55,12 @@ enum ExtensionType as u16 {
 	quic_transport_parameters = 57
 	// RFC 5746 §4.1, not RFC 8446: servers may carry it in EncryptedExtensions unoffered.
 	renegotiation_info        = 65281 // 0xff01
+	// pre_shared_key carries PSK identities (ClientHello) or the server's
+	// selected PSK index (ServerHello) (RFC 8446 §4.2.9).
+	pre_shared_key            = 41
+	// psk_key_exchange_modes tells the server which PSK key-exchange modes
+	// the client supports (mode 1 = psk_dhe_ke, PSK with (EC)DHE) (RFC 8446 §4.2.11).
+	psk_key_exchange_modes    = 45
 }
 
 // NamedGroup defines key exchange groups (RFC 8446 §4.2.7); only the two mandatory
@@ -236,4 +242,108 @@ fn split_handshake_message(full_msg []u8) !(HandshakeType, []u8) {
 		return error('handshake: handshake message header declares ${length} body bytes, message carries ${r.remaining()}')
 	}
 	return msg_type, r.read_bytes(length)!
+}
+
+// PskKeyExchangeMode names the PSK key-exchange modes (RFC 8446 §4.2.11).
+pub enum PskKeyExchangeMode as u8 {
+	psk_ke     = 0 // PSK only, no (EC)DHE (no forward secrecy)
+	psk_dhe_ke = 1 // PSK with (EC)DHE (forward secrecy)
+}
+
+// supported_psk_key_exchange_modes is the mode list this client offers:
+// psk_dhe_ke only, so every PSK handshake keeps forward secrecy.
+pub const supported_psk_key_exchange_modes = [PskKeyExchangeMode.psk_dhe_ke]
+
+// PskIdentity is one offered PSK: an opaque ticket (the identity) and its
+// obfuscated ticket age (ticket_age_add + age mod 2^32) (RFC 8446 §4.2.9).
+pub struct PskIdentity {
+mut:
+	identity              []u8 // opaque PSK identity (a NewSessionTicket's ticket bytes)
+	obfuscated_ticket_age u32  // ticket_age_add + age (mod 2^32), obfuscating real age
+}
+
+// Psk is a usable pre-shared key: the identity presented on the wire plus the
+// key material both sides use to derive binders and the Early Secret (RFC 8446
+// §7.1).
+pub struct Psk {
+pub mut:
+	identity []u8 // opaque PSK identity (ticket bytes, sent in the ClientHello)
+	key      []u8 // PSK key material (known to both client and server)
+	// obfuscated_ticket_age is the ticket_age_add-obfuscated age sent for a
+	// resumption PSK (RFC 8446 §4.2.9); zero is valid for a freshly issued ticket.
+	obfuscated_ticket_age u32
+	// external selects the "ext binder" label over the resumption default
+	// "res binder" (RFC 8446 §7.1); importers of externally provisioned PSKs set it.
+	external bool
+}
+
+// PskBinderEntry is one PSK binder: an HMAC over the finished binder key and the
+// truncated ClientHello transcript hash (RFC 8446 §4.2.9).
+pub struct PskBinderEntry {
+mut:
+	binder []u8
+}
+
+// build_psk_key_exchange_modes_extension encodes the psk_key_exchange_modes
+// extension (RFC 8446 §4.2.11): a u8-length vector of modes.
+fn build_psk_key_exchange_modes_extension() ![]u8 {
+	mut body := wire.new_writer(1 + 3)
+	mut modes := wire.new_writer(2)
+	for m in supported_psk_key_exchange_modes {
+		modes.write_u8(u8(m))
+	}
+	body.write_vector_u8(modes.bytes())!
+	return body.bytes()
+}
+
+// build_pre_shared_key_identities encodes the identities vector of the
+// pre_shared_key extension (RFC 8446 §4.2.9), including its u16 length prefix.
+fn build_pre_shared_key_identities(identities []PskIdentity) ![]u8 {
+	mut entries := wire.new_writer(64)
+	for id in identities {
+		entries.write_vector_u16(id.identity)!
+		entries.write_u32(id.obfuscated_ticket_age)
+	}
+	mut out := wire.new_writer(entries.len() + 2)
+	out.write_vector_u16(entries.bytes())!
+	return out.bytes()
+}
+
+// build_pre_shared_key_binders encodes the binders vector of the
+// pre_shared_key extension (RFC 8446 §4.2.9), including its u16 length prefix.
+// Each PskBinderEntry is an opaque<32..255>, so its own length is one byte.
+fn build_pre_shared_key_binders(binders []PskBinderEntry) ![]u8 {
+	mut entries := wire.new_writer(64)
+	for b in binders {
+		entries.write_vector_u8(b.binder)!
+	}
+	mut out := wire.new_writer(entries.len() + 2)
+	out.write_vector_u16(entries.bytes())!
+	return out.bytes()
+}
+
+// build_pre_shared_key_extension encodes the pre_shared_key extension body
+// (RFC 8446 §4.2.9): a u16-length vector of identities followed by a u16-length
+// vector of binders. Binders may be empty placeholders to be filled later.
+fn build_pre_shared_key_extension(identities []PskIdentity, binders []PskBinderEntry) ![]u8 {
+	if identities.len != binders.len {
+		return error('handshake: pre_shared_key has ${identities.len} identities but ${binders.len} binders')
+	}
+	ids := build_pre_shared_key_identities(identities)!
+	binds := build_pre_shared_key_binders(binders)!
+	mut body := wire.new_writer(ids.len + binds.len)
+	body.write_bytes(ids)
+	body.write_bytes(binds)
+	return body.bytes()
+}
+
+// parse_server_selected_psk decodes the pre_shared_key extension body from a
+// ServerHello: exactly one u16 selected identity index (RFC 8446 §4.2.9).
+fn parse_server_selected_psk(ext_data []u8) !u16 {
+	mut r := wire.new_reader(ext_data)
+	selected := r.read_u16()!
+	if r.remaining() != 0 {
+		return error('handshake: trailing bytes in ServerHello pre_shared_key extension')
+	}
+	return selected
 }

@@ -342,3 +342,102 @@ fn test_connected_destroys_handshake_secret_keeps_app_secrets() ! {
 	app_client.wipe()
 	app_server.wipe()
 }
+
+// test_psk_only_handshake_reaches_connected checks a resumption-style PSK
+// handshake where the server authenticates with the PSK alone: EE followed by
+// Finished, no Certificate/CertificateVerify (RFC 8446 §4.4.2).
+fn test_psk_only_handshake_reaches_connected() ! {
+	key := [u8(0x42)].repeat(32)
+	identity := 'fakeserver-psk'.bytes()
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
+		validator: fixture_trusted_validator()
+		psks:      [Psk{ identity: identity, key: key }]
+	})!
+	mut srv := fakeserver.new_server(psk: key, psk_identity: identity)!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	assert !fl.is_hrr
+	h.receive_initial_bytes(fl.server_hello)!
+	assert h.selected_psk? == u16(0)
+
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl.rest))!
+	assert h.state() == .connected
+	assert h.server_certs.len == 0
+	assert produced.len == 1
+	srv.handle_client_finished(produced[0].msg)!
+}
+
+// test_external_psk_handshake_uses_ext_binder checks the "ext binder" label and
+// that the server verifies the resulting binder (RFC 8446 §7.1).
+fn test_external_psk_handshake_uses_ext_binder() ! {
+	key := [u8(0x24)].repeat(32)
+	identity := 'external-psk'.bytes()
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
+		validator: fixture_trusted_validator()
+		psks:      [Psk{ identity: identity, key: key, external: true }]
+	})!
+	mut srv := fakeserver.new_server(psk: key, psk_identity: identity, psk_external: true)!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	h.receive_initial_bytes(fl.server_hello)!
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl.rest))!
+	assert h.state() == .connected
+	srv.handle_client_finished(produced[0].msg)!
+}
+
+// test_psk_hello_retry_request_rebinds_binder checks that the retried ClientHello
+// binder covers message_hash(ClientHello1) || HelloRetryRequest (RFC 8446 §4.2.9).
+fn test_psk_hello_retry_request_rebinds_binder() ! {
+	key := [u8(0x7e)].repeat(32)
+	identity := 'hrr-psk'.bytes()
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
+		validator: fixture_trusted_validator()
+		psks:      [Psk{ identity: identity, key: key }]
+	})!
+	mut srv := fakeserver.new_server(hrr: .change_group, psk: key, psk_identity: identity)!
+
+	ch1 := h.create_client_hello()!
+	fl1 := srv.handle_client_hello(ch1)!
+	assert fl1.is_hrr
+	out := h.receive_initial_bytes(fl1.server_hello)!
+	assert out.len == 1
+
+	fl2 := srv.handle_client_hello(out[0].msg)!
+	assert !fl2.is_hrr
+	h.receive_initial_bytes(fl2.server_hello)!
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl2.rest))!
+	assert h.state() == .connected
+	srv.handle_client_finished(produced[0].msg)!
+}
+
+// test_psk_server_selects_second_identity_with_certificate checks per-entry
+// binders and selected_identity resolution when multiple PSKs are offered, and
+// the PSK + certificate-authenticated path where CertificateVerify is still sent.
+fn test_psk_server_selects_second_identity_with_certificate() ! {
+	first_key := [u8(0x11)].repeat(32)
+	second_key := [u8(0x22)].repeat(32)
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
+		validator: fixture_trusted_validator()
+		psks:      [
+			Psk{ identity: 'first-psk'.bytes(), key: first_key },
+			Psk{ identity: 'second-psk'.bytes(), key: second_key },
+		]
+	})!
+	mut srv := fakeserver.new_server(
+		psk:          second_key
+		psk_identity: 'second-psk'.bytes()
+		psk_only:     false
+	)!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	h.receive_initial_bytes(fl.server_hello)!
+	assert h.selected_psk? == u16(1)
+
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl.rest))!
+	assert h.state() == .connected
+	assert h.server_certs.len == 1
+	srv.handle_client_finished(produced[0].msg)!
+}

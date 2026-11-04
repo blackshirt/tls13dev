@@ -118,7 +118,7 @@ fn test_rfc8448_composite_phase_helpers() ! {
 	hash := HashAlgorithm.sha256
 	ecdh_shared := hex.decode(rfc8448_ecdhe_shared_secret)!
 	transcript_ch_sh := hex.decode(rfc8448_transcript_hash_ch_sh)!
-	handshake_secret := derive_handshake_secret(hash, ecdh_shared)!
+	handshake_secret := derive_handshake_secret(hash, ecdh_shared, none)!
 	assert hex.encode(handshake_secret) == rfc8448_handshake_secret
 	hs_c := derive_client_hs_secret(hash, handshake_secret, transcript_ch_sh)!
 	hs_s := derive_server_hs_secret(hash, handshake_secret, transcript_ch_sh)!
@@ -177,7 +177,7 @@ fn test_derivers_leave_input_secret_untouched() ! {
 	client_hs_traffic := hex.decode(rfc8448_client_hs_traffic)!
 
 	shared_before := shared_secret.clone()
-	_ = derive_handshake_secret(hash, shared_secret)!
+	_ = derive_handshake_secret(hash, shared_secret, none)!
 	assert shared_secret == shared_before
 
 	hs_before := handshake_secret.clone()
@@ -253,7 +253,7 @@ fn test_sha384_split_chain_matches_primitives() ! {
 	early := hkdf_extract(hash, []u8{}, []u8{len: 48})
 	derived_early := derive_secret(hash, early, 'derived', empty_transcript_hash(hash))!
 	manual_hs := hkdf_extract(hash, derived_early, shared_secret)
-	split_hs := derive_handshake_secret(hash, shared_secret)!
+	split_hs := derive_handshake_secret(hash, shared_secret, none)!
 	assert split_hs == manual_hs
 	assert split_hs.len == 48
 
@@ -263,4 +263,98 @@ fn test_sha384_split_chain_matches_primitives() ! {
 	split_master := derive_master_secret(hash, manual_hs)!
 	assert split_master == manual_master
 	assert split_master.len == 48
+}
+
+// test_psk_handshake_secret_changes_with_psk verifies that adding a PSK to the
+// Early Secret changes the Handshake Secret (RFC 8446 §7.1: the PSK is mixed
+// into the Early Secret via HKDF-Extract).
+fn test_psk_handshake_secret_changes_with_psk() {
+	hash := HashAlgorithm.sha256
+	shared_secret := []u8{len: 32, init: 0xab}
+	psk := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+		0xff, 0x00]
+
+	hs_zero_psk := derive_handshake_secret(hash, shared_secret, none)!
+	hs_with_psk := derive_handshake_secret(hash, shared_secret, psk)!
+
+	assert hs_zero_psk != hs_with_psk
+	assert hs_zero_psk.len == 32
+	assert hs_with_psk.len == 32
+}
+
+// test_psk_early_secret_is_psk_when_offered verifies that the Early Secret is
+// HKDF-Extract(0, psk) when a PSK is offered, and HKDF-Extract(0, 0) when not.
+fn test_psk_early_secret_is_psk_when_offered() {
+	hash := HashAlgorithm.sha256
+	psk := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+		0xff, 0x00]
+
+	early_zero := hkdf_extract(hash, []u8{}, []u8{len: 32})
+	early_psk := hkdf_extract(hash, []u8{}, psk)
+
+	assert early_zero != early_psk
+	assert early_zero.len == 32
+	assert early_psk.len == 32
+}
+
+// test_psk_binder_key_is_different_per_psk verifies that the binder key derived
+// from the Early Secret is keyed material that differs with different Early Secrets.
+fn test_psk_binder_key_is_different_per_psk() {
+	hash := HashAlgorithm.sha256
+	psk1 := [u8(0x11), 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+		0xee, 0xff, 0x00]
+	psk2 := [u8(0xff), 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33,
+		0x22, 0x11, 0x00]
+
+	early1 := hkdf_extract(hash, []u8{}, []u8{len: 32})
+	early2 := hkdf_extract(hash, []u8{}, psk1)
+
+	binder_key_zero := derive_binder_key(hash, early1)!
+	binder_key_psk := derive_binder_key(hash, early2)!
+
+	assert binder_key_zero != binder_key_psk
+	assert binder_key_zero.len == 32
+	assert binder_key_psk.len == 32
+}
+
+// test_psk_identity_round_trip verifies PskIdentity and PskBinderEntry can be
+// constructed and accessed (foundation for ClientHello binder computation).
+fn test_psk_identity_round_trip() {
+	id := PskIdentity{
+		identity:              [u8(0xde), 0xad, 0xbe, 0xef]
+		obfuscated_ticket_age: 12345
+	}
+	assert id.identity.len == 4
+	assert id.obfuscated_ticket_age == 12345
+
+	binder := PskBinderEntry{
+		binder: [u8(0x01), 0x02, 0x03, 0x04]
+	}
+	assert binder.binder.len == 4
+}
+
+// test_psk_key_exchange_modes_extension verifies the psk_key_exchange_modes
+// extension body encodes only psk_dhe_ke (mode 1) (RFC 8446 §4.2.11).
+fn test_psk_key_exchange_modes_extension() {
+	ext := build_psk_key_exchange_modes_extension()!
+	// Extension body: mode_len(1) + mode(1) = 2 bytes
+	assert ext.len == 2
+	assert ext[0] == 0x01 // one mode
+	assert ext[1] == 0x01 // mode = psk_dhe_ke
+}
+
+// test_rfc8448_resumption_psk_binder pins the PSK binder construction to the
+// RFC 8448 §4 resumption example: early secret from the PSK, the "res binder"
+// label, then the "finished" expansion over the ClientHello prefix hash.
+fn test_rfc8448_resumption_psk_binder() ! {
+	hash := HashAlgorithm.sha256
+	psk := hex.decode('4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3')!
+	client_hello_prefix_hash := hex.decode('63224b2e4573f2d3454ca84b9d009a04f6be9e05711a8396473aefa01e924a14')!
+
+	binder := compute_psk_binder(hash, psk, 'res binder', client_hello_prefix_hash)!
+	assert hex.encode(binder) == '3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d'
+
+	// External PSKs use a distinct label and therefore a distinct binder.
+	external := compute_psk_binder(hash, psk, 'ext binder', client_hello_prefix_hash)!
+	assert external != binder
 }

@@ -31,6 +31,7 @@ const ext_alpn = u16(16)
 const ext_supported_versions = u16(43)
 const ext_cookie = u16(44)
 const ext_key_share = u16(51)
+const ext_pre_shared_key = u16(41)
 const ext_quic_transport_parameters = u16(57)
 
 // Named groups (RFC 8446 §4.2.7) the fakeserver can negotiate.
@@ -58,16 +59,20 @@ const hrr_cookie = 'fakeserver-hrr-cookie-v1'.bytes()
 // flight; everything else (SNI, signature_algorithms, ...) is parsed past.
 struct ClientHello {
 mut:
-	random      []u8
-	session_id  []u8
-	suites      []u16
-	groups      []u16
-	share_group u16
-	share       []u8
-	cookie      []u8
-	alpn        []string
-	versions    []u16
-	is_quic     bool
+	random         []u8
+	session_id     []u8
+	suites         []u16
+	groups         []u16
+	share_group    u16
+	share          []u8
+	cookie         []u8
+	alpn           []string
+	versions       []u16
+	is_quic        bool
+	psk_identities [][]u8
+	psk_ages       []u32
+	psk_binders    [][]u8
+	psk_truncated  []u8 // ClientHello up to but excluding the binders vector (§4.2.9)
 }
 
 // HrrMode selects the HelloRetryRequest behavior of the next new_server.
@@ -111,6 +116,16 @@ pub:
 	// RFC 9000 §7.3 makes a server that omits it non-compliant, so a QUIC fakeserver
 	// must be given it.
 	quic_original_dcid []u8
+	// psk is the pre-shared key the server accepts when non-empty. The client must
+	// offer psk_identity with a matching binder, and the server selects that index.
+	psk []u8
+	// psk_identity is the identity associated with psk (RFC 8446 §4.2.9).
+	psk_identity []u8
+	// psk_external chooses the "ext binder" label instead of "res binder".
+	psk_external bool
+	// psk_only omits Certificate/CertificateVerify when a PSK was selected, exercising
+	// the §4.4.1 PSK-authenticated flight.
+	psk_only bool = true
 }
 
 // Stage tracks where the fakeserver is in its two-hello state machine.
@@ -140,6 +155,8 @@ mut:
 	server_hsk_traffic  []u8
 	client_app_traffic  []u8
 	server_app_traffic  []u8
+	selected_psk        ?u16
+	psk_key             []u8
 	// pending_tail holds the server-flight messages deferred until the client's
 	// empty Certificate is folded into the transcript.
 	pending_tail [][]u8
@@ -176,6 +193,18 @@ fn (t &Transcript) hash() []u8 {
 	for m in t.msgs {
 		total << m
 	}
+	return sha256_digest(total)
+}
+
+// hash_with_suffix returns SHA-256 over every transcript message followed by suffix,
+// without mutating the transcript. PSK binders hash the retry context plus a
+// truncated ClientHello (§4.2.9).
+fn (t &Transcript) hash_with_suffix(suffix []u8) []u8 {
+	mut total := []u8{}
+	for m in t.msgs {
+		total << m
+	}
+	total << suffix
 	return sha256_digest(total)
 }
 
@@ -279,14 +308,45 @@ fn pick_hrr_group(groups []u16, current u16) !u16 {
 	return error('fakeserver: client offered no alternative group for HelloRetryRequest')
 }
 
+// select_psk verifies the offered binder for the configured PSK and returns its
+// selected_identity index (RFC 8446 §4.2.9).
+fn (mut s Server) select_psk(ch ClientHello) !u16 {
+	if ch.psk_truncated.len == 0 || ch.psk_binders.len == 0 {
+		return error('fakeserver: configured a PSK but the ClientHello offered none')
+	}
+	mut idx := -1
+	for i, id in ch.psk_identities {
+		if id == s.cfg.psk_identity {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return error('fakeserver: ClientHello did not offer PSK identity "${s.cfg.psk_identity.bytestr()}"')
+	}
+	binder := hkdf_extract([]u8{}, s.cfg.psk)
+	label := if s.cfg.psk_external { 'ext binder' } else { 'res binder' }
+	binder_key := derive_secret(binder, label, sha256_digest([]u8{}))!
+	th := s.transcript.hash_with_suffix(ch.psk_truncated)
+	expected := finished_verify_data(binder_key, th)!
+	if ch.psk_binders[idx] != expected {
+		return error('fakeserver: selected PSK binder mismatch')
+	}
+	s.selected_psk = u16(idx)
+	s.psk_key = s.cfg.psk.clone()
+	return u16(idx)
+}
+
 // finish_flight performs the (EC)DHE exchange, builds ServerHello, derives the
 // handshake secrets and emits the flight (RFC 8446 §4.4.1/§4.4.2).
 fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
+	selected_psk := if s.cfg.psk.len > 0 { s.select_psk(ch)! } else { none }
 	server_share, shared := server_ecdhe(ch.share_group, ch.share)!
 	s.shared_secret = shared
 	s.share_group = ch.share_group
 
-	sh := build_server_hello(s.session_id, s.cfg.cipher_suite, ch.share_group, server_share)!
+	sh := build_server_hello(s.session_id, s.cfg.cipher_suite, ch.share_group, server_share,
+		selected_psk)!
 	// Transcript now covers ClientHello2 (or 1) and ServerHello (th_ch_sh, §7.1).
 	s.transcript.append(ch_msg)
 	s.transcript.append(sh)
@@ -324,7 +384,11 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 		}
 	}
 
-	tail := s.build_server_tail()!
+	tail := if s.selected_psk != none && s.cfg.psk_only {
+		s.build_psk_server_tail()!
+	} else {
+		s.build_server_tail()!
+	}
 	s.stage = .expect_client_finished
 	mut rest := [][]u8{cap: 1 + tail.len}
 	rest << ee
@@ -334,6 +398,20 @@ fn (mut s Server) finish_flight(ch ClientHello, ch_msg []u8) !Flight {
 		server_hello: sh
 		rest:         rest
 	}
+}
+
+// build_psk_server_tail builds the PSK-authenticated server flight: just Finished,
+// since §4.4.2 skips Certificate and CertificateVerify.
+fn (mut s Server) build_psk_server_tail() ![][]u8 {
+	th := s.transcript.hash()
+	mut verify_data := finished_verify_data(s.server_hsk_traffic, th)!
+	if s.cfg.bad_finished {
+		verify_data[verify_data.len - 1] = verify_data[verify_data.len - 1] ^ 0xff
+	}
+	fin := wrap_handshake(hs_finished, verify_data)
+	s.transcript.append(fin)
+	s.derive_application_secrets()!
+	return [fin]
 }
 
 // build_server_tail builds Certificate + CertificateVerify + Finished over the
@@ -439,7 +517,8 @@ pub fn (mut s Server) handle_client_finished(msg []u8) ! {
 fn (mut s Server) derive_handshake_secrets() ! {
 	zeros := []u8{len: hash_len}
 	empty := sha256_digest([]u8{})
-	early_secret := hkdf_extract(zeros.clone(), zeros.clone())
+	psk_ikm := if s.psk_key.len > 0 { s.psk_key.clone() } else { zeros.clone() }
+	early_secret := hkdf_extract(zeros.clone(), psk_ikm)
 	derived_early := derive_secret(early_secret, 'derived', empty)!
 	handshake_secret := hkdf_extract(derived_early, s.shared_secret)
 	th := s.transcript.hash()
@@ -638,6 +717,30 @@ fn parse_client_hello(msg []u8) !ClientHello {
 				ch.share_group = kr.read_u16()!
 				ch.share = kr.read_vector_u16()!
 			}
+		} else if etyp == ext_pre_shared_key {
+			// §4.2.9: pre_shared_key must be the last extension so its binders are
+			// the final bytes of the ClientHello.
+			if e.remaining() != 0 {
+				return error('fakeserver: pre_shared_key is not the last ClientHello extension')
+			}
+			ids := d.read_vector_u16()!
+			mut ir := wire.new_reader(ids)
+			for ir.remaining() > 0 {
+				ch.psk_identities << ir.read_vector_u16()!
+				ch.psk_ages << ir.read_u32()!
+			}
+			binders := d.read_vector_u16()!
+			mut br := wire.new_reader(binders)
+			for br.remaining() > 0 {
+				ch.psk_binders << br.read_vector_u8()!
+			}
+			if d.remaining() != 0 {
+				return error('fakeserver: trailing bytes in pre_shared_key extension')
+			}
+			if 2 + binders.len > msg.len {
+				return error('fakeserver: pre_shared_key binders exceed ClientHello length')
+			}
+			ch.psk_truncated = msg[..msg.len - (2 + binders.len)]
 		} else if etyp == ext_quic_transport_parameters {
 			ch.is_quic = true
 		} else if etyp == ext_signature_algorithms {
@@ -712,7 +815,8 @@ fn server_ecdhe(group u16, client_share []u8) !([]u8, []u8) {
 
 // build_server_hello emits a TLS 1.3 ServerHello echoing the session id and
 // selecting the negotiated suite and group (RFC 8446 §4.1.3).
-fn build_server_hello(session_id []u8, suite u16, share_group u16, server_share []u8) ![]u8 {
+fn build_server_hello(session_id []u8, suite u16, share_group u16, server_share []u8,
+	selected_psk ?u16) ![]u8 {
 	mut body := wire.new_writer(128)
 	body.write_u16(0x0303) // legacy_version (§4.1.3)
 	body.write_bytes(rand.bytes(32) or {
@@ -732,6 +836,11 @@ fn build_server_hello(session_id []u8, suite u16, share_group u16, server_share 
 	entry.write_vector_u16(server_share)!
 	ext.write_u16(ext_key_share)
 	ext.write_vector_u16(entry.bytes())!
+	if idx := selected_psk {
+		// pre_shared_key in ServerHello is exactly the selected_identity u16 (§4.2.9).
+		ext.write_u16(ext_pre_shared_key)
+		ext.write_vector_u16([u8(idx >> 8), u8(idx & 0xff)])!
+	}
 
 	body.write_vector_u16(ext.bytes())!
 	return wrap_handshake(hs_server_hello, body.bytes())

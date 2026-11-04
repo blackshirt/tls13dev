@@ -139,7 +139,10 @@ fn (h &HandshakeCore) is_handshake_message_accepted(msg_type HandshakeType) bool
 	return match h.state {
 		.wait_ee { msg_type == .encrypted_extensions }
 		.wait_cert_cr {
+			// A PSK-authenticated server may skip Certificate/CertificateVerify and
+			// send Finished directly after EncryptedExtensions (§4.4.2).
 			msg_type == .certificate_request || msg_type == .certificate
+				|| (h.selected_psk != none && msg_type == .finished)
 		}
 		.wait_cert { msg_type == .certificate }
 		.wait_cv { msg_type == .certificate_verify }

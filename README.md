@@ -94,6 +94,10 @@ sibling import (`tls`) relative to the executable's own directory.
 - **Server auth completeness**: `Finished` verify_data, `CertificateVerify`
   over the §4.4.3 signed content, transcript-hash binding throughout
 - **ALPN** negotiation with RFC 7301 §3.1 selection checks
+- **Pre-shared keys**: caller-supplied resumption/external PSKs with
+  `psk_dhe_ke` (PSK + ECDHE) binders in the ClientHello, server PSK selection
+  in ServerHello, and PSK-authenticated flights without CertificateVerify
+  (RFC 8446 §4.2.9/§4.4.2); automatic ticket-to-PSK resumption is not wired up
 - **Post-handshake**: `NewSessionTicket` collection, `KeyUpdate` handling
   (read keys update on receipt; a response is sent with correct §4.6.3
   old-key-before-new ordering when the server requests it), sender-side
@@ -108,8 +112,8 @@ sibling import (`tls`) relative to the executable's own directory.
 
 ## Not (yet) implemented
 
-- Session resumption / PSK / 0-RTT (tickets are received but not usable;
-  the key schedule always runs the no-PSK "early secret" path)
+- Automatic session resumption and 0-RTT (tickets are received but not
+  converted into PSKs; callers may supply PSKs explicitly via `Config.psks`)
 - Certificate **revocation** — CRL and OCSP are not implemented, so a
   revoked-but-unexpired certificate is accepted; there is no callback hook
   either. See [`docs.md`](docs.md) for the rationale and the recommended

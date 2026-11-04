@@ -168,3 +168,47 @@ fn test_server_hello_reports_missing_supported_versions() ! {
 	}
 	assert wrong, 'a present-but-wrong version must keep the wrong-value wording'
 }
+
+// test_server_hello_pre_shared_key_selection checks the §4.2.9 ServerHello
+// shape: a single u16 selected_identity is decoded, while an empty or overlong
+// extension is fatal rather than silently treated as "no PSK selected".
+fn test_server_hello_pre_shared_key_selection() ! {
+	mut exts := wire.new_writer(96)
+	exts.write_bytes(ext_block(u16(ExtensionType.supported_versions), [u8(0x03), 0x04])!)
+	mut ks := wire.new_writer(40)
+	ks.write_u16(0x001d)
+	ks.write_vector_u16([]u8{len: 32, init: 0x22})!
+	exts.write_bytes(ext_block(u16(ExtensionType.key_share), ks.bytes())!)
+	exts.write_bytes(ext_block(u16(ExtensionType.pre_shared_key), [u8(0x00), 0x01])!)
+	sh := parse_server_hello(sh_body(exts.bytes())!)!
+	assert sh.selected_psk? == u16(1)
+
+	for bad in [[]u8{}, [u8(0x00)], [u8(0x00), 0x00, 0x01]] {
+		mut bad_exts := wire.new_writer(96)
+		bad_exts.write_bytes(ext_block(u16(ExtensionType.supported_versions), [
+			u8(0x03),
+			0x04,
+		])!)
+		bad_exts.write_bytes(ext_block(u16(ExtensionType.pre_shared_key), bad)!)
+		mut rejected := false
+		parse_server_hello(sh_body(bad_exts.bytes())!) or {
+			assert err.msg().contains('pre_shared_key')
+			rejected = true
+		}
+		assert rejected, 'malformed pre_shared_key data ${bad.len} must be rejected'
+	}
+}
+
+// test_server_hello_rejects_pre_shared_key_in_hrr pins §4.2.9: the extension
+// may only appear in a ServerHello, never in a HelloRetryRequest.
+fn test_server_hello_rejects_pre_shared_key_in_hrr() ! {
+	mut exts := wire.new_writer(96)
+	exts.write_bytes(ext_block(u16(ExtensionType.supported_versions), [u8(0x03), 0x04])!)
+	exts.write_bytes(ext_block(u16(ExtensionType.pre_shared_key), [u8(0x00), 0x00])!)
+	mut rejected := false
+	parse_server_hello(sh_body_at(hello_retry_request_random.clone(), exts.bytes())!) or {
+		assert err.msg().contains('illegal in HelloRetryRequest')
+		rejected = true
+	}
+	assert rejected, 'pre_shared_key in a HelloRetryRequest must be fatal'
+}

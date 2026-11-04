@@ -167,6 +167,9 @@ pub:
 	root_cas ?pki.TrustStore
 	// min_rsa_bits floors the accepted RSA leaf key size; 0 keeps the 2048-bit default.
 	min_rsa_bits int
+	// psks are the pre-shared keys the client may offer in the ClientHello
+	// (RFC 8446 §4.2.9). Each carries an identity and the shared key material.
+	psks []handshake.Psk
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }
@@ -179,6 +182,7 @@ pub fn default_config(server_name string) Config {
 		insecure_skip_verify: false
 		root_cas:             none
 		hsk_options:          handshake.HandshakeOptions{}
+		psks:                 []handshake.Psk{}
 	}
 }
 
@@ -233,7 +237,12 @@ pub fn dial(address string, config Config) !&Conn {
 	if config.min_rsa_bits > 0 {
 		validator.set_min_rsa_bits(config.min_rsa_bits)
 	}
-	options := handshake_options.with_validator(validator)
+	mut options := handshake_options.with_validator(validator)
+	// Config.psks is the dial-facing slot; keep PSKs already supplied through
+	// hsk_options when the shorthand list is empty.
+	if config.psks.len > 0 {
+		options.psks = config.psks.clone()
+	}
 
 	mut hs := handshake.new_tls_handshake(server_name, options) or {
 		sock.close() or {}

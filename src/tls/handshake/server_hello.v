@@ -31,10 +31,14 @@ mut:
 	has_key_share bool
 	// cookie holds the cookie value from a HelloRetryRequest, empty otherwise.
 	cookie []u8
+	// selected_psk: the index of the PSK the server selected (ServerHello
+	// pre_shared_key extension), or none when no PSK was negotiated.
+	selected_psk ?u16
 }
 
 // validate performs the ServerHello/HelloRetryRequest checks independent of the message
 // variant (RFC 8446 §4.1.3): the echoed session id must match and the suite must be offered.
+// When a PSK was negotiated, the server's selected index must be within the offered list.
 fn (sh ServerHello) validate(cfg &ClientHelloConfig) ! {
 	// A session-id mismatch means the hello we answer is not the one we sent (illegal_parameter).
 	if sh.session_id_echo != cfg.session_id {
@@ -43,6 +47,15 @@ fn (sh ServerHello) validate(cfg &ClientHelloConfig) ! {
 	// An unoffered suite would let an attacker downgrade us to one the state machine never configured.
 	if !sh.is_offered_cipher_suite(cfg) {
 		return error('handshake: server selected unoffered cipher suite ${sh.cipher_suite} (illegal_parameter)')
+	}
+	// The server may select at most one PSK; its index must be within the offered list.
+	if sh.selected_psk != none {
+		if cfg.psks.len == 0 {
+			return error('handshake: server selected a PSK but the client offered none (illegal_parameter)')
+		}
+		if sh.selected_psk! >= u16(cfg.psks.len) {
+			return error('handshake: server selected PSK index ${sh.selected_psk} but only ${cfg.psks.len} offered (illegal_parameter)')
+		}
 	}
 }
 
@@ -83,6 +96,8 @@ fn parse_server_hello(body []u8) !ServerHello {
 	mut server_share := KeyShareEntry{}
 	mut has_key_share := false
 	mut cookie := []u8{}
+	mut has_psk := false
+	mut selected_psk := u16(0)
 	is_hrr := random == hello_retry_request_random // §4.1.3: fixed sentinel random identifies an HRR
 
 	exts := parse_extensions(ext_bytes)!
@@ -140,6 +155,18 @@ fn parse_server_hello(body []u8) !ServerHello {
 					return error('handshake: trailing bytes in HelloRetryRequest cookie')
 				}
 			}
+			u16(ExtensionType.pre_shared_key) {
+				// §4.2.9: a server MUST NOT send pre_shared_key in a
+				// HelloRetryRequest, and in a ServerHello it is exactly one u16
+				// selected_identity.
+				if is_hrr {
+					return error('handshake: pre_shared_key extension is illegal in HelloRetryRequest (illegal_parameter)')
+				}
+				selected_psk = parse_server_selected_psk(data_r.read_bytes(data_r.remaining())!) or {
+					return error('handshake: malformed ServerHello pre_shared_key extension: ${err.msg()}')
+				}
+				has_psk = true
+			}
 			else {
 				// The §4.2 allowlist: TLS 1.2 leftovers must never reach client state.
 				return error('handshake: extension 0x${ext.typ:04x} not permitted in ServerHello (unsupported_extension)')
@@ -165,5 +192,6 @@ fn parse_server_hello(body []u8) !ServerHello {
 		is_hello_retry_req: is_hrr
 		has_key_share:      has_key_share
 		cookie:             cookie
+		selected_psk:       if has_psk { selected_psk } else { none }
 	}
 }

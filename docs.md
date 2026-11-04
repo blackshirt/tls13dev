@@ -8,7 +8,7 @@ crypto — no OpenSSL bindings, no third-party dependencies.
 
 | | |
 |---|---|
-| **Protocol** | TLS 1.3 (RFC 8446) — client only; no TLS 1.2 fallback, resumption, or 0-RTT |
+| **Protocol** | TLS 1.3 (RFC 8446) — client only; no TLS 1.2 fallback, automatic ticket resumption, or 0-RTT |
 | **Implementation** | Pure V over the standard-library crypto stack; strict, bounds-checked parsing throughout |
 | **API surface** | `dial()` · `Conn` · `Config` · `default_config()` · `pki.TrustStore` — plus the importable `tls.handshake` core for non-TCP transports; everything else is module-private |
 | **Modules** | `tls` (record layer + TCP API) → `tls.handshake` (transport-neutral core) → `tls.pki` (trust & parsing) → `tls.wire` (byte codec) |
@@ -180,7 +180,8 @@ The full exchange one successful `dial()` performs, in wire order:
   ─────────►  Finished              client flight; both sides derive
                                     application keys on success
   ⇄ ⇄ ⇄ ⇄ ⇄   application_data …    records sealed with traffic keys
-  ◄─────────  NewSessionTicket …    collected (capped at 32), not yet usable
+  ◄─────────  NewSessionTicket …    collected (capped at 32); PSKs are
+                                    supplied explicitly via Config.psks
   ◄─────────  KeyUpdate             read keys ratchet; response sent when
   ─────────►  KeyUpdate             requested (old-key-before-new order)
   ─────────►  close_notify          `Conn.close()`, then TCP FIN
@@ -445,6 +446,7 @@ pub:
 	insecure_skip_verify bool
 	root_cas             ?pki.TrustStore
 	min_rsa_bits         int
+	psks                 []handshake.Psk
 	hsk_options handshake.HandshakeOptions = handshake.HandshakeOptions{}
 	timeout              time.Duration = 30 * time.second
 }
@@ -460,6 +462,7 @@ build one up front from `default_config()`).
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
+| `psks` | empty | Caller-supplied pre-shared keys to offer with `psk_dhe_ke` (RFC 8446 §4.2.9). Each `Psk` carries an identity, key material, an optional obfuscated ticket age, and an `external` flag selecting the `"ext binder"` label. PSKs are offered only alongside (EC)DHE; the server may select one or authenticate with certificates. Automatic ticket-to-PSK resumption and 0-RTT are not implemented. |
 | `hsk_options` | defaults | ALPN protocols to offer, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. An empty ALPN list offers no ALPN; the server's pick is verified against the offered list. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 

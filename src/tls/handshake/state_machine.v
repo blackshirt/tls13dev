@@ -73,12 +73,15 @@ pub:
 	cipher_suites []CipherSuite
 	// signature_algorithms is preference-ordered; empty uses the built-in list.
 	signature_algorithms []SignatureScheme
+	// psks are the pre-shared keys the client may offer in the ClientHello
+	// (RFC 8446 §4.2.9). Each carries an identity and the shared key material.
+pub mut:
+	psks []Psk
 	// legacy_session_id is the ClientHello session id echoed in ServerHello.
 	legacy_session_id []u8
 	// random is the ClientHello random; with legacy_session_id it lets a test vector
 	// pin a deterministic handshake.
 	random []u8
-pub mut:
 	// quic_transport_params is the encoded content of the TLS
 	// quic_transport_parameters extension (RFC 9001 §8.2), copied through without
 	// interpretation: the adapter above encodes and decodes it.
@@ -99,6 +102,7 @@ pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOpt
 		legacy_session_id:     o.legacy_session_id.clone()
 		random:                o.random.clone()
 		quic_transport_params: o.quic_transport_params
+		psks:                  o.psks.clone()
 	}
 }
 
@@ -150,6 +154,8 @@ mut:
 
 	// Handshake retry and outcome.
 	hrr_cipher_suite ?CipherSuite   // suite from the retry request; presence marks a retry
+	selected_psk     ?u16           // PSK index selected by the server (ServerHello pre_shared_key)
+	selected_psk_key []u8           // resolved PSK key material for the Early Secret
 	state            HandshakeState // position in the client state machine (RFC 8446 App. A.1)
 	negotiated_alpn  string         // protocol chosen by the server, or empty if none
 	fail_alert       AlertDescription = .internal_error // alert to report if the handshake fails
@@ -200,6 +206,7 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 			cipher_suites:         options.cipher_suites.clone()
 			supported_groups:      options.supported_groups.clone()
 			signature_algorithms:  options.signature_algorithms.clone()
+			psks:                  options.psks.clone()
 			is_quic:               is_quic
 			quic_transport_params: if is_quic {
 				options.quic_transport_params
@@ -359,7 +366,19 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	h.set_hash_algo(suite_hash_algo(sh.cipher_suite))
 	h.update_transcript(full_sh_msg)!
 
+	// Record the server-selected PSK index for the key schedule. The server may
+	// only select from identities we offered, which validate() already checked.
+	h.selected_psk = sh.selected_psk
+	// Resolve the selected PSK's key material for the key schedule Early Secret.
+	if h.selected_psk != none {
+		idx := int(h.selected_psk!)
+		if idx < h.config.psks.len {
+			h.selected_psk_key = h.config.psks[idx].key.clone()
+		}
+	}
+
 	// §7.1 handshake phase: derive the Handshake Secret and the client/server handshake traffic secrets.
+	// With a server-selected PSK, the Early Secret binds to it instead of zeros.
 	mut shared_secret := h.compute_shared_secret(sh.server_share)!
 	defer {
 		wipe_secret(mut shared_secret)
@@ -370,7 +389,11 @@ fn (mut h HandshakeCore) handle_server_hello_message(sh_msg []u8) ![]HandshakeMe
 	// Derive the retained Handshake Secret, then each direction's traffic secret from it.
 	// Stored to h.handshake_secret, so it cannot be defer-wiped (a defer would zero the
 	// buffer the field still needs); each expansion wipes it on its own error path instead.
-	mut hs_secret := derive_handshake_secret(h.hash_algo, shared_secret)!
+	mut hs_secret := derive_handshake_secret(h.hash_algo, shared_secret, if h.selected_psk_key.len > 0 {
+		h.selected_psk_key.clone()
+	} else {
+		none
+	})!
 	c_hs := derive_client_hs_secret(h.hash_algo, hs_secret, th_ch_sh) or {
 		wipe_secret(mut hs_secret)
 		return err
@@ -433,6 +456,11 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 	// A cookie-only HelloRetryRequest keeps the original key share; the cookie is
 	// echoed verbatim (§4.1.4/§4.2.2).
 	h.config.cookie = cookie
+	// Bind the retried ClientHello to the rewritten transcript
+	// (message_hash(ClientHello1) || HelloRetryRequest), using the HRR suite's
+	// hash, so PSK binders cover the full retry context (§4.2.9/§4.4.1).
+	h.config.binder_transcript = h.transcript.messages.clone()
+	h.config.binder_hash_algo = h.hash_algo
 	_, full_ch2 := build_client_hello(h.config)!
 	// Hash the retry into the already message_hash-rewritten transcript so the
 	// Finished MAC covers the retried flight (§4.4.1).
