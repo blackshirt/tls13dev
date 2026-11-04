@@ -35,6 +35,7 @@ fn new_test_conn() !&Conn {
 		fail_alert:         none
 		deadline_ms:        0 // socket-free fixture: post-handshake shape, no framing cap
 		sock_timeout:       0 // unused without the do_handshake loop
+		read_guard:         sync.new_mutex()
 		guard:              sync.new_mutex()
 		negotiated_alpn:    ''
 		server_name:        ''
@@ -426,6 +427,7 @@ fn test_close_is_idempotent_with_live_socket() ! {
 		peer_terminated:    false
 		failure_alert_sent: false
 		fail_alert:         none
+		read_guard:         sync.new_mutex()
 		guard:              sync.new_mutex()
 		negotiated_alpn:    ''
 		server_name:        ''
@@ -435,6 +437,9 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	c.close()!
 	assert c.closed
 	assert c.close_notify_sent
+	assert c.sock_closed
+	// Repeating the internal close helper must not close the descriptor twice.
+	c.close_tcp_socket()
 	assert c.sock_closed
 	// The single-phase teardown reached every protection state (§7.5). The fixture
 	// leaves the protection states unset, so this pins that close() never
@@ -513,6 +518,35 @@ fn test_write_abort_terminates_read_side() ! {
 	assert false, 'a write onto the nil socket must abort'
 }
 
+// test_write_after_abort_preserves_the_sticky_error ensures closed state does not
+// mask the reason an earlier write terminated the connection.
+fn test_write_after_abort_preserves_the_sticky_error() ! {
+	mut c := new_test_conn()!
+	c.closed = true
+	c.fatal_error = 'tls: original write failure'
+	c.write([u8(1)]) or {
+		assert err.msg() == 'tls: original write failure'
+		return
+	}
+	assert false, 'a write after a fatal failure must return the sticky error'
+}
+
+// test_destroy_all_wipes_session_tickets ensures teardown clears retained opaque
+// ticket bytes as well as the ticket values held by Conn.
+fn test_destroy_all_wipes_session_tickets() ! {
+	mut c := new_test_conn()!
+	nst_body := [u8(0), 0, 0, 1, 0, 0, 0, 0, 1, 0xab, 0, 2, 0xcd, 0xce, 0, 2, 0xef, 0xf0]
+	c.session_tickets << handshake.parse_new_session_ticket(nst_body)!
+	ticket_bytes := c.session_tickets[0].bytes()
+	assert ticket_bytes.len == 2
+
+	c.destroy_all()!
+	assert c.session_tickets.len == 0
+	for b in ticket_bytes {
+		assert b == 0
+	}
+}
+
 // test_read_surfaces_fatal_on_empty_buffer pins the Finding B reorder: a 0-length
 // liveness probe must report a sticky fatal/truncation error rather than a clean EOF,
 // so a failed connection can never masquerade as gracefully shut down (§6.1).
@@ -550,18 +584,18 @@ fn test_default_config_applies_field_defaults() {
 
 // parked_read_worker blocks in Conn.read() until it returns (a parked socket read
 // released guard, an unguarded close(), or the read timeout) and reports completion.
-fn parked_read_worker(mut cc Conn, done_ch chan bool) {
+fn parked_read_worker(mut cc Conn, done_ch chan string) {
 	mut buf := []u8{len: 16}
 	cc.read(mut buf) or {
-		done_ch <- true
+		done_ch <- err.msg()
 		return
 	}
-	done_ch <- true
+	done_ch <- 'read returned data'
 }
 
-// test_close_is_not_blocked_by_parked_read pins the single-mutex invariant: read()
-// releases guard around the indefinite blocking sock.read(), so a concurrent close()
-// acquires guard and returns promptly instead of deadlocking behind a parked reader.
+// test_close_is_not_blocked_by_parked_read pins the guard-release invariant: read()
+// releases guard around the blocking sock.read(), so a concurrent close() can proceed
+// without waiting for the read mutex or deadlocking behind the parked socket read.
 // The client socket carries a 1s read timeout as a hard backstop, so the assertion is
 // that close() itself completes well under it — the property a lock held across the
 // read would violate.
@@ -572,7 +606,7 @@ fn test_close_is_not_blocked_by_parked_read() ! {
 	}
 	local := listener.addr()!
 	mut cli := net.dial_tcp(local.str())!
-	cli.set_read_timeout(1 * time.second)
+	cli.set_read_timeout(2 * time.second)
 	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store()) })!
 	mut c := &Conn{
 		sock:               cli
@@ -587,23 +621,38 @@ fn test_close_is_not_blocked_by_parked_read() ! {
 		peer_terminated:    false
 		failure_alert_sent: false
 		fail_alert:         none
+		read_guard:         sync.new_mutex()
 		guard:              sync.new_mutex()
 		negotiated_alpn:    ''
 		server_name:        ''
 		rec:                new_record_layer()
 	}
-	done_ch := chan bool{cap: 1}
+	done_ch := chan string{cap: 1}
 	spawn parked_read_worker(mut c, done_ch)
-	// Give the reader time to park inside sock.read() with guard released.
-	time.sleep(150 * time.millisecond)
+	// Wait until the reader has marked the socket read active under guard, rather than
+	// relying on a scheduling delay before racing close() against its timeout.
+	mut parked := false
+	for _ in 0 .. 100 {
+		c.guard.lock()
+		parked = c.socket_read_active
+		c.guard.unlock()
+		if parked {
+			break
+		}
+		time.sleep(10 * time.millisecond)
+	}
+	assert parked, 'reader did not park in sock.read()'
 	t0 := time.sys_mono_now()
 	c.close()!
 	close_us := (time.sys_mono_now() - t0) / 1000
-	// Drain the reader: it returns once the closed socket aborts sock.read() or, at
-	// the latest, when its 1s read timeout fires.
-	_ := <-done_ch
-	assert close_us < 900000 // µs; well under the 1s read timeout
+	// The in-flight read must observe close rather than report its socket timeout as
+	// a retryable result.
+	read_result := <-done_ch
+	assert close_us < 900000 // µs; well under the 2s read timeout
 	assert c.closed
+	assert read_result.contains('connection closed while reading record')
+	assert !c.socket_read_active
+	assert !c.close_after_socket_read
 }
 
 // test_is_transport_error_predicate pins the socket-read timeout classifier boundary

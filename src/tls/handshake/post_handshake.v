@@ -32,6 +32,7 @@ pub fn build_key_update(request_update bool) []u8 {
 // until resumption gives them one.
 @[noinit]
 pub struct NewSessionTicket {
+mut:
 	ticket_lifetime u32  // seconds the ticket may be used after issuance; 0 means no support
 	ticket_age_add  u32  // random value for obfuscating ticket age in early_data (§4.6.1)
 	ticket_nonce    []u8 // ties the ticket to this connection's resumption master secret
@@ -46,6 +47,21 @@ pub fn (t &NewSessionTicket) lifetime() u32 {
 // bytes returns the opaque ticket (the resumption token) to store for a future ClientHello.
 pub fn (t &NewSessionTicket) bytes() []u8 {
 	return t.ticket
+}
+
+// wipe clears the resumption token and nonce when their owning connection is
+// torn down; it also releases all ticket metadata held in the parsed value.
+pub fn (mut t NewSessionTicket) wipe() {
+	for i in 0 .. t.ticket.len {
+		t.ticket[i] = 0
+	}
+	for i in 0 .. t.ticket_nonce.len {
+		t.ticket_nonce[i] = 0
+	}
+	t.ticket_lifetime = 0
+	t.ticket_age_add = 0
+	t.ticket = []u8{}
+	t.ticket_nonce = []u8{}
 }
 
 // parse_new_session_ticket decodes NewSessionTicket (RFC 8446 §4.6.1); ticket

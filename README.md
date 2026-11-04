@@ -35,6 +35,11 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 socket; after a peer `close_notify`, `read()` returns clean EOF but `close()`
 is still needed to release the socket.
 
+Concurrent `read()` calls are serialized. While one read waits for socket data,
+`write()` and `close()` can proceed; `close()` does not interrupt that pending
+read, and socket release waits until the read returns (possibly at its timeout).
+See [`docs.md`](docs.md#22-conn) for the concurrency details.
+
 `Config` is a `@[params]` struct: pass named arguments straight to `dial()`;
 omitted fields keep their declared defaults (`default_config()` builds the same
 value). Knobs: `server_name`, `hsk_options`, `root_cas`,

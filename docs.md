@@ -345,6 +345,18 @@ caller is the negotiated ALPN protocol, read through the `negotiated_alpn()`
 accessor below; the SNI name and the verified host stay internal (a caller
 already holds both in its own `Config`).
 
+#### Concurrency
+
+`Conn` serializes concurrent `read()` calls so they cannot race over the shared
+record buffers or reorder stream data. A read releases the connection-state
+lock while it waits for socket input, allowing `write()` and `close()` to
+proceed. Only one socket read is active at a time.
+
+`close()` does not interrupt an already-blocked socket read. It returns without
+waiting for that read, but defers closing the TCP descriptor until the read
+returns; depending on the peer and socket timeout, the in-flight `read()` may
+remain blocked until its timeout and then returns a connection-closed error.
+
 #### `read`
 
 ```v
