@@ -19,11 +19,9 @@ crypto — no OpenSSL bindings, no third-party dependencies.
 > **Status: experimental.** Not audited; do not ship in production.
 
 > [!NOTE]
-> **Visual conventions** — <span style="color:#2ea44f">green</span> marks safety
-> and robustness guarantees, <span style="color:#cf222e">red</span> marks
-> dangerous options and rejected/error outcomes, amber marks cautions. Colors
-> render fully in IDE Markdown preview; where inline styles are stripped, the
-> badges and tinted callout boxes carry the same palette.
+> **Visual conventions** — green marks safety guarantees, red marks
+> dangerous/rejected outcomes, amber marks cautions. Badges and callout boxes
+> carry the same palette.
 
 ## Contents
 
@@ -66,17 +64,14 @@ own `module` and importing only the layers beneath it:
 | `tls.quic` | `src/tls/quic/` | QUIC client engine — the sibling of `tls` that drives the same core without importing it |
 | `tls.fakeserver` | `src/tls/fakeserver/` | Test-only fake TLS 1.3 server flight; no role in the shipped library |
 
-The dependency graph is strictly downward —
-`tls → tls.handshake → tls.pki → tls.wire`, with `tls.quic` riding the same
-rail on top of `tls.handshake` — so
-<span style="color:#2ea44f">lower layers never reference higher ones</span>, and
-the separation is enforced by the compiler rather than by convention alone.
-In particular a grep gate over `src/tls/handshake/` proves the core owns no
+The dependency graph is strictly downward — `tls → tls.handshake → tls.pki →
+tls.wire`, with `tls.quic` riding the same rail on top of `tls.handshake` — so
+lower layers never reference higher ones, and the separation is enforced by the
+compiler. A grep gate over `src/tls/handshake/` proves the core owns no
 record-layer token (`Record`, `TLSProtection`, `ContentType`,
 `change_cipher_spec`, `record_header_len`), which is what makes `tls.handshake`
-safe to import from a QUIC stack that has no record layer at all. Building such
-a stack is covered end to end in
-[`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md).
+safe to import from a QUIC stack with no record layer. Building such a stack is
+covered end to end in [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md).
 
 ### 1.1 Public vs. private surface
 
@@ -91,20 +86,19 @@ For a TLS-over-TCP caller the entry point is `tls`, which exports only:
 | `pki.TrustStore` | struct (`tls.pki`) | Custom root-CA set for `Config.root_cas` |
 
 Within `tls`, the record layer, protection states, and TCP transport are
-module-private implementation detail. The handshake core, by contrast, is a
-deliberately **importable** module: `tls.handshake` exposes a small `pub` seam —
-the [adapter contract](#15-adapter-contract-tlshandshake) below — so a QUIC
-engine can drive the handshake without importing `tls`, pulling trust anchors
-from `tls.pki`. `tls.wire` (`Reader`/`Writer`) is a lower-level shared utility;
-its `pub` surface exists for the modules above it rather than as a documented
+module-private implementation detail. The handshake core is deliberately
+**importable**: `tls.handshake` exposes a small `pub` seam — the
+[adapter contract](#15-adapter-contract-tlshandshake) below — so a QUIC engine
+can drive the handshake without importing `tls`, pulling trust anchors from
+`tls.pki`. `tls.wire` (`Reader`/`Writer`) is a lower-level shared utility; its
+`pub` surface exists for the modules above it rather than as a documented
 end-user API. `TrustStore` is public only because `Config.root_cas ?pki.TrustStore`
 is a public field.
 
 ### 1.2 Layer map
 
-Strict layering, bottom to top, enforced by the module boundaries. Each file
-carries a doc preamble in its source with the authoritative description of its
-role; this table summarizes it by owning module.
+Strict layering, bottom to top, enforced by module boundaries. Each file carries
+a doc preamble with its authoritative role; this table summarizes it.
 
 ```text
    caller
@@ -129,20 +123,19 @@ role; this table summarizes it by owning module.
  └───────────────────────────────────────────────┘
 ```
 
-The map draws the TLS-over-TCP stack only; `tls.quic` is a sibling of `tls`
-plugging into the same `tls.handshake` core (walked through in
-[`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md)) and `tls.fakeserver`
-is test-only scaffolding — both are listed in the table below.
+`tls.quic` is a sibling of `tls` plugging into the same `tls.handshake` core
+(walked through in [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md));
+`tls.fakeserver` is test-only scaffolding — both listed below.
 
 | Module | Files | Responsibility |
 |---|---|---|
 | `tls.wire` | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
-| `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Minimal strict DER reader and X.509 v3 decoding behind element-count guards, RFC 5280 chain building to a trusted root with name-constraint enforcement, RFC 6125 hostname matching, RSA/PSS/ECDSA/Ed25519 signature verification, and system trust-bundle loading. The rejection rules are enumerated in §4.3; `TrustStore` is public so `Config.root_cas` can be populated. |
-| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `state_machine.v`, `state_machine_extra.v`, `key_exchange.v`, `client_hello.v`, `server_hello.v`, `server_flight.v`, `post_handshake.v`, `core_guarded.v` | The transport-neutral core: RFC 8446 §4 message structures and the running Transcript-Hash (§4.4.1), the §7.1 HKDF ladder and phase derivations with the retained secret holders and their §7.5 lifecycle (`key_schedule.v`), AEAD constructors (`aead.v`), the CertificateVerify check (`certificate_verify.v`), the shared alert vocabulary with the RFC 9001 §4.8 mapping (`alert.v`), recordless CRYPTO-stream reassembly (`state_machine_extra.v`), and post-handshake NewSessionTicket/KeyUpdate parsing (`post_handshake.v`). `state_machine.v` defines the shared `HandshakeCore` types, struct, constructor, the `HandshakeState` cursor (the RFC 8446 Appendix A.1 client states, plus an implementation `failed` terminal), and the ServerHello/HRR and encrypted-flight phase transitions — with inbound byte reassembly, the receive/dispatch routing and the terminal-failure primitives in `state_machine_extra.v`, and its ephemeral ECDHE methods in `key_exchange.v` and its derived-secret holders and lifecycle in `key_schedule.v` — and owns the key ratchet behind the `pub` seam; transport-specific methods are `is_quic`-guarded on the unified `HandshakeCore` (the `reassembly_len` accessor and KeyUpdate ratchet, the QUIC transport parameters and HRR flag), so a wrong-transport call fails at run time — <span style="color:#2ea44f">it owns no record, cipher, or socket concept</span>. Transport choice at construction fixes the mode flag (§1.5); secret-hygiene timing is in §2.1 and the source preambles. |
-| `tls` | `record.v`, `record_protection.v`, `record_layer.v` | The TLS record layer (RFC 8446 §5): record framing and reassembly, the `ContentType`-tagged `Record` frame, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and the §5.5 per-key record limit, and adapters hiding AES-GCM / ChaCha20-Poly1305 backends behind one seal/open interface. `record.v` keeps only the record-side framing helpers (`new_record`, `change_cipher_spec`) that stamp a `ContentType` onto an outbound message; the recordless CRYPTO-stream reassembly lives in the core's `state_machine_extra.v`. `record_layer.v` is the record facade `Conn` holds: the four `TLSProtection` states, the post-handshake reassembly buffer, and the whole KeyUpdate mechanism — the §4.5 one-in-a-row run guard, the §5.5 rekey trigger, and the ratchet-then-swap of one leg (`receive_key_update()`, `build_key_update_notice()` / `complete_key_update()`), all driven through the core's `next_application_key_material()` so a secret and its installed generation can never diverge. |
-| `tls` | `conn.v` | The public TCP adapter: `conn.v` owns `dial()`, the `Conn` type, the caller-facing `Config`/`default_config()`, its read/write/close path, and the `do_handshake` that drives the `tls.handshake` core — decrypt-then-route record handling, the §5.1 ServerHello record-boundary check, and the framing/batching/CCS mechanics (reading records off the TCP stream, batching writes into a single `write(2)`, dummy-CCS validation, §5.5 send-side limits). The record state itself and the protection installation through the `new_tls_protection_from_keys()` builder live in the `RecordLayer` facade `Conn` holds as its `rec` field. |
-| `tls.quic` | `engine.v`, `client.v`, `packet.v`, `packet_parse.v`, `protection.v`, `initial_keys.v`, `frame.v`, `varint.v`, `reasm.v`, `transport_params.v` | The QUIC client (RFC 9000/9001). `engine.v` holds the module-internal `Engine` — the eight-step loop driving the QUIC mode of `tls.handshake`'s `HandshakeCore`, long/short header (de)serialization and sample-based packet + header protection, Initial-key derivation from the original DCID, CRYPTO-stream reassembly, varints, frames, and the `original_destination_connection_id`-guarded transport parameters — now hardened for a lossy path: it emits ACK frames (piggybacked and bare), retransmits the handshake flight on a caller-driven probe timeout, and fragments outbound CRYPTO to `Config.max_packet_size`. `client.v` wraps that engine in the socket-owning `dial()` facade returning a `Conn` (`negotiated_alpn` / `negotiated_cipher_suite` / `close`) that owns a `net.UdpConn` and runs the loop to confirmation under `Config.timeout`. Only `dial()`, `Conn`, `negotiated_alpn()`, `negotiated_cipher_suite()`, `close()`, and `Config` are public; the engine and all other `Conn` accessors are internal. Construction and the protection layers never import `tls`; see [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). |
-| `tls.fakeserver` | `server.v`, `fixtures.v`, `keys.v` | Test-only adaptive TLS 1.3 server flight generator: builds a spec-conformant server response — full flight or HelloRetryRequest — from the client's actual ClientHello so the end-to-end tests can drive the real client byte by byte. Ships no library API. |
+| `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Strict DER reader and X.509 v3 decoding with element-count guards, RFC 5280 chain building to a trusted root with name-constraint enforcement, RFC 6125 hostname matching, RSA/PSS/ECDSA/Ed25519 signature verification, system trust-bundle loading. Rejection rules in §4.3; `TrustStore` is public so `Config.root_cas` can be populated. |
+| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `state_machine.v`, `state_machine_extra.v`, `key_exchange.v`, `client_hello.v`, `server_hello.v`, `server_flight.v`, `post_handshake.v`, `core_guarded.v` | Transport-neutral core: RFC 8446 §4 message structures and running Transcript-Hash (§4.4.1), §7.1 HKDF ladder with retained secret holders and their §7.5 lifecycle, AEAD constructors, CertificateVerify check, shared alert vocabulary with RFC 9001 §4.8 mapping, recordless CRYPTO-stream reassembly, post-handshake NewSessionTicket/KeyUpdate parsing. `state_machine.v` defines `HandshakeCore`, `HandshakeState` cursor, and phase transitions. Owns no record, cipher, or socket concept; transport-specific methods are `is_quic`-guarded. |
+| `tls` | `record.v`, `record_protection.v`, `record_layer.v` | TLS record layer (§5): record framing/reassembly, `ContentType`-tagged `Record` frame, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and §5.5 per-key record limit, AES-GCM / ChaCha20-Poly1305 behind one seal/open interface. `record_layer.v` is the `Conn`-held facade: four `TLSProtection` states, post-handshake reassembly buffer, KeyUpdate mechanism (§4.5 one-in-a-row guard, §5.5 rekey trigger). |
+| `tls` | `conn.v` | Public TCP adapter: `dial()`, `Conn`, caller-facing `Config`/`default_config()`, read/write/close path, and `do_handshake` driving the `tls.handshake` core — record handling, §5.1 ServerHello boundary check, framing/batching/CCS mechanics. Record state and protection installation live in the `RecordLayer` facade `Conn` holds as its `rec` field. |
+| `tls.quic` | `engine.v`, `client.v`, `packet.v`, `packet_parse.v`, `protection.v`, `initial_keys.v`, `frame.v`, `varint.v`, `reasm.v`, `transport_params.v` | QUIC client (RFC 9000/9001). `engine.v` holds the module-internal `Engine` — long/short header (de)serialization, header protection, Initial-key derivation from the original DCID, CRYPTO-stream reassembly, ACK frames, handshake-flight retransmit on probe timeout, CRYPTO fragmentation to `Config.max_packet_size`. `client.v` wraps it in the socket-owning `dial()` facade returning a `Conn` over a `net.UdpConn`. Only `dial()`, `Conn`, `negotiated_alpn()`, `negotiated_cipher_suite()`, `close()`, and `Config` are public; construction never imports `tls`. See [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). |
+| `tls.fakeserver` | `server.v`, `fixtures.v`, `keys.v` | Test-only adaptive TLS 1.3 server flight generator: builds spec-conformant server responses from the client's actual ClientHello so end-to-end tests drive the real client byte by byte. Ships no library API. |
 
 ### 1.3 Data flow of `dial()`
 
@@ -154,14 +147,13 @@ TCP socket ──► read_raw_record() ──► state machine ──► validat
 write_records() ◄── followups / client flight / Finished
 ```
 
-The TCP adapter (`conn.v`) is the only code that
-touches the socket. The handshake loop accepts
-dummy CCS (middlebox compatibility, §5), plaintext alerts (pre-key only),
-handshake records, and encrypted records outer-typed as `application_data`
-(§5.1/§5.2), and exits only when the state machine reports `.connected`. A
-HelloRetryRequest round trip (new group, optional cookie echo,
-`message_hash` transcript substitution) is handled transparently inside the
-same loop — callers see a plain `dial()`.
+The TCP adapter (`conn.v`) is the only code that touches the socket. The
+handshake loop accepts dummy CCS (middlebox compatibility, §5), plaintext alerts
+(pre-key only), handshake records, and encrypted records outer-typed as
+`application_data` (§5.1/§5.2), and exits only when the state machine reports
+`.connected`. A HelloRetryRequest round trip (new group, optional cookie echo,
+`message_hash` transcript substitution) is handled transparently inside the same
+loop — callers see a plain `dial()`.
 
 > [!TIP]
 > Every diagram in this section is strict bottom-to-top: a defect in any
@@ -204,9 +196,7 @@ folded into the transcript after the server flight is verified — the library
 has no client certificate to offer, so it declines rather than aborting.
 Post-handshake messages (`NewSessionTicket`, `KeyUpdate`) are reassembled from
 the decrypted record stream even when a single message is split across records
-(the core's 1 MiB cap still bounds the buffer), and a ticket coalesced into the
-same record as the server's `Finished` is drained to this reassembler at the end
-of the handshake instead of orphaning in the core (§4.6.1).
+(the core's 1 MiB cap bounds the buffer).
 
 ### 1.5 Adapter contract (`tls.handshake`)
 
@@ -246,27 +236,24 @@ new_quic_handshake(server_name string, options HandshakeOptions) !HandshakeCore 
 ```
 
 - **The protection phase is carried by the call, not the message.** A
-  `HandshakeMessage` returned by `receive_initial_bytes()` belongs to the
-  pre-ServerHello phase; one returned by `receive_handshake_bytes()` belongs to the
-  handshake-key phase. No public message carries a level tag, and `tls.handshake`
-  no longer keeps an `EncryptionLevel` vocabulary: the phase is implied by the
-  core's current `HandshakeState` and by the entry point that produced the bytes.
-The public seam names the phase in the entry point — `receive_initial_bytes()` for pre-ServerHello bytes, `receive_handshake_bytes()` for handshake-key bytes — and `traffic_keys()` dispatches on `HandshakeState` to return the right secret set. The transport shape (record vs packet legs) is left to the core's mode, so no adapter ever builds or matches on a level value. The initial phase means the pre-ServerHello TLS handshake stage; it is not QUIC Initial packet protection. QUIC Initial packet keys derive from the destination connection ID and are not part of this TLS secret API.
+  `HandshakeMessage` from `receive_initial_bytes()` is pre-ServerHello; from
+  `receive_handshake_bytes()` it is handshake-key phase. No public message
+  carries a level tag, and `tls.handshake` no longer keeps an `EncryptionLevel`
+  vocabulary: the phase is implied by the core's `HandshakeState` and by the
+  entry point that produced the bytes. QUIC Initial packet keys derive from the
+  destination connection ID and are not part of this TLS secret API.
 - **Keys stay adapter-shaped.** `HandshakeCore` derives key material on demand in
-  both modes and hands it out in one handle shape: an opaque `TrafficKeys` generation
-  wrapping one `KeyMaterial` per direction — key-and-IV with an empty header-protection
-  slot on a TLS-mode core, all three slots filled on a QUIC-mode core; one accessor name
-  per phase, the mode picks the shape.
-  It also implements the TLS KeyUpdate ratchet. Raw traffic secrets never leave the
-  core in either mode; the QUIC engine still owns packet protection state and QUIC
-  key updates.
-- **Lifecycle and framing stay explicit.** Both modes share failure cleanup
-  and handshake-secret zeroization. `zeroize_traffic_secrets()` wipes both
-  directions' traffic secrets *and* the reassembly buffer at `.connected`, so nothing
-  survives past handshake completion. The record adapter uses `reassembly_len()` for
-  the TLS ServerHello record-boundary rule; it and
-  `take_buffered_handshake_bytes()` refuse a QUIC-mode core; QUIC maps alert
-  descriptions to QUIC connection errors.
+  both modes and hands out an opaque `TrafficKeys` wrapping one `KeyMaterial`
+  per direction — key-and-IV with an empty header-protection slot on a
+  TLS-mode core, all three slots filled on QUIC. Raw traffic secrets never
+  leave the core; the QUIC engine owns packet protection state and QUIC key
+  updates.
+- **Lifecycle and framing stay explicit.** Both modes share failure cleanup and
+  handshake-secret zeroization. `zeroize_traffic_secrets()` wipes both
+  directions' traffic secrets *and* the reassembly buffer at `.connected`. The
+  record adapter uses `reassembly_len()` for the TLS ServerHello record-boundary
+  rule; it and `take_buffered_handshake_bytes()` refuse a QUIC-mode core; QUIC
+  maps alert descriptions to QUIC connection errors.
 
 ---
 
@@ -311,50 +298,37 @@ Behavior and guarantees:
   host is derived from `address` so a bare `"host:port"` still supplies SNI and
   the name the certificate is verified against.
 - **Timeouts** — `config.timeout` (or 30 s when unset/zero) is applied to both
-  socket directions before the handshake, so a stalled peer cannot hang `dial()`.
-  The handshake phase additionally carries a total deadline of 4× that per-operation
-  timeout: a slow-loris peer dribbling valid bytes under every individual read
-  timeout is still cut off, while post-handshake `read()` stays bound only by the
-  per-operation timeout.
-- **Server name gate** — a name over the 253-character DNS ceiling (RFC 1035 §2.3.4)
-  or carrying stray whitespace is rejected before the socket opens, so the name
-  dialed is always the name sent in SNI and the name verified.
+  socket directions before the handshake; the handshake phase additionally
+  carries a total deadline of 4× that per-operation timeout. Post-handshake
+  `read()` stays bound only by the per-operation timeout.
+- **Server name gate** — a name over the 253-character DNS ceiling (RFC 1035
+  §2.3.4) or carrying stray whitespace is rejected before the socket opens.
 - **Trust anchors, by precedence** — explicit `config.root_cas` is used as-is;
-  else the system CA bundle is loaded — parsed once per process, then cached for
-  every later `dial()` (a load failure is a dial error) — unless
-  `insecure_skip_verify` is set, in which case an empty store suffices.
+  else the system CA bundle is loaded — parsed once per process, then cached —
+  unless `insecure_skip_verify` is set, in which case an empty store suffices.
 - <span style="color:#2ea44f">**No fd leaks**</span> — any handshake failure
-  closes the socket it opened before
-  returning the error; a half-connected `Conn` is never returned.
-- <span style="color:#2ea44f">**Forward secrecy of retained secrets**</span> — the
-  handshake secret and ephemeral X25519 / P-256 private keys are released when
-  the state machine reaches `.connected`. All traffic secrets — handshake and
-  application — are zeroized together at `close()` via `zeroize_traffic_secrets()`;
-  the §7.1 derivations also zeroize their own in-function intermediates — the
-  Early and Master secrets, the `derived` seeds, every HKDF-Expand round input,
-  and the single-use Finished MAC key — so no orphaned key material outlives
-  the call that produced it.
-- **ALPN is enforced** — a server selecting a protocol that wasn't offered aborts
-  the handshake (RFC 7301 §3.1); an empty `alpn` list forbids any ALPN response.
-- **Resource bounds** — a handshake message declaring more than 1 MiB is refused
-  at its header before fragments accumulate; a `Certificate` list with more than
-  32 entries is rejected during parsing (before each is ASN.1-decoded), and so are
-  chains that long, CA RSA keys shorter than 2048 bits, and a leaf under the
-  `min_rsa_bits` floor; at most two middlebox
-  dummy ChangeCipherSpec records are tolerated during the handshake, so a streamed
-  CCS flood cannot pin the loop, and the whole server flight is additionally capped
-  at 64 records with empty inner-handshake payloads refused, so even state-neutral
-  but decryptable records cannot burn AEAD work past a deterministic bound instead
-  of only the monotonic handshake deadline; a HelloRetryRequest cookie longer than 8 KiB is
-  refused at parse time so the echoing ClientHello stays frameable in one record;
-  unconsumed framed bytes are capped at two maximal
-  records plus one socket read while handshaking, so dribbled incomplete records
-  cannot grow memory without bound; a single `read()` call skips at most 100
-  tolerated records (zero-length padding or post-handshake messages) before
-  failing, and one record may deliver at most 1000 complete post-handshake
-  messages before their parse/rekey work is cut off, so a verified flood cannot
-  starve the caller; the post-handshake `NewSessionTicket` backlog is
-  capped at 32 stored tickets.
+  closes the socket it opened before returning the error; a half-connected
+  `Conn` is never returned.
+- <span style="color:#2ea44f">**Forward secrecy of retained secrets**</span> —
+  the handshake secret and ephemeral X25519 / P-256 private keys are released
+  when the state machine reaches `.connected`. All traffic secrets — handshake
+  and application — are zeroized together at `close()` via
+  `zeroize_traffic_secrets()`; the §7.1 derivations zeroize their own
+  in-function intermediates so no orphaned key material outlives the call that
+  produced it.
+- **ALPN is enforced** — a server selecting a protocol that wasn't offered
+  aborts the handshake (RFC 7301 §3.1); an empty `alpn` list forbids any ALPN
+  response.
+- **Resource bounds** — handshake messages > 1 MiB are refused at their header;
+  a `Certificate` list over 32 entries is rejected before ASN.1 decoding; CA RSA
+  keys under 2048 bits and leaves under `min_rsa_bits` are refused; at most two
+  dummy ChangeCipherSpec records are tolerated during the handshake; the server
+  flight is capped at 64 records with empty inner-handshake payloads refused;
+  unconsumed framed bytes are capped at two maximal records plus one socket read
+  while handshaking; a single `read()` skips at most 100 tolerated records
+  before failing, and one record may deliver at most 1000 post-handshake
+  messages before their parse/rekey work is cut off; the `NewSessionTicket`
+  backlog is capped at 32 stored tickets.
 
 ### 2.2 `Conn`
 
@@ -380,32 +354,31 @@ pub fn (mut c Conn) read(mut buf []u8) !int
 Decrypts application data into `buf` and returns the byte count. `0` means a
 clean end of stream (peer `close_notify` or connection already closed).
 
-- A decrypted record larger than `buf` is buffered internally; subsequent calls
-  drain the remainder before reading new records — no plaintext is dropped or reordered.
-- Zero-length (padding-only) records and inner-type-handshake records are skipped
-  transparently, up to the per-`read()` tolerated-record bound (§2.1 Resource bounds);
+- A record larger than `buf` is buffered internally; subsequent calls drain the
+  remainder before reading new records — no plaintext is dropped or reordered.
+- Zero-length (padding-only) records and inner-type-handshake records are
+  skipped transparently, up to the per-`read()` tolerated-record bound (§2.1);
   past it the connection fails closed with `unexpected_message`.
 - **Plaintext hygiene** — the decrypted staging copy is scrubbed on every exit
-  from the record branch (delivered prefix, alert, post-handshake, or error),
-  the undelivered `app_buf` remainder is zeroed when it
-  drains or on terminal teardown, and post-handshake reassembly bytes are wiped
-  when the connection dies (RFC 8446 §7.5 spirit: freed memory retains no plaintext).
-- The per-operation socket timeout (`Config.timeout`) is a **transient, retryable
-  error**, not a protocol fault: `read()` reports it and leaves the connection
-  intact — no alert, no key teardown, and a later `read()` continues normally.
-  Stream damage (an abrupt TCP close without `close_notify`) stays terminal.
-- A **plaintext outer alert after the handshake is
-  <span style="color:#2ea44f">rejected</span>**, and so is a
-  plaintext ChangeCipherSpec record — RFC 8446 §5/§6 make both fatal
-  (`unexpected_message`) once keys exist, preventing record injection.
+  from the record branch; the undelivered `app_buf` remainder is zeroed when it
+  drains or on terminal teardown; post-handshake reassembly bytes are wiped
+  when the connection dies (RFC 8446 §7.5 spirit: freed memory retains no
+  plaintext).
+- The per-operation socket timeout (`Config.timeout`) is a **transient,
+  retryable error**, not a protocol fault: `read()` reports it and leaves the
+  connection intact — no alert, no key teardown, and a later `read()` continues
+  normally. Stream damage (an abrupt TCP close without `close_notify`) stays
+  terminal.
+- A plaintext outer alert or ChangeCipherSpec record after the handshake is
+  rejected as fatal `unexpected_message`, preventing record injection.
 - The receive side aborts if the peer exceeds the §5.5 per-key record limit
   without rekeying (2²⁴ records per key generation).
 - Post-handshake encrypted records are demultiplexed by inner content type:
   `NewSessionTicket` messages are collected, `KeyUpdate` read-key updates are
-  applied (a response is sent with the correct §4.6.3 old-key-before-new ordering
-  when the server requests one, and §4.5's rule against more than one KeyUpdate
-  in a row is enforced on receipt — a second consecutive one aborts before its
-  rekey work is paid for), and encrypted `alert`s end the stream.
+  applied (a response is sent with correct old-key-before-new ordering when the
+  server requests one; §4.5's rule against more than one KeyUpdate in a row is
+  enforced — a second consecutive one aborts before its rekey work is paid for),
+  and encrypted `alert`s end the stream.
 - Reading with an empty `buf` returns `0` without I/O.
 
 #### `write`
@@ -415,16 +388,13 @@ pub fn (mut c Conn) write(data []u8) !int
 ```
 
 Encrypts and sends application data, returning the number of bytes accepted
-(the full `data.len` on success). One call may emit many records: plaintext is
-chunked at 2¹⁴ bytes, the TLS maximum (§5.1). Before a key generation crosses
-the §5.5 record limit the client transparently rekeys — it fires at
-`limit − 1`, reserving the one slot the KeyUpdate notice itself needs (its
-encrypted record goes through the same send-side backstop that guards received
-data, which would otherwise refuse the record at exactly the boundary), then
-sends a `KeyUpdate (update_not_requested)` under the old keys and updates the
-write keys, exactly as the §4.6.3 response path does. Writing on a closed
-connection or before the handshake completes is an error — the state machine is
-the gate, not caller ordering.
+(the full `data.len` on success). Plaintext is chunked at 2¹⁴ bytes, the TLS
+maximum (§5.1). Before a key generation crosses the §5.5 record limit the client
+transparently rekeys — firing at `limit − 1`, reserving the one slot the
+KeyUpdate notice itself needs — then sends a `KeyUpdate (update_not_requested)`
+under the old keys and updates the write keys. Writing on a closed connection or
+before the handshake completes is an error — the state machine is the gate, not
+caller ordering.
 
 #### `close`
 
@@ -438,8 +408,7 @@ TCP socket. <span style="color:#2ea44f">**Idempotent**</span>: a second
 `close()` neither re-sends `close_notify` nor double-closes the socket, and
 never errors. Use it in a `defer` block.
 If the peer sends `close_notify`, `read()` answers with our own `close_notify`
-first — the symmetric §6.1 answer, emitted while the write keys still exist —
-then returns `0` but leaves the TCP socket
+first — the symmetric §6.1 answer — then returns `0` but leaves the TCP socket
 open; call `close()` to release it.
 
 #### `negotiated_alpn`
@@ -667,24 +636,18 @@ verification binds the entire two-round exchange.
 This is a deliberate scope decision, not an oversight. Revocation checking is
 famously unreliable — soft-fail CRL/OCSP silently accepts when the responder is
 unreachable, hard-fail turns a third-party outage into a client outage, OCSP
-stapling requires the server to cooperate, and CRLs are large and stale. A
+stapling requires server cooperation, and CRLs are large and stale. A
 half-implemented check gives operators false confidence. There is also **no
-callback hook**: a hook that runs after `dial()` returns is too late to stop the
-handshake, and one that runs mid-handshake would have to be `pub` in the
-transport-neutral core, dragging application policy into a module that owns no
-socket concept.
+callback hook**: a hook after `dial()` returns is too late to stop the
+handshake; one mid-handshake would have to be `pub` in the transport-neutral
+core, dragging application policy into a module that owns no socket concept.
 
-If your threat model needs revocation:
-
-1. Validate the leaf **out of band** before trusting the connection — fetch the
-   issuer's CRL or an OCSP response, verify its signature and freshness, and
-   check the leaf's serial number against it. Do this against the certificate
-   the server presented, not a second one fetched independently.
-2. Use short-lived leaf certificates so revocation windows are minutes, not
-   months — the practical mitigation most large deployments rely on.
-3. If you must bind it to the handshake, terminate TLS in a component that
-   already does stapled-OCSP validation and treat this library's result as the
-   transport beneath it.
+If your threat model needs revocation, validate the leaf **out of band** before
+trusting the connection (fetch the issuer's CRL or an OCSP response, verify its
+signature and freshness, check the leaf's serial), use short-lived leaf
+certificates so revocation windows are minutes not months, or terminate TLS in a
+component that already does stapled-OCSP validation and treat this library's
+result as the transport beneath it.
 
 ---
 

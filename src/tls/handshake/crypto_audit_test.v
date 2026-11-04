@@ -28,10 +28,3 @@ fn test_default_key_len_is_16_for_sha256() ! {
 	mut h := new_tls_handshake('example.com', HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store()) })!
 	assert h.key_len == 16 // default SHA-256 AES-128-GCM
 }
-
-fn test_finished_verify_data_uses_transcript_hash() ! {
-	// Finished verify_data = HMAC(finished_key, Transcript-Hash)
-	// The constant-time compare is in state_machine.v handle_finished.
-	// Covered by full_flight_test.v bad_finished test.
-	assert true
-}

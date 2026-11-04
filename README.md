@@ -31,32 +31,21 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 // conn.read(mut buf), conn.negotiated_alpn(), conn.close() ...
 ```
 
-Set `QUIC_DEBUG=1` to trace the QUIC handshake on stderr (the plaintext
-ClientHello, datagram sizes, and first-flight bytes):
-
-```bash
-QUIC_DEBUG=1 v run src/example/quic_dial_example.v
-```
-
-`Conn.close()` sends `close_notify` when possible, then releases the TCP
+`Conn.close()` sends `close_notify` (when keys exist) then releases the TCP
 socket; after a peer `close_notify`, `read()` returns clean EOF but `close()`
 is still needed to release the socket.
 
-`Config` is a `@[params]` struct: pass named arguments straight to `dial()`,
-and any field you omit keeps its declared default (`default_config()` is an
-explicit way to build the same value). The caller-facing knobs are
-`server_name` (SNI + the name the certificate is checked against),
-`hsk_options` (offered ALPN protocols and handshake preferences), `root_cas`
-(override the system trust store), and `insecure_skip_verify` (test/lab only;
-it removes all authentication). The complete field table, defaults, and
-behavioral guarantees live in [`docs.md`](docs.md).
+`Config` is a `@[params]` struct: pass named arguments straight to `dial()`;
+omitted fields keep their declared defaults (`default_config()` builds the same
+value). Knobs: `server_name`, `hsk_options`, `root_cas`,
+`insecure_skip_verify` (test/lab only — removes all authentication). Full field
+table in [`docs.md`](docs.md).
 
-The `tls` module deliberately exports only `dial()`, `Conn`, `Config`,
-`default_config()`, and the `pki.TrustStore` behind `Config.root_cas`; the
-record layer and TCP transport stay module-private. The handshake core is
-separately importable (`tls.handshake`) — its `pub` seam is the adapter
-contract in [CONTRACT.md](src/tls/handshake/CONTRACT.md) — so a non-TCP
-transport like QUIC can drive it without ever importing `tls`.
+The `tls` module exports only `dial()`, `Conn`, `Config`, `default_config()`,
+and `pki.TrustStore` (behind `Config.root_cas`); record layer and TCP transport
+stay module-private. The importable `tls.handshake` core exposes a `pub` seam
+([CONTRACT.md](src/tls/handshake/CONTRACT.md)) so a non-TCP transport like QUIC
+can drive it without importing `tls`.
 
 ## Repository layout
 
@@ -76,11 +65,10 @@ src/
 ```
 
 Each module keeps its `*_test.v` files alongside its sources. V resolves
-submodules by directory path, so `v.mod` stays rooted at `tls` and the child
+submodules by directory path, so `v.mod` stays rooted at `tls` and child
 directories become `tls.handshake`, `tls.pki`, `tls.quic`, `tls.wire`, and the
-test-only `tls.fakeserver`. The demo lives under `src/` (not a top-level
-`example/`) because V resolves the library's bare sibling import (`tls`)
-relative to the executable's own directory.
+test-only `tls.fakeserver`. Demos live under `src/` because V resolves the bare
+sibling import (`tls`) relative to the executable's own directory.
 
 ## What is implemented
 
@@ -164,10 +152,9 @@ imports only `tls.wire`/`tls.pki`, so it shares no code with the
 implementation under test.
 
 Honest limits: the RFC 8448 vectors pin the AES-128-GCM / SHA-256 path (the
-ECDHE computation itself is not vector-pinned); the other suites are
-verified by round trips and suite-parameter consistency. Real-server
-behavior across all suites is what the demo
-(`v run src/example/dial_example.v`) exercises.
+ECDHE computation itself is not vector-pinned); the other suites are verified
+by round trips and suite-parameter consistency. Real-server behavior across all
+suites is what the demo (`v run src/example/dial_example.v`) exercises.
 
 ## References
 
@@ -187,9 +174,9 @@ behavior across all suites is what the demo
 
 ## Notes for contributors
 
-The codebase has a documentation convention worth keeping: comments explain
-*why*, cite the governing RFC section inline (e.g. `§4.2.8.2`), and call out
-deliberate trade-offs rather than hiding them. Each source file carries a doc
-preamble describing its layer's role in the stack.
+The codebase has a documentation convention: comments explain *why*, cite the
+governing RFC section inline (e.g. `§4.2.8.2`), and call out deliberate
+trade-offs rather than hiding them. Each source file carries a doc preamble
+describing its layer's role in the stack.
 
 MIT licensed — see `v.mod`.
