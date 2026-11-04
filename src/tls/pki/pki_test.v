@@ -170,7 +170,7 @@ fn test_verify_certificate_chain_rejects_empty_hostname() ! {
 }
 
 // test_chain_trust_anchor_can_precede_cross_signed_tail locks the anchor
-// placement rule in chain_has_trusted_anchor: a chain that carries the trusted
+// placement rule in trusted_anchor_index: a chain that carries the trusted
 // root anywhere (leaf, cross-signed intermediate, or a tail past the intended
 // anchor) is accepted, while a chain that omits the trusted root entirely is
 // refused. Servers commonly append a cross-signed copy of their issuing CA after
@@ -187,8 +187,8 @@ fn test_chain_trust_anchor_can_precede_cross_signed_tail() {
 		Certificate{ raw: [u8(0x01)] },
 		Certificate{ raw: [u8(0x03)] },
 	]
-	assert chain_has_trusted_anchor(chain, [root], 100)
-	assert !chain_has_trusted_anchor([chain[0], chain[2]], [root], 100)
+	assert trusted_anchor_index(chain, [root], 100) >= 0
+	assert trusted_anchor_index([chain[0], chain[2]], [root], 100) < 0
 }
 
 // test_path_len_counts_only_non_self_issued_intermediate_cas follows RFC 5280:
@@ -498,10 +498,10 @@ fn test_parse_certificate_rejects_oversized_der() ! {
 	assert false
 }
 
-// test_chain_has_trusted_anchor_skips_non_ca_root: RFC 5280 §6.1.1 anchors
+// test_trusted_anchor_skips_non_ca_root: RFC 5280 §6.1.1 anchors
 // are CA certificates. Without the is_ca guard, a leaf misguidedly placed
 // in the trust store via add_der would anchor any chain it byte-matched.
-fn test_chain_has_trusted_anchor_skips_non_ca_root() ! {
+fn test_trusted_anchor_skips_non_ca_root() ! {
 	far_future := i64(4102444800) // year 2100
 	non_ca := Certificate{
 		is_ca:           false
@@ -510,7 +510,7 @@ fn test_chain_has_trusted_anchor_skips_non_ca_root() ! {
 		raw:             [u8(0xaa)]
 	}
 	// Raw bytes match on both sides, but is_ca=false must veto the anchor.
-	assert !chain_has_trusted_anchor([non_ca], [non_ca], 100)
+	assert trusted_anchor_index([non_ca], [non_ca], 100) < 0
 
 	ca := Certificate{
 		is_ca:           true
@@ -519,13 +519,13 @@ fn test_chain_has_trusted_anchor_skips_non_ca_root() ! {
 		raw:             [u8(0xaa)]
 	}
 	// Same content, is_ca=true → anchors via the raw-equality fast path.
-	assert chain_has_trusted_anchor([ca], [ca], 100)
+	assert trusted_anchor_index([ca], [ca], 100) >= 0
 }
 
-// test_chain_has_trusted_anchor_skips_root_without_key_cert_sign: a CA that
+// test_trusted_anchor_skips_root_without_key_cert_sign: a CA that
 // asserts keyUsage but omits keyCertSign (bit 5) cannot anchor, mirroring
 // the same rule already enforced on intermediates at chain index i+1.
-fn test_chain_has_trusted_anchor_skips_root_without_key_cert_sign() ! {
+fn test_trusted_anchor_skips_root_without_key_cert_sign() ! {
 	far_future := i64(4102444800)
 	root := Certificate{
 		is_ca:           true
@@ -535,7 +535,7 @@ fn test_chain_has_trusted_anchor_skips_root_without_key_cert_sign() ! {
 		not_after_unix:  far_future
 		raw:             [u8(0xaa)]
 	}
-	assert !chain_has_trusted_anchor([root], [root], 100)
+	assert trusted_anchor_index([root], [root], 100) < 0
 	// Absent keyUsage leaves the anchor unconstrained (RFC 5280 §4.2.1.3).
 	unconstrained := Certificate{
 		is_ca:           true
@@ -544,7 +544,7 @@ fn test_chain_has_trusted_anchor_skips_root_without_key_cert_sign() ! {
 		not_after_unix:  far_future
 		raw:             [u8(0xaa)]
 	}
-	assert chain_has_trusted_anchor([unconstrained], [unconstrained], 100)
+	assert trusted_anchor_index([unconstrained], [unconstrained], 100) >= 0
 }
 
 // test_match_hostname_rejects_empty_pattern_or_host: defense in depth

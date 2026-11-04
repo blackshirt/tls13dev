@@ -72,7 +72,7 @@ mut:
 	psk_identities [][]u8
 	psk_ages       []u32
 	psk_binders    [][]u8
-	psk_truncated  []u8 // ClientHello up to but excluding the binders vector (§4.2.9)
+	psk_truncated  []u8 // ClientHello up to but excluding the binders vector (§4.2.11)
 }
 
 // HrrMode selects the HelloRetryRequest behavior of the next new_server.
@@ -119,7 +119,7 @@ pub:
 	// psk is the pre-shared key the server accepts when non-empty. The client must
 	// offer psk_identity with a matching binder, and the server selects that index.
 	psk []u8
-	// psk_identity is the identity associated with psk (RFC 8446 §4.2.9).
+	// psk_identity is the identity associated with psk (RFC 8446 §4.2.11).
 	psk_identity []u8
 	// psk_external chooses the "ext binder" label instead of "res binder".
 	psk_external bool
@@ -198,7 +198,7 @@ fn (t &Transcript) hash() []u8 {
 
 // hash_with_suffix returns SHA-256 over every transcript message followed by suffix,
 // without mutating the transcript. PSK binders hash the retry context plus a
-// truncated ClientHello (§4.2.9).
+// truncated ClientHello (§4.2.11).
 fn (t &Transcript) hash_with_suffix(suffix []u8) []u8 {
 	mut total := []u8{}
 	for m in t.msgs {
@@ -309,7 +309,7 @@ fn pick_hrr_group(groups []u16, current u16) !u16 {
 }
 
 // select_psk verifies the offered binder for the configured PSK and returns its
-// selected_identity index (RFC 8446 §4.2.9).
+// selected_identity index (RFC 8446 §4.2.11).
 fn (mut s Server) select_psk(ch ClientHello) !u16 {
 	if ch.psk_truncated.len == 0 || ch.psk_binders.len == 0 {
 		return error('fakeserver: configured a PSK but the ClientHello offered none')
@@ -718,7 +718,7 @@ fn parse_client_hello(msg []u8) !ClientHello {
 				ch.share = kr.read_vector_u16()!
 			}
 		} else if etyp == ext_pre_shared_key {
-			// §4.2.9: pre_shared_key must be the last extension so its binders are
+			// §4.2.11: pre_shared_key must be the last extension so its binders are
 			// the final bytes of the ClientHello.
 			if e.remaining() != 0 {
 				return error('fakeserver: pre_shared_key is not the last ClientHello extension')
@@ -837,7 +837,7 @@ fn build_server_hello(session_id []u8, suite u16, share_group u16, server_share 
 	ext.write_u16(ext_key_share)
 	ext.write_vector_u16(entry.bytes())!
 	if idx := selected_psk {
-		// pre_shared_key in ServerHello is exactly the selected_identity u16 (§4.2.9).
+		// pre_shared_key in ServerHello is exactly the selected_identity u16 (§4.2.11).
 		ext.write_u16(ext_pre_shared_key)
 		ext.write_vector_u16([u8(idx >> 8), u8(idx & 0xff)])!
 	}

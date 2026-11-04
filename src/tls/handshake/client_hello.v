@@ -87,7 +87,7 @@ fn validate_handshake_options(options HandshakeOptions) ! {
 		}
 	}
 	// Validate PSKs: each must have a non-empty identity and key, and no duplicate
-	// identities (RFC 8446 §4.2.9 forbids duplicate identities in the list).
+	// identities (RFC 8446 §4.2.11 forbids duplicate identities in the list).
 	if options.psks.len > 0 {
 		mut seen_ids := [][]u8{}
 		for psk in options.psks {
@@ -139,16 +139,16 @@ mut:
 	supported_groups []NamedGroup
 	// Signature algorithms the client supports.
 	signature_algorithms []SignatureScheme
-	// Pre-shared keys the client may offer (RFC 8446 §4.2.9).
+	// Pre-shared keys the client may offer (RFC 8446 §4.2.11).
 	psks []Psk
 	// binder_transcript is the raw handshake-message transcript preceding this
 	// ClientHello. It is empty for the first ClientHello and holds
 	// message_hash(ClientHello1) || HelloRetryRequest for the retry, so PSK
-	// binders cover the complete transcript (RFC 8446 §4.2.9/§4.4.1).
+	// binders cover the complete transcript (RFC 8446 §4.2.11/§4.4.1).
 	binder_transcript []u8
-	// binder_hash_algo pins the hash used for binder computation. It is unset
-	// for the first ClientHello (the first offered suite's hash applies) and is
-	// set to the HelloRetryRequest suite's hash for the retried ClientHello.
+	// binder_hash_algo pins the HelloRetryRequest hash after a retry. It is
+	// unset for the first ClientHello (each PSK's own hash applies) and, when
+	// set, every retried PSK must carry that hash (RFC 8446 §4.2.11/§4.4.1).
 	binder_hash_algo ?HashAlgorithm
 
 	// ClientHello values reused or echoed during HelloRetryRequest.
@@ -158,6 +158,11 @@ mut:
 	random []u8
 	// Cookie received in HelloRetryRequest and echoed in the retry ClientHello.
 	cookie []u8
+	// cookie_received tracks whether a cookie was received in an HRR; RFC 8446
+	// §4.1.4 requires the retry ClientHello to echo it verbatim. Separating it
+	// from cookie.len makes the "must echo" contract explicit rather than
+	// inferring it from cookie.len > 0.
+	cookie_received bool
 
 	// QUIC-specific settings.
 	// Whether this ClientHello is for a QUIC connection.
@@ -240,7 +245,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	body.write_vector_u8([u8(0x00)])!
 
 	// Build all non-PSK extension bytes first. PSK extensions are appended last
-	// after a two-pass binder computation (§4.2.9): pass 1 builds the extension
+	// after a two-pass binder computation (§4.2.11): pass 1 builds the extension
 	// with empty binders to compute the ClientHello handshake hash, pass 2 fills
 	// in real binders. We track non-PSK extensions as raw bytes so we can
 	// concatenate them with either binder pass without truncating a Writer.
@@ -347,7 +352,17 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		non_psk_exts << ext_w.bytes()
 	}
 
-	// cookie (RFC 8446 §4.2.2) — echoed after HelloRetryRequest
+	// cookie (RFC 8446 §4.2.2) — echoed after HelloRetryRequest. RFC 8446 §4.1.4
+	// requires the retry ClientHello to echo the cookie verbatim; cookie_received
+	// makes that contract explicit rather than inferring it from cookie.len > 0.
+	if cfg.cookie_received {
+		if cfg.cookie.len == 0 {
+			return error('handshake: HelloRetryRequest cookie was received but is empty in the retry ClientHello (illegal_parameter)')
+		}
+		if cfg.cookie.len > max_hrr_cookie_len {
+			return error('handshake: HelloRetryRequest cookie is ${cfg.cookie.len} bytes, exceeds ${max_hrr_cookie_len} byte echo limit')
+		}
+	}
 	if cfg.cookie.len > 0 {
 		mut cookie_w := wire.new_writer(cfg.cookie.len + 2)
 		cookie_w.write_vector_u16(cfg.cookie)!
@@ -356,7 +371,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		non_psk_exts << ext_w.bytes()
 	}
 
-	// Build the full extensions block, with PSK extensions last: §4.2.9 requires
+	// Build the full extensions block, with PSK extensions last: §4.2.11 requires
 	// pre_shared_key to be the final extension in the ClientHello.
 	mut ext_bytes := non_psk_exts.clone()
 	if cfg.psks.len > 0 {
@@ -367,7 +382,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		ext_bytes << kem_ext_w.bytes()
 
 		// Convert Psk identities to PskIdentity wire values, preserving the
-		// caller-supplied obfuscated ticket age (§4.2.9).
+		// caller-supplied obfuscated ticket age (§4.2.11).
 		mut psk_ids := []PskIdentity{cap: cfg.psks.len}
 		for psk in cfg.psks {
 			psk_ids << PskIdentity{
@@ -377,19 +392,25 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		}
 		ids_bytes := build_pre_shared_key_identities(psk_ids)!
 
-		// Determine the hash for binder computation from the first offered
-		// ciphersuite, unless a retry pinned it to the HRR suite (RFC 8446 §4.2.9).
-		binder_hash := cfg.binder_hash_algo or {
-			suite_hash_algo(offered_cipher_suites(&cfg)[0])
+		// Each PSK is associated with its own Hash (RFC 8446 §4.2.11). After a
+		// HelloRetryRequest the state machine filters to PSKs whose hash matches
+		// the retry suite; reject a direct config that violates that pin.
+		if pinned := cfg.binder_hash_algo {
+			for psk in cfg.psks {
+				if psk.hash_algo != pinned {
+					return error('handshake: PSK hash ${psk.hash_algo} is incompatible with retry hash ${pinned}')
+				}
+			}
 		}
-		hash_len := binder_hash.hash_len()
 
-		// Binder entries are Hash.length bytes; build a placeholder with those
-		// lengths so the truncated ClientHello carries the same length fields as
-		// the final message (RFC 8446 §4.2.9).
+		// Binder entries are Hash.length bytes; build placeholders with each
+		// PSK's hash length so the truncated ClientHello carries the same length
+		// fields as the final message (RFC 8446 §4.2.11).
 		mut placeholder_binders := []PskBinderEntry{cap: cfg.psks.len}
-		for _ in 0 .. cfg.psks.len {
-			placeholder_binders << PskBinderEntry{ binder: []u8{len: hash_len} }
+		for psk in cfg.psks {
+			placeholder_binders << PskBinderEntry{
+				binder: []u8{len: psk.hash_algo.hash_len()}
+			}
 		}
 		binders_bytes := build_pre_shared_key_binders(placeholder_binders)!
 		psk_body_len := ids_bytes.len + binders_bytes.len
@@ -404,7 +425,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		// The binder transcript is the ClientHello truncated immediately before
 		// the binders vector, with every length field set as if binders were
 		// present, including the 4-byte handshake header and any prior HRR
-		// transcript (RFC 8446 §4.2.9/§4.4.1).
+		// transcript (RFC 8446 §4.2.11/§4.4.1).
 		mut partial := wire.new_writer(4 + body.len() + 2 + ext_bytes.len + 4 + ids_bytes.len)
 		partial.write_u8(u8(HandshakeType.client_hello))
 		partial.write_u24(u32(body.len() + 2 + exts_len))
@@ -417,13 +438,13 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 
 		mut binder_transcript := cfg.binder_transcript.clone()
 		binder_transcript << partial.bytes()
-		client_hello_hash := binder_hash.compute_hash(binder_transcript)
 
-		// Compute one binder per PSK, each bound to its own Early Secret and
-		// binder label (RFC 8446 §4.2.9/§7.1).
+		// Compute one binder per PSK, each over its own Hash, Early Secret, and
+		// binder label (RFC 8446 §4.2.11/§7.1).
 		mut binders := []PskBinderEntry{cap: cfg.psks.len}
 		for psk in cfg.psks {
-			binder := compute_psk_binder(binder_hash, psk.key, psk_binder_label(psk),
+			client_hello_hash := psk.hash_algo.compute_hash(binder_transcript)
+			binder := compute_psk_binder(psk.hash_algo, psk.key, psk_binder_label(psk),
 				client_hello_hash)!
 			binders << PskBinderEntry{ binder: binder }
 		}

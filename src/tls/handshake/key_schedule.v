@@ -182,7 +182,7 @@ fn derive_binder_key_labeled(hash_algo HashAlgorithm, early_secret []u8, label s
 }
 
 // compute_psk_binder computes one PSK binder over the ClientHello transcript
-// hash (RFC 8446 §4.2.9): bind the PSK into the Early Secret, derive the binder
+// hash (RFC 8446 §4.2.11): bind the PSK into the Early Secret, derive the binder
 // and finished keys, then HMAC the transcript hash. Each intermediate is wiped
 // before returning; the caller owns the binder bytes.
 fn compute_psk_binder(hash_algo HashAlgorithm, psk_key []u8, label string, transcript_hash []u8) ![]u8 {

@@ -139,10 +139,16 @@ fn (h &HandshakeCore) is_handshake_message_accepted(msg_type HandshakeType) bool
 	return match h.state {
 		.wait_ee { msg_type == .encrypted_extensions }
 		.wait_cert_cr {
-			// A PSK-authenticated server may skip Certificate/CertificateVerify and
-			// send Finished directly after EncryptedExtensions (§4.4.2).
-			msg_type == .certificate_request || msg_type == .certificate
-				|| (h.selected_psk != none && msg_type == .finished)
+			// RFC 8446 §4.4.2: a PSK-authenticated server sends Finished directly
+			// after EncryptedExtensions and MUST NOT send CertificateRequest,
+			// Certificate, or CertificateVerify (PSK and certificates are not
+			// combined). A certificate-authenticated server starts with either
+			// CertificateRequest or Certificate.
+			if h.selected_psk != none {
+				msg_type == .finished
+			} else {
+				msg_type == .certificate_request || msg_type == .certificate
+			}
 		}
 		.wait_cert { msg_type == .certificate }
 		.wait_cv { msg_type == .certificate_verify }

@@ -74,7 +74,7 @@ pub:
 	// signature_algorithms is preference-ordered; empty uses the built-in list.
 	signature_algorithms []SignatureScheme
 	// psks are the pre-shared keys the client may offer in the ClientHello
-	// (RFC 8446 §4.2.9). Each carries an identity and the shared key material.
+	// (RFC 8446 §4.2.11). Each carries an identity and the shared key material.
 pub mut:
 	psks []Psk
 	// legacy_session_id is the ClientHello session id echoed in ServerHello.
@@ -213,6 +213,8 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 			} else {
 				none
 			}
+			cookie:                []u8{}
+			cookie_received:       false
 		}
 		transcript: new_transcript(.sha256)
 		hash_algo:  .sha256
@@ -437,6 +439,18 @@ fn (mut h HandshakeCore) handle_hello_retry_request(sh ServerHello, full_sh_msg 
 	h.hrr_cipher_suite = sh.cipher_suite
 	// §4.4.1: the message_hash uses the HRR suite's hash, so switch before applying the HRR.
 	h.set_hash_algo(suite_hash_algo(sh.cipher_suite))
+	// RFC 8446 §4.2.11: a PSK is bound to one Hash, and the retried ClientHello
+	// can only carry PSKs compatible with the now-fixed suite. Drop the rest so
+	// we neither compute an unusable binder nor let the server select it.
+	if h.config.psks.len > 0 {
+		mut compatible := []Psk{cap: h.config.psks.len}
+		for psk in h.config.psks {
+			if psk.hash_algo == h.hash_algo {
+				compatible << psk
+			}
+		}
+		h.config.psks = compatible
+	}
 	h.transcript.apply_hello_retry_request(full_sh_msg)!
 
 	return h.build_second_client_hello(sh.has_key_share, sh.server_share.group, sh.cookie)!
@@ -453,12 +467,15 @@ fn (mut h HandshakeCore) build_second_client_hello(change_group bool, group Name
 			key_exchange: h.public_key_bytes()!
 		}
 	}
-	// A cookie-only HelloRetryRequest keeps the original key share; the cookie is
-	// echoed verbatim (§4.1.4/§4.2.2).
+	// §4.1.4: a cookie-only HelloRetryRequest keeps the original key share;
+	// the cookie is echoed verbatim (§4.1.4/§4.2.2).
 	h.config.cookie = cookie
+	if cookie.len > 0 {
+		h.config.cookie_received = true
+	}
 	// Bind the retried ClientHello to the rewritten transcript
 	// (message_hash(ClientHello1) || HelloRetryRequest), using the HRR suite's
-	// hash, so PSK binders cover the full retry context (§4.2.9/§4.4.1).
+	// hash, so PSK binders cover the full retry context (§4.2.11/§4.4.1).
 	h.config.binder_transcript = h.transcript.messages.clone()
 	h.config.binder_hash_algo = h.hash_algo
 	_, full_ch2 := build_client_hello(h.config)!

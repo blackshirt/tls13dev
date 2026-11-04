@@ -222,12 +222,6 @@ fn is_trusted_anchor(cert Certificate, roots []Certificate, now i64) bool {
 	return false
 }
 
-// chain_has_trusted_anchor reports whether any certificate in the validated
-// peer chain is trusted directly or verifies under a valid stored root.
-fn chain_has_trusted_anchor(chain []Certificate, roots []Certificate, now i64) bool {
-	return trusted_anchor_index(chain, roots, now) >= 0
-}
-
 // count_intermediate_cas_below returns the number of non-self-issued CA
 // certificates between the target leaf and the certificate at parent_index.
 fn count_intermediate_cas_below(chain []Certificate, parent_index int) int {

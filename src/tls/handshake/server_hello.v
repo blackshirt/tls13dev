@@ -56,6 +56,13 @@ fn (sh ServerHello) validate(cfg &ClientHelloConfig) ! {
 		if sh.selected_psk! >= u16(cfg.psks.len) {
 			return error('handshake: server selected PSK index ${sh.selected_psk} but only ${cfg.psks.len} offered (illegal_parameter)')
 		}
+		// RFC 8446 §4.2.11: the suite's hash MUST be the one associated with the
+		// selected PSK; otherwise binder and key schedule disagree.
+		psk := cfg.psks[sh.selected_psk!]
+		selected_hash := suite_hash_algo(sh.cipher_suite)
+		if selected_hash != psk.hash_algo {
+			return error('handshake: server selected cipher suite ${sh.cipher_suite} (hash ${selected_hash}) incompatible with PSK hash ${psk.hash_algo} (illegal_parameter)')
+		}
 	}
 }
 
@@ -90,6 +97,11 @@ fn parse_server_hello(body []u8) !ServerHello {
 	}
 
 	ext_bytes := r.read_vector_u16()!
+	// A complete ServerHello body ends with the extensions block; leftover bytes
+	// mean a malformed message that must not be interpreted permissively.
+	if r.remaining() != 0 {
+		return error('handshake: trailing bytes after ServerHello extensions')
+	}
 
 	mut got_version := false
 	mut selected_version := u16(0)
@@ -156,7 +168,7 @@ fn parse_server_hello(body []u8) !ServerHello {
 				}
 			}
 			u16(ExtensionType.pre_shared_key) {
-				// §4.2.9: a server MUST NOT send pre_shared_key in a
+				// §4.2.11: a server MUST NOT send pre_shared_key in a
 				// HelloRetryRequest, and in a ServerHello it is exactly one u16
 				// selected_identity.
 				if is_hrr {

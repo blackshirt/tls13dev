@@ -168,7 +168,7 @@ pub:
 	// min_rsa_bits floors the accepted RSA leaf key size; 0 keeps the 2048-bit default.
 	min_rsa_bits int
 	// psks are the pre-shared keys the client may offer in the ClientHello
-	// (RFC 8446 §4.2.9). Each carries an identity and the shared key material.
+	// (RFC 8446 §4.2.11). Each carries an identity and the shared key material.
 	psks []handshake.Psk
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second

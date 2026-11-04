@@ -388,13 +388,21 @@ fn test_external_psk_handshake_uses_ext_binder() ! {
 }
 
 // test_psk_hello_retry_request_rebinds_binder checks that the retried ClientHello
-// binder covers message_hash(ClientHello1) || HelloRetryRequest (RFC 8446 §4.2.9).
+// drops PSKs incompatible with the HRR suite hash, then recomputes the surviving
+// binder over message_hash(ClientHello1) || HelloRetryRequest (RFC 8446 §4.2.11).
 fn test_psk_hello_retry_request_rebinds_binder() ! {
 	key := [u8(0x7e)].repeat(32)
 	identity := 'hrr-psk'.bytes()
 	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
 		validator: fixture_trusted_validator()
-		psks:      [Psk{ identity: identity, key: key }]
+		psks:      [
+			Psk{
+				identity:  'incompatible-psk'.bytes()
+				key:       [u8(0x6d)].repeat(32)
+				hash_algo: .sha384
+			},
+			Psk{ identity: identity, key: key },
+		]
 	})!
 	mut srv := fakeserver.new_server(hrr: .change_group, psk: key, psk_identity: identity)!
 
@@ -412,29 +420,85 @@ fn test_psk_hello_retry_request_rebinds_binder() ! {
 	srv.handle_client_finished(produced[0].msg)!
 }
 
-// test_psk_server_selects_second_identity_with_certificate checks per-entry
-// binders and selected_identity resolution when multiple PSKs are offered, and
-// the PSK + certificate-authenticated path where CertificateVerify is still sent.
-fn test_psk_server_selects_second_identity_with_certificate() ! {
+// test_psk_server_selects_second_identity checks per-entry binders when offered
+// PSKs use different hashes (SHA-384 first, SHA-256 second), then resolves the
+// server's selected_identity to the second PSK in a PSK-only flight.
+fn test_psk_server_selects_second_identity() ! {
 	first_key := [u8(0x11)].repeat(32)
 	second_key := [u8(0x22)].repeat(32)
 	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
 		validator: fixture_trusted_validator()
 		psks:      [
-			Psk{ identity: 'first-psk'.bytes(), key: first_key },
+			Psk{
+				identity:  'first-psk'.bytes()
+				key:       first_key
+				hash_algo: .sha384
+			},
 			Psk{ identity: 'second-psk'.bytes(), key: second_key },
 		]
 	})!
+	mut srv := fakeserver.new_server(psk: second_key, psk_identity: 'second-psk'.bytes())!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	h.receive_initial_bytes(fl.server_hello)!
+	assert h.selected_psk? == u16(1)
+
+	produced := h.receive_handshake_bytes(fakeserver.flatten(fl.rest))!
+	assert h.state() == .connected
+	assert h.server_certs.len == 0
+	srv.handle_client_finished(produced[0].msg)!
+}
+
+// test_psk_with_certificate_is_rejected pins RFC 8446 §2.2/§4.4.2: a server that
+// selects a PSK must not also authenticate with Certificate/CertificateVerify.
+fn test_psk_with_certificate_is_rejected() ! {
+	key := [u8(0x33)].repeat(32)
+	identity := 'psk-with-cert'.bytes()
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
+		validator: fixture_trusted_validator()
+		psks:      [Psk{ identity: identity, key: key }]
+	})!
 	mut srv := fakeserver.new_server(
-		psk:          second_key
-		psk_identity: 'second-psk'.bytes()
+		psk:          key
+		psk_identity: identity
 		psk_only:     false
 	)!
 
 	ch := h.create_client_hello()!
 	fl := srv.handle_client_hello(ch)!
 	h.receive_initial_bytes(fl.server_hello)!
-	assert h.selected_psk? == u16(1)
+	assert h.selected_psk? == u16(0)
+
+	h.receive_handshake_bytes(fakeserver.flatten(fl.rest)) or {
+		assert err.msg().contains('unexpected Certificate')
+		assert h.failure_alert() == .unexpected_message
+		return
+	}
+	assert false, 'Certificate after a server-selected PSK must abort'
+}
+
+// test_multiple_psks_fall_back_to_certificate checks that the client may offer
+// several PSKs and still complete a certificate-authenticated handshake when the
+// server declines all of them.
+fn test_multiple_psks_fall_back_to_certificate() ! {
+	mut h := new_tls_handshake(fakeserver.server_name, HandshakeOptions{
+		validator: fixture_trusted_validator()
+		psks:      [
+			Psk{
+				identity:  'first-psk'.bytes()
+				key:       [u8(0x44)].repeat(32)
+				hash_algo: .sha384
+			},
+			Psk{ identity: 'second-psk'.bytes(), key: [u8(0x55)].repeat(32) },
+		]
+	})!
+	mut srv := fakeserver.new_server()!
+
+	ch := h.create_client_hello()!
+	fl := srv.handle_client_hello(ch)!
+	h.receive_initial_bytes(fl.server_hello)!
+	assert h.selected_psk == none
 
 	produced := h.receive_handshake_bytes(fakeserver.flatten(fl.rest))!
 	assert h.state() == .connected

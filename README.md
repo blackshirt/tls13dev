@@ -97,7 +97,7 @@ sibling import (`tls`) relative to the executable's own directory.
 - **Pre-shared keys**: caller-supplied resumption/external PSKs with
   `psk_dhe_ke` (PSK + ECDHE) binders in the ClientHello, server PSK selection
   in ServerHello, and PSK-authenticated flights without CertificateVerify
-  (RFC 8446 §4.2.9/§4.4.2); automatic ticket-to-PSK resumption is not wired up
+  (RFC 8446 §4.2.11/§4.4.2); automatic ticket-to-PSK resumption is not wired up
 - **Post-handshake**: `NewSessionTicket` collection, `KeyUpdate` handling
   (read keys update on receipt; a response is sent with correct §4.6.3
   old-key-before-new ordering when the server requests it), sender-side

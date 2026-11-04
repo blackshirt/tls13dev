@@ -693,7 +693,7 @@ fn test_parse_finished_requires_hash_length() ! {
 	assert false
 }
 
-// test_build_client_hello_pre_shared_key_encoding checks the §4.2.9 wire shape:
+// test_build_client_hello_pre_shared_key_encoding checks the §4.2.11 wire shape:
 // pre_shared_key is the final extension, identities carry u16 lengths plus the
 // obfuscated age, binders use a u8 entry length inside a u16 vector, and each
 // binder covers the ClientHello truncated before the binders vector.
@@ -709,6 +709,12 @@ fn test_build_client_hello_pre_shared_key_encoding() ! {
 		external:              true
 		obfuscated_ticket_age: 0x55667788
 	}
+	psk_c := Psk{
+		identity:              [u8(0xff)]
+		key:                   []u8{len: 32, init: 0x33}
+		obfuscated_ticket_age: 0x99aabbcc
+		hash_algo:             .sha384
+	}
 	cfg := ClientHelloConfig{
 		client_share: KeyShareEntry{
 			group:        .x25519
@@ -716,7 +722,7 @@ fn test_build_client_hello_pre_shared_key_encoding() ! {
 		}
 		session_id:   []u8{len: 32, init: 0x33}
 		random:       []u8{len: client_hello_random_len, init: 0x44}
-		psks:         [psk_a, psk_b]
+		psks:         [psk_a, psk_b, psk_c]
 	}
 	_, full := build_client_hello(cfg)!
 
@@ -749,7 +755,7 @@ fn test_build_client_hello_pre_shared_key_encoding() ! {
 	mut psk_reader := wire.new_reader(psk_data)
 	ids_bytes := psk_reader.read_vector_u16()!
 	mut ids_reader := wire.new_reader(ids_bytes)
-	for expected in [psk_a, psk_b] {
+	for expected in [psk_a, psk_b, psk_c] {
 		assert ids_reader.read_vector_u16()! == expected.identity
 		assert ids_reader.read_u32()! == expected.obfuscated_ticket_age
 	}
@@ -761,21 +767,22 @@ fn test_build_client_hello_pre_shared_key_encoding() ! {
 	for binder_reader.remaining() > 0 {
 		binders << binder_reader.read_vector_u8()!
 	}
-	assert binders.len == 2
+	assert binders.len == 3
 	assert binders[0].len == 32
 	assert binders[1].len == 32
+	assert binders[2].len == 48, 'a SHA-384 PSK binder must be Hash.length bytes'
 	assert psk_reader.remaining() == 0
 
 	// Recompute each binder over the message bytes that precede the binders
 	// vector; the builder must have used the same truncated transcript, with
 	// full-message length fields already in place.
-	binder_tail_len := 2 + binders.len * (1 + 32)
+	binder_tail_len := 2 + (1 + 32) + (1 + 32) + (1 + 48)
 	prefix := full[..full.len - binder_tail_len]
-	prefix_hash := HashAlgorithm.sha256.compute_hash(prefix)
-	for i, psk in [psk_a, psk_b] {
-		expected := compute_psk_binder(HashAlgorithm.sha256, psk.key, psk_binder_label(psk),
+	for i, psk in [psk_a, psk_b, psk_c] {
+		prefix_hash := psk.hash_algo.compute_hash(prefix)
+		expected := compute_psk_binder(psk.hash_algo, psk.key, psk_binder_label(psk),
 			prefix_hash)!
-		assert binders[i] == expected, 'binder ${i} does not cover the truncated ClientHello'
+		assert binders[i] == expected, 'binder ${i} does not use its PSK hash'
 	}
 }
 

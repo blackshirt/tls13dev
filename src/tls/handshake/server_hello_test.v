@@ -147,6 +147,128 @@ fn test_server_hello_rejects_oversized_hrr_cookie() ! {
 	assert rejected, 'an oversized HRR cookie must be rejected'
 }
 
+// test_build_client_hello_echoes_cookie verifies that when a cookie was received
+// in an HRR (cookie_received=true), the retry ClientHello includes the cookie
+// extension verbatim (RFC 8446 §4.1.4/§4.2.2).
+fn test_build_client_hello_echoes_cookie() ! {
+	cfg := ClientHelloConfig{
+		server_name:           'example.com'
+		alpn:                  []
+		session_id:            [u8(0x11), 0x22]
+		random:                []u8{len: 32, init: 0xab}
+		cipher_suites:         default_cipher_suites()
+		supported_groups:      default_supported_groups()
+		signature_algorithms:  default_signature_algorithms()
+		psks:                  []Psk{}
+		is_quic:               false
+		quic_transport_params: none
+		cookie:                [u8(0xde), 0xad, 0xbe, 0xef]
+		cookie_received:       true
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0x01}
+		}
+	}
+	_, full := build_client_hello(cfg)! or { return err }
+	// The echoed cookie bytes must appear in the ClientHello.
+	mut found := false
+	for i in 0 .. full.len - 3 {
+		if full[i] == 0xde && full[i + 1] == 0xad && full[i + 2] == 0xbe && full[i + 3] == 0xef {
+			found = true
+			break
+		}
+	}
+	assert found, 'retry ClientHello must include the echoed cookie bytes'
+	// And the handshake message must be a ClientHello.
+	assert full[0] == u8(HandshakeType.client_hello)
+}
+
+// test_build_client_hello_rejects_unechoed_cookie enforces RFC 8446 §4.1.4:
+// when cookie_received is true but cookie is empty, the retry ClientHello must
+// fail — the cookie must be echoed verbatim.
+fn test_build_client_hello_rejects_unechoed_cookie() ! {
+	cfg := ClientHelloConfig{
+		server_name:           'example.com'
+		alpn:                  []
+		session_id:            [u8(0x11), 0x22]
+		random:                []u8{len: 32, init: 0xab}
+		cipher_suites:         default_cipher_suites()
+		supported_groups:      default_supported_groups()
+		signature_algorithms:  default_signature_algorithms()
+		psks:                  []Psk{}
+		is_quic:               false
+		quic_transport_params: none
+		cookie:                []u8{}
+		cookie_received:       true
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0x01}
+		}
+	}
+	build_client_hello(cfg) or {
+		assert err.msg().contains('cookie was received but is empty')
+		return
+	}
+	assert false, 'an unechoed cookie in the retry ClientHello must be fatal'
+}
+
+// test_build_client_hello_rejects_oversized_cookie_echo verifies that echoing
+// an oversized cookie is rejected before it can make the ClientHello
+// unframeable (§5.1).
+fn test_build_client_hello_rejects_oversized_cookie_echo() ! {
+	mut cookie := []u8{len: max_hrr_cookie_len + 1, init: 0xaa}
+	cfg := ClientHelloConfig{
+		server_name:           'example.com'
+		alpn:                  []
+		session_id:            [u8(0x11), 0x22]
+		random:                []u8{len: 32, init: 0xab}
+		cipher_suites:         default_cipher_suites()
+		supported_groups:      default_supported_groups()
+		signature_algorithms:  default_signature_algorithms()
+		psks:                  []Psk{}
+		is_quic:               false
+		quic_transport_params: none
+		cookie:                cookie
+		cookie_received:       true
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0x01}
+		}
+	}
+	build_client_hello(cfg) or {
+		assert err.msg().contains('exceeds')
+		return
+	}
+	assert false, 'an oversized cookie echo must be fatal'
+}
+
+// test_build_client_hello_without_cookie_is_fine checks that a ClientHello with
+// no cookie (first flight) builds successfully — cookie_received defaults to
+// false and cookie stays empty.
+fn test_build_client_hello_without_cookie_is_fine() ! {
+	cfg := ClientHelloConfig{
+		server_name:           'example.com'
+		alpn:                  []
+		session_id:            [u8(0x11), 0x22]
+		random:                []u8{len: 32, init: 0xab}
+		cipher_suites:         default_cipher_suites()
+		supported_groups:      default_supported_groups()
+		signature_algorithms:  default_signature_algorithms()
+		psks:                  []Psk{}
+		is_quic:               false
+		quic_transport_params: none
+		cookie:                []u8{}
+		cookie_received:       false
+		client_share:          KeyShareEntry{
+			group:        .x25519
+			key_exchange: []u8{len: 32, init: 0x01}
+		}
+	}
+	_, full := build_client_hello(cfg)! or { return err }
+	assert full.len > 0
+	assert full[0] == u8(HandshakeType.client_hello)
+}
+
 // test_server_hello_reports_missing_supported_versions distinguishes the two
 // version failures: an absent mandatory extension (§4.2.1) is worded as a
 // missing extension, not as a negotiated 0x0000 the peer never sent, while a
@@ -169,7 +291,7 @@ fn test_server_hello_reports_missing_supported_versions() ! {
 	assert wrong, 'a present-but-wrong version must keep the wrong-value wording'
 }
 
-// test_server_hello_pre_shared_key_selection checks the §4.2.9 ServerHello
+// test_server_hello_pre_shared_key_selection checks the §4.2.11 ServerHello
 // shape: a single u16 selected_identity is decoded, while an empty or overlong
 // extension is fatal rather than silently treated as "no PSK selected".
 fn test_server_hello_pre_shared_key_selection() ! {
@@ -199,7 +321,7 @@ fn test_server_hello_pre_shared_key_selection() ! {
 	}
 }
 
-// test_server_hello_rejects_pre_shared_key_in_hrr pins §4.2.9: the extension
+// test_server_hello_rejects_pre_shared_key_in_hrr pins §4.2.11: the extension
 // may only appear in a ServerHello, never in a HelloRetryRequest.
 fn test_server_hello_rejects_pre_shared_key_in_hrr() ! {
 	mut exts := wire.new_writer(96)
@@ -211,4 +333,44 @@ fn test_server_hello_rejects_pre_shared_key_in_hrr() ! {
 		rejected = true
 	}
 	assert rejected, 'pre_shared_key in a HelloRetryRequest must be fatal'
+}
+
+// test_server_hello_rejects_psk_hash_incompatible_with_suite pins the
+// RFC 8446 §4.2.11 rule that a selected PSK's Hash must match the suite's.
+fn test_server_hello_rejects_psk_hash_incompatible_with_suite() ! {
+	mut exts := wire.new_writer(96)
+	exts.write_bytes(ext_block(u16(ExtensionType.supported_versions), [u8(0x03), 0x04])!)
+	exts.write_bytes(ext_block(u16(ExtensionType.pre_shared_key), [u8(0x00), 0x00])!)
+	sh := parse_server_hello(sh_body(exts.bytes())!)!
+	cfg := ClientHelloConfig{
+		session_id: [u8(0x11), 0x22, 0x33]
+		psks:       [
+			Psk{
+				identity:  [u8(0x01)]
+				key:       []u8{len: 32, init: 0x42}
+				hash_algo: .sha384
+			},
+		]
+	}
+	mut rejected := false
+	sh.validate(&cfg) or {
+		assert err.msg().contains('incompatible with PSK hash')
+		rejected = true
+	}
+	assert rejected, 'a SHA-256 suite must not accept a SHA-384 PSK'
+}
+
+// test_server_hello_rejects_trailing_body_bytes ensures a ServerHello body that
+// continues past its extensions block is a decode error, not silently ignored.
+fn test_server_hello_rejects_trailing_body_bytes() ! {
+	mut exts := wire.new_writer(32)
+	exts.write_bytes(ext_block(u16(ExtensionType.supported_versions), [u8(0x03), 0x04])!)
+	mut body := sh_body(exts.bytes())!
+	body << u8(0x00)
+	mut rejected := false
+	parse_server_hello(body) or {
+		assert err.msg().contains('trailing bytes after ServerHello extensions')
+		rejected = true
+	}
+	assert rejected, 'trailing bytes after the ServerHello extensions must be fatal'
 }

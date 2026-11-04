@@ -334,7 +334,7 @@ fn test_psk_identity_round_trip() {
 }
 
 // test_psk_key_exchange_modes_extension verifies the psk_key_exchange_modes
-// extension body encodes only psk_dhe_ke (mode 1) (RFC 8446 §4.2.11).
+// extension body encodes only psk_dhe_ke (mode 1) (RFC 8446 §4.2.9).
 fn test_psk_key_exchange_modes_extension() {
 	ext := build_psk_key_exchange_modes_extension()!
 	// Extension body: mode_len(1) + mode(1) = 2 bytes
