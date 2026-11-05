@@ -7,7 +7,7 @@ module handshake
 
 // AlertLevel classifies an alert as warning or fatal (RFC 8446 §6).
 // In TLS 1.3 only close_notify may be a warning; every other alert is fatal.
-pub enum AlertLevel as u8 {
+enum AlertLevel as u8 {
 	warning = 1
 	fatal   = 2
 }
@@ -46,7 +46,7 @@ pub enum AlertDescription as u8 {
 // Alert is the 2-byte TLS alert payload, read-only outside this module; @[noinit]
 // keeps a caller from fabricating an out-of-range level.
 @[noinit]
-pub struct Alert {
+struct Alert {
 pub:
 	level       AlertLevel       // warning (1) or fatal (2)
 	description AlertDescription // what went wrong (RFC 8446 §6.2)

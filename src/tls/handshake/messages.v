@@ -8,7 +8,7 @@ module handshake
 import tls.wire
 
 // HandshakeType identifies TLS 1.3 handshake messages (RFC 8446 §4).
-pub enum HandshakeType as u8 {
+enum HandshakeType as u8 {
 	client_hello         = 1
 	server_hello         = 2
 	new_session_ticket   = 4
@@ -245,18 +245,20 @@ fn split_handshake_message(full_msg []u8) !(HandshakeType, []u8) {
 }
 
 // PskKeyExchangeMode names the PSK key-exchange modes (RFC 8446 §4.2.9).
-pub enum PskKeyExchangeMode as u8 {
+enum PskKeyExchangeMode as u8 {
 	psk_ke     = 0 // PSK only, no (EC)DHE (no forward secrecy)
 	psk_dhe_ke = 1 // PSK with (EC)DHE (forward secrecy)
 }
 
 // supported_psk_key_exchange_modes is the mode list this client offers:
 // psk_dhe_ke only, so every PSK handshake keeps forward secrecy.
-pub const supported_psk_key_exchange_modes = [PskKeyExchangeMode.psk_dhe_ke]
+const supported_psk_key_exchange_modes = [PskKeyExchangeMode.psk_dhe_ke]
 
 // PskIdentity is one offered PSK: an opaque ticket (the identity) and its
 // obfuscated ticket age (ticket_age_add + age mod 2^32) (RFC 8446 §4.2.11).
-pub struct PskIdentity {
+// @[noinit]: only the handshake module builds these wire values.
+@[noinit]
+struct PskIdentity {
 mut:
 	identity              []u8 // opaque PSK identity (a NewSessionTicket's ticket bytes)
 	obfuscated_ticket_age u32  // ticket_age_add + age (mod 2^32), obfuscating real age
@@ -264,9 +266,14 @@ mut:
 
 // Psk is a usable pre-shared key: the identity presented on the wire plus the
 // key material both sides use to derive binders and the Early Secret (RFC 8446
-// §7.1).
+// §7.1). `identity` and `key` are the only required fields. `obfuscated_ticket_age`
+// defaults to zero (a fresh ticket), `external` to false (resumption binder), and
+// `hash_algo` to the zero value (SHA-256); none of them must be set by a caller.
+// @[noinit]: construct via new_psk; read identity/key via the getters. Fields are
+// module-private, not publicly exposed, and immutable once constructed.
+@[noinit]
 pub struct Psk {
-pub mut:
+mut:
 	identity []u8 // opaque PSK identity (ticket bytes, sent in the ClientHello)
 	key      []u8 // PSK key material (known to both client and server)
 	// obfuscated_ticket_age is the ticket_age_add-obfuscated age sent for a
@@ -281,9 +288,30 @@ pub mut:
 	hash_algo HashAlgorithm
 }
 
+// new_psk constructs a PSK with the required identity and key. obfuscated_ticket_age,
+// external, and hash_algo default to zero values.
+pub fn new_psk(identity []u8, key []u8) Psk {
+	return Psk{
+		identity: identity
+		key:      key
+	}
+}
+
+// identity returns the opaque PSK identity (ticket bytes, sent in the ClientHello).
+pub fn (p &Psk) identity() []u8 {
+	return p.identity
+}
+
+// key returns the PSK key material (known to both client and server).
+pub fn (p &Psk) key() []u8 {
+	return p.key
+}
+
 // PskBinderEntry is one PSK binder: an HMAC over the finished binder key and the
 // truncated ClientHello transcript hash (RFC 8446 §4.2.11).
-pub struct PskBinderEntry {
+// @[noinit]: only the handshake module builds binder entries.
+@[noinit]
+struct PskBinderEntry {
 mut:
 	binder []u8
 }

@@ -482,6 +482,13 @@ pub fn (c Conn) negotiated_alpn() string {
 	return c.negotiated_alpn
 }
 
+// session_tickets returns the NewSessionTicket backlog parsed during this
+// connection (RFC 8446 §4.6.1). Each ticket's opaque token is available via
+// ticket.bytes() and can be reused as a PSK identity on a future connection.
+pub fn (c &Conn) session_tickets() []handshake.NewSessionTicket {
+	return c.session_tickets
+}
+
 // do_handshake drives the full client flight over TCP: frame the ClientHello
 // (+dummy CCS), then feed records into the core until it reports .connected (§5.1).
 fn (mut c Conn) do_handshake() ! {

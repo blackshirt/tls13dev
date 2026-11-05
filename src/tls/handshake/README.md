@@ -43,6 +43,27 @@ initial and preference-ordered supported groups, cipher suites, and signature al
 lists keep the built-in defaults; if no validator is supplied the constructors use the system root
 CA bundle.
 
+## Pre-shared keys
+
+PSK support ([RFC 8446 §4.2.11](https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11)) is configured through `HandshakeOptions.psks`
+(and `tls.Conn.Config.psks`). A PSK is constructed through the curated API rather than a struct
+literal: its fields are module-private, so callers cannot fabricate or mutate them directly.
+
+```v
+psk := handshake.new_psk(identity, key)    // identity: ticket bytes; key: shared material
+assert psk.identity() == identity
+assert psk.key() == key
+```
+
+Only `identity` (ticket bytes sent in the ClientHello) and `key` (the shared key material) are
+publicly readable. `obfuscated_ticket_age`, `external`, and `hash_algo` default to zero (a fresh
+ticket, the resumption "res binder" label, SHA-256); none of them can be set from outside the
+module — external PSKs and per-PSK hashes are configured internally by the module. Once
+constructed, a `Psk` is immutable to callers.
+
+`PskIdentity`, `PskBinderEntry`, `PskKeyExchangeMode`, and the `build_pre_shared_key_*`
+wire-codec helpers are module-private; callers never construct them by hand.
+
 ## File map
 
 ```
@@ -69,6 +90,9 @@ key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations
                       retained secret holders with their §7.5 lifecycle
 transcript.v          running transcript the schedule and CertificateVerify hash over
 messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + header
+                      encoding plus PSK wire codecs (identities, binders,
+                      pre_shared_key extension); Psk/PskIdentity/PskBinderEntry
+                      wire types are module-private
 aead.v                cipher-suite → AEAD/hash helpers
 alert.v               §6 alert vocabulary; quic_connection_error (§4.8) mapping
 post_handshake.v      NewSessionTicket and KeyUpdate parsing

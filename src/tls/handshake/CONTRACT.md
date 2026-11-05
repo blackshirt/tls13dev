@@ -223,6 +223,27 @@ post-handshake handling or transport key setup: `next_unframed_message()`,
 `new_aead_for_suite()`. These are protocol building blocks, not alternatives
 to the core's phase-checked handshake entry points.
 
+## Pre-shared keys
+
+PSK support ([RFC 8446 §4.2.11](https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11)) is configured through
+`HandshakeOptions.psks` (and `tls.Conn.Config.psks`). A PSK is constructed through
+`handshake.new_psk(identity, key)` — struct literals are not usable outside the module because
+`Psk` is `@[noinit]` and its fields are module-private.
+
+```v
+psk := handshake.new_psk(identity, key)
+assert psk.identity() == identity
+assert psk.key() == key
+```
+
+Only `identity` (ticket bytes sent in the ClientHello) and `key` (the shared key material) are
+publicly readable via `identity()`/`key()`. `obfuscated_ticket_age`, `external`, and `hash_algo`
+are module-private with zero defaults (fresh ticket, resumption "res binder" label, SHA-256).
+Once constructed, a `Psk` is immutable to callers outside the module.
+
+`PskIdentity`, `PskBinderEntry`, `PskKeyExchangeMode`, `supported_psk_key_exchange_modes`,
+and the `build_pre_shared_key_*` wire-codec helpers are module-private.
+
 ## Ownership boundary
 
 The core owns TLS handshake ordering, transcript updates, certificate
