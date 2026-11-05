@@ -299,6 +299,9 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 		}
 		return n
 	}
+	// `closed` also covers a released descriptor: close(), handle_alert and abort_connection
+	// mark it before close_tcp_socket(), so a read() reaching the loop below always has a
+	// live socket (only dial()'s never-returned failed Conn skips the mark).
 	if c.closed {
 		return 0
 	}
