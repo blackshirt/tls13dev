@@ -74,9 +74,7 @@ fn parse_certificate_verify(body []u8) !ParsedCertificateVerify {
 fn certificate_verify_signed_content(transcript_hash []u8) []u8 {
 	context_string := 'TLS 1.3, server CertificateVerify'.bytes()
 	mut out := []u8{cap: 64 + context_string.len + 1 + transcript_hash.len}
-	for _ in 0 .. 64 {
-		out << 0x20 // 64 space octets
-	}
+	out << []u8{len: 64, init: 0x20}
 	out << context_string
 	out << 0x00
 	out << transcript_hash
