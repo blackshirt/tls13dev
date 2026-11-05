@@ -244,12 +244,16 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 	// Legacy compression methods: clients must offer only the null method (§4.2).
 	body.write_vector_u8([u8(0x00)])!
 
-	// Build all non-PSK extension bytes first. PSK extensions are appended last
+	// Build non-PSK extension bytes first. PSK extensions are appended last
 	// after a two-pass binder computation (§4.2.11): pass 1 builds the extension
 	// with empty binders to compute the ClientHello handshake hash, pass 2 fills
-	// in real binders. We track non-PSK extensions as raw bytes so we can
-	// concatenate them with either binder pass without truncating a Writer.
-	mut non_psk_exts := []u8{}
+	// in real binders. We track extensions as raw bytes so we can concatenate them
+	// with either binder pass without truncating a Writer.
+	//
+	// 768 bytes covers a typical ClientHello's extension block (SNI + supported_
+	// versions + groups + sig_algs + key_share + ALPN); the slice grows past it
+	// for an unusually long server_name or ALPN list.
+	mut ext_bytes := []u8{cap: 768}
 
 	// SNI host_name is a DNS name; omit it for IP literals (RFC 6066 §3).
 	if cfg.server_name.len > 0 && !pki.is_ip_literal(cfg.server_name) {
@@ -260,7 +264,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		sni_w.write_vector_u16(snl_w.bytes())!
 		mut ext_w := wire.new_writer(sni_w.len() + 4)
 		write_extension(mut ext_w, .server_name, sni_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// supported_versions (RFC 8446 §4.2.1)
@@ -269,7 +273,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		sv_w.write_vector_u8([u8(0x03), 0x04])! // TLS 1.3
 		mut ext_w := wire.new_writer(sv_w.len() + 4)
 		write_extension(mut ext_w, .supported_versions, sv_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// supported_groups (RFC 8446 §4.2.7)
@@ -283,7 +287,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		sg_w.write_vector_u16(groups_w.bytes())!
 		mut ext_w := wire.new_writer(sg_w.len() + 4)
 		write_extension(mut ext_w, .supported_groups, sg_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// signature_algorithms (RFC 8446 §4.2.3)
@@ -297,7 +301,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		sa_w.write_vector_u16(slist_w.bytes())!
 		mut ext_w := wire.new_writer(sa_w.len() + 4)
 		write_extension(mut ext_w, .signature_algorithms, sa_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// key_share (RFC 8446 §4.2.8): a u16 vector of group (u16) plus
@@ -323,7 +327,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		ks_w.write_vector_u16(entry_w.bytes())!
 		mut ext_w := wire.new_writer(ks_w.len() + 4)
 		write_extension(mut ext_w, .key_share, ks_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// ALPN (RFC 7301)
@@ -336,7 +340,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		alpn_w.write_vector_u16(protocols_w.bytes())!
 		mut ext_w := wire.new_writer(alpn_w.len() + 4)
 		write_extension(mut ext_w, .alpn, alpn_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// QUIC transport parameters are carried in ClientHello (RFC 9001 §8.2). TLS is
@@ -349,7 +353,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		}
 		mut ext_w := wire.new_writer(params.len + 4)
 		write_extension(mut ext_w, .quic_transport_parameters, params)!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
 	// cookie (RFC 8446 §4.2.2) — echoed after HelloRetryRequest. RFC 8446 §4.1.4
@@ -368,15 +372,14 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		cookie_w.write_vector_u16(cfg.cookie)!
 		mut ext_w := wire.new_writer(cookie_w.len() + 4)
 		write_extension(mut ext_w, .cookie, cookie_w.bytes())!
-		non_psk_exts << ext_w.bytes()
+		ext_bytes << ext_w.bytes()
 	}
 
-	// Build the full extensions block, with PSK extensions last: §4.2.11 requires
-	// pre_shared_key to be the final extension in the ClientHello.
-	mut ext_bytes := non_psk_exts.clone()
+	// Append the PSK extensions last: §4.2.11 requires pre_shared_key to be
+	// the final extension in the ClientHello.
 	if cfg.psks.len > 0 {
 		// psk_key_exchange_modes: advertise only psk_dhe_ke (forward secrecy).
-		mut kem := build_psk_key_exchange_modes_extension()!
+		kem := build_psk_key_exchange_modes_extension()!
 		mut kem_ext_w := wire.new_writer(4 + kem.len)
 		write_extension(mut kem_ext_w, .psk_key_exchange_modes, kem)!
 		ext_bytes << kem_ext_w.bytes()
@@ -454,7 +457,7 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		write_extension(mut psk_ext_w, .pre_shared_key, psk_ext)!
 		ext_bytes << psk_ext_w.bytes()
 	}
-
+	// Write the extensions block to the ClientHello.
 	body.write_vector_u16(ext_bytes)! or {
 		return err
 	}

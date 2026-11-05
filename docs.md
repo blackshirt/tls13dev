@@ -8,7 +8,7 @@ crypto — no OpenSSL bindings, no third-party dependencies.
 
 | | |
 |---|---|
-| **Protocol** | TLS 1.3 (RFC 8446) — client only; no TLS 1.2 fallback, automatic ticket resumption, or 0-RTT |
+| **Protocol** | TLS 1.3 (RFC 8446) — client only; no TLS 1.2 fallback and no 0-RTT. Ticket-based resumption (§7.2) is available through `Conn.resumption_psks()`, not automatic |
 | **Implementation** | Pure V over the standard-library crypto stack; strict, bounds-checked parsing throughout |
 | **API surface** | `dial()` · `Conn` · `Config` · `default_config()` · `pki.TrustStore` — plus the importable `tls.handshake` core for non-TCP transports; everything else is module-private |
 | **Modules** | `tls` (record layer + TCP API) → `tls.handshake` (transport-neutral core) → `tls.pki` (trust & parsing) → `tls.wire` (byte codec) |
@@ -110,7 +110,7 @@ a doc preamble with its authoritative role; this table summarizes it.
  │                                               │  alert records
  ├───────────────────────────────────────────────┤
  │ module tls.handshake                          │  transport-neutral core (adapter
- │   state_machine.v · messages.v ·              │  contract): sequencing, §7.1
+ │   state_machine.v · messages.v · psk.v ·      │  contract): sequencing, §7.1
  │   key_schedule.v · transcript.v ·             │  ladder, codecs, AEAD ctors,
 │   aead.v · alert.v · certificate_verify.v ·   │  alert vocabulary, recordless
 │   state_machine_extra.v                       │  CRYPTO-stream passthrough
@@ -131,7 +131,7 @@ a doc preamble with its authoritative role; this table summarizes it.
 |---|---|---|
 | `tls.wire` | `reader.v`, `writer.v` | Bounds-checked byte cursor / big-endian length-prefixed emitter. No TLS semantics, only framing arithmetic; every out-of-bounds access is an error, <span style="color:#2ea44f">never a panic</span>. |
 | `tls.pki` | `x509.v`, `asn1.v`, `rsa.v`, `validator.v`, `hostname.v`, `trust_store.v` | Strict DER reader and X.509 v3 decoding with element-count guards, RFC 5280 chain building to a trusted root with name-constraint enforcement, RFC 6125 hostname matching, RSA/PSS/ECDSA/Ed25519 signature verification, system trust-bundle loading. Rejection rules in §4.3; `TrustStore` is public so `Config.root_cas` can be populated. |
-| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `state_machine.v`, `state_machine_extra.v`, `key_exchange.v`, `client_hello.v`, `server_hello.v`, `server_flight.v`, `post_handshake.v`, `core_guarded.v` | Transport-neutral core: RFC 8446 §4 message structures and running Transcript-Hash (§4.4.1), §7.1 HKDF ladder with retained secret holders and their §7.5 lifecycle, AEAD constructors, CertificateVerify check, shared alert vocabulary with RFC 9001 §4.8 mapping, recordless CRYPTO-stream reassembly, post-handshake NewSessionTicket/KeyUpdate parsing. `state_machine.v` defines `HandshakeCore`, `HandshakeState` cursor, and phase transitions. Owns no record, cipher, or socket concept; transport-specific methods are `is_quic`-guarded. |
+| `tls.handshake` | `messages.v`, `transcript.v`, `key_schedule.v`, `aead.v`, `certificate_verify.v`, `alert.v`, `state_machine.v`, `state_machine_extra.v`, `key_exchange.v`, `client_hello.v`, `psk.v`, `server_hello.v`, `server_flight.v`, `post_handshake.v`, `core_guarded.v` | Transport-neutral core: RFC 8446 §4 message structures and running Transcript-Hash (§4.4.1), §7.1 HKDF ladder with retained secret holders and their §7.5 lifecycle, AEAD constructors, CertificateVerify check, shared alert vocabulary with RFC 9001 §4.8 mapping, recordless CRYPTO-stream reassembly, post-handshake NewSessionTicket/KeyUpdate parsing. `state_machine.v` defines `HandshakeCore`, `HandshakeState` cursor, and phase transitions. Owns no record, cipher, or socket concept; transport-specific methods are `is_quic`-guarded. |
 | `tls` | `record.v`, `record_protection.v`, `record_layer.v` | TLS record layer (§5): record framing/reassembly, `ContentType`-tagged `Record` frame, per-direction AEAD key/IV/sequence state with §5.3 nonce construction and §5.5 per-key record limit, AES-GCM / ChaCha20-Poly1305 behind one seal/open interface. `record_layer.v` is the `Conn`-held facade: four `TLSProtection` states, post-handshake reassembly buffer, KeyUpdate mechanism (§4.5 one-in-a-row guard, §5.5 rekey trigger). |
 | `tls` | `conn.v` | Public TCP adapter: `dial()`, `Conn`, caller-facing `Config`/`default_config()`, read/write/close path, and `do_handshake` driving the `tls.handshake` core — record handling, §5.1 ServerHello boundary check, framing/batching/CCS mechanics. Record state and protection installation live in the `RecordLayer` facade `Conn` holds as its `rec` field. |
 | `tls.quic` | `engine.v`, `client.v`, `packet.v`, `packet_parse.v`, `protection.v`, `initial_keys.v`, `frame.v`, `varint.v`, `reasm.v`, `transport_params.v` | QUIC client (RFC 9000/9001). `engine.v` holds the module-internal `Engine` — long/short header (de)serialization, header protection, Initial-key derivation from the original DCID, CRYPTO-stream reassembly, ACK frames, handshake-flight retransmit on probe timeout, CRYPTO fragmentation to `Config.max_packet_size`. `client.v` wraps it in the socket-owning `dial()` facade returning a `Conn` over a `net.UdpConn`. Only `dial()`, `Conn`, `negotiated_alpn()`, `negotiated_cipher_suite()`, `close()`, and `Config` are public; construction never imports `tls`. See [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md). |
@@ -220,7 +220,7 @@ new_quic_handshake(server_name string, options HandshakeOptions) !HandshakeCore 
 (mut h) receive_initial_bytes(bytes []u8) ![]HandshakeMessage    // pre-ServerHello phase
 (mut h) receive_handshake_bytes(bytes []u8) ![]HandshakeMessage  // handshake-key phase
      (h) state() HandshakeState   /   negotiated_alpn() string   /   negotiated_cipher_suite() CipherSuite
-     (h) failure_alert() AlertDescription
+     (h) selected_psk_index() ?u16   /   failure_alert() AlertDescription
 (mut h) fail_and_zeroize_secrets()   // bulk, unguarded; wipes everything and parks .failed
 (mut h) zeroize_traffic_secrets() !    // guarded teardown of all traffic-phase secrets
 
@@ -341,10 +341,11 @@ pub struct Conn {}
 A TLS 1.3 client connection over TCP. `@[noinit]` prevents constructing one
 without `dial()` supplying every field.
 
-All `Conn` fields are module-private. The only connection identity surfaced to a
-caller is the negotiated ALPN protocol, read through the `negotiated_alpn()`
-accessor below; the SNI name and the verified host stay internal (a caller
-already holds both in its own `Config`).
+All `Conn` fields are module-private. Connection identity is surfaced through
+the accessors below: `negotiated_alpn()` reports the ALPN pick and
+`negotiated_psk_index()` reports whether the peer selected one of the offered
+PSKs. The SNI name and the verified host stay internal (a caller already holds
+both in its own `Config`).
 
 #### Concurrency
 
@@ -433,6 +434,19 @@ pub fn (c Conn) negotiated_alpn() string
 Returns the negotiated ALPN protocol, if any (`''` otherwise). Populated only
 after the handshake has proven the server's choice was offered.
 
+#### `negotiated_psk_index`
+
+```v
+pub fn (c &Conn) negotiated_psk_index() ?u16
+```
+
+Returns the identity index the server echoed in the ServerHello
+`pre_shared_key` extension, or `none` when every offered PSK was declined and
+the connection completed a full certificate handshake. Not secret material —
+the identity bytes travel in the clear — so it stays readable after `close()`.
+Pairs with `Config.psks`: the returned index is the position in that list the
+server picked.
+
 ### 2.3 `Config`
 
 ```v
@@ -462,7 +476,7 @@ build one up front from `default_config()`).
 | `insecure_skip_verify` | `false` | Disables chain **and** hostname validation. Removes all authentication the handshake provides — tests and pinned lab environments only, never shipped enabled. |
 | `root_cas` | `none` | When set, used instead of the system trust store (private CAs, enterprise, testing). Otherwise the system bundle is used, parsed once per process and cached for every later `dial()`. |
 | `min_rsa_bits` | `0` (⇒ 2048) | Minimum accepted RSA **leaf** key size in bits. Zero keeps the default floor (`pki.default_min_rsa_bits` = 2048); set lower only for interoperability with a legacy server. Chain (CA) RSA keys are floored at 2048 unconditionally. |
-| `psks` | empty | Caller-supplied pre-shared keys to offer with `psk_dhe_ke` (RFC 8446 §4.2.11). Each `Psk` carries an identity, key material, an optional obfuscated ticket age, an `external` flag selecting the `"ext binder"` label, and its associated `hash_algo` (SHA-256 default). PSKs are offered only alongside (EC)DHE; the server may select one instead of certificate authentication. Automatic ticket-to-PSK resumption and 0-RTT are not implemented. |
+| `psks` | empty | Caller-supplied pre-shared keys to offer with `psk_dhe_ke` (RFC 8446 §4.2.11). Each `Psk` carries an identity, key material, an optional obfuscated ticket age, an `external` flag selecting the `"ext binder"` label, and its associated `hash_algo` (SHA-256 default). PSKs are offered only alongside (EC)DHE; the server may select one instead of certificate authentication. Tickets received on a prior connection are turned into `Psk` handles via `Conn.resumption_psks()` (RFC 8446 §7.2). 0-RTT / early data is not implemented. |
 | `hsk_options` | defaults | ALPN protocols to offer, optional explicit validator, key-share group, and preference-ordered supported groups, cipher suites, and signature algorithms. An empty ALPN list offers no ALPN; the server's pick is verified against the offered list. Empty preference lists retain the defaults. Explicit random and legacy session-ID values are for deterministic test vectors only. In `dial()`, a validator in these options takes precedence over `root_cas` and `insecure_skip_verify`; otherwise the validator is built from the Config trust settings. |
 | `timeout` | `30s` | Socket read/write timeout applied before the handshake; a zero value falls back to 30 s. |
 

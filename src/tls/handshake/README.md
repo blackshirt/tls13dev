@@ -50,10 +50,15 @@ PSK support ([RFC 8446 §4.2.11](https://www.rfc-editor.org/rfc/rfc8446#section-
 literal: its fields are module-private, so callers cannot fabricate or mutate them directly.
 
 ```v
-psk := handshake.new_psk(identity, key)    // identity: ticket bytes; key: shared material
+psk := handshake.new_psk(identity, key)!   // identity: ticket bytes; key: shared material
 assert psk.identity() == identity
 assert psk.key() == key
 ```
+
+`new_psk` rejects an empty identity, an identity past the `opaque<0..2^16-1>`
+wire limit, or a key outside the 32–1024 byte window (see the `psk_*_len` consts
+in `psk.v`), and copies both inputs into the handle so later caller-side mutation
+cannot reach the bytes the handshake binds over.
 
 Only `identity` (ticket bytes sent in the ClientHello) and `key` (the shared key material) are
 publicly readable. `obfuscated_ticket_age`, `external`, and `hash_algo` default to zero (a fresh
@@ -62,7 +67,27 @@ module — external PSKs and per-PSK hashes are configured internally by the mod
 constructed, a `Psk` is immutable to callers.
 
 `PskIdentity`, `PskBinderEntry`, `PskKeyExchangeMode`, and the `build_pre_shared_key_*`
-wire-codec helpers are module-private; callers never construct them by hand.
+wire-codec helpers live in `psk.v`, are module-private, and callers never construct
+them by hand.
+
+### Resumption
+
+RFC 8446 §7.2 resumption is wired end-to-end: at .connected the core derives
+a `resumption_master_secret` from the Master Secret over the transcript that
+includes the client Finished, and retains it until `zeroize_traffic_secrets()`
+at teardown. Callers never see the raw value — `HandshakeCore.resumption_psk(&
+NewSessionTicket) !Psk` returns a fully-populated `Psk` handle whose key is
+`HKDF-Expand-Label(RMS, "resumption", ticket_nonce)` and whose identity is
+the opaque ticket bytes. `tls.Conn.resumption_psks() ![]handshake.Psk` walks
+the backlog the same way. The next ClientHello's binder, Early Secret, and
+handshake traffic keys then follow the standard §7.1 ladder; when the server
+selects a PSK, `is_handshake_message_accepted` shortens the flight to
+EncryptedExtensions / Finished with no Certificate or CertificateVerify.
+
+`HandshakeCore.selected_psk_index() ?u16` reports which identity the peer
+picked (or `none` when every offer was declined); `tls.Conn.negotiated_psk_index()
+?u16` mirrors it. The value is not secret material — the identity bytes travel
+in the clear — so it stays readable after `zeroize_traffic_secrets()`.
 
 ## File map
 
@@ -72,7 +97,8 @@ state_machine.v       the unified core vocabulary + HandshakeCore: states,
                       create_client_hello, the receive lifecycle, and the ServerHello/HRR
                       and encrypted-flight phase transitions
 state_machine_extra.v the core's intake plumbing + terminal-failure primitives: the
-                      reassembly buffer, the receive/dispatch routing, and
+                      reassembly buffer, next_unframed_message, the
+                      receive/dispatch routing, and
                       classify_failure / fail_with / failure_alert
 key_exchange.v        the core's ECDHE methods: key share, public share,
                       peer-share validation and secret derivation
@@ -81,6 +107,9 @@ core_guarded.v        One-sided surfaces of the core (is_quic-guarded): TLS-reco
                       returns the next generation's key material; QUIC side — peer
                       transport params and the HRR flag (the key accessors are shared)
 client_hello.v        validate options, build the §4.1.2 ClientHello (PSK identities/binders)
+psk.v                 the pre-shared key surface: Psk/PskIdentity/PskBinderEntry, the
+                      binder key and computation, and the pre_shared_key /
+                      psk_key_exchange_modes wire codecs
 server_hello.v        decode ServerHello / HelloRetryRequest + agreement checks, PSK selection
 server_flight.v       decode EncryptedExtensions/Certificate/CertificateVerify/Finished
 certificate_verify.v  verify the §4.4.3 CertificateVerify (pure, no state change)
@@ -90,13 +119,11 @@ key_schedule.v        §7.1 HKDF ladder, HashAlgorithm, phase secret derivations
                       retained secret holders with their §7.5 lifecycle
 transcript.v          running transcript the schedule and CertificateVerify hash over
 messages.v            HandshakeType/NamedGroup/SignatureScheme/CipherSuite + header
-                      encoding plus PSK wire codecs (identities, binders,
-                      pre_shared_key extension); Psk/PskIdentity/PskBinderEntry
-                      wire types are module-private
+                      encoding and the shared framing/extension codecs; PSK types
+                      and wire codecs live in psk.v
 aead.v                cipher-suite → AEAD/hash helpers
 alert.v               §6 alert vocabulary; quic_connection_error (§4.8) mapping
 post_handshake.v      NewSessionTicket and KeyUpdate parsing
-state_machine_extra.v     recordless message-framing helper
 ```
 
 Each `*_test.v` sits beside its source.

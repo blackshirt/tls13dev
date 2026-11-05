@@ -138,6 +138,10 @@ mut:
 	c_app_tsec       []u8 // client application traffic secret
 	s_hsk_tsec       []u8 // server handshake traffic secret
 	s_app_tsec       []u8 // server application traffic secret
+	// resumption_master_secret is the client uses to derive per-ticket
+	// PSKs from any NewSessionTicket the server pushes after .connected. Never
+	// exported raw: callers get a Psk handle via resumption_psk().
+	resumption_master_secret []u8
 
 	// Incoming handshake bytes that do not yet form complete messages.
 	reassembly []u8 // inbound bytes pending a complete message, across both phases
@@ -261,6 +265,16 @@ fn (h &HandshakeCore) is_in_flight() bool {
 // negotiated_alpn returns the ALPN protocol the server picked ('' when none).
 pub fn (h &HandshakeCore) negotiated_alpn() string {
 	return h.negotiated_alpn
+}
+
+// selected_psk_index returns the identity index the server echoed in the
+// ServerHello pre_shared_key extension, or none when the peer declined every
+// offered PSK and ran a full certificate handshake. The value is written once
+// during ServerHello handling and is not secret material (the identity bytes
+// travel in the clear), so it survives zeroize_traffic_secrets() and callers
+// may read it after .connected to audit whether resumption actually fired.
+pub fn (h &HandshakeCore) selected_psk_index() ?u16 {
+	return h.selected_psk
 }
 
 // negotiated_cipher_suite reports the suite selected by the server in ServerHello.
@@ -601,10 +615,6 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	defer { wipe_secret(mut master_secret) }
 	c_ap := derive_client_app_secret(h.hash_algo, master_secret, th_sfin)!
 	s_ap := derive_server_app_secret(h.hash_algo, master_secret, th_sfin)!
-	// §7.5: erase as soon as no longer required; the defer above is idempotent, so this
-	// early wipe just shortens the happy-path lifetime. The Master Secret is never
-	// stored — KeyUpdate (§7.2) chains from the traffic secrets alone.
-	wipe_secret(mut master_secret)
 	h.c_app_tsec = c_ap
 	h.s_app_tsec = s_ap
 
@@ -615,6 +625,15 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 	client_fin_msg := build_finished(client_verify_data)
 	h.update_transcript(client_fin_msg)!
 	out << new_handshake_message(client_fin_msg)!
+
+	// RFC 8446 §7.2: with the client Finished folded into the transcript, expand
+	// the Resumption Master Secret before wiping the Master Secret. The RMS lives
+	// on the core until zeroize_traffic_secrets() at teardown so NewSessionTickets
+	// arriving after .connected can be turned into resumption PSKs. Master itself
+	// is dead once both ap-traffic secrets and the RMS are out (§7.5).
+	th_cfin := h.transcript.current_hash()
+	h.resumption_master_secret = derive_resumption_master_secret(h.hash_algo, master_secret, th_cfin)!
+	wipe_secret(mut master_secret)
 
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
@@ -647,7 +666,8 @@ pub fn (mut h HandshakeCore) receive_handshake_bytes(bytes []u8) ![]HandshakeMes
 
 // zeroize_traffic_secrets destroys all traffic secrets (handshake and application)
 // once the connection is closed — retiring the record keys that derive from them
-// (§7.5). Valid only after .connected.
+// (§7.5) and the §7.2 resumption master secret that lets tickets turn into PSKs.
+// Valid only after .connected.
 pub fn (mut h HandshakeCore) zeroize_traffic_secrets() ! {
 	if h.state != .connected {
 		return error('handshake: zeroizing traffic secrets is only valid once the handshake reaches .connected (state: ${h.state()})')
@@ -656,6 +676,10 @@ pub fn (mut h HandshakeCore) zeroize_traffic_secrets() ! {
 	wipe_secret(mut h.s_hsk_tsec)
 	wipe_secret(mut h.c_app_tsec)
 	wipe_secret(mut h.s_app_tsec)
+	// The Resumption Master Secret is retired here rather than at
+	// wipe_key_schedule_secrets(): post-handshake tickets keep deriving PSKs from
+	// it until the caller tears the connection down.
+	wipe_secret(mut h.resumption_master_secret)
 	// Scrub any leftover reassembly bytes so nothing survives past handshake
 	// completion. take_buffered_handshake_bytes() (TLS-record-only) already drains
 	// reassembly on the TLS path, but QUIC has no equivalent, so this covers both.

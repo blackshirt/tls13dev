@@ -161,39 +161,8 @@ fn derive_handshake_secret(hash_algo HashAlgorithm, shared_secret []u8, psk ?[]u
 	return handshake_secret
 }
 
-// psk_binder_label returns the binder key label for a PSK: external PSKs use
-// "ext binder", resumption PSKs the default "res binder" (RFC 8446 §7.1).
-fn psk_binder_label(psk Psk) string {
-	return if psk.external { 'ext binder' } else { 'res binder' }
-}
-
-// derive_binder_key expands a resumption PSK binder key from the Early Secret
-// (RFC 8446 §7.1, "res binder" label). The returned key is wiped by the caller
-// after use.
-fn derive_binder_key(hash_algo HashAlgorithm, early_secret []u8) ![]u8 {
-	return derive_binder_key_labeled(hash_algo, early_secret, 'res binder')
-}
-
-// derive_binder_key_labeled expands a binder key under either the resumption or
-// external PSK label (RFC 8446 §7.1). The Derive-Secret context is
-// Transcript-Hash("") — the hash of the empty message, not an empty byte string.
-fn derive_binder_key_labeled(hash_algo HashAlgorithm, early_secret []u8, label string) ![]u8 {
-	return derive_secret(hash_algo, early_secret, label, empty_transcript_hash(hash_algo))!
-}
-
-// compute_psk_binder computes one PSK binder over the ClientHello transcript
-// hash (RFC 8446 §4.2.11): bind the PSK into the Early Secret, derive the binder
-// and finished keys, then HMAC the transcript hash. Each intermediate is wiped
-// before returning; the caller owns the binder bytes.
-fn compute_psk_binder(hash_algo HashAlgorithm, psk_key []u8, label string, transcript_hash []u8) ![]u8 {
-	mut early_secret := hkdf_extract(hash_algo, []u8{}, psk_key)
-	defer { wipe_secret(mut early_secret) }
-	mut binder_key := derive_binder_key_labeled(hash_algo, early_secret, label)!
-	defer { wipe_secret(mut binder_key) }
-	mut finished_key := derive_finished_key(hash_algo, binder_key)!
-	defer { wipe_secret(mut finished_key) }
-	return hash_algo.compute_hmac(finished_key, transcript_hash)
-}
+// The PSK binder key and binder computation live in psk.v, beside the Psk
+// wire types they operate on.
 
 // derive_client_hs_secret expands the client handshake traffic secret (RFC 8446
 // §7.1, "c hs traffic" label) from the Handshake Secret over the ClientHello..ServerHello transcript.
@@ -210,12 +179,31 @@ fn derive_server_hs_secret(hash_algo HashAlgorithm, handshake_secret []u8, th_ch
 // derive_master_secret advances the §7.1 Handshake->Master ladder from the Handshake
 // Secret: the "derived" salt then a zero-PSK extract. The derived_hs intermediate is
 // wiped here (§7.5); the returned Master Secret is zeroized by the caller after both
-// application traffic secrets are expanded, since it is never stored.
+// application traffic secrets AND the §7.2 resumption master secret are expanded,
+// since it is never stored.
 fn derive_master_secret(hash_algo HashAlgorithm, handshake_secret []u8) ![]u8 {
 	mut derived_hs := derive_secret(hash_algo, handshake_secret, 'derived', empty_transcript_hash(hash_algo))!
 	master_secret := hkdf_extract(hash_algo, derived_hs, []u8{len: hash_algo.hash_len()})
 	wipe_secret(mut derived_hs)
 	return master_secret
+}
+
+// derive_resumption_master_secret advances the §7.2 Master->Resumption-Master step:
+// Derive-Secret(Master Secret, "res master", Transcript-Hash(Handshake Context,
+// client Finished)). The RFC forbids exporting this value to applications; it is
+// retained inside HandshakeCore until the connection is torn down so NewSessionTicket
+// messages arriving after .connected can be turned into PSKs via
+// derive_resumption_psk.
+fn derive_resumption_master_secret(hash_algo HashAlgorithm, master_secret []u8, th_cfin []u8) ![]u8 {
+	return derive_secret(hash_algo, master_secret, 'res master', th_cfin)!
+}
+
+// derive_resumption_psk expands one §7.2 PSK from the Resumption Master Secret and a
+// ticket's nonce: HKDF-Expand-Label(RMS, "resumption", ticket_nonce, Hash.length).
+// Each NewSessionTicket carries a distinct nonce, so every ticket on the same
+// connection yields a distinct PSK. The caller wipes the returned key.
+fn derive_resumption_psk(hash_algo HashAlgorithm, rms []u8, ticket_nonce []u8) ![]u8 {
+	return hkdf_expand_label(hash_algo, rms, 'resumption', ticket_nonce, hash_algo.hash_len())!
 }
 
 // derive_client_app_secret expands the client application traffic secret (RFC 8446
@@ -457,6 +445,12 @@ pub fn (h &HandshakeCore) traffic_keys() !TrafficKeys {
 // failure otherwise and would leak SNI/ALPN/certificate material on the heap.
 pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 	h.wipe_key_schedule_secrets()
+	// The Resumption Master Secret is not covered by wipe_key_schedule_secrets()
+	// (surviving .connected on the happy path so post-handshake tickets can derive
+	// PSKs), but a failure has no such consumer: scrub it here so a mid-Finished
+	// classify_failure between the RMS assignment and the state transition cannot
+	// leave the value on the heap.
+	wipe_secret(mut h.resumption_master_secret)
 	// Scrub plaintext handshake history: every message exchanged so far, plus the
 	// running digest state (its partial block can hold recent plaintext bytes).
 	h.transcript.scrub()
@@ -479,6 +473,9 @@ pub fn (mut h HandshakeCore) fail_and_zeroize_secrets() {
 // ephemeral ECDHE halves at .connected (RFC 8446 §1.3.1/§7.5). Handshake
 // traffic secrets are dead once the client Finished is sent / server Finished
 // verified, so they are wiped here rather than surviving until connection close.
+// The Resumption Master Secret is deliberately NOT touched here: it must live
+// past .connected so post-handshake NewSessionTickets can be turned into PSKs,
+// and zeroize_traffic_secrets() owns that later wipe.
 pub fn (mut h HandshakeCore) wipe_key_schedule_secrets() {
 	wipe_secret(mut h.handshake_secret)
 	wipe_secret(mut h.c_hsk_tsec)

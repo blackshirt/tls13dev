@@ -15,8 +15,8 @@ import tls.pki
 import tls.wire
 
 // max_stored_session_tickets bounds the NewSessionTicket backlog kept on the
-// Conn; resumption is unimplemented, so the queue is only diagnostic
-// (RFC 8446 §4.6.1).
+// Conn (RFC 8446 §4.6.1). Every stored ticket can be turned into a resumption
+// PSK via Conn.resumption_psks(), so the queue is functional, not diagnostic.
 const max_stored_session_tickets = 32
 
 // recv_buf_compact_threshold is the consumed-prefix size at which try_reclaim_recv_buf
@@ -482,11 +482,33 @@ pub fn (c Conn) negotiated_alpn() string {
 	return c.negotiated_alpn
 }
 
+// negotiated_psk_index returns the identity index the server selected in the
+// ServerHello pre_shared_key extension, or none when the peer declined every
+// offered PSK and completed a full certificate handshake. Read it after dial()
+// to know whether the connection actually resumed.
+pub fn (c &Conn) negotiated_psk_index() ?u16 {
+	return c.hs.selected_psk_index()
+}
+
 // session_tickets returns the NewSessionTicket backlog parsed during this
 // connection (RFC 8446 §4.6.1). Each ticket's opaque token is available via
 // ticket.bytes() and can be reused as a PSK identity on a future connection.
+// Call Conn.resumption_psks() to obtain ready-to-offer Psk handles derived
+// from this session's resumption master secret.
 pub fn (c &Conn) session_tickets() []handshake.NewSessionTicket {
 	return c.session_tickets
+}
+
+// resumption_psks derives one RFC 8446 §7.2 resumption PSK per stored
+// NewSessionTicket, ready to place in the next dial's Config.psks list.
+// Returns an error if the underlying HandshakeCore has already had its
+// traffic secrets zeroized (call this before Conn.close()).
+pub fn (c &Conn) resumption_psks() ![]handshake.Psk {
+	mut out := []handshake.Psk{cap: c.session_tickets.len}
+	for t in c.session_tickets {
+		out << c.hs.resumption_psk(t)!
+	}
+	return out
 }
 
 // do_handshake drives the full client flight over TCP: frame the ClientHello

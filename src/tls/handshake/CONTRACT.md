@@ -25,6 +25,9 @@ The implementation is split by ownership:
 - [`key_schedule.v`](./key_schedule.v) runs the §7.1 HKDF ladder and holds the
   core's flat derived-secret fields (`c_hsk_tsec`/`s_hsk_tsec`/`c_app_tsec`/`s_app_tsec`), with
   the §7.5 wiping and zeroization lifecycle methods.
+- [`psk.v`](./psk.v) owns the pre-shared key surface: the `Psk` handle and its
+  wire types, the binder key/computation, and the `pre_shared_key` /
+  `psk_key_exchange_modes` extension codecs.
 - [`key_exchange.v`](./key_exchange.v) implements the core's ephemeral ECDHE
   methods: per-group key generation, the public share, and the peer-share
   validation and secret derivation.
@@ -227,11 +230,15 @@ to the core's phase-checked handshake entry points.
 
 PSK support ([RFC 8446 §4.2.11](https://www.rfc-editor.org/rfc/rfc8446#section-4.2.11)) is configured through
 `HandshakeOptions.psks` (and `tls.Conn.Config.psks`). A PSK is constructed through
-`handshake.new_psk(identity, key)` — struct literals are not usable outside the module because
-`Psk` is `@[noinit]` and its fields are module-private.
+`handshake.new_psk(identity, key)!` — struct literals are not usable outside the module because
+`Psk` is `@[noinit]` and its fields are module-private. The constructor rejects an
+empty identity, an identity past the `opaque<0..2^16-1>` wire limit, or a key
+outside the 32–1024 byte window (see the `psk_*_len` consts in `psk.v`), and
+copies both inputs into the handle so caller-side mutation cannot reach the
+bytes the handshake binds over.
 
 ```v
-psk := handshake.new_psk(identity, key)
+psk := handshake.new_psk(identity, key)!
 assert psk.identity() == identity
 assert psk.key() == key
 ```
@@ -242,7 +249,27 @@ are module-private with zero defaults (fresh ticket, resumption "res binder" lab
 Once constructed, a `Psk` is immutable to callers outside the module.
 
 `PskIdentity`, `PskBinderEntry`, `PskKeyExchangeMode`, `supported_psk_key_exchange_modes`,
-and the `build_pre_shared_key_*` wire-codec helpers are module-private.
+and the `build_pre_shared_key_*` wire-codec helpers live in `psk.v` and are module-private.
+
+### Resumption
+
+`HandshakeCore` implements RFC 8446 §7.2 end-to-end. `handle_finished()` derives
+a `resumption_master_secret` from the Master Secret over the transcript
+including the client Finished, retains it on the core until
+`zeroize_traffic_secrets()` at teardown, and never exports the raw value.
+`pub fn (h &HandshakeCore) resumption_psk(&NewSessionTicket) !Psk` returns a
+ready-to-offer PSK handle for a ticket this core issued; callers pass the
+result as the next `Config.psks` entry. `tls.Conn.resumption_psks() ![]Psk`
+wraps it over the whole backlog. When the next ServerHello echoes
+`pre_shared_key`, `is_handshake_message_accepted` skips the Certificate and
+CertificateVerify branches so the resumption flight is
+ClientHello / ServerHello / EncryptedExtensions / Finished.
+
+`pub fn (h &HandshakeCore) selected_psk_index() ?u16` reports the identity
+the server selected in ServerHello (`none` if the peer declined every offer).
+It is a read of the same field the shortened-flight path uses, not secret
+material, and survives `zeroize_traffic_secrets()`. `tls.Conn.negotiated_psk_index()
+?u16` mirrors it for application callers.
 
 ## Ownership boundary
 

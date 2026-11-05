@@ -27,9 +27,9 @@ pub fn build_key_update(request_update bool) []u8 {
 }
 
 // NewSessionTicket holds a parsed NewSessionTicket (RFC 8446 §4.6.1); its fields are
-// module-private. Only lifetime() and bytes() have consumers today — the ticket is
-// stored, not resumed — so the age-obfuscation values stay private and accessor-less
-// until resumption gives them one.
+// module-private. HandshakeCore.resumption_psk() consumes all of them when the
+// caller asks for a §7.2 PSK, so no public accessor beyond lifetime() / bytes()
+// is needed and age/nonce stay private to the module.
 @[noinit]
 pub struct NewSessionTicket {
 mut:
@@ -81,8 +81,9 @@ pub fn parse_new_session_ticket(body []u8) !NewSessionTicket {
 	if ticket.len == 0 {
 		return error('handshake: empty ticket in NewSessionTicket (decode_error)')
 	}
-	_ := r.read_vector_u16()! // extensions (max_early_data, …): unused while
-	// resumption is unimplemented (see Conn.session_tickets on the tls side)
+	_ := r.read_vector_u16()! // extensions (max_early_data, …): skipped because
+	// this stack does 1-RTT §7.2 resumption but never early data, so a
+	// max_early_data value would be a hint with no code path to honour it.
 	if r.remaining() != 0 {
 		// Strict framing: leftover bytes mean the ticket was misframed.
 		return error('handshake: trailing bytes in NewSessionTicket (decode_error)')
