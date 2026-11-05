@@ -6,9 +6,8 @@ secret lifecycle. It does **not** frame or encrypt transport records or packets 
 the adapters. Keeping this core importable is what lets both a TCP client (`tls.Conn`) and a QUIC
 engine drive the same state machine without importing each other's transport.
 
-This file orients you to the layout. The transport-facing contract is documented in depth in
-[`CONTRACT.md`](./CONTRACT.md), and the eight-step QUIC engine loop over the seam is walked
-through in [`QUIC.md`](./QUIC.md).
+This file orients you to the layout. The QUIC adapter that drives this core over the
+`pub` seam is documented in the [`tls.quic`](../quic/README.md) module README.
 
 ## One core, one type, two guarded surfaces
 
@@ -180,5 +179,5 @@ Covers the RFC 8448 §3 key-schedule and transcript vectors, ServerHello/HRR cod
 hand-built and malformed fixtures, the full HRR state-machine path (group change, cookie echo,
 cipher-suite binding, replay rejection), alert classification, and CertificateVerify
 scheme-vs-key-type and curve binding. The complete flight is exercised end to end against the
-in-repo fake server (`src/tls/fakeserver/`). See [`QUIC.md`](./QUIC.md) for how a QUIC engine
-drives this same core.
+in-repo fake server (`src/tls/fakeserver/`). See the [`tls.quic`](../quic/README.md) README
+for how the QUIC engine drives this same core.

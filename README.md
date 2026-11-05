@@ -5,7 +5,8 @@ A **TLS 1.3 client library written in [V](https://vlang.io)**, implementing
 no bindings to OpenSSL — handshake messaging, record protection, key
 schedule, and X.509 path validation are built from V standard/crypto modules.
 
-Full module and API reference documentation lives in [`docs.md`](docs.md).
+Each module carries a README in its source directory (`src/tls/handshake/`,
+`src/tls/pki/`, `src/tls/quic/`) with its layout, API surface, and invariants.
 
 > **Status: experimental.** The handshake, record layer, and certificate
 > validation are complete and covered by unit tests (handshake vectors from
@@ -19,6 +20,7 @@ Full module and API reference documentation lives in [`docs.md`](docs.md).
 v test .                                # unit tests across all modules
 v run src/example/simple_example.v      # minimal client: HTTPS GET
 v run src/example/dial_example.v        # live demo: handshake + HTTP GET over TLS
+v run src/example/psk_connect.v         # PSK resumption: tickets → PSKs → second dial
 v run src/example/trust_store_example.v # client supplying its own root_cas
 v run src/example/quic_dial_example.v   # QUIC handshake with cloudflare-quic.com:443
 ```
@@ -32,25 +34,24 @@ conn.write('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'.by
 ```
 
 `Conn.close()` sends `close_notify` (when keys exist) then releases the TCP
-socket; after a peer `close_notify`, `read()` returns clean EOF but `close()`
-is still needed to release the socket.
+socket; a peer `close_notify` makes `read()` return clean EOF and releases the
+socket in the same step, so calling `close()` afterwards is a harmless no-op.
 
-Concurrent `read()` calls are serialized. While one read waits for socket data,
-`write()` and `close()` can proceed; `close()` does not interrupt that pending
-read, and socket release waits until the read returns (possibly at its timeout).
-See [`docs.md`](docs.md#22-conn) for the concurrency details.
+A `Conn` is single-thread-owned: it holds no locks and serializes nothing, so
+one connection handle must not be driven from several threads at the same time.
+`read()` blocks until a record arrives or the socket timeout fires; call it from
+the thread that owns the connection, and `close()` from that same thread once the
+reader returns. Use one `Conn` per thread when a program needs several connections.
 
 `Config` is a `@[params]` struct: pass named arguments straight to `dial()`;
 omitted fields keep their declared defaults (`default_config()` builds the same
-value). Knobs: `server_name`, `hsk_options`, `root_cas`,
-`insecure_skip_verify` (test/lab only — removes all authentication). Full field
-table in [`docs.md`](docs.md).
+value). Knobs: `server_name`, `hsk_options`, `root_cas`, `min_rsa_bits`, `psks`,
+`timeout`, and `insecure_skip_verify` (test/lab only — removes all authentication).
 
 The `tls` module exports only `dial()`, `Conn`, `Config`, `default_config()`,
 and `pki.TrustStore` (behind `Config.root_cas`); record layer and TCP transport
-stay module-private. The importable `tls.handshake` core exposes a `pub` seam
-([CONTRACT.md](src/tls/handshake/CONTRACT.md)) so a non-TCP transport like QUIC
-can drive it without importing `tls`.
+stay module-private. The importable `tls.handshake` core exposes a curated `pub`
+seam so a non-TCP transport like QUIC can drive it without importing `tls`.
 
 ## Repository layout
 
@@ -60,6 +61,7 @@ src/
     simple_example.v      minimal client (handshake + HTTPS GET, no flags)
     trust_store_example.v minimal client with its own Config.root_cas
     dial_example.v        fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
+    psk_connect.v         PSK resumption demo (tickets → PSKs → second dial)
     quic_dial_example.v   QUIC handshake with cloudflare-quic.com:443
   tls/              module `tls`: record layer + public TCP client API
     handshake/      module `tls.handshake`: transport-neutral handshake core
@@ -97,7 +99,8 @@ sibling import (`tls`) relative to the executable's own directory.
 - **Pre-shared keys**: caller-supplied resumption/external PSKs with
   `psk_dhe_ke` (PSK + ECDHE) binders in the ClientHello, server PSK selection
   in ServerHello, and PSK-authenticated flights without CertificateVerify
-  (RFC 8446 §4.2.11/§4.4.2); automatic ticket-to-PSK resumption is not wired up
+  (RFC 8446 §4.2.11/§4.4.2); received tickets are stored and convertible into
+  resumption PSKs via `Conn.resumption_psks()`
 - **Post-handshake**: `NewSessionTicket` collection, `KeyUpdate` handling
   (read keys update on receipt; a response is sent with correct §4.6.3
   old-key-before-new ordering when the server requests it), sender-side
@@ -112,12 +115,14 @@ sibling import (`tls`) relative to the executable's own directory.
 
 ## Not (yet) implemented
 
-- Automatic session resumption and 0-RTT (tickets are received but not
-  converted into PSKs; callers may supply PSKs explicitly via `Config.psks`)
+- Automatic session resumption across dials and 0-RTT (tickets are stored and
+  convertible into PSKs via `Conn.resumption_psks()`, but the caller must
+  re-offer them through `Config.psks`; nothing persists automatically across
+  connections)
 - Certificate **revocation** — CRL and OCSP are not implemented, so a
   revoked-but-unexpired certificate is accepted; there is no callback hook
-  either. See [`docs.md`](docs.md) for the rationale and the recommended
-  out-of-band pattern.
+  either. See the [`tls.pki`](src/tls/pki/README.md) README for the rationale
+  and the recommended out-of-band pattern.
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A full **QUIC transport stack** (RFC 9000/9001). The in-repo `tls.quic`
   module completes the RFC 9001 handshake and now survives a lossy path: its
@@ -132,11 +137,8 @@ sibling import (`tls`) relative to the executable's own directory.
   needs only `tls.handshake` + `tls.pki` and never imports `tls`. What remains
   out is the *data plane*: streams, flow control, loss recovery and congestion
   control for application data, migration, Retry/0-RTT, and the 1-RTT Key
-  Phase update. The engine loop is walked through in
-  [`src/tls/handshake/QUIC.md`](src/tls/handshake/QUIC.md) and the core's seam
-  in [`src/tls/handshake/CONTRACT.md`](src/tls/handshake/CONTRACT.md). The
-  [`tls.quic`](src/tls/quic/README.md) module README orients you to its layout
-  and public API surface.
+  Phase update. The [`tls.quic`](src/tls/quic/README.md) module README orients
+  you to its layout and public API surface.
 - A server mode — this library is client-only
 
 ## Testing
@@ -144,21 +146,6 @@ sibling import (`tls`) relative to the executable's own directory.
 ```
 v test .
 ```
-
-Covers the wire and record layers (framing bounds, AEAD round trips and
-tamper detection), the RFC 8448 §3 key-schedule vectors, the handshake
-message codecs and malformed-fixture negatives (extension strictness, key
-share sizes, the full HRR state-machine path), X.509 decoding and the PKI
-rules (name matching, Name Constraints, RSA strength, CertificateVerify
-binding, secret zeroization), and TCP record (re)framing in the connection
-layer.
-
-The flight also runs end to end against an in-repo test-only fake TLS 1.3
-server (`src/tls/fakeserver/`): byte-exact handshake assertions plus a live
-loopback dial through `tls.dial()`, including HelloRetryRequest and the
-negative paths. The fake server reimplements the key schedule locally and
-imports only `tls.wire`/`tls.pki`, so it shares no code with the
-implementation under test.
 
 Honest limits: the RFC 8448 vectors pin the AES-128-GCM / SHA-256 path (the
 ECDHE computation itself is not vector-pinned); the other suites are verified
@@ -173,19 +160,12 @@ suites is what the demo (`v run src/example/dial_example.v`) exercises.
   `tls.handshake` core is importable by a QUIC adapter; §4 CRYPTO framing, §4.1
   secret levels, §4.8 alert→error mapping, §6 Key Phase)
 - [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) — QUIC transport
-  (CONNECTION_CLOSE frame types and packet-number spaces referenced by the QUIC
-  walkthrough in `tls.handshake`)
+  (CONNECTION_CLOSE frame types and packet-number spaces referenced by the
+  `tls.quic` engine)
 - [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280) — X.509 profiles
 - [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) — hostname validation
 - [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017) — RSA (PKCS#1 v1.5 / PSS)
 - [RFC 7301](https://www.rfc-editor.org/rfc/rfc7301) — ALPN
 - [RFC 5746](https://www.rfc-editor.org/rfc/rfc5746) — renegotiation_info
-
-## Notes for contributors
-
-The codebase has a documentation convention: comments explain *why*, cite the
-governing RFC section inline (e.g. `§4.2.8.2`), and call out deliberate
-trade-offs rather than hiding them. Each source file carries a doc preamble
-describing its layer's role in the stack.
 
 MIT licensed — see `v.mod`.

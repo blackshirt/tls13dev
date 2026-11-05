@@ -9,7 +9,7 @@
 // protection, CRYPTO frame packing and offset-ordered reassembly, and the packet loop
 // shuttling bytes between transport and core. It is a handshake engine, not a full
 // QUIC stack — no loss recovery, congestion control, streams, migration, Retry/0-RTT,
-// or Key Phase (see QUIC.md §7).
+// or Key Phase.
 module quic
 
 import crypto.rand
@@ -89,10 +89,9 @@ mut:
 	tx_crypto_hands   []u8 // queued bytes for the Handshake-level CRYPTO stream.
 
 	// Connection and handshake lifecycle.
-	confirmed   bool // Whether HANDSHAKE_DONE was received.
-	closed      bool // Whether the engine has entered its terminal closed state.
-	close_error u64  // Last QUIC error code set when closing, if any.
-	ch_trace    []u8 // Plaintext first ClientHello, retained for the QUIC_DEBUG dump only.
+	confirmed bool // Whether HANDSHAKE_DONE was received.
+	closed    bool // Whether the engine has entered its terminal closed state.
+	ch_trace  []u8 // Plaintext first ClientHello, retained for the QUIC_DEBUG dump only.
 
 	// Current 1-RTT Key Phase bit; key updates are not implemented yet.
 	key_phase bool
@@ -174,22 +173,6 @@ fn (e &Engine) is_confirmed() bool {
 // cannot open the retry flight.
 fn (e &Engine) original_dcid() []u8 {
 	return e.orig_dcid
-}
-
-// source_cid returns the engine's Source Connection ID (the server echoes it).
-fn (e &Engine) source_cid() []u8 {
-	return e.scid
-}
-
-// failure_alert returns the alert the handshake core classified on failure.
-fn (e &Engine) failure_alert() handshake.AlertDescription {
-	return e.hs.failure_alert()
-}
-
-// close_error_code returns the QUIC transport error code the engine last closed
-// with (a CRYPTO_ERROR, 0x100 + alert, on a handshake failure).
-fn (e &Engine) close_error_code() u64 {
-	return e.close_error
 }
 
 // start returns the initial outbound datagram carrying the first ClientHello in
@@ -290,7 +273,6 @@ fn (mut e Engine) flush() ![]u8 {
 // protection.
 fn (mut e Engine) close(error_code u32, reason string) ![]u8 {
 	e.closed = true
-	e.close_error = error_code
 	mut frame := encode_connection_close(u64(error_code), 0, reason.bytes())!
 	// Seal the CONNECTION_CLOSE while the packet keys are still present, then destroy.
 	mut packet := []u8{}
@@ -544,7 +526,6 @@ fn (mut e Engine) handle_frames(ptype PacketType, payload []u8) ! {
 					return error('quic: invalid CONNECTION_CLOSE frame: ${err.msg()}')
 				}
 				e.closed = true
-				e.close_error = cc.error_code
 				return error('quic: peer closed the connection (${describe_connection_error(cc.error_code)}) during ${e.hs.state()}: ${cc.reason.bytestr()}')
 			}
 			else {
@@ -953,14 +934,12 @@ fn (mut e Engine) clear_unacked() {
 	e.next_pto_ms = 0
 }
 
-// fail_close classifies the handshake failure's alert as a QUIC CRYPTO_ERROR,
-// records it, and destroys the handshake key material (RFC 9001 §4.8, RFC 8446
-// §7.5). The record adapter wipes its core secrets on failure (its dial-time
-// destroy_on_close); the QUIC adapter must do the same, or a dead handshake
-// leaves the ephemeral ECDHE private key and derived traffic secrets in memory.
-// The caller emits a CONNECTION_CLOSE with the recorded code.
+// fail_close destroys the handshake key material on a handshake failure
+// (RFC 9001 §4.8, RFC 8446 §7.5). The record adapter wipes its core secrets on
+// failure (its dial-time destroy_on_close); the QUIC adapter must do the same, or
+// a dead handshake leaves the ephemeral ECDHE private key and derived traffic
+// secrets in memory.
 fn (mut e Engine) fail_close() ! {
-	e.close_error = u64(e.hs.failure_alert().quic_connection_error())
 	e.hs.fail_and_zeroize_secrets()
 	e.closed = true
 }

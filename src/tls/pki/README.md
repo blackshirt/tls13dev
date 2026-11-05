@@ -5,8 +5,8 @@ module answers one question — *can this certificate list be trusted for this h
 nothing else in the stack re-decides it. It is built from V's `crypto` packages and this module's
 own DER reader; there are no OpenSSL bindings.
 
-The rest of the API reference lives in [`docs.md`](../../../docs.md); this file orients you to the
-module's layout and security posture.
+This file orients you to the module's layout and security posture; the public
+API is the curated surface shown under "Public entry points" below.
 
 ## Public entry points
 
@@ -82,8 +82,7 @@ This module treats parsing as the attack surface it is:
 ## Revocation
 
 CRL and OCSP are **not** implemented: a revoked-but-unexpired certificate is accepted. A caller
-needing revocation must validate out of band before trusting the connection — see
-[`docs.md`](../../../docs.md).
+needing revocation must validate out of band before trusting the connection.
 
 ## Testing
 

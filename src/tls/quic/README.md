@@ -12,7 +12,8 @@ facade runs the whole loop to confirmation over a `net.UdpConn`.
 
 The public entry point is `quic.dial()`. Behind it, `quic.Engine` is module-internal —
 it builds and protects packets in memory but owns no socket. Users who want a non-socket
-transport should drive the public `tls.handshake` core directly instead (see `handshake/CONTRACT.md`).
+transport should drive the public `tls.handshake` core directly instead (see the
+[`tls.handshake`](../handshake/README.md) README).
 
 ```v
 import tls.handshake
@@ -100,8 +101,7 @@ Each `*_test.v` sits beside its source.
   no-op and never errors.
 - **No data plane.** There are no streams, flow control, loss recovery beyond the
   handshake flight, congestion control, migration, Retry/0-RTT, or Key Phase. After
-  confirmation, `serve(idle)` keeps the datagram pump running to acknowledge and
-  consume post-handshake traffic until idle timeout.
+  confirmation `dial()` returns a `Conn` exposing only the negotiated parameters.
 
 ## What this module does *not* give you
 
@@ -122,5 +122,5 @@ v test src/tls/quic/
 Covers packet protection seal/open symmetry, long/short header (de)serialization,
 varint encoding, frame parsing, CRYPTO reassembly, transport-parameter encoding,
 the full RFC 9001 handshake against an in-repo ferry server, and the ACK/retransmit
-clock. See [`handshake/QUIC.md`](../handshake/QUIC.md) for the eight-step engine
-loop walked through over the `tls.handshake` seam.
+clock. The engine's file preambles describe the loop it walks over the
+`tls.handshake` seam.

@@ -8,7 +8,6 @@
 module tls
 
 import net
-import sync
 import time
 import tls.handshake
 import tls.pki
@@ -68,8 +67,9 @@ const max_tolerated_records_per_read = 100
 // rekey (plus a KeyUpdate response write), so the bound fires before that work.
 const max_post_handshake_messages_per_record = 1000
 
-// Conn is a TLS 1.3 client connection over TCP, built only by dial(). Mutexes
-// serialize read calls and protect the shared connection state.
+// Conn is a TLS 1.3 client connection over TCP, built only by dial(). A Conn is
+// single-thread-owned: it serializes nothing internally, so one handle must not be
+// driven from several threads concurrently.
 @[noinit]
 pub struct Conn {
 mut:
@@ -112,27 +112,16 @@ mut:
 	// Set before attempting the local close_notify write, so a failed write or a
 	// repeat close() never retries it.
 	close_notify_sent bool
-	// Whether close_tcp_socket() has run; separate from `closed` because
-	// handle_alert closes the protocol but leaves the socket for close().
+	// Whether the descriptor has been released; separate from `closed` because every
+	// terminal path (handle_alert, abort_connection, close) marks the protocol closed
+	// first, and this latch is what keeps the fd from being closed twice.
 	sock_closed bool
-	// True only while the serialized read path has released guard for sock.read().
-	socket_read_active bool
-	// close_tcp_socket sets this instead of closing a descriptor used by sock.read();
-	// resume_socket_read closes it after that socket read returns.
-	close_after_socket_read bool
 	// Sticky fatal read error; returned again on subsequent read() calls instead
 	// of appearing as a clean EOF.
 	fatal_error string
 	// Set by the first failure alert sent, so one failure emits at most one alert
 	// (RFC 8446 §6): abort_connection and dial()'s teardown cannot double-send.
 	failure_alert_sent bool
-
-	// read_guard serializes public read() calls so they cannot race over sock_buf/recv_buf.
-	// It is always acquired before guard; no other path acquires it.
-	read_guard &sync.Mutex
-	// guard protects shared connection state. Only read_raw_record releases it, around
-	// sock.read(), so close() and write() are not blocked by a parked network read.
-	guard &sync.Mutex // serializes read(), write(), close() and every teardown
 
 	// Negotiated connection identity and protocol.
 	negotiated_alpn string // server's ALPN pick — always one of HandshakeOptions.alpn (the handshake aborts otherwise), '' if none
@@ -258,8 +247,6 @@ pub fn dial(address string, config Config) !&Conn {
 		app_buf:         []u8{cap: max_plaintext_record_len} // one full plaintext record
 		deadline_ms:     deadline_ms
 		sock_timeout:    timeout
-		read_guard:      sync.new_mutex()
-		guard:           sync.new_mutex()
 		server_name:     server_name
 		// The record facade's four protections are probed (send_failure_alert) before any
 		// install, so they start uninitialized rather than carrying key material.
@@ -271,8 +258,8 @@ pub fn dial(address string, config Config) !&Conn {
 	// to send the classified fatal alert (§6), destroy secrets and close the socket. It stays
 	// a safety net so no future `return` path can leak material.
 	conn.do_handshake() or {
-		// do_handshake released guard on return, and the Conn is not shared yet, so this
-		// teardown runs single-threaded with no lock held.
+		// The failed Conn was never handed to the caller, so this teardown runs
+		// on dial()'s own thread.
 		conn.send_failure_alert()
 		// A handshake that failed never reached .connected, so destroy_all takes
 		// its no-error branch and the swallow below cannot discard a real failure.
@@ -282,7 +269,7 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 	// The ALPN pick is exposed only after the handshake proved it was offered (RFC 7301 §3.1).
 	conn.negotiated_alpn = conn.hs.negotiated_alpn()
-	// Retire the handshake-only markers: the framing cap and deadline guard key
+	// Retire the handshake-only markers: the framing cap and deadline check key
 	// off deadline_ms, and steady-state reads must obey only the per-op timeout.
 	conn.deadline_ms = 0
 	// do_handshake shrinks the read timeout toward the handshake deadline; a
@@ -293,16 +280,6 @@ pub fn dial(address string, config Config) !&Conn {
 
 // read decrypts application data into buf. Returns bytes read (0 on clean close).
 pub fn (mut c Conn) read(mut buf []u8) !int {
-	// Serialize readers independently of guard: guard must be released while waiting
-	// for socket data, but the shared socket and framing buffers still have one owner.
-	c.read_guard.lock()
-	defer {
-		c.read_guard.unlock()
-	}
-	c.guard.lock()
-	defer {
-		c.guard.unlock()
-	}
 	// A fatal alert is sticky: report it on every later read, never 0. This is checked
 	// before the empty-buffer shortcut so a 0-length liveness probe cannot masquerade a
 	// truncated or fatally-errored stream as a clean EOF (RFC 8446 §6.1).
@@ -423,13 +400,6 @@ pub fn (mut c Conn) read(mut buf []u8) !int {
 // write encrypts and sends application data.
 @[direct_array_access]
 pub fn (mut c Conn) write(data []u8) !int {
-	// Serialize against other writers and the read path's KeyUpdate response. Writes
-	// stay under guard because sock.write is bounded by dial()'s write timeout, so a
-	// held guard never pins close(); any failure is terminal and aborts in place.
-	c.guard.lock()
-	defer {
-		c.guard.unlock()
-	}
 	// A sticky fatal error must surface at the public boundary too, not only
 	// inside write_application_data(): a future caller could bypass it.
 	if c.fatal_error != '' {
@@ -448,14 +418,9 @@ pub fn (mut c Conn) write(data []u8) !int {
 
 // close sends a close_notify alert and closes the underlying TCP connection.
 pub fn (mut c Conn) close() ! {
-	// Single-phase teardown under guard: emit close_notify at most once (it needs the write
-	// keys alive, so it runs before destroy_all wipes them), mark closed, destroy every
-	// secret and buffer, then release the socket. A parked reader holds no guard, so this
-	// acquires it; the parked read surfaces the close itself (see the lock discipline).
-	c.guard.lock()
-	defer {
-		c.guard.unlock()
-	}
+	// Single-phase teardown: emit close_notify at most once (it needs the write
+	// keys alive, so it runs before destroy_all wipes them), mark closed, destroy
+	// every secret and buffer, then release the socket.
 	if c.closed {
 		c.close_tcp_socket()
 		return
@@ -514,13 +479,6 @@ pub fn (c &Conn) resumption_psks() ![]handshake.Psk {
 // do_handshake drives the full client flight over TCP: frame the ClientHello
 // (+dummy CCS), then feed records into the core until it reports .connected (§5.1).
 fn (mut c Conn) do_handshake() ! {
-	// dial() runs this before the Conn is shared, so the lock is uncontended; holding
-	// it keeps the "helpers run with guard held" invariant true on the handshake path
-	// too (read_raw_record() releases/reacquires guard around each blocking socket read).
-	c.guard.lock()
-	defer {
-		c.guard.unlock()
-	}
 	ch := c.hs.create_client_hello()!
 	// The one-record bound (§5.1) is enforced inside send_plaintext_handshake_flight, the single
 	// choke point shared with the retry ClientHello below.
@@ -750,31 +708,19 @@ fn (mut c Conn) read_raw_record() !Record {
 				return error('record: ${avail} unconsumed bytes exceed the handshake framing bound ${max_handshake_recv_buf_len}')
 			}
 		}
-		if c.sock_closed {
-			return error('tls: connection closed (no socket available to read further records)')
+		if c.sock == unsafe { nil } {
+			return error('tls: no socket available to read further records')
 		}
 		if c.deadline_ms != 0 {
 			// The deadline must also bite inside an incomplete record: a slow-loris
 			// dribble never completes one, so this fill loop is where the stall lives.
 			c.handshake_read_timeleft()!
 		}
-		// Mark the one active socket read before releasing guard. close() can then
-		// defer closing the descriptor until resume_socket_read() safely reacquires it.
-		c.begin_socket_read()
 		// Classify socket-level failures: a mundane I/O condition (per-op timeout, EINTR,
 		// EAGAIN) returns as a non-sticky transport tag (is_transport_error) so read() can
 		// retry; EOF/reset stays terminal because a truncated stream is a §6.1
 		// truncation-attack boundary. Every branch returns, so the or-block never falls through.
 		n := c.sock.read(mut c.sock_buf) or {
-			c.resume_socket_read()
-			// A concurrent close()/abort may have run in the unguarded window: surface its
-			// sticky failure before doing any further work.
-			if c.fatal_error != '' {
-				return error(c.fatal_error)
-			}
-			if c.closed || c.sock_closed {
-				return error('tls: connection closed while reading record')
-			}
 			if c.deadline_ms != 0 && mono_ms() >= c.deadline_ms {
 				return c.classify_failure(.unexpected_message, 'tls: handshake deadline exceeded (unexpected_message)')
 			}
@@ -786,18 +732,6 @@ fn (mut c Conn) read_raw_record() !Record {
 			// close_notify. V surfaces a clean FIN as an `EOF` read error, not `n == 0`, so
 			// truncation lands here. §6.1 makes it terminal and sticky (a silent clean EOF
 			// would hide a truncation attack), so reuse the 'connection closed' wording.
-			return error('tls: connection closed while reading record')
-		}
-		c.resume_socket_read()
-		// The promised post-reacquire terminal-flag re-check (see the Conn lock
-		// discipline): if close()/abort ran during the unguarded read, stop here
-		// instead of decrypting against protections destroy_all already wiped —
-		// which would surface as a spurious protocol error or a plaintext alert.
-		if c.fatal_error != '' {
-			return error(c.fatal_error)
-		}
-		if c.closed || c.sock_closed {
-			// A concurrent close()/abort turned the transient condition terminal.
 			return error('tls: connection closed while reading record')
 		}
 		if n == 0 {
@@ -826,9 +760,8 @@ fn (mut c Conn) try_reclaim_recv_buf() {
 // handle_alert processes an alert received after the handshake. It marks the
 // connection closed and returns 0 for a clean close_notify, else an error.
 fn (mut c Conn) handle_alert(payload []u8) !int {
-	// read() already holds guard, so this arm terminates the connection and destroys
-	// every secret and buffer directly (RFC 8446 §1.3.1/§7.5).
-	// Any alert is terminal: mark closed before decoding, even a malformed body.
+	// Any alert is terminal: mark closed before decoding, even a malformed body,
+	// then destroy every secret and buffer directly (RFC 8446 §1.3.1/§7.5).
 	c.closed = true
 	peer_alert := handshake.parse_alert(payload) or {
 		// A malformed alert body is fatal: destroy everything, close the socket,
@@ -984,13 +917,13 @@ fn (mut c Conn) write_records(recs []Record) ! {
 	}
 }
 
-// write_application_data encrypts and sends application data while the caller
-// holds guard. Any failure is terminal because sequence numbers or stream bytes
-// may already have advanced, so it aborts the connection in place.
+// write_application_data encrypts and sends application data. Any failure is
+// terminal because sequence numbers or stream bytes may already have advanced,
+// so it aborts the connection in place.
 @[direct_array_access]
 fn (mut c Conn) write_application_data(data []u8) !int {
 	// A fatal error is sticky: refuse to write application data on a dead
-	// connection, mirroring read()'s guard (§6.1).
+	// connection, mirroring read()'s sticky check (§6.1).
 	if c.fatal_error != '' {
 		return error(c.fatal_error)
 	}
@@ -1001,13 +934,13 @@ fn (mut c Conn) write_application_data(data []u8) !int {
 			handshake.AlertDescription.internal_error
 		}
 		// Terminal failure: pin the sticky error, send the best-effort fatal alert, close
-		// the socket and destroy every secret/buffer in one phase; the caller holds guard.
+		// the socket and destroy every secret/buffer in one phase.
 		return c.abort_connection(alert, 'tls: application write failed: ${err.msg()}')
 	}
 }
 
 // write_application_data_inner performs record generation and socket writes.
-// The caller holds guard and owns terminal error handling.
+// The caller owns terminal error handling.
 @[direct_array_access]
 fn (mut c Conn) write_application_data_inner(data []u8) !int {
 	// Chunk to max_plaintext_record_len (2^14): TLS forbids larger records (RFC 8446 §5.1).
@@ -1047,8 +980,7 @@ fn (mut c Conn) write_application_data_inner(data []u8) !int {
 // and then swaps in the next write generation (RFC 8446 §4.6.3/§5.5) — the record facade
 // builds the notice and completes the rekey on either side of this socket write, so the
 // notice is always the last record of the generation it retires. Both the §5.5 write-path
-// trigger and the answer to a peer's request_update come through here. The caller must
-// already hold guard.
+// trigger and the answer to a peer's request_update come through here.
 fn (mut c Conn) send_key_update() ! {
 	notice := c.rec.build_key_update_notice()!
 	c.write_records([notice])!
@@ -1074,11 +1006,10 @@ fn key_update_failure_alert(msg string) handshake.AlertDescription {
 	return .internal_error
 }
 
-// abort_connection terminates the connection while the caller holds guard: it pins the
-// sticky failure, sends the best-effort fatal alert, closes the socket, destroys every
-// secret and buffer, and returns the error to propagate (RFC 8446 §6). It never locks,
-// so the read-origin, write-origin and alert aborts all share this one body without a
-// recursive acquisition; the handshake-phase callers run under do_handshake's guard.
+// abort_connection terminates the connection: it pins the sticky failure, sends
+// the best-effort fatal alert, closes the socket, destroys every secret and buffer,
+// and returns the error to propagate (RFC 8446 §6), so the read-origin, write-origin
+// and alert aborts all share this one body.
 fn (mut c Conn) abort_connection(alert handshake.AlertDescription, message string) IError {
 	c.fail_alert = alert
 	c.closed = true
@@ -1099,13 +1030,13 @@ fn (mut c Conn) classify_failure(alert handshake.AlertDescription, message strin
 	return error(message)
 }
 
-// destroy_all is the single terminal teardown, run with guard held: it drops the core's
-// live traffic secrets (the whole key schedule unless the handshake reached .connected),
+// destroy_all is the single terminal teardown: it drops the core's live traffic
+// secrets (the whole key schedule unless the handshake reached .connected),
 // wipes the record facade's four protection states, and scrubs the read-side staging
 // buffers, so no close or abort path can wipe one layer and forget another
-// (RFC 8446 §1.3.1/§7.5). It never locks itself, so the read-origin abort, handle_alert,
-// close() and the dial() teardown all share one body without a recursive acquisition;
-// wipe() is idempotent, so it is safe on protection state that was never installed.
+// (RFC 8446 §1.3.1/§7.5). The read-origin abort, handle_alert, close() and the
+// dial() teardown all share one body; wipe() is idempotent, so it is safe on
+// protection state that was never installed.
 fn (mut c Conn) destroy_all() ! {
 	mut zeroize_err := ''
 	if c.hs.state() == .connected {
@@ -1160,34 +1091,11 @@ fn (mut c Conn) send_failure_alert() {
 	c.write_records([new_record(.alert, payload)]) or {}
 }
 
-// begin_socket_read is called with guard held. It marks the descriptor in use
-// before releasing guard so close_tcp_socket cannot close it during sock.read().
-fn (mut c Conn) begin_socket_read() {
-	c.socket_read_active = true
-	c.guard.unlock()
-}
-
-// resume_socket_read reacquires guard after sock.read(). If close() requested
-// shutdown while the syscall was active, this is now safe to perform.
-fn (mut c Conn) resume_socket_read() {
-	c.guard.lock()
-	c.socket_read_active = false
-	if c.close_after_socket_read {
-		c.close_after_socket_read = false
-		c.close_tcp_socket()
-	}
-}
-
 // close_tcp_socket releases the TCP socket without sending TLS shutdown alerts.
-// It is guarded separately because handle_alert marks closed but leaves it open.
-// If sock.read() is active, defer closing the descriptor until that syscall returns;
-// this avoids descriptor reuse while recv() may still be using it.
+// The sock_closed latch makes it idempotent, so a peer alert that already tore the
+// connection down and a later close() can both call it without re-closing the fd.
 fn (mut c Conn) close_tcp_socket() {
 	if c.sock_closed || c.sock == unsafe { nil } {
-		return
-	}
-	if c.socket_read_active {
-		c.close_after_socket_read = true
 		return
 	}
 	c.sock.close() or {}

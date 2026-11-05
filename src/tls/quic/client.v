@@ -8,8 +8,7 @@
 // the engine; this facade only moves bytes between the socket and the engine.
 //
 // It gives the caller a confirmed handshake, not a data plane: there are no streams,
-// flow control, or congestion control (see QUIC.md §7). `serve()` keeps the pump
-// running afterward so the engine can acknowledge and consume post-handshake traffic.
+// flow control, or congestion control.
 module quic
 
 import net
@@ -45,7 +44,7 @@ fn debug_hex(data []u8, limit int) string {
 
 // Conn is a confirmed QUIC connection owning a UDP socket and the handshake engine
 // behind it. It mirrors tls.Conn's shape: dial once, read the negotiated parameters,
-// then close (or keep the pump alive with serve).
+// then close.
 pub struct Conn {
 mut:
 	engine       Engine        // transport-agnostic handshake state machine.
@@ -53,7 +52,6 @@ mut:
 	buf          []u8          // reused receive buffer for every datagram.
 	deadline_ms  i64           // absolute handshake deadline in monotonic ms; 0 after confirmation.
 	sock_timeout time.Duration // per-operation socket timeout the caller configured.
-	server_name  string        // the SNI name the handshake was run under.
 	debug        bool          // when true, dump each handshake datagram's size + head bytes (QUIC_DEBUG=1).
 }
 
@@ -94,7 +92,6 @@ pub fn dial(address string, config Config) !&Conn {
 		buf:          []u8{len: max_datagram_read}
 		deadline_ms:  deadline_ms
 		sock_timeout: timeout
-		server_name:  server_name
 		debug:        os.getenv('QUIC_DEBUG') == '1'
 	}
 	// On any handshake failure the socket is released before the error reaches the
@@ -162,37 +159,9 @@ fn (mut c Conn) do_handshake() ! {
 		}
 	}
 	// The handshake is done: retire the deadline guard and restore the full
-	// per-operation timeout so serve()/later reads obey only the caller's bound.
+	// per-operation timeout so later reads obey only the caller's bound.
 	c.deadline_ms = 0
 	c.sock.set_read_timeout(c.sock_timeout)
-}
-
-// serve keeps the datagram pump running after confirmation so the engine can
-// acknowledge packets and process the server's post-handshake traffic (which, with no
-// application data plane, is the only reason to keep reading). It returns when
-// idle_timeout elapses with no datagram, or once the peer closes the connection. A
-// zero or negative idle_timeout waits indefinitely for the socket's own timeout.
-fn (mut c Conn) serve(idle_timeout time.Duration) ! {
-	if idle_timeout > 0 {
-		c.sock.set_read_timeout(idle_timeout)
-	}
-	for {
-		mut timed_out := false
-		n := c.read_into() or {
-			timed_out = true
-			int(0)
-		}
-		if timed_out || n == 0 {
-			return
-		}
-		// Post-handshake faults (a peer CONNECTION_CLOSE, or 1-RTT CRYPTO this engine
-		// does not decode) end the pump rather than propagating: serve is liveness, not
-		// a data path.
-		out := c.engine.receive(c.buf[..n]) or {
-			return
-		}
-		c.write_datagram(out)!
-	}
 }
 
 // write_datagram sends one datagram in full or fails; a short UDP write means the
@@ -237,16 +206,6 @@ fn (mut c Conn) read_into() !int {
 	return n
 }
 
-// is_confirmed reports whether the handshake finished (HANDSHAKE_DONE processed).
-fn (c &Conn) is_confirmed() bool {
-	return c.engine.is_confirmed()
-}
-
-// state exposes the handshake state for polling.
-fn (c &Conn) state() handshake.HandshakeState {
-	return c.engine.state()
-}
-
 // negotiated_alpn returns the server's ALPN pick ('' if none).
 pub fn (c &Conn) negotiated_alpn() string {
 	return c.engine.negotiated_alpn()
@@ -255,16 +214,6 @@ pub fn (c &Conn) negotiated_alpn() string {
 // negotiated_cipher_suite returns the negotiated suite.
 pub fn (c &Conn) negotiated_cipher_suite() handshake.CipherSuite {
 	return c.engine.negotiated_cipher_suite()
-}
-
-// original_dcid returns the destination CID used in the first Initial packet.
-fn (c &Conn) original_dcid() []u8 {
-	return c.engine.original_dcid()
-}
-
-// source_cid returns this endpoint's source CID.
-fn (c &Conn) source_cid() []u8 {
-	return c.engine.source_cid()
 }
 
 // close seals a CONNECTION_CLOSE, sends it best-effort, and releases the socket.

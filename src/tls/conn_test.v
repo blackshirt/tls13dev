@@ -8,7 +8,6 @@ module tls
 
 import crypto.aes
 import net
-import sync
 import time
 import tls.handshake
 import tls.pki
@@ -35,8 +34,6 @@ fn new_test_conn() !&Conn {
 		fail_alert:         none
 		deadline_ms:        0 // socket-free fixture: post-handshake shape, no framing cap
 		sock_timeout:       0 // unused without the do_handshake loop
-		read_guard:         sync.new_mutex()
-		guard:              sync.new_mutex()
 		negotiated_alpn:    ''
 		server_name:        ''
 		rec:                new_record_layer()
@@ -104,6 +101,20 @@ fn test_read_raw_record_oversized_payload() ! {
 	if _ := c.read_raw_record() {
 		assert false
 	}
+}
+
+// test_read_raw_record_without_socket_fails_clean pins the socket-free read path: an
+// incomplete frame on a Conn with no descriptor must surface a clean error instead of
+// dereferencing the nil socket.
+fn test_read_raw_record_without_socket_fails_clean() ! {
+	full := new_record(.handshake, [u8(1), 2, 3, 4]).serialize()
+	mut c := new_test_conn()!
+	c.recv_buf << full[..record_header_len] // header only; the payload never arrives
+	c.read_raw_record() or {
+		assert err.msg() == 'tls: no socket available to read further records'
+		return
+	}
+	assert false, 'a socket-free incomplete frame must not report success'
 }
 
 // test_conn_nil_safety verifies that calling close() and read(empty) on a
@@ -213,9 +224,7 @@ fn test_application_write_failure_fails_closed() ! {
 	c.rec.c_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	// write_application_data runs the single-phase abort against the nil test socket:
 	// it pins the sticky error and destroys every key layer and buffer before returning.
-	c.guard.lock()
 	c.write_application_data([u8(42)]) or {
-		c.guard.unlock()
 		assert err.msg().contains('application write failed')
 		assert c.closed
 		assert c.fatal_error == err.msg()
@@ -224,7 +233,6 @@ fn test_application_write_failure_fails_closed() ! {
 		assert c.rec.c_app_protection.iv.len == 0
 		return
 	}
-	c.guard.unlock()
 	assert false, 'a failed socket write must make the connection terminal'
 }
 
@@ -427,8 +435,6 @@ fn test_close_is_idempotent_with_live_socket() ! {
 		peer_terminated:    false
 		failure_alert_sent: false
 		fail_alert:         none
-		read_guard:         sync.new_mutex()
-		guard:              sync.new_mutex()
 		negotiated_alpn:    ''
 		server_name:        ''
 		rec:                new_record_layer()
@@ -490,7 +496,7 @@ fn test_close_wipes_read_protection_states_and_buffers() ! {
 
 // test_write_abort_terminates_read_side proves a write-origin abort destroys the
 // reader-owned protection state and buffers in the same single-phase teardown that
-// write_application_data runs (all under the held guard), never leaving them behind.
+// write_application_data runs, never leaving them behind.
 // Forcing the nil-socket write failure must wipe the read protection state and clear
 // both buffers as a side effect of the abort itself.
 fn test_write_abort_terminates_read_side() ! {
@@ -502,9 +508,7 @@ fn test_write_abort_terminates_read_side() ! {
 	c.rec.s_app_protection = new_tls_protection(aes.new_aes_gcm(key)!, iv)!
 	c.app_buf << [u8(9), 8, 7]
 	c.rec.post_hsk_buf << [u8(6), 5]
-	c.guard.lock()
 	c.write_application_data([u8(1)]) or {
-		c.guard.unlock()
 		// The single-phase abort pinned the sticky failure and destroyed the reader-owned
 		// protection state and buffers in the same step.
 		assert c.fatal_error != ''
@@ -514,7 +518,6 @@ fn test_write_abort_terminates_read_side() ! {
 		assert c.rec.post_hsk_buf.len == 0
 		return
 	}
-	c.guard.unlock()
 	assert false, 'a write onto the nil socket must abort'
 }
 
@@ -580,79 +583,6 @@ fn test_default_config_applies_field_defaults() {
 	assert cfg.insecure_skip_verify == false
 	// timeout inherits the declared 30s default rather than the 0 unset value.
 	assert cfg.timeout == 30 * time.second
-}
-
-// parked_read_worker blocks in Conn.read() until it returns (a parked socket read
-// released guard, an unguarded close(), or the read timeout) and reports completion.
-fn parked_read_worker(mut cc Conn, done_ch chan string) {
-	mut buf := []u8{len: 16}
-	cc.read(mut buf) or {
-		done_ch <- err.msg()
-		return
-	}
-	done_ch <- 'read returned data'
-}
-
-// test_close_is_not_blocked_by_parked_read pins the guard-release invariant: read()
-// releases guard around the blocking sock.read(), so a concurrent close() can proceed
-// without waiting for the read mutex or deadlocking behind the parked socket read.
-// The client socket carries a 1s read timeout as a hard backstop, so the assertion is
-// that close() itself completes well under it — the property a lock held across the
-// read would violate.
-fn test_close_is_not_blocked_by_parked_read() ! {
-	mut listener := net.listen_tcp(.ip, '127.0.0.1:0')!
-	defer {
-		listener.close() or {}
-	}
-	local := listener.addr()!
-	mut cli := net.dial_tcp(local.str())!
-	cli.set_read_timeout(2 * time.second)
-	mut hs := handshake.new_tls_handshake('', handshake.HandshakeOptions{ validator: pki.new_validator(pki.new_trust_store()) })!
-	mut c := &Conn{
-		sock:               cli
-		hs:                 hs
-		recv_buf:           []u8{}
-		app_buf:            []u8{}
-		app_pos:            0
-		closed:             false
-		close_notify_sent:  false
-		sock_closed:        false
-		fatal_error:        ''
-		peer_terminated:    false
-		failure_alert_sent: false
-		fail_alert:         none
-		read_guard:         sync.new_mutex()
-		guard:              sync.new_mutex()
-		negotiated_alpn:    ''
-		server_name:        ''
-		rec:                new_record_layer()
-	}
-	done_ch := chan string{cap: 1}
-	spawn parked_read_worker(mut c, done_ch)
-	// Wait until the reader has marked the socket read active under guard, rather than
-	// relying on a scheduling delay before racing close() against its timeout.
-	mut parked := false
-	for _ in 0 .. 100 {
-		c.guard.lock()
-		parked = c.socket_read_active
-		c.guard.unlock()
-		if parked {
-			break
-		}
-		time.sleep(10 * time.millisecond)
-	}
-	assert parked, 'reader did not park in sock.read()'
-	t0 := time.sys_mono_now()
-	c.close()!
-	close_us := (time.sys_mono_now() - t0) / 1000
-	// The in-flight read must observe close rather than report its socket timeout as
-	// a retryable result.
-	read_result := <-done_ch
-	assert close_us < 900000 // µs; well under the 2s read timeout
-	assert c.closed
-	assert read_result.contains('connection closed while reading record')
-	assert !c.socket_read_active
-	assert !c.close_after_socket_read
 }
 
 // test_is_transport_error_predicate pins the socket-read timeout classifier boundary
