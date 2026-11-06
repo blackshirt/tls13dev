@@ -49,6 +49,22 @@ pub fn (t &NewSessionTicket) bytes() []u8 {
 	return t.ticket
 }
 
+// encode serializes the ticket to its RFC 8446 §4.6.1 wire format:
+//   uint32 ticket_lifetime
+//   uint32 ticket_age_add
+//   opaque ticket_nonce<0..2^16-1>
+//   opaque ticket<0..2^16-1>
+//   opaque extensions<0..2^16-1>
+pub fn (t &NewSessionTicket) encode() []u8 {
+	mut w := wire.new_writer(8 + t.ticket_nonce.len + t.ticket.len + 6)
+	w.write_u32(t.ticket_lifetime)
+	w.write_u32(t.ticket_age_add)
+	w.write_vector_u8(t.ticket_nonce) or {}
+	w.write_vector_u16(t.ticket) or {}
+	w.write_vector_u16([]u8{}) or {} // extensions (none)
+	return w.bytes()
+}
+
 // wipe clears the resumption token and nonce when their owning connection is
 // torn down; it also releases all ticket metadata held in the parsed value.
 pub fn (mut t NewSessionTicket) wipe() {

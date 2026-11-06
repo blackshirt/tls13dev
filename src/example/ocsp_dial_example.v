@@ -47,13 +47,13 @@ fn main() {
 	validator.set_revocation_scope(pki.RevocationScope.leaf_only)
 
 	mut conn := tls.dial(address,
-		server_name:            host
-		hsk_options:            handshake.HandshakeOptions{
-			validator:             validator
+		server_name:           host
+		hsk_options:           handshake.HandshakeOptions{
+			validator: validator
 		}
-		insecure_skip_verify:   false
-		request_ocsp_stapling:  strict
-		timeout:                30 * time.second
+		insecure_skip_verify:  false
+		request_ocsp_stapling: strict
+		timeout:               30 * time.second
 	) or {
 		eprintln('dial failed: ${err}')
 		exit(1)

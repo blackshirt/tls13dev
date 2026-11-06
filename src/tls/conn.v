@@ -81,6 +81,9 @@ mut:
 	// connection (RFC 8446 §4.6.1). Every stored ticket can be turned into a
 	// resumption PSK via Conn.resumption_psks().
 	ticket_backlog []handshake.NewSessionTicket
+	// ticket_persistence, when set, persists accepted tickets to disk so they
+	// survive process restarts (§7.5).
+	ticket_persistence ?DiskTicketStore
 
 	// Read-side buffers: socket bytes are framed into records, then decrypted
 	// application bytes are delivered to callers.
@@ -170,8 +173,12 @@ pub:
 	psks []handshake.Psk
 	// session_ticket_store, when set, seeds Conn's ticket backlog at dial time
 	// (RFC 8446 §4.6.1). Tickets accepted during the connection are kept in
-	// Conn's own session_tickets slice and wiped on teardown (§7.5).
+	// Conn's own ticket_backlog slice and wiped on teardown (§7.5).
 	session_ticket_store ?SessionTicketStore
+	// ticket_persistence, when set, persists accepted NewSessionTicket values
+	// to disk so they survive process restarts. Construction failures fall back
+	// to in-memory only (no persistence). See DiskTicketStore.
+	ticket_persistence ?DiskTicketStore
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }
@@ -187,7 +194,14 @@ pub fn default_config(server_name string) Config {
 		psks:                  []handshake.Psk{}
 		request_ocsp_stapling: false
 		session_ticket_store:  none
+		ticket_persistence:    none
 	}
+}
+
+// new_disk_ticket_store_or_none creates a DiskTicketStore for `dir`, returning
+// none on any failure so callers can fall back to in-memory-only persistence.
+pub fn new_disk_ticket_store_or_none(dir string) ?DiskTicketStore {
+	return new_disk_ticket_store(dir) or { none }
 }
 
 // dial connects to address (host:port), performs a TLS 1.3 handshake, and returns
@@ -258,25 +272,36 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:            sock
-		hs:              hs
-		ticket_backlog:  []handshake.NewSessionTicket{cap: 4}
-		sock_buf:        []u8{len: recv_read_size} // reused by every socket read for this connection
-		recv_buf:        []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
-		app_buf:         []u8{cap: max_plaintext_record_len} // one full plaintext record
-		deadline_ms:     deadline_ms
-		sock_timeout:    timeout
-		server_name:     server_name
+		sock:             sock
+		hs:               hs
+		ticket_backlog:   []handshake.NewSessionTicket{cap: 4}
+		ticket_persistence: config.ticket_persistence
+		sock_buf:         []u8{len: recv_read_size} // reused by every socket read for this connection
+		recv_buf:       []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
+		app_buf:        []u8{cap: max_plaintext_record_len} // one full plaintext record
+		deadline_ms:    deadline_ms
+		sock_timeout:   timeout
+		server_name:    server_name
 		// The record facade's four protections are probed (send_failure_alert) before any
 		// install, so they start uninitialized rather than carrying key material.
-		rec:             new_record_layer()
+		rec:            new_record_layer()
 	}
 
 	// Seed the ticket backlog from the optional external store (RFC 8446 §4.6.1).
 	if config.session_ticket_store != none {
 		for t in config.session_ticket_store!.tickets() {
-		if conn.ticket_backlog.len < max_stored_session_tickets {
-			conn.ticket_backlog << t
+			if conn.ticket_backlog.len < max_stored_session_tickets {
+				conn.ticket_backlog << t
+			}
+		}
+	}
+	// Seed from the optional disk persistence store as well (fallback: in-memory
+	// only if disk is unavailable). Disk tickets are merged ahead of store tickets
+	// so persisted state takes precedence.
+	if config.ticket_persistence != none {
+		for t in config.ticket_persistence!.tickets() {
+			if conn.ticket_backlog.len < max_stored_session_tickets {
+				conn.ticket_backlog << t
 			}
 		}
 	}
@@ -891,6 +916,10 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				if c.ticket_backlog.len < max_stored_session_tickets {
 					c.ticket_backlog << ticket
 				}
+				// Persist to disk if a ticket persistence store is configured.
+				if c.ticket_persistence != none {
+					c.ticket_persistence!.put(ticket)
+				}
 				// An accepted non-KeyUpdate message breaks the run (§4.5).
 				c.rec.clear_key_update_run()
 			}
@@ -1089,6 +1118,10 @@ fn (mut c Conn) destroy_all() ! {
 		c.ticket_backlog[i].wipe()
 	}
 	c.ticket_backlog = []handshake.NewSessionTicket{}
+	// Wipe persisted tickets from disk (§7.5).
+	if c.ticket_persistence != none {
+		c.ticket_persistence!.wipe()
+	}
 	if zeroize_err != '' {
 		return error(zeroize_err)
 	}

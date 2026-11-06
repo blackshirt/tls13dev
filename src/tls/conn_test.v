@@ -20,6 +20,7 @@ fn new_test_conn() !&Conn {
 		sock:               unsafe { nil }
 		hs:                 hs
 		ticket_backlog:     []handshake.NewSessionTicket{cap: 4}
+		ticket_persistence: none
 		sock_buf:           []u8{len: recv_read_size}
 		recv_buf:           []u8{}
 		recv_pos:           0
