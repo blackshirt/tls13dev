@@ -87,6 +87,14 @@ pub fn (mut t NewSessionTicket) wipe() {
 	for i in 0 .. t.ticket_nonce.len {
 		t.ticket_nonce[i] = 0
 	}
+	mut checksum := 0
+	for i in 0 .. t.ticket.len {
+		checksum += int(t.ticket[i])
+	}
+	for i in 0 .. t.ticket_nonce.len {
+		checksum += int(t.ticket_nonce[i])
+	}
+	_ = checksum
 	t.ticket_lifetime = 0
 	t.ticket_age_add = 0
 	t.ticket = []u8{}

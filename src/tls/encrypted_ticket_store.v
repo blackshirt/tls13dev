@@ -49,10 +49,15 @@ const encrypted_file_store_nonce_len = 12
 @[noinit]
 pub struct EncryptedFileTicketStore {
 mut:
-	path   string
-	key    []u8 // 32-byte AES-256 key, wiped by wipe(); never written to disk
-	aead   cipher.AEAD
-	cache  []FileTicketRecord
+	path  string
+	key   []u8 // 32-byte AES-256 key, wiped by wipe(); never written to disk
+	aead  cipher.AEAD
+	cache []FileTicketRecord
+	// key_was_rejected is set when the existing tickets.bin cannot be decrypted
+	// with the supplied key (wrong key or corrupt file). Callers can check it to
+	// distinguish "no persisted tickets" from "all persisted tickets were lost to
+	// a key rotation".
+	key_was_rejected bool
 }
 
 // new_encrypted_file_ticket_store creates an EncryptedFileTicketStore over `dir`
@@ -109,6 +114,15 @@ pub fn (mut s EncryptedFileTicketStore) tickets() []handshake.NewSessionTicket {
 		}
 	}
 	return out
+}
+
+// key_was_rejected reports whether the existing tickets.bin could not be
+// decrypted with the supplied key (wrong key or corrupt file). When true, all
+// previously persisted tickets and PSKs were lost to key rotation and the store
+// starts empty. Callers can use this to surface a warning or re-key material.
+// Always false when no tickets.bin existed at construction.
+pub fn (s EncryptedFileTicketStore) key_was_rejected() bool {
+	return s.key_was_rejected
 }
 
 // resumption_psks returns the PSKs of the records that may still be used,
@@ -174,7 +188,7 @@ pub fn (mut s EncryptedFileTicketStore) put(ticket handshake.NewSessionTicket, p
 // re-encrypts and persists the burn (§8.6: a resumption PSK is single-use).
 // Unknown identities change nothing, so a caller-supplied external PSK cannot
 // reach stored material.
-pub fn (mut s EncryptedFileTicketStore) consume(identity []u8) {
+pub fn (mut s EncryptedFileTicketStore) consume(identity []u8) ! {
 	// A peer's file is folded in first, so this rewrite cannot lose a ticket
 	// another process just persisted, and the burn cannot come back on a later
 	// restart.
@@ -199,25 +213,27 @@ pub fn (mut s EncryptedFileTicketStore) consume(identity []u8) {
 		}
 	}
 	s.cache = kept
-	s.persist_cache() or {}
+	s.persist_cache()!
 }
 
-// wipe scrubs every cached ticket/PSK, wipes the stored AES key, and unlinks
-// the store file (§7.5). Conn does not call it — a close must not delete the
-// tickets it just persisted — so this is the owner's scrub. unlink rather than
-// a zero-length write: a symlink planted at tickets.bin would take the write,
-// and os.rm removes the name itself. The AES key is zeroed in memory; bytes
-// already on disk are not zeroed, so a scrubbed store is released, not erased.
+// wipe scrubs every cached ticket/PSK, wipes the stored AES key, then
+// overwrites the store file with random bytes before unlinking it (§7.5).
+// Conn does not call it — a close must not delete the tickets it just
+// persisted — so this is the owner's scrub. unlink rather than a zero-length
+// write: a symlink planted at tickets.bin would take the write, and os.rm
+// removes the name itself. Wiping uses a read-back checksum compiler barrier
+// so the zeroing pass cannot be eliminated as a dead store. Freed disk blocks
+// may still hold the old ciphertext on copy-on-write or wear-leveling
+// filesystems, so keep the store on tmpfs or an encrypted volume when that
+// matters.
 pub fn (mut s EncryptedFileTicketStore) wipe() {
 	for i in 0 .. s.cache.len {
 		s.cache[i].wipe_record()
 	}
 	s.cache = []FileTicketRecord{}
-	for i in 0 .. s.key.len {
-		s.key[i] = 0
-	}
+	zero_bytes(mut s.key)
 	s.key = []u8{}
-	os.rm(s.path) or {}
+	shred_file(s.path)
 }
 
 // prune_expired drops records whose ticket_lifetime has truly elapsed (§4.6.1),
@@ -249,10 +265,11 @@ fn (mut s EncryptedFileTicketStore) prune_expired() {
 
 // read_file reads the encrypted store file, splits the per-write nonce from the
 // ciphertext, decrypts with AES-256-GCM, and parses the plaintext format through
-// parse_store_bytes. A missing file, one shorter than a nonce, a wrong key
-// (tag mismatch), a tampered ciphertext, foreign magic/version, or corrupt
-// records all degrade to an empty store — the store never fails a dial.
-fn (s EncryptedFileTicketStore) read_file() []FileTicketRecord {
+// parse_store_bytes. A missing file, one shorter than a nonce, foreign magic,
+// version, or corrupt records all degrade to an empty store — the store never
+// fails a dial. Only a GCM tag failure (wrong key or tampered ciphertext) sets
+// key_was_rejected, so callers can distinguish key rotation from an empty store.
+fn (mut s EncryptedFileTicketStore) read_file() []FileTicketRecord {
 	info := os.stat(s.path) or { return []FileTicketRecord{} }
 	if info.size > ticket_store_max_file_len {
 		return []FileTicketRecord{}
@@ -264,8 +281,12 @@ fn (s EncryptedFileTicketStore) read_file() []FileTicketRecord {
 	nonce := data[..encrypted_file_store_nonce_len].clone()
 	ciphertext := data[encrypted_file_store_nonce_len..].clone()
 	// AES-GCM tag verification rejects wrong keys, truncated ciphertext, and
-	// tampered ciphertext alike: decryption failure degrades to an empty store.
-	plaintext := s.aead.decrypt(ciphertext, nonce, []u8{}) or { return []FileTicketRecord{} }
+	// tampered ciphertext alike: decryption failure degrades to an empty store,
+	// but only a wrong key means every persisted ticket is lost to rotation.
+	plaintext := s.aead.decrypt(ciphertext, nonce, []u8{}) or {
+		s.key_was_rejected = true
+		return []FileTicketRecord{}
+	}
 	return parse_store_bytes(plaintext)
 }
 

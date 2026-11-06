@@ -9,6 +9,7 @@ import os
 import crypto.rand
 import tls.handshake
 import tls.wire
+import crypto
 
 // nst_ticket builds a NewSessionTicket carrying the given lifetime and opaque
 // token, using the same §4.6.1 wire encoding the store persists.
@@ -210,4 +211,41 @@ fn test_encrypted_ticket_store_ciphertext_changes_per_write() ! {
 		}
 	}
 	assert nonce_differs // nonce prefix changed: fresh random nonce per write
+}
+
+// test_encrypted_ticket_store_key_was_rejected checks that opening a store with
+// a wrong key sets key_was_rejected(), so callers can detect that all persisted
+// tickets were lost to key rotation rather than simply being absent.
+fn test_encrypted_ticket_store_key_was_rejected() ! {
+	dir := est_store_dir('tls_est_kwr')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0xdd), 0xee]
+	key_a := est_key()!
+	key_b := est_key()!
+	assert key_a != key_b
+
+	// Write one ticket under key_a.
+	mut store := new_encrypted_file_ticket_store(dir, key_a)! or { return err }
+	store.put(est_nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(est_psk_blob(token, 32, 0))!) or {}
+	assert store.tickets().len == 1
+	assert !store.key_was_rejected()
+
+	// Reopen with a different key: decryption fails, store is empty, and the
+	// flag tells the caller exactly why.
+	mut wrong := new_encrypted_file_ticket_store(dir, key_b)! or { return err }
+	assert wrong.tickets().len == 0
+	assert wrong.resumption_psks().len == 0
+	assert wrong.key_was_rejected()
+
+	// An absent tickets.bin does not set the flag.
+	dir2 := est_store_dir('tls_est_kwr_empty')
+	defer {
+		os.rmdir_all(dir2) or {}
+	}
+	mut fresh := new_encrypted_file_ticket_store(dir2, est_key()!)! or { return err }
+	assert fresh.tickets().len == 0
+	assert !fresh.key_was_rejected()
 }

@@ -408,7 +408,7 @@ fn test_file_ticket_store_consume_burns_used_ticket() ! {
 	store.put(nst_ticket(3600, spare)!, handshake.parse_resumption_psk(psk_blob(spare, 32, 0))!)
 	assert store.read_file().len == 2
 
-	store.consume(used)
+	store.consume(used) or {}
 	assert store.tickets().len == 1
 	assert store.tickets()[0].bytes() == spare
 	assert store.resumption_psks()[0].identity() == spare
@@ -419,7 +419,7 @@ fn test_file_ticket_store_consume_burns_used_ticket() ! {
 	assert reopened.resumption_psks().len == 1
 	assert reopened.resumption_psks()[0].identity() == spare
 	// An identity the store never held — a caller's external PSK — burns nothing.
-	reopened.consume([u8(0xfe), 0xff])
+	reopened.consume([u8(0xfe), 0xff]) or {}
 	assert reopened.tickets().len == 1
 }
 
@@ -479,7 +479,7 @@ fn test_file_ticket_store_header_count_matches_records() ! {
 	count := (u16(raw[ticket_store_magic.len + 1]) << 8) | u16(raw[ticket_store_magic.len + 2])
 	assert count == u16(3)
 
-	store.consume(b)
+	store.consume(b) or {}
 	burned := os.read_bytes(path)!
 	count2 := (u16(burned[ticket_store_magic.len + 1]) << 8) | u16(burned[ticket_store_magic.len + 2])
 	assert count2 == u16(2)
@@ -651,7 +651,7 @@ fn test_in_memory_ticket_store_consume_burns_pair() ! {
 	store.put(nst_ticket(3600, third)!, handshake.parse_resumption_psk(psk_blob(third, 64, 0))!)
 	assert store.tickets().len == 3
 
-	store.consume(second)
+	store.consume(second) or {}
 	assert store.tickets().len == 2
 	assert store.issued_at.len == 2
 	assert store.tickets()[0].bytes() == first
@@ -661,7 +661,7 @@ fn test_in_memory_ticket_store_consume_burns_pair() ! {
 	assert psks[0].key().len == 32
 	assert psks[1].key().len == 64 // each PSK still belongs to its own ticket
 	// An identity the store never held changes nothing.
-	store.consume([u8(0xfe), 0xff])
+	store.consume([u8(0xfe), 0xff]) or {}
 	assert store.tickets().len == 2
 	assert store.issued_at.len == 2
 }
@@ -683,7 +683,7 @@ fn test_stores_satisfy_ticket_store_seam() ! {
 	file_backend.put(nst_ticket(3600, token)!, psk)
 	assert file_backend.tickets().len == 1
 	assert file_backend.resumption_psks().len == 1
-	file_backend.consume(token) // §8.6: the resumed pair is gone, not just unread
+	file_backend.consume(token) or {} // §8.6: the resumed pair is gone, not just unread
 	assert file_backend.tickets().len == 0
 	assert file_backend.resumption_psks().len == 0
 	file_backend.put(nst_ticket(3600, token)!, psk)
@@ -695,9 +695,9 @@ fn test_stores_satisfy_ticket_store_seam() ! {
 	mem_backend.put(nst_ticket(3600, token)!, psk)
 	assert mem_backend.tickets().len == 1
 	assert mem_backend.resumption_psks()[0].key().len == 32
-	mem_backend.consume([u8(0xfe), 0xff]) // an unknown identity burns nothing
+	mem_backend.consume([u8(0xfe), 0xff]) or {} // an unknown identity burns nothing
 	assert mem_backend.tickets().len == 1
-	mem_backend.consume(token)
+	mem_backend.consume(token) or {}
 	assert mem_backend.tickets().len == 0
 	mem_backend.wipe()
 	assert mem_backend.resumption_psks().len == 0

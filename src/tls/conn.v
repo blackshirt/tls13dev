@@ -351,7 +351,7 @@ pub fn dial(address string, config Config) !&Conn {
 		idx := int(selected!)
 		if idx < options.psks.len {
 			mut store := config.session_ticket_store!
-			store.consume(options.psks[idx].identity())
+			store.consume(options.psks[idx].identity()) or {}
 		}
 	}
 	return conn

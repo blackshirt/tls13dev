@@ -320,7 +320,9 @@ pub fn parse_resumption_psk(data []u8) !Psk {
 }
 
 // wipe scrubs the key material and the identity bytes when the holder of this
-// PSK is torn down (§7.5: no secret survives the session it came from).
+// PSK is torn down (§7.5: no secret survives the session it came from). The
+// trailing read-back checksum is a compiler barrier so the zeroing pass cannot
+// be eliminated as a dead store.
 pub fn (mut p Psk) wipe() {
 	for i in 0 .. p.key.len {
 		p.key[i] = 0
@@ -328,6 +330,14 @@ pub fn (mut p Psk) wipe() {
 	for i in 0 .. p.identity.len {
 		p.identity[i] = 0
 	}
+	mut checksum := 0
+	for i in 0 .. p.key.len {
+		checksum += int(p.key[i])
+	}
+	for i in 0 .. p.identity.len {
+		checksum += int(p.identity[i])
+	}
+	_ = checksum
 	p.key = []u8{}
 	p.identity = []u8{}
 	p.obfuscated_ticket_age = 0

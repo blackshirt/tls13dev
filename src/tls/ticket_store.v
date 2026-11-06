@@ -19,10 +19,12 @@
 // that answers it, the module-internal in-memory backend, then private helpers.
 module tls
 
+import crypto.rand
 import os
 import time
 import tls.handshake
 import tls.wire
+import crypto
 
 // max_stored_session_tickets bounds how many tickets a store may hold, out of
 // the many a server may push.
@@ -82,7 +84,7 @@ mut:
 	tickets() []handshake.NewSessionTicket
 	resumption_psks() []handshake.Psk
 	put(ticket handshake.NewSessionTicket, psk handshake.Psk) !
-	consume(identity []u8)
+	consume(identity []u8) !
 	wipe()
 }
 
@@ -223,7 +225,7 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 // connection has resumed on it (§8.6: a resumption PSK is single-use, and
 // offering it twice lets a peer link the two connections). Unknown identities
 // change nothing, so a caller-supplied external PSK cannot reach stored material.
-pub fn (mut s FileTicketStore) consume(identity []u8) {
+pub fn (mut s FileTicketStore) consume(identity []u8) ! {
 	// A peer's file is folded in first, so this rewrite cannot lose a ticket
 	// another process just persisted, and the burn cannot come back on a later merge.
 	s.merge_disk_state()
@@ -247,20 +249,41 @@ pub fn (mut s FileTicketStore) consume(identity []u8) {
 		}
 	}
 	s.cache = kept
-	s.persist_cache() or {}
+	s.persist_cache()!
 }
 
-// wipe drops every cached record and unlinks the store file (§7.5). Conn does not
-// call it — a close must not delete the tickets it just persisted — so this is
+// wipe drops every cached record, scrubs them in memory, then overwrites the
+// store file with random bytes before unlinking it (§7.5). Conn does not call
+// it — a close must not delete the tickets it just persisted — so this is
 // the owner's teardown. unlink rather than a zero-length write: a symlink planted
-// at tickets.bin would take the write, and os.rm removes the name itself. Bytes
-// already on disk are not zeroed, so a scrubbed store is released, not erased.
+// at tickets.bin would take the write, and os.rm removes the name itself.
+// Wiping uses a read-back checksum compiler barrier so the zeroing pass cannot
+// be eliminated as a dead store. Best-effort: on filesystems with copy-on-write
+// or wear-leveling (SSD, ZFS, btrfs) the original blocks may still exist
+// elsewhere; the store file should live on a tmpfs or encrypted volume when that
+// matters.
 pub fn (mut s FileTicketStore) wipe() {
 	for i in 0 .. s.cache.len {
 		s.cache[i].wipe_record()
 	}
 	s.cache = []FileTicketRecord{}
-	os.rm(s.path) or {}
+	shred_file(s.path)
+}
+
+// shred_file overwrites `path` with random bytes before unlinking it, so
+// previously persisted key material is not recoverable from freed blocks.
+// Best-effort: on copy-on-write or wear-leveling filesystems the original
+// blocks may still exist elsewhere.
+fn shred_file(path string) {
+	info := os.stat(path) or { return }
+	if info.size == 0 {
+		os.rm(path) or {}
+		return
+	}
+	mut junk := []u8{len: int(info.size)}
+	junk = crypto.rand.bytes(int(info.size)) or { junk }
+	os.write_bytes(path, junk) or {}
+	os.rm(path) or {}
 }
 
 // InMemoryTicketStore keeps tickets and their PSKs in three parallel slices,
@@ -287,8 +310,8 @@ fn new_in_memory_ticket_store() InMemoryTicketStore {
 
 // put stores a ticket with its resumption PSK, pruning first so expired pairs
 // cannot hold the bounded slots, refreshing a reissued token in place as
-// FileTicketStore does, and dropping the pair if the store is full. Never fails:
-// a rejected or inconsistent pair stays in Conn's backlog only.
+// FileTicketStore does, and returning an error if the store is full. A rejected
+// or inconsistent pair stays in Conn's backlog only.
 pub fn (mut s InMemoryTicketStore) put(ticket handshake.NewSessionTicket, psk handshake.Psk) ! {
 	// Same bound-pair and §4.6.1 lifetime rules as FileTicketStore.put.
 	if psk.identity() != ticket.bytes() || ticket.lifetime() == 0 {
@@ -309,7 +332,7 @@ pub fn (mut s InMemoryTicketStore) put(ticket handshake.NewSessionTicket, psk ha
 		}
 	}
 	if s.tickets.len >= max_stored_session_tickets {
-		return
+		return error('tls: ticket store full: ${max_stored_session_tickets} tickets stored')
 	}
 	s.tickets << ticket.clone()
 	s.psks << held_psk
@@ -319,7 +342,7 @@ pub fn (mut s InMemoryTicketStore) put(ticket handshake.NewSessionTicket, psk ha
 // consume burns the pair whose PSK carries this identity, once a connection has
 // resumed on it (§8.6). Unknown identities change nothing. The three slices are
 // rebuilt together so they keep one record per index.
-pub fn (mut s InMemoryTicketStore) consume(identity []u8) {
+pub fn (mut s InMemoryTicketStore) consume(identity []u8) ! {
 	mut target := -1
 	for i in 0 .. s.psks.len {
 		if s.psks[i].identity() == identity {
@@ -450,18 +473,20 @@ fn (mut s FileTicketStore) prune_expired() {
 		}
 		alive << r
 	}
-		if dropped {
-			for i in 0 .. s.cache.len {
-				if ticket_expired(s.cache[i].ticket, s.cache[i].issued_at_ms, now) {
-					s.cache[i].wipe_record()
-				}
+	if dropped {
+		for i in 0 .. s.cache.len {
+			if ticket_expired(s.cache[i].ticket, s.cache[i].issued_at_ms, now) {
+				s.cache[i].wipe_record()
 			}
-			s.cache = alive
-			s.write_file() or {}
 		}
+		s.cache = alive
+		s.write_file() or {}
+	}
 }
 
-// wipe_record scrubs the ticket token and the PSK key the record holds.
+// wipe_record scrubs the ticket token and the PSK key the record holds. Both
+// delegate to the handshake wipe methods, which use a read-back checksum
+// compiler barrier so the zeroing pass cannot be eliminated as a dead store.
 fn (mut r FileTicketRecord) wipe_record() {
 	r.ticket.wipe()
 	r.psk.wipe()
