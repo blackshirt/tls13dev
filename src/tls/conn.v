@@ -13,11 +13,6 @@ import tls.handshake
 import tls.pki
 import tls.wire
 
-// max_stored_session_tickets bounds the NewSessionTicket backlog kept on the
-// Conn (RFC 8446 §4.6.1). Every stored ticket can be turned into a resumption
-// PSK via Conn.resumption_psks(), so the queue is functional, not diagnostic.
-const max_stored_session_tickets = 32
-
 // recv_buf_compact_threshold is the consumed-prefix size at which try_reclaim_recv_buf
 // shifts recv_buf's tail to the front, keeping the reclaim amortized O(1) per byte.
 const recv_buf_compact_threshold = 16384
@@ -82,9 +77,10 @@ mut:
 	// because Conn is @[noinit] and an uninitialized nested struct is garbage, not zeros.
 	rec RecordLayer
 
-	// session_tickets holds the NewSessionTicket backlog the core parses but does
-	// not keep; exceeding it drops the ticket, never the connection (RFC 8446 §4.6.1).
-	session_tickets []handshake.NewSessionTicket
+	// ticket_backlog holds the NewSessionTicket backlog parsed during this
+	// connection (RFC 8446 §4.6.1). Every stored ticket can be turned into a
+	// resumption PSK via Conn.resumption_psks().
+	ticket_backlog []handshake.NewSessionTicket
 
 	// Read-side buffers: socket bytes are framed into records, then decrypted
 	// application bytes are delivered to callers.
@@ -172,6 +168,10 @@ pub:
 	// psks are the pre-shared keys the client may offer in the ClientHello
 	// (RFC 8446 §4.2.11). Each carries an identity and the shared key material.
 	psks []handshake.Psk
+	// session_ticket_store, when set, seeds Conn's ticket backlog at dial time
+	// (RFC 8446 §4.6.1). Tickets accepted during the connection are kept in
+	// Conn's own session_tickets slice and wiped on teardown (§7.5).
+	session_ticket_store ?SessionTicketStore
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }
@@ -186,6 +186,7 @@ pub fn default_config(server_name string) Config {
 		hsk_options:           handshake.HandshakeOptions{}
 		psks:                  []handshake.Psk{}
 		request_ocsp_stapling: false
+		session_ticket_store:  none
 	}
 }
 
@@ -259,7 +260,7 @@ pub fn dial(address string, config Config) !&Conn {
 	mut conn := &Conn{
 		sock:            sock
 		hs:              hs
-		session_tickets: []handshake.NewSessionTicket{cap: 4}
+		ticket_backlog:  []handshake.NewSessionTicket{cap: 4}
 		sock_buf:        []u8{len: recv_read_size} // reused by every socket read for this connection
 		recv_buf:        []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
 		app_buf:         []u8{cap: max_plaintext_record_len} // one full plaintext record
@@ -269,6 +270,15 @@ pub fn dial(address string, config Config) !&Conn {
 		// The record facade's four protections are probed (send_failure_alert) before any
 		// install, so they start uninitialized rather than carrying key material.
 		rec:             new_record_layer()
+	}
+
+	// Seed the ticket backlog from the optional external store (RFC 8446 §4.6.1).
+	if config.session_ticket_store != none {
+		for t in config.session_ticket_store!.tickets() {
+		if conn.ticket_backlog.len < max_stored_session_tickets {
+			conn.ticket_backlog << t
+			}
+		}
 	}
 
 	// The single handshake-phase teardown choke-point: every do_handshake() failure —
@@ -482,7 +492,7 @@ pub fn (c &Conn) negotiated_psk_index() ?u16 {
 // Call Conn.resumption_psks() to obtain ready-to-offer Psk handles derived
 // from this session's resumption master secret.
 pub fn (c &Conn) session_tickets() []handshake.NewSessionTicket {
-	return c.session_tickets
+	return c.ticket_backlog
 }
 
 // resumption_psks derives one RFC 8446 §7.2 resumption PSK per stored
@@ -490,8 +500,8 @@ pub fn (c &Conn) session_tickets() []handshake.NewSessionTicket {
 // Returns an error if the underlying HandshakeCore has already had its
 // traffic secrets zeroized (call this before Conn.close()).
 pub fn (c &Conn) resumption_psks() ![]handshake.Psk {
-	mut out := []handshake.Psk{cap: c.session_tickets.len}
-	for t in c.session_tickets {
+	mut out := []handshake.Psk{cap: max_stored_session_tickets}
+	for t in c.ticket_backlog {
 		out << c.hs.resumption_psk(t)!
 	}
 	return out
@@ -878,8 +888,8 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 					return c.abort_connection(alert, err.msg())
 				}
 				// Keep a bounded sample of the backlog; drop the overflow.
-				if c.session_tickets.len < max_stored_session_tickets {
-					c.session_tickets << ticket
+				if c.ticket_backlog.len < max_stored_session_tickets {
+					c.ticket_backlog << ticket
 				}
 				// An accepted non-KeyUpdate message breaks the run (§4.5).
 				c.rec.clear_key_update_run()
@@ -1075,10 +1085,10 @@ fn (mut c Conn) destroy_all() ! {
 	// reader (§7.5 spirit: no decrypted or framed bytes left behind in freed memory).
 	c.wipe_app_buf()
 	c.rec.wipe_post_hsk_buf()
-	for i in 0 .. c.session_tickets.len {
-		c.session_tickets[i].wipe()
+	for i in 0 .. c.ticket_backlog.len {
+		c.ticket_backlog[i].wipe()
 	}
-	c.session_tickets.clear()
+	c.ticket_backlog = []handshake.NewSessionTicket{}
 	if zeroize_err != '' {
 		return error(zeroize_err)
 	}

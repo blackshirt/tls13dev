@@ -19,7 +19,7 @@ fn new_test_conn() !&Conn {
 	return &Conn{
 		sock:               unsafe { nil }
 		hs:                 hs
-		session_tickets:    []handshake.NewSessionTicket{cap: 4}
+		ticket_backlog:     []handshake.NewSessionTicket{cap: 4}
 		sock_buf:           []u8{len: recv_read_size}
 		recv_buf:           []u8{}
 		recv_pos:           0
@@ -539,12 +539,13 @@ fn test_write_after_abort_preserves_the_sticky_error() ! {
 fn test_destroy_all_wipes_session_tickets() ! {
 	mut c := new_test_conn()!
 	nst_body := [u8(0), 0, 0, 1, 0, 0, 0, 0, 1, 0xab, 0, 2, 0xcd, 0xce, 0, 2, 0xef, 0xf0]
-	c.session_tickets << handshake.parse_new_session_ticket(nst_body)!
-	ticket_bytes := c.session_tickets[0].bytes()
+	ticket := handshake.parse_new_session_ticket(nst_body)!
+	c.ticket_backlog << ticket
+	ticket_bytes := c.ticket_backlog[0].bytes()
 	assert ticket_bytes.len == 2
 
 	c.destroy_all()!
-	assert c.session_tickets.len == 0
+	assert c.ticket_backlog.len == 0
 	for b in ticket_bytes {
 		assert b == 0
 	}
