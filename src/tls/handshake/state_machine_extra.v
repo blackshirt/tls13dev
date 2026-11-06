@@ -151,7 +151,12 @@ fn (h &HandshakeCore) is_handshake_message_accepted(msg_type HandshakeType) bool
 			}
 		}
 		.wait_cert { msg_type == .certificate }
-		.wait_cert_status { msg_type == .certificate_status }
+		.wait_cert_status {
+			// CertificateStatus (OCSP stapling) may be omitted by a server that
+			// does not staple; CertificateVerify or Finished (PSK) may follow
+			// directly, in which case revocation runs with no stapled response.
+			msg_type == .certificate_status || msg_type == .certificate_verify || msg_type == .finished
+		}
 		.wait_cv { msg_type == .certificate_verify }
 		.wait_finished { msg_type == .finished }
 		else { false }

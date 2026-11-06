@@ -602,6 +602,14 @@ fn (mut h HandshakeCore) handle_certificate_status(full_msg []u8, body []u8) ![]
 
 // handle_certificate_verify checks the server's signature over the transcript.
 fn (mut h HandshakeCore) handle_certificate_verify(full_msg []u8, body []u8) ![]HandshakeMessage {
+	// If OCSP stapling was offered but no CertificateStatus arrived, run the
+	// deferred revocation check now with no stapled response. strict checkers
+	// reject (fail-closed); soft-fail checkers accept.
+	if h.config.request_ocsp_stapling && h.ocsp_stapled_response == none {
+		h.validator.check_revocation(h.server_certs, h.config.server_name, none) or {
+			return h.fail_with(.bad_certificate, err)
+		}
+	}
 	cv := parse_certificate_verify(body) or {
 		return h.fail_with(.decode_error, err)
 	}
