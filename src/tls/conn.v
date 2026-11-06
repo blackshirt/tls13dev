@@ -81,9 +81,11 @@ mut:
 	// connection (RFC 8446 §4.6.1). Every stored ticket can be turned into a
 	// resumption PSK via Conn.resumption_psks().
 	ticket_backlog []handshake.NewSessionTicket
-	// ticket_persistence, when set, persists accepted tickets to disk so they
-	// survive process restarts (§7.5).
-	ticket_persistence ?DiskTicketStore
+	// ticket_store is the session ticket store this connection write-throughs
+	// accepted tickets (with their §7.2 PSKs) to, so resumption survives process
+	// restarts (§7.5). It is the Config.session_ticket_store seam, kept as a copy
+	// for the connection's life.
+	ticket_store ?SessionTicketStore
 
 	// Read-side buffers: socket bytes are framed into records, then decrypted
 	// application bytes are delivered to callers.
@@ -170,15 +172,19 @@ pub:
 	request_ocsp_stapling bool
 	// psks are the pre-shared keys the client may offer in the ClientHello
 	// (RFC 8446 §4.2.11). Each carries an identity and the shared key material.
+	// Resumption PSKs from Config.session_ticket_store are appended to this list
+	// by dial(), so a caller offering none still resumes; identities already in
+	// the list are never duplicated, and §4.2.11 ordering (most preferred first)
+	// keeps the caller's own PSKs ahead of the stored ones.
 	psks []handshake.Psk
-	// session_ticket_store, when set, seeds Conn's ticket backlog at dial time
-	// (RFC 8446 §4.6.1). Tickets accepted during the connection are kept in
-	// Conn's own ticket_backlog slice and wiped on teardown (§7.5).
+	// session_ticket_store, when set, is the ticket store for this connection:
+	// dial() seeds Conn's ticket_backlog from it and appends its resumption PSKs
+	// to the offered list (RFC 8446 §4.6.1/§4.2.11), and tickets accepted during the
+	// connection are write-throughed back to it together with the §7.2 PSK
+	// derived from this session's resumption master secret. The store outlives the
+	// connection: close does not wipe it, since persisting tickets is its purpose.
+	// FileTicketStore is the implementation; see ticket_store.v.
 	session_ticket_store ?SessionTicketStore
-	// ticket_persistence, when set, persists accepted NewSessionTicket values
-	// to disk so they survive process restarts. Construction failures fall back
-	// to in-memory only (no persistence). See DiskTicketStore.
-	ticket_persistence ?DiskTicketStore
 	// timeout sets the socket read and write timeouts; defaults to 30 seconds.
 	timeout time.Duration = 30 * time.second
 }
@@ -194,14 +200,7 @@ pub fn default_config(server_name string) Config {
 		psks:                  []handshake.Psk{}
 		request_ocsp_stapling: false
 		session_ticket_store:  none
-		ticket_persistence:    none
 	}
-}
-
-// new_disk_ticket_store_or_none creates a DiskTicketStore for `dir`, returning
-// none on any failure so callers can fall back to in-memory-only persistence.
-pub fn new_disk_ticket_store_or_none(dir string) ?DiskTicketStore {
-	return new_disk_ticket_store(dir) or { none }
 }
 
 // dial connects to address (host:port), performs a TLS 1.3 handshake, and returns
@@ -264,6 +263,28 @@ pub fn dial(address string, config Config) !&Conn {
 	if config.psks.len > 0 {
 		options.psks = config.psks.clone()
 	}
+	// Resumption PSKs the store kept from earlier sessions join the offered list
+	// (§7.2): they carry the key derived when the ticket was issued, which is the
+	// only binder material a server will accept for that identity, already aged
+	// per §4.6.1 by the store. Skip any whose identity the caller already offered,
+	// as §4.2.11 forbids duplicates.
+	if config.session_ticket_store != none {
+		mut store := config.session_ticket_store!
+		mut offered := [][]u8{}
+		for p in options.psks {
+			offered << p.identity().clone()
+		}
+		for p in store.resumption_psks() {
+			if p.identity() in offered {
+				continue
+			}
+			if options.psks.len >= max_stored_session_tickets {
+				break
+			}
+			offered << p.identity().clone() // a store copy may duplicate one it already handed out
+			options.psks << p
+		}
+	}
 	options.request_ocsp_stapling = config.request_ocsp_stapling
 
 	mut hs := handshake.new_tls_handshake(server_name, options) or {
@@ -272,11 +293,11 @@ pub fn dial(address string, config Config) !&Conn {
 	}
 
 	mut conn := &Conn{
-		sock:             sock
-		hs:               hs
-		ticket_backlog:   []handshake.NewSessionTicket{cap: 4}
-		ticket_persistence: config.ticket_persistence
-		sock_buf:         []u8{len: recv_read_size} // reused by every socket read for this connection
+		sock:           sock
+		hs:             hs
+		ticket_backlog: []handshake.NewSessionTicket{cap: 4}
+		ticket_store:   config.session_ticket_store
+		sock_buf:       []u8{len: recv_read_size} // reused by every socket read for this connection
 		recv_buf:       []u8{cap: 2 * (max_ciphertext_record_len + record_header_len)} // one frame parsing, one arriving
 		app_buf:        []u8{cap: max_plaintext_record_len} // one full plaintext record
 		deadline_ms:    deadline_ms
@@ -287,19 +308,11 @@ pub fn dial(address string, config Config) !&Conn {
 		rec:            new_record_layer()
 	}
 
-	// Seed the ticket backlog from the optional external store (RFC 8446 §4.6.1).
+	// Seed the ticket backlog from the store (RFC 8446 §4.6.1); with no store
+	// configured the backlog starts empty and only this session's tickets count.
 	if config.session_ticket_store != none {
-		for t in config.session_ticket_store!.tickets() {
-			if conn.ticket_backlog.len < max_stored_session_tickets {
-				conn.ticket_backlog << t
-			}
-		}
-	}
-	// Seed from the optional disk persistence store as well (fallback: in-memory
-	// only if disk is unavailable). Disk tickets are merged ahead of store tickets
-	// so persisted state takes precedence.
-	if config.ticket_persistence != none {
-		for t in config.ticket_persistence!.tickets() {
+		mut store := config.session_ticket_store!
+		for t in store.tickets() {
 			if conn.ticket_backlog.len < max_stored_session_tickets {
 				conn.ticket_backlog << t
 			}
@@ -328,6 +341,19 @@ pub fn dial(address string, config Config) !&Conn {
 	// do_handshake shrinks the read timeout toward the handshake deadline; a
 	// successful dial must hand the caller the full per-operation timeout again.
 	sock.set_read_timeout(conn.sock_timeout)
+	// §8.6/§4.6.1: a resumption PSK is single-use. The ServerHello named the
+	// identity the peer picked out of the list handed to the handshake, so burn that
+	// store record now: offering the same PSK on a later connection would let the
+	// peer link the two sessions. An identity the store does not hold — a caller's
+	// external PSK — consumes nothing.
+	selected := conn.hs.selected_psk_index()
+	if selected != none && config.session_ticket_store != none {
+		idx := int(selected!)
+		if idx < options.psks.len {
+			mut store := config.session_ticket_store!
+			store.consume(options.psks[idx].identity())
+		}
+	}
 	return conn
 }
 
@@ -916,12 +942,20 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				if c.ticket_backlog.len < max_stored_session_tickets {
 					c.ticket_backlog << ticket
 				}
-				// Persist to disk if a ticket persistence store is configured.
-				if c.ticket_persistence != none {
-					c.ticket_persistence!.put(ticket)
-				}
-				// An accepted non-KeyUpdate message breaks the run (§4.5).
+				// An accepted non-KeyUpdate message breaks the run (§4.5). Clearing it
+				// first keeps that bookkeeping independent of the store write below.
 				c.rec.clear_key_update_run()
+				// Write the ticket through to the store with the §7.2 PSK derived
+				// from this session's resumption master secret: the ticket bytes
+				// alone could never re-bind on a later connection. A ticket we
+				// cannot turn into a PSK (no RMS yet, or an identity too long for
+				// the wire) stays in the backlog only — persisting is the store's
+				// business and never a reason to fail a healthy connection.
+				if c.ticket_store != none && c.hs.has_resumption_master_secret() {
+					psk := c.hs.resumption_psk(ticket) or { continue }
+					mut store := c.ticket_store!
+					store.put(ticket, psk)
+				}
 			}
 			.key_update {
 				// The record facade owns this mechanism: it enforces §4.5's one-in-a-row rule
@@ -1118,10 +1152,11 @@ fn (mut c Conn) destroy_all() ! {
 		c.ticket_backlog[i].wipe()
 	}
 	c.ticket_backlog = []handshake.NewSessionTicket{}
-	// Wipe persisted tickets from disk (§7.5).
-	if c.ticket_persistence != none {
-		c.ticket_persistence!.wipe()
-	}
+	// The ticket store is deliberately NOT wiped here: it is caller-owned state
+	// that must outlive this connection, which is the whole reason FileTicketStore
+	// exists. destroy_all runs on every close and abort, so wiping it would delete
+	// the tickets the just-finished session persisted. SessionTicketStore.wipe()
+	// stays available for the owner that decides the material is no longer needed.
 	if zeroize_err != '' {
 		return error(zeroize_err)
 	}

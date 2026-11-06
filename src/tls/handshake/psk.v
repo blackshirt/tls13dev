@@ -211,9 +211,12 @@ fn parse_server_selected_psk(ext_data []u8) !u16 {
 // must ask before zeroize_traffic_secrets() runs at close.
 //
 // obfuscated_ticket_age is set to the ticket's age_add alone (§4.6.1: age +
-// age_add mod 2^32); the stack does not track wall-clock since issuance, so
-// every PSK presents as freshly minted. Servers treat a stale age as a signal
-// to fall back to the full handshake, never as an error.
+// age_add mod 2^32): this derivation does not know wall-clock time, so the PSK
+// presents as freshly minted at the instant it is derived. A ticket store that
+// keeps the PSK longer advances the age on the copy it hands back
+// (clone_aged), which is how §4.6.1 stays satisfied across a restart.
+// Servers treat a stale age as a signal to fall back to the full handshake,
+// never as an error.
 pub fn (h &HandshakeCore) resumption_psk(ticket &NewSessionTicket) !Psk {
 	if h.resumption_master_secret.len == 0 {
 		return error('handshake: no resumption master secret (call before zeroize_traffic_secrets(), or the connection never reached .connected)')
@@ -232,4 +235,102 @@ pub fn (h &HandshakeCore) resumption_psk(ticket &NewSessionTicket) !Psk {
 		external:              false
 		hash_algo:             h.hash_algo
 	}
+}
+
+// has_resumption_master_secret reports whether HandshakeCore can still derive
+// §7.2 resumption PSKs. Ticket stores use it to decide whether an accepted
+// ticket is persistable, instead of reading a derivation failure as an error.
+pub fn (h &HandshakeCore) has_resumption_master_secret() bool {
+	return h.resumption_master_secret.len > 0
+}
+
+// clone_aged copies a PSK with fresh identity and key buffers and the
+// §4.2.11 obfuscated age advanced by `held_ms` — the milliseconds the caller has
+// kept the ticket. This is the ticket store's seam: it holds a PSK long after
+// the session that derived it was destroyed, and the copy handed to the next
+// ClientHello must carry the real elapsed time (§4.6.1: ticket_age_add +
+// age_ms, mod 2^32) rather than the issue-time value. Time the caller cannot
+// have observed (a negative held_ms from a clock behind the issue time)
+// contributes nothing. The handle it was given is never rewritten.
+pub fn (p &Psk) clone_aged(held_ms i64) Psk {
+	held := if held_ms < 0 { i64(0) } else { held_ms }
+	age := u32((u64(p.obfuscated_ticket_age) + u64(held)) & 0xffffffff)
+	return Psk{
+		identity:              p.identity.clone()
+		key:                   p.key.clone()
+		obfuscated_ticket_age: age
+		external:              p.external
+		hash_algo:             p.hash_algo
+	}
+}
+
+// encode serializes a resumption PSK for a ticket store that must outlive the
+// connection which derived it: identity, key, obfuscated age, hash and binder
+// label, big-endian with length-prefixed vectors. A store may advance only the
+// age of the copy it hands back (§4.6.1, clone_aged) — a handle whose identity,
+// key or hash drifted would bind a binder the server cannot reproduce.
+// Nothing on the RFC 8446 wire carries these bytes — they travel only between
+// the store and its owner (§7.2).
+pub fn (p &Psk) encode() []u8 {
+	mut w := wire.new_writer(10 + p.identity.len + p.key.len)
+	w.write_vector_u16(p.identity) or {}
+	w.write_vector_u16(p.key) or {}
+	w.write_u32(p.obfuscated_ticket_age)
+	w.write_u8(u8(p.hash_algo))
+	w.write_u8(if p.external { 1 } else { 0 })
+	return w.bytes()
+}
+
+// parse_resumption_psk decodes what Psk.encode produced, screening every field
+// through the same wire limits and entropy floors new_psk applies, so a corrupt
+// or hostile store file cannot hand the handshake a malformed key (§7.1).
+pub fn parse_resumption_psk(data []u8) !Psk {
+	mut r := wire.new_reader(data)
+	identity := r.read_vector_u16()!
+	if identity.len == 0 || identity.len > psk_identity_max_len {
+		return error('handshake: stored PSK identity of ${identity.len} bytes is outside 1..${psk_identity_max_len}')
+	}
+	key := r.read_vector_u16()!
+	if key.len < psk_key_min_len || key.len > psk_key_max_len {
+		return error('handshake: stored PSK key of ${key.len} bytes is outside ${psk_key_min_len}..${psk_key_max_len}')
+	}
+	age := r.read_u32()!
+	hash_byte := r.read_u8()!
+	if hash_byte > 1 {
+		return error('handshake: stored PSK hash ${hash_byte} is not a known HashAlgorithm')
+	}
+	// The two suite-backed hashes, named rather than cast: V only allows a
+	// number-to-enum cast inside unsafe, and a stored PSK comes from a file that
+	// may have been edited, so the byte is screened here instead of trusted.
+	stored_hash := if hash_byte == 0 { HashAlgorithm.sha256 } else { HashAlgorithm.sha384 }
+	external := r.read_u8()!
+	if external > 1 {
+		return error('handshake: stored PSK binder flag ${external} is not 0 or 1')
+	}
+	if r.remaining() != 0 {
+		return error('handshake: trailing bytes in stored PSK')
+	}
+	return Psk{
+		identity:              identity
+		key:                   key
+		obfuscated_ticket_age: age
+		external:              external == 1
+		hash_algo:             stored_hash
+	}
+}
+
+// wipe scrubs the key material and the identity bytes when the holder of this
+// PSK is torn down (§7.5: no secret survives the session it came from).
+pub fn (mut p Psk) wipe() {
+	for i in 0 .. p.key.len {
+		p.key[i] = 0
+	}
+	for i in 0 .. p.identity.len {
+		p.identity[i] = 0
+	}
+	p.key = []u8{}
+	p.identity = []u8{}
+	p.obfuscated_ticket_age = 0
+	p.external = false
+	p.hash_algo = .sha256
 }

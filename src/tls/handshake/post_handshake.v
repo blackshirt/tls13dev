@@ -49,6 +49,19 @@ pub fn (t &NewSessionTicket) bytes() []u8 {
 	return t.ticket
 }
 
+// clone returns an independent copy with fresh nonce and token buffers. A holder
+// that keeps a ticket past the session that issued it — a ticket store — must not
+// share bytes with that session's backlog, because Conn's teardown wipes every
+// backlog ticket in place (§7.5).
+pub fn (t &NewSessionTicket) clone() NewSessionTicket {
+	return NewSessionTicket{
+		ticket_lifetime: t.ticket_lifetime
+		ticket_age_add:  t.ticket_age_add
+		ticket_nonce:    t.ticket_nonce.clone()
+		ticket:          t.ticket.clone()
+	}
+}
+
 // encode serializes the ticket to its RFC 8446 §4.6.1 wire format:
 //   uint32 ticket_lifetime
 //   uint32 ticket_age_add

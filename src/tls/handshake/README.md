@@ -59,11 +59,12 @@ wire limit, or a key outside the 32–1024 byte window (see the `psk_*_len` cons
 in `psk.v`), and copies both inputs into the handle so later caller-side mutation
 cannot reach the bytes the handshake binds over.
 
-Only `identity` (ticket bytes sent in the ClientHello) and `key` (the shared key material) are
-publicly readable. `obfuscated_ticket_age`, `external`, and `hash_algo` default to zero (a fresh
-ticket, the resumption "res binder" label, SHA-256); none of them can be set from outside the
-module — external PSKs and per-PSK hashes are configured internally by the module. Once
-constructed, a `Psk` is immutable to callers.
+`identity()` (ticket bytes sent in the ClientHello) and `key()` (the shared key
+material) are the only readers. `obfuscated_ticket_age`, `external`, and
+`hash_algo` default to zero (a fresh ticket, the resumption "res binder" label,
+SHA-256), are set only by this module's own constructors, and have no setters —
+even the age a ticket store must advance travels through `clone_aged`. A `Psk` a
+caller holds can never be mutated, only replaced by a copy.
 
 `PskIdentity`, `PskBinderEntry`, `PskKeyExchangeMode`, and the `build_pre_shared_key_*`
 wire-codec helpers live in `psk.v`, are module-private, and callers never construct
@@ -87,6 +88,22 @@ EncryptedExtensions / Finished with no Certificate or CertificateVerify.
 picked (or `none` when every offer was declined); `tls.Conn.negotiated_psk_index()
 ?u16` mirrors it. The value is not secret material — the identity bytes travel
 in the clear — so it stays readable after `zeroize_traffic_secrets()`.
+
+A ticket that must outlive the session which received it needs more than the
+ticket bytes: the key only the issuing session's RMS can produce. Three handles
+support that, all used by `tls.SessionTicketStore` implementations:
+
+- `Psk.encode() []u8` / `parse_resumption_psk([]u8) !Psk` serialize a resumption
+  PSK between the store and its owner (never onto the RFC 8446 wire), the decoder
+  re-screening every field through the same limits `new_psk` applies.
+- `Psk.clone_aged(held_ms i64) Psk` hands out a copy whose obfuscated age has
+  been advanced by the time the store held the ticket (§4.6.1: age + age_add,
+  mod 2^32, negative time ignored), so a restarted process offers real ages
+  without the age ever becoming a writable field.
+- `Psk.wipe()` zeroes the key and identity bytes (§7.5).
+
+`HandshakeCore.has_resumption_master_secret() bool` lets a store tell "this
+ticket is not persistable yet" apart from a derivation failure.
 
 ## File map
 

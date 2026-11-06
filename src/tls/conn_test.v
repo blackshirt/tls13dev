@@ -20,7 +20,7 @@ fn new_test_conn() !&Conn {
 		sock:               unsafe { nil }
 		hs:                 hs
 		ticket_backlog:     []handshake.NewSessionTicket{cap: 4}
-		ticket_persistence: none
+		ticket_store:       none
 		sock_buf:           []u8{len: recv_read_size}
 		recv_buf:           []u8{}
 		recv_pos:           0
@@ -426,6 +426,10 @@ fn test_close_is_idempotent_with_live_socket() ! {
 	mut c := &Conn{
 		sock:               sock
 		hs:                 hs
+		// close() reaches both ticket fields in destroy_all(), so neither may stay
+		// the garbage @[noinit] leaves behind.
+		ticket_backlog:     []handshake.NewSessionTicket{cap: 4}
+		ticket_store:       none
 		recv_buf:           []u8{}
 		app_buf:            []u8{}
 		app_pos:            0

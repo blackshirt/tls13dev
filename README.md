@@ -103,7 +103,10 @@ sibling import (`tls`) relative to the executable's own directory.
   `psk_dhe_ke` (PSK + ECDHE) binders in the ClientHello, server PSK selection
   in ServerHello, and PSK-authenticated flights without CertificateVerify
   (RFC 8446 §4.2.11/§4.4.2); received tickets are stored and convertible into
-  resumption PSKs via `Conn.resumption_psks()`
+  resumption PSKs via `Conn.resumption_psks()`, and a `Config.session_ticket_store`
+  (the file-backed `FileTicketStore`) keeps ticket + PSK pairs across process
+  restarts, offers them automatically, and retires the pair a resumption actually
+  used (§8.6 single use)
 - **Post-handshake**: `NewSessionTicket` collection, `KeyUpdate` handling
   (read keys update on receipt; a response is sent with correct §4.6.3
   old-key-before-new ordering when the server requests it), sender-side
@@ -118,10 +121,13 @@ sibling import (`tls`) relative to the executable's own directory.
 
 ## Not (yet) implemented
 
-- Automatic session resumption across dials and 0-RTT (tickets are stored and
-  convertible into PSKs via `Conn.resumption_psks()`, but the caller must
-  re-offer them through `Config.psks`; nothing persists automatically across
-  connections)
+- **0-RTT** early data (resumption itself is 1-RTT: a ticket store hands out
+  the §7.2 PSKs the next ClientHello binds, but no `max_early_data` path exists)
+- Ticket **ages rest on the local clock**: a ticket store folds the time a
+  ticket has been held into its obfuscated age (§4.6.1) and drops one past its
+  `ticket_lifetime` instead of re-offering it, so a skewed or rewound client
+  clock makes the age wrong — a server reacts by falling back to a full
+  handshake, never by failing
 - Certificate **revocation** — CRL fetching is not implemented (no network
   dependencies), but a caller may supply a `pki.RevocationChecker` through
   `Config.revocation_checker` to reject revoked certificates at handshake time;
