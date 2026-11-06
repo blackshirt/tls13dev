@@ -78,17 +78,9 @@ fn run() ! {
 	println('handshake took ${elapsed.str()}')
 
 	if idx := conn.negotiated_psk_index() {
-		// Mirror dial()'s offer so the reported index maps to a real identity,
-		// then burn the pair (§8.6 single-use) so it is not re-offered later.
-		mut offered := [][]u8{}
-		for p in store.resumption_psks() {
-			if p.identity() in offered {
-				continue
-			}
-			offered << p.identity().clone()
-		}
+		// dial() already burned the resumed pair via store.consume() (§8.6),
+		// so there is nothing more for the caller to do here.
 		println('resumed via PSK index ${idx}')
-		store.consume(offered[int(idx)])
 	} else {
 		println('no resumption; full certificate handshake (store empty or peer declined)')
 	}

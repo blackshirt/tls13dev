@@ -67,6 +67,12 @@ const ticket_store_max_file_len = 8 * 1024 * 1024
 // PSKs derived from them. tickets() and resumption_psks() hand back what is still
 // live, aged by the hold time (§4.6.1); put() is the write-through side.
 //
+// Concurrency: a store is not thread-safe. One store instance must be used from a
+// single thread, and one directory should have one live store per process. The
+// merge_disk_state() fold-in at write time mitigates lost updates between two
+// processes sharing a directory, but it is not a distributed lock — two live
+// stores over the same tickets.bin can overwrite each other's records.
+//
 // A store outlives the connection that filled it: Conn never calls wipe(), since
 // teardown runs on every close and would otherwise delete the tickets it just
 // persisted. wipe() is the owner's scrub (§7.5), and consume() is the narrower
@@ -75,7 +81,7 @@ pub interface SessionTicketStore {
 mut:
 	tickets() []handshake.NewSessionTicket
 	resumption_psks() []handshake.Psk
-	put(ticket handshake.NewSessionTicket, psk handshake.Psk)
+	put(ticket handshake.NewSessionTicket, psk handshake.Psk) !
 	consume(identity []u8)
 	wipe()
 }
@@ -114,6 +120,14 @@ pub fn new_file_ticket_store(dir string) !FileTicketStore {
 		if info.mode & 0o077 != 0 {
 			return error('tls: ticket store directory ${dir} is group- or world-writable')
 		}
+	} $else {
+		// On Windows, mode bits don't map to Unix permissions. Verify the directory is
+		// at least writable by creating and deleting a probe file.
+		probe := os.join_path(dir, '.tls_ticket_store_probe')
+		os.write_bytes(probe, []u8{}) or {
+			return error('tls: cannot write to ticket store directory ${dir}')
+		}
+		os.rm(probe) or {}
 	}
 	mut s := FileTicketStore{
 		path:  os.join_path(dir, ticket_store_filename)
@@ -156,10 +170,11 @@ pub fn (mut s FileTicketStore) resumption_psks() []handshake.Psk {
 }
 
 // put persists a server-issued ticket with the §7.2 PSK derived for it,
-// replacing an earlier record carrying the same token (§4.6.1 allows a server to
-// reissue one). Never fails: an unusable or inconsistent pair, a write error, an
-// unroundtrippable PSK or a full store is silent.
-pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handshake.Psk) {
+// replacing an earlier record carrying the same token (§4.6.1 allows a server
+// to reissue one). Returns an error on a full store or a write/disk failure;
+// an unusable or inconsistent pair, a lifetime of 0, or an unroundtrippable
+// PSK is silent by design — the ticket stays in Conn's backlog only.
+pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handshake.Psk) ! {
 	// A record is a bound pair: §7.2 makes the PSK identity the ticket bytes, so a
 	// pair that disagrees is refused rather than kept as an offer no server can
 	// reproduce and no read can match again.
@@ -189,19 +204,19 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 				ticket:       ticket.clone()
 				psk:          held_psk
 			}
-			s.write_file()
+			s.write_file()!
 			return
 		}
 	}
 	if s.cache.len >= max_stored_session_tickets {
-		return // store full: the ticket stays in Conn's backlog only
+		return error('tls: ticket store full: ${max_stored_session_tickets} tickets stored')
 	}
 	s.cache << FileTicketRecord{
 		issued_at_ms: now_ms
 		ticket:       ticket.clone()
 		psk:          held_psk
 	}
-	s.write_file()
+	s.write_file()!
 }
 
 // consume burns the record whose §7.2 PSK carries this identity, once a
@@ -232,7 +247,7 @@ pub fn (mut s FileTicketStore) consume(identity []u8) {
 		}
 	}
 	s.cache = kept
-	s.persist_cache()
+	s.persist_cache() or {}
 }
 
 // wipe drops every cached record and unlinks the store file (§7.5). Conn does not
@@ -274,7 +289,7 @@ fn new_in_memory_ticket_store() InMemoryTicketStore {
 // cannot hold the bounded slots, refreshing a reissued token in place as
 // FileTicketStore does, and dropping the pair if the store is full. Never fails:
 // a rejected or inconsistent pair stays in Conn's backlog only.
-pub fn (mut s InMemoryTicketStore) put(ticket handshake.NewSessionTicket, psk handshake.Psk) {
+pub fn (mut s InMemoryTicketStore) put(ticket handshake.NewSessionTicket, psk handshake.Psk) ! {
 	// Same bound-pair and §4.6.1 lifetime rules as FileTicketStore.put.
 	if psk.identity() != ticket.bytes() || ticket.lifetime() == 0 {
 		return
@@ -435,15 +450,15 @@ fn (mut s FileTicketStore) prune_expired() {
 		}
 		alive << r
 	}
-	if dropped {
-		for i in 0 .. s.cache.len {
-			if ticket_expired(s.cache[i].ticket, s.cache[i].issued_at_ms, now) {
-				s.cache[i].wipe_record()
+		if dropped {
+			for i in 0 .. s.cache.len {
+				if ticket_expired(s.cache[i].ticket, s.cache[i].issued_at_ms, now) {
+					s.cache[i].wipe_record()
+				}
 			}
+			s.cache = alive
+			s.write_file() or {}
 		}
-		s.cache = alive
-		s.write_file()
-	}
 }
 
 // wipe_record scrubs the ticket token and the PSK key the record holds.
@@ -466,6 +481,16 @@ fn (s FileTicketStore) read_file() []FileTicketRecord {
 		return []FileTicketRecord{}
 	}
 	data := os.read_bytes(s.path) or { return []FileTicketRecord{} }
+	return parse_store_bytes(data)
+}
+
+// parse_store_bytes decodes the store file framing (magic + version + u16 count
+// + records) into records. All rejection rules mirror put()'s invariants: a file
+// that separates a ticket from its own PSK, or carries an unroundtrippable PSK,
+// never reaches the cache. Both FileTicketStore and EncryptedFileTicketStore
+// share this loader so a wrong magic, version, or corrupt record always degrades
+// to empty rather than failing the dial that consults it.
+fn parse_store_bytes(data []u8) []FileTicketRecord {
 	mut out := []FileTicketRecord{}
 	if data.len < ticket_store_header_len {
 		return out // absent, empty, or an older layout: start clean
@@ -517,23 +542,23 @@ fn (s FileTicketStore) read_file() []FileTicketRecord {
 }
 
 // write_file merges what peers persisted, then writes exactly the result, so a
-// whole-file rewrite cannot lose their tickets. Write failures are ignored: the
-// cache stays authoritative here.
-fn (mut s FileTicketStore) write_file() {
+// whole-file rewrite cannot lose their tickets. Returns an error on write/disk
+// failure; the cache stays authoritative here.
+fn (mut s FileTicketStore) write_file() ! {
 	s.merge_disk_state()
-	s.persist_cache()
+	s.persist_cache()!
 }
 
-// persist_cache serializes exactly this cache through a 0600 temp file and a
-// rename, so a torn or stale copy never shadows the live store. Counting records
-// as they are serialized keeps the header honest: a body too large for its u16
-// prefix is skipped whole instead of truncating the records behind it. consume()
-// calls this directly, because folding in a peer's file would resurrect the
-// record it just burned.
-fn (s FileTicketStore) persist_cache() {
-	mut body := wire.new_writer(s.cache.len * (ticket_record_header_len + 128))
+// serialize_cache serializes exactly this cache through the on-disk framing:
+// magic + version byte + u16 count + records. Counting records as they are
+// serialized keeps the header honest: a body too large for its u16 prefix is
+// skipped whole instead of truncating the records behind it. Both
+// FileTicketStore.persist_cache and EncryptedFileTicketStore.persist_cache use
+// this so the serialized bytes are identical before any encryption is applied.
+fn serialize_cache(cache []FileTicketRecord) []u8 {
+	mut body := wire.new_writer(cache.len * (ticket_record_header_len + 128))
 	mut persisted := 0
-	for r in s.cache {
+	for r in cache {
 		encoded_ticket := r.ticket.encode()
 		encoded_psk := r.psk.encode()
 		if encoded_ticket.len > ticket_record_body_max_len {
@@ -553,7 +578,15 @@ fn (s FileTicketStore) persist_cache() {
 	w.write_u8(ticket_store_version)
 	w.write_u16(u16(persisted))
 	w.write_bytes(encoded)
-	out := w.bytes()
+	return w.bytes()
+}
+
+// persist_cache serializes exactly this cache through a 0600 temp file and a
+// rename, so a torn or stale copy never shadows the live store. Returns an error
+// on write/disk failure. consume() calls this directly, because folding in a
+// peer's file would resurrect the record it just burned.
+fn (s FileTicketStore) persist_cache() ! {
+	out := serialize_cache(s.cache)
 	// The pid keeps two processes writing the same store from sharing one temp
 	// name, which would rename an interleaved stream into place. It cannot tell two
 	// stores in one process apart, so a directory should have one live store per
@@ -562,10 +595,10 @@ fn (s FileTicketStore) persist_cache() {
 	// The name is still predictable, so it may be a symlink planted by another
 	// process and write_bytes would follow it: os.rm unlinks it first.
 	os.rm(tmp_path) or {}
-	os.write_bytes(tmp_path, out) or { return }
+	os.write_bytes(tmp_path, out) or { return err }
 	// Created under the process umask, so tighten it to 0600 before the rename
 	// adopts it; the store directory's 0700 mode already hides it meanwhile.
-	os.chmod(tmp_path, 0o600) or {}
+	os.chmod(tmp_path, 0o600) or { return err }
 	// POSIX rename(2) replaces an existing file atomically, but the CRT
 	// _wrename os.rename calls on Windows fails when the target exists, so unlink
 	// there and accept a brief window with no store file rather than never
@@ -573,7 +606,7 @@ fn (s FileTicketStore) persist_cache() {
 	$if windows {
 		os.rm(s.path) or {}
 	}
-	os.rename(tmp_path, s.path) or { return }
+	os.rename(tmp_path, s.path) or { return err }
 }
 
 // merge_disk_state folds in records another process persisted since this cache

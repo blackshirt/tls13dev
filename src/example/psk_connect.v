@@ -89,16 +89,6 @@ fn run() ! {
 		timeout:              30 * time.second
 	}
 
-	// Mirror dial()'s second-flight offer so negotiated_psk_index() maps onto a
-	// real identity we can burn (§8.6: a resumed PSK is single-use).
-	mut offered := [][]u8{}
-	for p in store.resumption_psks() {
-		if p.identity() in offered {
-			continue
-		}
-		offered << p.identity().clone()
-	}
-
 	println('connecting to cloudflare.com:443 (second handshake, store-seeded resumption offer)...')
 	t2 := time.now()
 	mut conn2 := tls.dial('cloudflare.com:443', cfg2)! or { return err }
@@ -109,9 +99,10 @@ fn run() ! {
 	// The stack reports the ServerHello pre_shared_key index directly, so no
 	// timing inference is needed: none means every offer was declined and the
 	// peer ran a full certificate handshake; an int means resumption fired.
+	// dial() already burned the resumed pair via store.consume() (§8.6), so
+	// there is nothing more for the caller to do here.
 	if idx := conn2.negotiated_psk_index() {
 		println('resumed via PSK index ${idx}')
-		store.consume(offered[int(idx)])
 	} else {
 		println('PSK offer declined; full certificate handshake')
 	}

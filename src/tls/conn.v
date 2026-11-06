@@ -954,7 +954,7 @@ fn (mut c Conn) handle_post_handshake(data []u8) ! {
 				if c.ticket_store != none && c.hs.has_resumption_master_secret() {
 					psk := c.hs.resumption_psk(ticket) or { continue }
 					mut store := c.ticket_store!
-					store.put(ticket, psk)
+					store.put(ticket, psk) or { continue }
 				}
 			}
 			.key_update {
