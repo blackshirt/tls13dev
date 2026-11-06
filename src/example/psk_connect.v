@@ -1,6 +1,7 @@
 // Copyright (c) 2026 blackshirt.
 //
-// TLS 1.3 connect example with RFC 8446 §7.2 PSK resumption.
+// TLS 1.3 connect example with RFC 8446 §7.2 PSK resumption, backed by a file
+// ticket store so resumption state survives across runs.
 //
 // Run:
 //   v run src/example/psk_connect.v   (from repo root)
@@ -8,15 +9,21 @@
 // Two connections to cloudflare.com:443:
 //   1. First handshake offers an external PSK identity the server has never
 //      seen; Cloudflare declines and completes a certificate handshake, then
-//      pushes one or more NewSessionTickets after .connected (§4.6.1).
-//   2. Derive resumption PSKs from those tickets with the §7.2 chain
-//      (HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce))
-//      via Conn.resumption_psks(), and offer them on the second dial. The
-//      server picks one, echoes its index in ServerHello.pre_shared_key, and
-//      the second flight shortens to ClientHello / ServerHello /
-//      EncryptedExtensions / Finished with no Certificate or CertificateVerify.
+//      pushes one or more NewSessionTickets after .connected (§4.6.1). Each
+//      accepted ticket is write-through to the file store together with the §7.2
+//      PSK derived from this session's resumption master secret.
+//   2. The second dial draws its resumption PSKs from the same store — dial()
+//      appends store.resumption_psks() to the ClientHello's pre_shared_key list
+//      — so no in-memory PSK plumbing is needed between the two flights. The
+//      server picks one, echoes its index, and the second flight shortens to
+//      ClientHello / ServerHello / EncryptedExtensions / Finished. After
+//      resumption the used PSK is burned (§8.6: single-use).
+//
+// The store lives in tickets.bin under a temp dir and is not wiped at the end,
+// so a later run can resume on tickets this run persisted.
 module main
 
+import os
 import time
 import tls
 import tls.handshake
@@ -28,8 +35,17 @@ import tls.handshake
 const first_psk_key = [u8(0x42)].repeat(32)
 const first_psk_identity = 'example-external-first'.bytes()
 
+// ticket_dir holds tickets.bin, the persisted resumption state. A fixed path
+// lets the store outlive this process; the next run reopens it.
+const ticket_dir = os.join_path(os.temp_dir(), 'tls_psk_connect')
+
 fn run() ! {
-	// ── First connection: certificate handshake, collect tickets ──
+	// One store for the whole run: it outlives both connections, so tickets
+	// accepted on the first are available to seed the second, and everything
+	// survives in tickets.bin for the next run.
+	mut store := tls.new_file_ticket_store(ticket_dir)! or { return err }
+
+	// ── First connection: certificate handshake, tickets flow into the store ──
 	cfg := tls.Config{
 		server_name:          'cloudflare.com'
 		insecure_skip_verify: false
@@ -37,12 +53,13 @@ fn run() ! {
 		root_cas:             none
 		min_rsa_bits:         0
 		psks:                 [handshake.new_psk(first_psk_identity, first_psk_key)!]
+		session_ticket_store: tls.SessionTicketStore(store)
 		timeout:              30 * time.second
 	}
 
 	println('connecting to cloudflare.com:443 (first handshake, external PSK offer)...')
 	t0 := time.now()
-	mut conn := tls.dial('cloudflare.com:443', cfg)!
+	mut conn := tls.dial('cloudflare.com:443', cfg)! or { return err }
 	elapsed1 := time.since(t0)
 	println('connected; ALPN: "${conn.negotiated_alpn()}"')
 	println('first handshake took ${elapsed1.str()}')
@@ -53,37 +70,38 @@ fn run() ! {
 	nr := conn.read(mut buf)! or { return err }
 	println('received ${nr} bytes on first connection')
 
-	// Derive resumption PSKs BEFORE close(): Conn.close() runs
-	// zeroize_traffic_secrets(), which retires the Resumption Master Secret the
-	// §7.2 chain needs. session_tickets() itself is diagnostic — the raw
-	// tokens are opaque to us; the derived Psk is what carries the key.
-	resume_psks := conn.resumption_psks()!
-	println('resumption PSKs derived: ${resume_psks.len}')
-	if resume_psks.len > 0 {
-		first := conn.session_tickets()[0]
-		println('first ticket lifetime=${first.lifetime()}s, PSK identity size=${resume_psks[0].identity().len} bytes')
-	}
+	// The store write-throughd each accepted ticket during the handshake, so its
+	// PSKs survive conn.close() (which zeroizes the traffic secrets this
+	// example's in-memory derivation would otherwise need).
+	mut persisted := store.resumption_psks()
+	println('tickets received: ${conn.session_tickets().len}; resumption PSKs persisted: ${persisted.len}')
+
 	conn.close()! or { return err }
-
-	if resume_psks.len == 0 {
-		println('no tickets issued by the server; skipping the resumption attempt')
-		return
-	}
-
-	// ── Second connection: offer the resumption PSKs ──
+	// dial() appends store.resumption_psks() to cfg2.psks automatically, so no
+	// caller-supplied psks are needed here.
 	cfg2 := tls.Config{
 		server_name:          'cloudflare.com'
 		insecure_skip_verify: false
 		hsk_options:          handshake.HandshakeOptions{}
 		root_cas:             none
 		min_rsa_bits:         0
-		psks:                 resume_psks
+		session_ticket_store: tls.SessionTicketStore(store)
 		timeout:              30 * time.second
 	}
 
-	println('connecting to cloudflare.com:443 (second handshake, resumption PSK offer)...')
+	// Mirror dial()'s second-flight offer so negotiated_psk_index() maps onto a
+	// real identity we can burn (§8.6: a resumed PSK is single-use).
+	mut offered := [][]u8{}
+	for p in store.resumption_psks() {
+		if p.identity() in offered {
+			continue
+		}
+		offered << p.identity().clone()
+	}
+
+	println('connecting to cloudflare.com:443 (second handshake, store-seeded resumption offer)...')
 	t2 := time.now()
-	mut conn2 := tls.dial('cloudflare.com:443', cfg2)!
+	mut conn2 := tls.dial('cloudflare.com:443', cfg2)! or { return err }
 	elapsed2 := time.since(t2)
 	println('connected; ALPN: "${conn2.negotiated_alpn()}"')
 	println('second handshake took ${elapsed2.str()}')
@@ -93,6 +111,7 @@ fn run() ! {
 	// peer ran a full certificate handshake; an int means resumption fired.
 	if idx := conn2.negotiated_psk_index() {
 		println('resumed via PSK index ${idx}')
+		store.consume(offered[int(idx)])
 	} else {
 		println('PSK offer declined; full certificate handshake')
 	}
@@ -102,14 +121,15 @@ fn run() ! {
 	nr2 := conn2.read(mut buf2)! or { return err }
 	println('received ${nr2} bytes on second connection')
 
-	new_tickets := conn2.resumption_psks()!
-	println('second-connection tickets issued: ${new_tickets.len}')
+	// Tickets accepted on the resumed connection are write-through too.
+	mut refreshed := store.resumption_psks()
+	println('resumption PSKs persisted after the second connection: ${refreshed.len}')
 
 	conn2.close()! or { return err }
 
 	println('=== Timing summary ===')
 	println('First handshake  (external PSK offer, cert auth): ${elapsed1.str()}')
-	println('Second handshake (resumption PSK offer):          ${elapsed2.str()}')
+	println('Second handshake (store-seeded resumption offer): ${elapsed2.str()}')
 	if elapsed2.milliseconds() < elapsed1.milliseconds() {
 		diff := elapsed1.milliseconds() - elapsed2.milliseconds()
 		println('handshake saved ${diff} ms')
