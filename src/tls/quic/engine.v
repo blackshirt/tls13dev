@@ -492,11 +492,16 @@ fn (mut e Engine) handle_frames(ptype PacketType, payload []u8) ! {
 				cf, used := parse_crypto_frame(body) or {
 					return error('quic: invalid CRYPTO frame: ${err.msg()}')
 				}
-				// 1-RTT CRYPTO is post-handshake traffic (NewSessionTicket), which
-				// this handshake-only engine does not consume. Discarding it keeps a
-				// server's ticket flight from blocking the HANDSHAKE_DONE that
-				// confirms the connection (RFC 9001 §4.1.4).
-				if ptype != .one_rtt {
+				if ptype == .one_rtt {
+					// RFC 9001 §5.3: TLS KeyUpdate does not exist over QUIC; an
+					// endpoint MUST NOT send one, and receiving one is a
+					// PROTOCOL_VIOLATION. NewSessionTicket is the only legitimate
+					// 1-RTT CRYPTO content; this handshake-only engine discards
+					// everything else. KeyUpdate is handshake type 24 (0x18).
+					if cf.data.len > 0 && cf.data[0] == 24 {
+						return error('quic: TLS KeyUpdate received over QUIC (PROTOCOL_VIOLATION, RFC 9001 §5.3)')
+					}
+				} else {
 					e.deliver_crypto(ptype, cf)!
 				}
 				off += 1 + used

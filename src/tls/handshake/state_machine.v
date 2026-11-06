@@ -685,9 +685,14 @@ fn (mut h HandshakeCore) handle_finished(full_msg []u8, body []u8) ![]HandshakeM
 
 	// RFC 8446 §4.6.1/§4.5.5.1 let the server coalesce NewSessionTicket (type 4)
 	// or KeyUpdate (type 24) behind its Finished; those stay buffered for the
-	// adapter's take_buffered_handshake_bytes. Any other leading byte is flight garbage.
+	// adapter's take_buffered_handshake_bytes. Over QUIC, KeyUpdate is prohibited
+	// (RFC 9001 §5.3) — only NewSessionTicket may trail Finished. Any other
+	// leading byte is flight garbage.
 	if h.reassembly.len > 0 {
 		leading := h.reassembly[0]
+		if h.config.is_quic && leading == u8(24) {
+			return h.classify_failure(.unexpected_message, 'handshake: KeyUpdate trailing Finished over QUIC (PROTOCOL_VIOLATION, RFC 9001 §5.3)')
+		}
 		if leading != u8(4) && leading != u8(24) {
 			return h.classify_failure(.decode_error, 'handshake: unexpected trailing data after server Finished in handshake flight')
 		}
