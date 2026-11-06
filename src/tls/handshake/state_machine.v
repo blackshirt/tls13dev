@@ -22,15 +22,16 @@ import x.crypto.curve25519
 // RFC 8446 Appendix A.1 (all-caps RFC names carry no formal meaning, so rendered here in
 // snake_case); `failed` is an implementation terminal the RFC does not define.
 pub enum HandshakeState {
-	start         // RFC START: nothing sent yet; create_client_hello moves us out of here
-	wait_sh       // RFC WAIT_SH: ClientHello sent; awaiting ServerHello or HelloRetryRequest
-	wait_ee       // RFC WAIT_EE: ServerHello accepted; awaiting EncryptedExtensions
-	wait_cert_cr  // RFC WAIT_CERT_CR: awaiting CertificateRequest or Certificate
-	wait_cert     // RFC WAIT_CERT: awaiting Certificate
-	wait_cv       // RFC WAIT_CV: awaiting CertificateVerify
-	wait_finished // RFC WAIT_FINISHED: awaiting Finished
-	connected     // RFC CONNECTED: server Finished verified; application data may flow
-	failed        // implementation terminal; no further handshake messages are accepted
+	start            // RFC START: nothing sent yet; create_client_hello moves us out of here
+	wait_sh          // RFC WAIT_SH: ClientHello sent; awaiting ServerHello or HelloRetryRequest
+	wait_ee          // RFC WAIT_EE: ServerHello accepted; awaiting EncryptedExtensions
+	wait_cert_cr     // RFC WAIT_CERT_CR: awaiting CertificateRequest or Certificate
+	wait_cert        // RFC WAIT_CERT: awaiting Certificate
+	wait_cert_status // RFC: awaiting CertificateStatus (OCSP stapling response)
+	wait_cv          // RFC WAIT_CV: awaiting CertificateVerify
+	wait_finished    // RFC WAIT_FINISHED: awaiting Finished
+	connected        // RFC CONNECTED: server Finished verified; application data may flow
+	failed           // implementation terminal; no further handshake messages are accepted
 }
 
 // HandshakeMessage is one outbound handshake message, unframed: msg holds the wire
@@ -86,6 +87,9 @@ pub mut:
 	// quic_transport_parameters extension (RFC 9001 §8.2), copied through without
 	// interpretation: the adapter above encodes and decodes it.
 	quic_transport_params []u8
+	// request_ocsp_stapling, when true, includes the status_request extension
+	// in the ClientHello to ask the server to staple an OCSP response (RFC 6066 §8).
+	request_ocsp_stapling bool
 }
 
 // with_validator returns a copy of the options with the given validator, preserving
@@ -103,6 +107,7 @@ pub fn (o HandshakeOptions) with_validator(validator pki.Validator) HandshakeOpt
 		random:                o.random.clone()
 		quic_transport_params: o.quic_transport_params
 		psks:                  o.psks.clone()
+		request_ocsp_stapling: o.request_ocsp_stapling
 	}
 }
 
@@ -149,6 +154,10 @@ mut:
 	// Certificate chain received from the server, leaf first; validated against the
 	// immutable validator declared above.
 	server_certs []pki.Certificate // certificates received from the server, leaf first
+
+	// OCSP stapling: the stapled OCSP response from the server's CertificateStatus
+	// message, if status_request was offered and the server stapled a response.
+	ocsp_stapled_response ?[]u8
 
 	// CertificateRequest echo state: the server asked for client auth; the client
 	// must answer with an (empty) Certificate only after the server flight is
@@ -219,6 +228,7 @@ fn new_handshake_core(server_name string, options HandshakeOptions, is_quic bool
 			}
 			cookie:                []u8{}
 			cookie_received:       false
+			request_ocsp_stapling: options.request_ocsp_stapling
 		}
 		transcript: new_transcript(.sha256)
 		hash_algo:  .sha256
@@ -257,7 +267,7 @@ pub fn (h &HandshakeCore) state() HandshakeState {
 // flight, the window in which handshake-phase bytes are legal.
 fn (h &HandshakeCore) is_in_flight() bool {
 	return match h.state {
-		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cv, .wait_finished { true }
+		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cert_status, .wait_cv, .wait_finished { true }
 		else { false }
 	}
 }
@@ -322,6 +332,7 @@ fn (mut h HandshakeCore) handle_handshake_message(full_msg []u8) ![]HandshakeMes
 		.encrypted_extensions { return h.handle_encrypted_extensions(full_msg, body) }
 		.certificate_request { return h.handle_certificate_request(full_msg, body) }
 		.certificate { return h.handle_certificate(full_msg, body) }
+		.certificate_status { return h.handle_certificate_status(full_msg, body) }
 		.certificate_verify { return h.handle_certificate_verify(full_msg, body) }
 		.finished { return h.handle_finished(full_msg, body) }
 		else {
@@ -553,7 +564,36 @@ fn (mut h HandshakeCore) handle_certificate(full_msg []u8, body []u8) ![]Handsha
 		}
 		h.server_certs << cert
 	}
-	h.validator.verify_certificate_chain(h.server_certs, h.config.server_name) or {
+	// Validate the chain structure and signatures, but defer revocation when
+	// OCSP stapling was requested: the stapled OCSP response arrives in the
+	// following CertificateStatus message and must be fed into the revocation
+	// checker before accept/reject.
+	h.validator.verify_certificate_chain(h.server_certs, h.config.server_name, h.config.request_ocsp_stapling) or {
+		return h.fail_with(.bad_certificate, err)
+	}
+	if h.config.request_ocsp_stapling {
+		h.state = .wait_cert_status
+		return []HandshakeMessage{}
+	}
+	h.state = .wait_cv
+	return []HandshakeMessage{}
+}
+
+// handle_certificate_status processes a stapled OCSP response from the server's
+// CertificateStatus message (RFC 6066 §8) and runs the deferred revocation check.
+// Only reachable when the ClientHello offered status_request.
+fn (mut h HandshakeCore) handle_certificate_status(full_msg []u8, body []u8) ![]HandshakeMessage {
+	if !h.config.request_ocsp_stapling {
+		return h.classify_failure(.unexpected_message, 'handshake: CertificateStatus received without status_request offered')
+	}
+	h.update_transcript(full_msg)!
+	ocsp_response := parse_certificate_status(body) or {
+		return h.fail_with(.decode_error, err)
+	}
+	h.ocsp_stapled_response = ocsp_response
+	// Deferred revocation check with the stapled OCSP response fed into the
+	// RevocationContext for the checker.
+	h.validator.check_revocation(h.server_certs, h.config.server_name, ocsp_response) or {
 		return h.fail_with(.bad_certificate, err)
 	}
 	h.state = .wait_cv

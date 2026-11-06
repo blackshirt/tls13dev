@@ -613,6 +613,44 @@ fn test_parse_name_constraints_explicit_multi_entry() ! {
 	assert c.permitted_dns == ['example.com', 'example.org']
 }
 
+// test_parse_aia_ocsp_urls: the AuthorityInfoAccess extension (RFC 5280
+// §4.2.2.1) must yield only the id-ad-ocsp URI locations; id-ad-caIssuers and
+// non-URI accessLocations are ignored.
+fn test_parse_aia_ocsp_urls() ! {
+	// AccessDescription ::= SEQUENCE { accessMethod OID, accessLocation GeneralName }
+	ocsp_method := [u8(0x06), 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01] // id-ad-ocsp
+	ocsp_loc := der_tlv(0x86, ['http://ocsp.example.com/'.bytes()])
+	ocsp_ad := der_tlv(0x30, [ocsp_method, ocsp_loc])
+	ca_method := [u8(0x06), 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02] // id-ad-caIssuers
+	ca_loc := der_tlv(0x82, ['ca.example.com'.bytes()]) // dNSName, not a URI
+	ca_ad := der_tlv(0x30, [ca_method, ca_loc])
+	aia_value := der_tlv(0x30, [ocsp_ad, ca_ad])
+	aia_oid := [u8(0x06), 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01] // 1.3.6.1.5.5.7.1.1
+
+	c := parse_certificate(minimal_extension_cert(aia_oid, false, aia_value))!
+	assert c.ocsp_urls == ['http://ocsp.example.com/']
+}
+
+// test_parse_crl_distribution_points: the fullName URI of each DistributionPoint
+// (RFC 5280 §4.2.1.13) must be decoded, in both the OpenSSL double-[0] form
+// (CHOICE + implicit GeneralNames) and the explicitly-SEQUENCE-wrapped form.
+fn test_parse_crl_distribution_points() ! {
+	uri_body := 'http://example.com/ca.crl'.bytes()
+	uri := der_tlv(0x86, [uri_body])
+	cdp_oid := [u8(0x06), 0x03, 0x55, 0x1d, 0x1f] // 2.5.29.31
+
+	// OpenSSL form: distributionPoint [0] > fullName [0] > GeneralName* directly.
+	dp_openssl := der_tlv(0x30, [der_tlv(0xa0, [der_tlv(0xa0, [uri])])])
+	// Explicit form: distributionPoint [0] > fullName [0] > SEQUENCE OF GeneralName.
+	dp_explicit := der_tlv(0x30, [der_tlv(0xa0, [der_tlv(0xa0, [der_tlv(0x30, [uri])])])])
+	// A point with only [1] reasons carries no locator and contributes nothing.
+	dp_no_locator := der_tlv(0x30, [[u8(0x81), 0x01, 0x00]])
+
+	cdp_value := der_tlv(0x30, [dp_openssl, dp_explicit, dp_no_locator])
+	c := parse_certificate(minimal_extension_cert(cdp_oid, false, cdp_value))!
+	assert c.crl_distribution_points == ['http://example.com/ca.crl', 'http://example.com/ca.crl']
+}
+
 // test_parse_name_constraints_explicit_and_implicit_mixed: a [0] field that is
 // EXPLICIT with a single entry is byte-identical to an IMPLICIT single entry;
 // both must parse to the same result.

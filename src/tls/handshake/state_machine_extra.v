@@ -151,6 +151,7 @@ fn (h &HandshakeCore) is_handshake_message_accepted(msg_type HandshakeType) bool
 			}
 		}
 		.wait_cert { msg_type == .certificate }
+		.wait_cert_status { msg_type == .certificate_status }
 		.wait_cv { msg_type == .certificate_verify }
 		.wait_finished { msg_type == .finished }
 		else { false }

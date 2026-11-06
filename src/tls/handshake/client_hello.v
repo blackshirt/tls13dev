@@ -170,6 +170,11 @@ mut:
 	// quic_transport_params is the already-encoded extension content, built by
 	// the QUIC adapter; it is required when is_quic is true.
 	quic_transport_params ?[]u8
+	// request_ocsp_stapling, when true, includes the status_request extension
+	// (type 5, empty data) asking the server to staple an OCSP response for the
+	// leaf certificate (RFC 6066 §8 / RFC 8446 §4.2.13). The stapled response
+	// arrives in a CertificateStatus handshake message after Certificate.
+	request_ocsp_stapling bool
 }
 
 // offered_cipher_suites returns the configured suites or the built-in defaults.
@@ -354,6 +359,15 @@ fn build_client_hello(cfg ClientHelloConfig) !([]u8, []u8) {
 		mut ext_w := wire.new_writer(params.len + 4)
 		write_extension(mut ext_w, .quic_transport_parameters, params)!
 		ext_bytes << ext_w.bytes()
+	}
+
+	// status_request: request OCSP stapling (RFC 6066 §8 / RFC 8446 §4.2.13).
+	// Extension data is empty; the server replies with a CertificateStatus
+	// message carrying the stapled OCSP response if it supports stapling.
+	if cfg.request_ocsp_stapling {
+		mut sr_w := wire.new_writer(4)
+		write_extension(mut sr_w, .status_request, [])!
+		ext_bytes << sr_w.bytes()
 	}
 
 	// cookie (RFC 8446 §4.2.2) — echoed after HelloRetryRequest. RFC 8446 §4.1.4

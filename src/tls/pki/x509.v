@@ -113,6 +113,15 @@ pub:
 	permitted_ip [][]u8
 	// Excluded iPAddress subtrees as address+mask byte pairs.
 	excluded_ip [][]u8
+	// OCSP responder locators from the authorityInfoAccess extension
+	// (id-ad-ocsp entries with a URI accessLocation, RFC 6960 §4.2.1); empty
+	// when the extension or such an entry is absent. Consumed by
+	// RevocationChecker implementations, never by the Validator itself.
+	ocsp_urls []string
+	// CRL distribution point URIs from the crlDistributionPoints extension
+	// (RFC 5280 §4.2.1.13, fullName form only); empty when absent. Consumed by
+	// RevocationChecker implementations, never by the Validator itself.
+	crl_distribution_points []string
 	// BIT STRING contents of signatureValue.
 	signature []u8
 }
@@ -324,6 +333,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 	mut excluded_dns := []string{}
 	mut permitted_ip := [][]u8{}
 	mut excluded_ip := [][]u8{}
+	mut ocsp_urls := []string{}
+	mut crl_distribution_points := []string{}
 	// RFC 5280 §4.2: each extension OID may appear at most once; a duplicate must
 	// not overwrite the first.
 	mut seen_ext_oids := []string{}
@@ -384,6 +395,12 @@ pub fn parse_certificate(der []u8) !Certificate {
 							// §6.1.4: propagate the parse error rather than accept an empty constraint set.
 							permitted_dns, excluded_dns, permitted_ip, excluded_ip = parse_name_constraints(ext_val_bytes)!
 						}
+						'2.5.29.31' { // CRL Distribution Points (RFC 5280 §4.2.1.13)
+							crl_distribution_points = parse_crl_distribution_points(ext_val_bytes)!
+						}
+						'1.3.6.1.5.5.7.1.1' { // Authority Info Access (RFC 5280 §4.2.2.1)
+							ocsp_urls = parse_ocsp_urls(ext_val_bytes)!
+						}
 						else {
 							// RFC 5280 §4.2: an unknown critical extension MUST be rejected
 							// (a constrained CA must not issue outside its sandbox).
@@ -436,6 +453,8 @@ pub fn parse_certificate(der []u8) !Certificate {
 		excluded_dns:             excluded_dns
 		permitted_ip:             permitted_ip
 		excluded_ip:              excluded_ip
+		ocsp_urls:                ocsp_urls
+		crl_distribution_points:  crl_distribution_points
 		signature:                signature_bytes
 	}
 }
@@ -583,6 +602,103 @@ fn parse_san_extension(ext_bytes []u8) ([]string, [][]u8) {
 		}
 	}
 	return dns, ip
+}
+
+// collect_general_name_uris appends every uniformResourceIdentifier ([6] = 0x86)
+// found in the given bytes to uris, descending through the SEQUENCE [0] wrapper
+// forms that GeneralNames appears behind (RFC 5280 §4.2.1.13 fullName and
+// RFC 6960 §4.2.1 accessLocation). Other GeneralName forms are ignored: a
+// revocation locator that is not a URI cannot be fetched by any checker.
+@[direct_array_access]
+fn collect_general_name_uris(bytes []u8, mut uris []string) {
+	mut r := wire.new_reader(bytes)
+	for r.remaining() > 0 {
+		el := read_asn1_element(mut r) or {
+			return
+		}
+		if el.tag == 0x86 { // [6] uniformResourceIdentifier
+			uris << el.data.bytestr()
+		} else if el.tag == 0x30 || el.tag == 0xa0 {
+			collect_general_name_uris(el.data, mut uris)
+		}
+	}
+}
+
+// parse_crl_distribution_points decodes a crlDistributionPoints extension
+// (RFC 5280 §4.2.1.13) and returns the URI of every fullName distribution
+// point. reasons and cRLIssuer are ignored; nameRelativeToCRLIssuer carries no
+// fetchable locator. Structural failures are fatal, matching the module's
+// policy for known extensions.
+@[direct_array_access]
+fn parse_crl_distribution_points(ext_bytes []u8) ![]string {
+	inner := unwrap_octet_string(ext_bytes)
+	mut r := wire.new_reader(inner)
+	seq := read_asn1_element(mut r) or {
+		return error('x509: crlDistributionPoints is not a decodable SEQUENCE')
+	}
+	if seq.tag != 0x30 {
+		return error('x509: crlDistributionPoints has unexpected tag 0x${seq.tag:02x}')
+	}
+	mut uris := []string{}
+	mut dps := wire.new_reader(seq.data)
+	for dps.remaining() > 0 {
+		dp := read_asn1_element(mut dps) or {
+			return error('x509: malformed DistributionPoint')
+		}
+		if dp.tag != 0x30 {
+			return error('x509: DistributionPoint is not a SEQUENCE (0x${dp.tag:02x})')
+		}
+		mut fields := wire.new_reader(dp.data)
+		for fields.remaining() > 0 {
+			field := read_asn1_element(mut fields) or {
+				return error('x509: malformed DistributionPoint field')
+			}
+			// distributionPoint [0] → DistributionPointName CHOICE → fullName [0]
+			if field.tag == 0xa0 {
+				collect_general_name_uris(field.data, mut uris)
+			}
+			// [1] reasons and [2] cRLIssuer carry no locator.
+		}
+	}
+	return uris
+}
+
+// parse_ocsp_urls decodes an authorityInfoAccess extension (RFC 5280 §4.2.2.1)
+// and returns the accessLocation URI of every id-ad-ocsp AccessDescription
+// (RFC 6960 §4.2.1). Other access methods (e.g. id-ad-caIssuers) are ignored.
+@[direct_array_access]
+fn parse_ocsp_urls(ext_bytes []u8) ![]string {
+	inner := unwrap_octet_string(ext_bytes)
+	mut r := wire.new_reader(inner)
+	seq := read_asn1_element(mut r) or {
+		return error('x509: authorityInfoAccess is not a decodable SEQUENCE')
+	}
+	if seq.tag != 0x30 {
+		return error('x509: authorityInfoAccess has unexpected tag 0x${seq.tag:02x}')
+	}
+	mut uris := []string{}
+	mut ads := wire.new_reader(seq.data)
+	for ads.remaining() > 0 {
+		ad := read_asn1_element(mut ads) or {
+			return error('x509: malformed AccessDescription')
+		}
+		if ad.tag != 0x30 {
+			return error('x509: AccessDescription is not a SEQUENCE (0x${ad.tag:02x})')
+		}
+		mut fields := wire.new_reader(ad.data)
+		method := read_asn1_element(mut fields) or {
+			return error('x509: AccessDescription missing accessMethod')
+		}
+		location := read_asn1_element(mut fields) or {
+			return error('x509: AccessDescription missing accessLocation')
+		}
+		// accessLocation is a bare GeneralName; only the URI form identifies a
+		// fetchable OCSP responder (RFC 6960 §4.2.1).
+		if method.tag == 0x06 && parse_oid(method.data) == '1.3.6.1.5.5.7.48.1' && location.tag == 0x86 { // id-ad-ocsp
+			uris << location.data.bytestr()
+		}
+	}
+	return uris
 }
 
 // parse_name_constraints decodes a nameConstraints extension. Per RFC 5280

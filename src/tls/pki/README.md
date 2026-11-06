@@ -33,8 +33,9 @@ constructor so the dangerous intent is spelled out at the call site rather than 
 ```
 asn1.v         bounds-checked ASN.1/DER element reader (tags, lengths, SEQUENCE)
 x509.v         X.509 v3 certificate + extension decoding (SAN, basicConstraints,
-               keyUsage, EKU, nameConstraints)
+               keyUsage, EKU, nameConstraints, AIA/OCSP URIs, CRLDP URIs)
 validator.v    chain building, path validation, trust anchoring, signature dispatch
+revocation.v   optional caller-supplied RevocationChecker interface
 hostname.v     RFC 6125 presentation-identifier matching (dNSName/CN/IP)
 rsa.v          RSASSA-PKCS1-v1_5 and RSASSA-PSS chain-signature verification
 trust_store.v  system trust bundle loading + process-wide cached roots
@@ -81,8 +82,15 @@ This module treats parsing as the attack surface it is:
 
 ## Revocation
 
-CRL and OCSP are **not** implemented: a revoked-but-unexpired certificate is accepted. A caller
-needing revocation must validate out of band before trusting the connection.
+CRL and OCSP fetching are **not** implemented — the module has no network dependencies. Instead a
+caller may supply a `RevocationChecker` through `tls.Config.revocation_checker` or
+`Validator.set_revocation_checker`. When one is set, it is invoked once per certificate in the
+validated path (leaf + intermediates, excluding the trusted anchor) after every other rule passes;
+a `.revoked` result rejects the chain and a checker error aborts validation (fail-closed). When
+none is set — the default — a revoked-but-unexpired certificate is accepted. To keep user-supplied
+checkers implementable, `parse_certificate` decodes the `authorityInfoAccess` OCSP URIs into
+`Certificate.ocsp_urls` and `crlDistributionPoints` fullName URIs into
+`Certificate.crl_distribution_points`, exposed to checkers through `RevocationContext.certificate`.
 
 ## Testing
 

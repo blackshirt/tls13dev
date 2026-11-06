@@ -162,7 +162,7 @@ fn test_is_ip_literal() {
 fn test_verify_certificate_chain_rejects_empty_hostname() ! {
 	validator := new_validator(new_trust_store())
 	leaf := Certificate{}
-	validator.verify_certificate_chain([leaf], '') or {
+	validator.verify_certificate_chain([leaf], '', false) or {
 		assert err.msg().contains('empty server name')
 		return
 	}
@@ -235,7 +235,7 @@ fn test_verify_certificate_chain_ignores_peer_tail_after_anchor() ! {
 
 	// This unrelated certificate would fail issuer/subject and signature checks
 	// if the verifier continued past the directly trusted first certificate.
-	v.verify_certificate_chain([root_and_leaf, Certificate{}], 'example.com')!
+	v.verify_certificate_chain([root_and_leaf, Certificate{}], 'example.com', false)!
 }
 
 // test_server_auth_eku_required_on_intermediate pins EKU purpose across the path:
@@ -271,7 +271,7 @@ fn test_server_auth_eku_required_on_intermediate() ! {
 	}
 	mut v := new_validator(new_trust_store())
 	v.store.certs << root
-	v.verify_certificate_chain([leaf, intermediate], 'example.com') or {
+	v.verify_certificate_chain([leaf, intermediate], 'example.com', false) or {
 		assert err.msg().contains('serverAuth')
 		return
 	}
@@ -349,7 +349,7 @@ fn test_set_min_rsa_bits_escape_hatch() {
 // empty store a chain is still verified (and here refused) rather than skipped.
 fn test_new_validator_always_verifies() ! {
 	mut v := new_validator(new_trust_store())
-	v.verify_certificate_chain([]Certificate{}, 'example.com') or {
+	v.verify_certificate_chain([]Certificate{}, 'example.com', false) or {
 		assert err.msg().contains('empty certificate chain')
 		return
 	}
@@ -361,7 +361,7 @@ fn test_new_validator_always_verifies() ! {
 // explicit, greppable constructor name.
 fn test_new_insecure_validator_skips_everything() ! {
 	mut v := new_insecure_validator()
-	v.verify_certificate_chain([]Certificate{}, 'example.com')!
+	v.verify_certificate_chain([]Certificate{}, 'example.com', false)!
 }
 
 // test_verify_cert_signature_errors_on_tampered_rsa_signature locks the

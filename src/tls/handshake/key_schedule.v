@@ -414,7 +414,7 @@ pub fn (h &HandshakeCore) traffic_keys() !TrafficKeys {
 		.start, .wait_sh, .failed {
 			return error('handshake: traffic keys unavailable (handshake secrets after ServerHello, application secrets at .connected)')
 		}
-		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cv, .wait_finished {
+		.wait_ee, .wait_cert_cr, .wait_cert, .wait_cert_status, .wait_cv, .wait_finished {
 			if h.c_hsk_tsec.len == 0 || h.s_hsk_tsec.len == 0 {
 				return error('handshake: handshake traffic keys unavailable (available after ServerHello)')
 			}

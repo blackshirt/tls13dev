@@ -20,6 +20,7 @@ enum HandshakeType as u8 {
 	certificate_request  = 13 // server→client auth; client holds no credential, so it answers with an empty Certificate (§4.4.2)
 	certificate_verify   = 15
 	finished             = 20
+	certificate_status   = 22 // OCSP stapling response (RFC 6066 §8)
 	key_update           = 24
 	// Synthetic: after a HelloRetryRequest, ClientHello1 becomes a message_hash (RFC 8446 §4.4.1).
 	message_hash         = 254
@@ -37,6 +38,7 @@ fn handshake_type_from_u8(b u8) !HandshakeType {
 		13 { .certificate_request }
 		15 { .certificate_verify }
 		20 { .finished }
+		22 { .certificate_status }
 		24 { .key_update }
 		254 { .message_hash }
 		else { error('handshake: unknown HandshakeType ${b}') }
@@ -55,6 +57,9 @@ enum ExtensionType as u16 {
 	cookie                    = 44
 	key_share                 = 51
 	quic_transport_parameters = 57
+	// status_request (RFC 6066 §8, RFC 8446 §4.2.13): empty extension_data in
+	// ClientHello requests OCSP stapling; absent data means "no stapling requested".
+	status_request            = 5
 	// RFC 5746 §4.1, not RFC 8446: servers may carry it in EncryptedExtensions unoffered.
 	renegotiation_info        = 65281 // 0xff01
 	// pre_shared_key carries PSK identities (ClientHello) or the server's

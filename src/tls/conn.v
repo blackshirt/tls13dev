@@ -156,6 +156,18 @@ pub:
 	root_cas ?pki.TrustStore
 	// min_rsa_bits floors the accepted RSA leaf key size; 0 keeps the 2048-bit default.
 	min_rsa_bits int
+	// revocation_checker, when set, replaces the default NoCheck checker and is
+	// invoked once per certificate in the validated path after all other
+	// validation rules pass. A .revoked result rejects the chain; an error from
+	// the checker aborts validation (fail-closed). When unset (the default),
+	// revocation is not checked — a revoked-but-unexpired certificate is accepted.
+	revocation_checker ?pki.RevocationChecker
+	// request_ocsp_stapling, when true, includes the status_request extension
+	// in the ClientHello to ask the server to staple an OCSP response for the
+	// leaf certificate (RFC 6066 §8 / RFC 8446 §4.2.13). The stapled response
+	// arrives in a CertificateStatus message and is fed into the revocation
+	// checker before the chain is accepted or rejected.
+	request_ocsp_stapling bool
 	// psks are the pre-shared keys the client may offer in the ClientHello
 	// (RFC 8446 §4.2.11). Each carries an identity and the shared key material.
 	psks []handshake.Psk
@@ -167,11 +179,12 @@ pub:
 // root store (root_cas stays none, so dial loads it) and keeps verification on.
 pub fn default_config(server_name string) Config {
 	return Config{
-		server_name:          server_name
-		insecure_skip_verify: false
-		root_cas:             none
-		hsk_options:          handshake.HandshakeOptions{}
-		psks:                 []handshake.Psk{}
+		server_name:           server_name
+		insecure_skip_verify:  false
+		root_cas:              none
+		hsk_options:           handshake.HandshakeOptions{}
+		psks:                  []handshake.Psk{}
+		request_ocsp_stapling: false
 	}
 }
 
@@ -226,12 +239,16 @@ pub fn dial(address string, config Config) !&Conn {
 	if config.min_rsa_bits > 0 {
 		validator.set_min_rsa_bits(config.min_rsa_bits)
 	}
+	if config.revocation_checker != none {
+		validator.set_revocation_checker(config.revocation_checker!)
+	}
 	mut options := handshake_options.with_validator(validator)
 	// Config.psks is the dial-facing slot; keep PSKs already supplied through
 	// hsk_options when the shorthand list is empty.
 	if config.psks.len > 0 {
 		options.psks = config.psks.clone()
 	}
+	options.request_ocsp_stapling = config.request_ocsp_stapling
 
 	mut hs := handshake.new_tls_handshake(server_name, options) or {
 		sock.close() or {}

@@ -102,6 +102,40 @@ struct CertificateRequest {
 	request_context []u8 // echoed verbatim in the responding Certificate (§4.4.2)
 }
 
+// parse_certificate_status decodes a CertificateStatus handshake message body
+// (RFC 6066 §8) and returns the stapled OCSP response bytes, if any.
+// The body layout is:
+//   CertificateStatus ::= status_type(1) + response
+//   response (ocsp)   ::= responder_id(2+len) + response_bytes(2+len)
+//   response_bytes    ::= response_status(1) + ocsp_response_data
+@[direct_array_access]
+fn parse_certificate_status(body []u8) ![]u8 {
+	mut r := wire.new_reader(body)
+	status_type := r.read_u8()!
+	if status_type != 1 {
+		return error('handshake: unsupported CertificateStatus status_type ${status_type} (expected ocsp=1)')
+	}
+	responder_id := r.read_vector_u16()!
+	_ = responder_id
+	response_bytes := r.read_vector_u16()!
+	if response_bytes.len == 0 {
+		return error('handshake: empty OCSP response in CertificateStatus')
+	}
+	mut rsp_r := wire.new_reader(response_bytes)
+	response_status := rsp_r.read_u8()!
+	if response_status != 0 {
+		return error('handshake: OCSP response status ${response_status} indicates failure')
+	}
+	ocsp_response := rsp_r.read_vector_u8()!
+	if rsp_r.remaining() != 0 {
+		return error('handshake: trailing bytes in OCSP response')
+	}
+	if ocsp_response.len == 0 {
+		return error('handshake: OCSP response data is empty')
+	}
+	return ocsp_response
+}
+
 // parse_certificate_request decodes the CertificateRequest body (RFC 8446 §4.3.2).
 // The extensions must be well-formed and bounded; their content is not interpreted here.
 @[direct_array_access]

@@ -34,6 +34,16 @@ mut:
 	// min_rsa_bits floors the accepted size of an RSA leaf (server) public key;
 	// 0 means default_min_rsa_bits (lower = deliberate downgrade).
 	min_rsa_bits int
+	// revocation_checker is invoked once per certificate in the validated path
+	// (leaf + intermediates, excluding the trusted anchor) after all other
+	// validation rules pass. Defaults to NoCheck (always .good), preserving
+	// the library's default behavior: a revoked-but-unexpired certificate is
+	// accepted. Replace it via set_revocation_checker to enforce revocation.
+	revocation_checker RevocationChecker
+	// revocation_scope selects which certificates in the validated path the
+	// RevocationChecker is applied to: leaf_only (the default),
+	// intermediates_only, or both.
+	revocation_scope RevocationScope
 }
 
 // new_validator creates a Validator that always performs chain, hostname and
@@ -42,8 +52,10 @@ mut:
 // verification off. Use it for every real peer.
 pub fn new_validator(store TrustStore) Validator {
 	return Validator{
-		store:        store
-		min_rsa_bits: default_min_rsa_bits
+		store:              store
+		min_rsa_bits:       default_min_rsa_bits
+		revocation_checker: &NoCheck{}
+		revocation_scope:   RevocationScope.leaf_only
 	}
 }
 
@@ -56,6 +68,8 @@ pub fn new_insecure_validator() Validator {
 		store:                new_trust_store()
 		insecure_skip_verify: true
 		min_rsa_bits:         default_min_rsa_bits
+		revocation_checker:   &NoCheck{}
+		revocation_scope:     RevocationScope.leaf_only
 	}
 }
 
@@ -75,6 +89,21 @@ pub fn (mut v Validator) set_min_rsa_bits(bits int) {
 	v.min_rsa_bits = if bits < min_rsa_bits_floor { min_rsa_bits_floor } else { bits }
 }
 
+// set_revocation_checker replaces the default NoCheck checker with a caller
+// supplied one (CRL, OCSP, or out-of-band). The Validator invokes it once per
+// certificate in the validated path after all other rules pass; a .revoked
+// result rejects the chain. An error propagates (fail-closed).
+pub fn (mut v Validator) set_revocation_checker(checker RevocationChecker) {
+	v.revocation_checker = checker
+}
+
+// set_revocation_scope selects which certificates in the validated path the
+// attached RevocationChecker is applied to: leaf_only, intermediates_only, or
+// both (the default constructed value).
+pub fn (mut v Validator) set_revocation_scope(scope RevocationScope) {
+	v.revocation_scope = scope
+}
+
 // effective_min_rsa_bits returns the floor in force, applying the default when zero.
 fn (v &Validator) effective_min_rsa_bits() int {
 	if v.min_rsa_bits <= 0 {
@@ -85,7 +114,7 @@ fn (v &Validator) effective_min_rsa_bits() int {
 
 // verify_certificate_chain validates a server's certificate list against the hostname
 // and trusted root store (RFC 5280 & RFC 6125).
-pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string) ! {
+pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname string, skip_revocation bool) ! {
 	if v.insecure_skip_verify {
 		// Deliberate no-op: the escape hatch skips every check below (testing only).
 		return
@@ -196,6 +225,63 @@ pub fn (v &Validator) verify_certificate_chain(chain []Certificate, hostname str
 	// trust path terminates at the first certificate already anchored to a root.
 	if anchor_index < 0 {
 		return error('pki: certificate chain cannot be verified up to a trusted root CA')
+	}
+
+	// Revocation check is skipped when the caller defers it (e.g. OCSP stapling:
+	// the stapled response arrives later in CertificateStatus). Otherwise run it
+	// now with no stapled response (NoCheck default => accept).
+	if !skip_revocation {
+		v.check_revocation(chain, hostname, none)!
+	}
+}
+
+pub fn (v &Validator) check_revocation(chain []Certificate, hostname string, ocsp_response ?[]u8) ! {
+	// Revocation check (CRL/OCSP/out-of-band). Invoked once per certificate in
+	// the validated path (leaf + intermediates, excluding the trusted anchor
+	// itself). A .revoked result rejects the chain; an error propagates
+	// (fail-closed). The default NoCheck checker always returns .good.
+	//
+	// The validated path is chain[0..=validation_end]. Normally validation_end is
+	// the anchor's index, so the loop stops just short of it. The exception is a
+	// directly-trusted leaf (anchor_index == 0, validation_end == 0): there the
+	// leaf itself is the object of trust and is still checked, so the range is
+	// widened to exclude only the (absent) intermediate.
+	if v.revocation_checker == none {
+		return
+	}
+	checker := v.revocation_checker
+	anchor_index := trusted_anchor_index(chain, v.store.certs, time.now().unix())
+	validation_end := if anchor_index >= 0 { anchor_index } else { chain.len - 1 }
+	revocation_end := if anchor_index == 0 { 1 } else { validation_end }
+	for i in 0 .. revocation_end {
+		// Apply the configured scope: leaf_only skips intermediates,
+		// intermediates_only skips the leaf, both checks all in range.
+		match v.revocation_scope {
+			.leaf_only {
+				if i != 0 {
+					continue
+				}
+			}
+			.intermediates_only {
+				if i == 0 {
+					continue
+				}
+			}
+			.both {}
+		}
+		ctx := RevocationContext{
+			certificate:   chain[i]
+			chain:         chain
+			chain_index:   i
+			hostname:      hostname
+			ocsp_response: ocsp_response
+		}
+		status := checker.check(ctx) or {
+			return error('pki: revocation check failed at chain index ${i}: ${err.msg()}')
+		}
+		if status == .revoked {
+			return error('pki: certificate at chain index ${i} is revoked')
+		}
 	}
 }
 

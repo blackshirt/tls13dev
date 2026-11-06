@@ -119,10 +119,12 @@ sibling import (`tls`) relative to the executable's own directory.
   convertible into PSKs via `Conn.resumption_psks()`, but the caller must
   re-offer them through `Config.psks`; nothing persists automatically across
   connections)
-- Certificate **revocation** — CRL and OCSP are not implemented, so a
-  revoked-but-unexpired certificate is accepted; there is no callback hook
-  either. See the [`tls.pki`](src/tls/pki/README.md) README for the rationale
-  and the recommended out-of-band pattern.
+- Certificate **revocation** — CRL and OCSP are not implemented (this library
+  has no network dependencies for them), so by default a revoked-but-unexpired
+  certificate is accepted. A caller may supply a `pki.RevocationChecker`
+  through `Config.revocation_checker` to reject revoked certificates at
+  handshake time; the checker receives the OCSP/CRL-DP URIs parsed from each
+  certificate. See the [`tls.pki`](src/tls/pki/README.md) README.
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A full **QUIC transport stack** (RFC 9000/9001). The in-repo `tls.quic`
   module completes the RFC 9001 handshake and now survives a lossy path: its
