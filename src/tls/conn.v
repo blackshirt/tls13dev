@@ -159,8 +159,9 @@ pub:
 	// revocation_checker, when set, replaces the default NoCheck checker and is
 	// invoked once per certificate in the validated path after all other
 	// validation rules pass. A .revoked result rejects the chain; an error from
-	// the checker aborts validation (fail-closed). When unset (the default),
-	// revocation is not checked — a revoked-but-unexpired certificate is accepted.
+	// the checker aborts validation (fail-closed). When unset (the default), the
+	// validator uses NoCheck, which always returns .good — a revoked-but-unexpired
+	// certificate is accepted, matching prior behavior.
 	revocation_checker ?pki.RevocationChecker
 	// request_ocsp_stapling, when true, includes the status_request extension
 	// in the ClientHello to ask the server to staple an OCSP response for the

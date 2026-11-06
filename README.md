@@ -23,6 +23,7 @@ v run src/example/dial_example.v        # live demo: handshake + HTTP GET over T
 v run src/example/psk_connect.v         # PSK resumption: tickets → PSKs → second dial
 v run src/example/trust_store_example.v # client supplying its own root_cas
 v run src/example/quic_dial_example.v   # QUIC handshake with cloudflare-quic.com:443
+v run src/example/ocsp_dial_example.v   # OCSP stapling: status_request + CertificateStatus
 ```
 
 ```v
@@ -46,7 +47,8 @@ reader returns. Use one `Conn` per thread when a program needs several connectio
 `Config` is a `@[params]` struct: pass named arguments straight to `dial()`;
 omitted fields keep their declared defaults (`default_config()` builds the same
 value). Knobs: `server_name`, `hsk_options`, `root_cas`, `min_rsa_bits`, `psks`,
-`timeout`, and `insecure_skip_verify` (test/lab only — removes all authentication).
+`timeout`, `insecure_skip_verify` (test/lab only — removes all authentication),
+`revocation_checker`, and `request_ocsp_stapling`.
 
 The `tls` module exports only `dial()`, `Conn`, `Config`, `default_config()`,
 and `pki.TrustStore` (behind `Config.root_cas`); record layer and TCP transport
@@ -63,6 +65,7 @@ src/
     dial_example.v        fuller demo (CLI args/flags, HTTP parsing, chunked bodies)
     psk_connect.v         PSK resumption demo (tickets → PSKs → second dial)
     quic_dial_example.v   QUIC handshake with cloudflare-quic.com:443
+    ocsp_dial_example.v   OCSP stapling demo (status_request + CertificateStatus)
   tls/              module `tls`: record layer + public TCP client API
     handshake/      module `tls.handshake`: transport-neutral handshake core
     pki/            module `tls.pki`: X.509/ASN.1 parsing + chain validation
@@ -119,12 +122,16 @@ sibling import (`tls`) relative to the executable's own directory.
   convertible into PSKs via `Conn.resumption_psks()`, but the caller must
   re-offer them through `Config.psks`; nothing persists automatically across
   connections)
-- Certificate **revocation** — CRL and OCSP are not implemented (this library
-  has no network dependencies for them), so by default a revoked-but-unexpired
-  certificate is accepted. A caller may supply a `pki.RevocationChecker`
-  through `Config.revocation_checker` to reject revoked certificates at
-  handshake time; the checker receives the OCSP/CRL-DP URIs parsed from each
-  certificate. See the [`tls.pki`](src/tls/pki/README.md) README.
+- Certificate **revocation** — CRL fetching is not implemented (no network
+  dependencies), but a caller may supply a `pki.RevocationChecker` through
+  `Config.revocation_checker` to reject revoked certificates at handshake time;
+  the checker receives `RevocationContext` (certificate, chain position, and any
+  stapled OCSP response) and returns `.good` / `.revoked` / an error (fail-closed).
+  The default `NoCheck` checker accepts everything, matching prior behavior. OCSP
+  stapling is available via `Config.request_ocsp_stapling`: the ClientHello offers
+  `status_request`, the server's stapled OCSP response arrives in `CertificateStatus`,
+  and is fed into the revocation checker before the chain is accepted or rejected.
+  See [`tls.pki`](src/tls/pki/README.md).
 - TLS 1.2 and below (legacy fields are wired for compatibility only)
 - A full **QUIC transport stack** (RFC 9000/9001). The in-repo `tls.quic`
   module completes the RFC 9001 handshake and now survives a lossy path: its

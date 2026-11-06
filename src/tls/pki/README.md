@@ -86,11 +86,28 @@ CRL and OCSP fetching are **not** implemented — the module has no network depe
 caller may supply a `RevocationChecker` through `tls.Config.revocation_checker` or
 `Validator.set_revocation_checker`. When one is set, it is invoked once per certificate in the
 validated path (leaf + intermediates, excluding the trusted anchor) after every other rule passes;
-a `.revoked` result rejects the chain and a checker error aborts validation (fail-closed). When
-none is set — the default — a revoked-but-unexpired certificate is accepted. To keep user-supplied
-checkers implementable, `parse_certificate` decodes the `authorityInfoAccess` OCSP URIs into
-`Certificate.ocsp_urls` and `crlDistributionPoints` fullName URIs into
-`Certificate.crl_distribution_points`, exposed to checkers through `RevocationContext.certificate`.
+a `.revoked` result rejects the chain and a checker error aborts validation (fail-closed).
+
+**Default checker.** The `Validator` is constructed with `NoCheck`, a non-public
+`RevocationChecker` that always returns `.good`. This matches prior behavior: a revoked-but-unexpired
+certificate is accepted unless a real checker is installed. Replace it through
+`Validator.set_revocation_checker`.
+
+**Scope.** `RevocationScope` selects which certificates in the validated path are checked:
+`leaf_only` (the default, checks only the end-entity certificate),
+`intermediates_only` (checks intermediate CAs), or `both` (checks leaf + intermediates, excludes
+the trusted anchor). Set it through `Validator.set_revocation_scope`.
+
+**OCSP stapling.** `tls.Config.request_ocsp_stapling` offers the `status_request` extension in the
+ClientHello; the server's stapled OCSP response arrives in `CertificateStatus` and is fed into the
+revocation checker's `RevocationContext.ocsp_response` before the chain is accepted or rejected.
+`OcspStaplingChecker` (built via `pki.new_ocsp_stapling_checker(strict)`) is a ready-made
+implementation: `strict=true` fails closed when no stapled response is present;
+`strict=false` accepts without one.
+
+**Checker context.** `RevocationContext.certificate` carries `Certificate.ocsp_urls` (from
+`authorityInfoAccess`) and `Certificate.crl_distribution_points` (from
+`crlDistributionPoints`) so checkers can fetch from real URIs if they implement network access.
 
 ## Testing
 
