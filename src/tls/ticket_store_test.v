@@ -1,13 +1,16 @@
 // Copyright (c) 2026 blackshirt.
 //
 // Tests for the ticket stores: the FileTicketStore file round-trip and its
-// expiry, reissue, bound-pair, single-use, merge and corrupt-input behaviour, and
-// the in-memory backend's share of the same SessionTicketStore contract dial()
-// drives.
+// expiry, reissue, bound-pair, single-use, merge and corrupt-input behaviour,
+// the AES-256-GCM encrypted file backend's at-rest protection and key-rotation
+// detection, and the in-memory backend's share of the same SessionTicketStore
+// contract dial() drives.
 module tls
 
 import os
 import time
+import crypto.rand
+import crypto
 import tls.handshake
 import tls.wire
 
@@ -82,6 +85,11 @@ fn store_dir(name string) string {
 	os.rmdir_all(dir) or {}
 	os.mkdir(dir, mode: 0o700) or {}
 	return dir
+}
+
+// est_key returns 32 random bytes suitable as an AES-256-GCM store key.
+fn est_key() ![]u8 {
+	return crypto.rand.bytes(32)!
 }
 
 // test_file_ticket_store_roundtrip checks that a persisted ticket and its PSK
@@ -664,6 +672,223 @@ fn test_in_memory_ticket_store_consume_burns_pair() ! {
 	store.consume([u8(0xfe), 0xff]) or {}
 	assert store.tickets().len == 2
 	assert store.recs.len == 2
+}
+
+// test_in_memory_ticket_store_roundtrip checks that an in-memory store keeps its
+// records across a reconstructed instance is not applicable (in-memory state does
+// not survive reconstruction); instead it checks put/read/consume/wipe directly.
+fn test_in_memory_ticket_store_roundtrip() ! {
+	token := [u8(0x99), 0x9a]
+	psk := handshake.parse_resumption_psk(psk_blob(token, 32, 0))!
+	mut store := new_in_memory_ticket_store()
+	store.put(nst_ticket(3600, token)!, psk)
+	assert store.tickets().len == 1
+	assert store.resumption_psks()[0].identity() == token
+	store.consume(token) or {}
+	assert store.tickets().len == 0
+}
+
+// test_encrypted_ticket_store_roundtrip checks that a persisted ticket and its
+// PSK survive a new encrypted store instance over the same directory with the
+// same key: the restart case.
+fn test_encrypted_ticket_store_roundtrip() ! {
+	dir := store_dir('tls_est_rt')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0xaa), 0xbb]
+	key := est_key()!
+	mut store := new_encrypted_file_ticket_store(dir, key)! or { return err }
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	assert store.tickets().len == 1
+	assert store.tickets()[0].bytes() == token
+	assert store.resumption_psks().len == 1
+	assert store.resumption_psks()[0].identity() == token
+
+	// Reopening with the same key decrypts and sees the persisted state.
+	mut reopened := new_encrypted_file_ticket_store(dir, key)! or { return err }
+	tickets := reopened.tickets()
+	assert tickets.len == 1
+	assert tickets[0].bytes() == token
+	psks := reopened.resumption_psks()
+	assert psks.len == 1
+	assert psks[0].key() == []u8{len: 32, init: 0x5a}
+	reopened.wipe()
+	assert reopened.tickets().len == 0
+}
+
+// test_encrypted_ticket_store_wrong_key_yields_empty_store checks that opening
+// an encrypted store with a different key yields an empty store: the AES-GCM
+// tag verification fails on the ciphertext written under the first key.
+fn test_encrypted_ticket_store_wrong_key_yields_empty_store() ! {
+	dir := store_dir('tls_est_wk')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0xcc), 0xdd]
+	key_a := est_key()!
+	key_b := est_key()!
+	assert key_a != key_b
+	mut store := new_encrypted_file_ticket_store(dir, key_a)! or { return err }
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	assert store.tickets().len == 1
+
+	// A different key cannot decrypt: GCM tag mismatch degrades to empty.
+	mut wrong := new_encrypted_file_ticket_store(dir, key_b)! or { return err }
+	assert wrong.tickets().len == 0
+	assert wrong.resumption_psks().len == 0
+	// The store stays usable under the wrong key: new writes encrypt under it.
+	mut other := [u8(0xee), 0xff]
+	wrong.put(nst_ticket(3600, other)!,
+		handshake.parse_resumption_psk(psk_blob(other, 32, 0))!) or { return err }
+	assert wrong.tickets().len == 1
+	assert wrong.tickets()[0].bytes() == other
+}
+
+// test_encrypted_ticket_store_tamper_detection checks that flipping a ciphertext
+// byte causes GCM tag verification to fail and the store degrades to empty,
+// rather than returning corrupted ticket or PSK material.
+fn test_encrypted_ticket_store_tamper_detection() ! {
+	dir := store_dir('tls_est_tm')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0x11), 0x22]
+	key := est_key()!
+	mut store := new_encrypted_file_ticket_store(dir, key)! or { return err }
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	assert store.tickets().len == 1
+
+	// Flip a byte in the ciphertext portion of tickets.bin.
+	path := os.join_path(dir, ticket_store_filename)
+	mut data := os.read_bytes(path)! or { return err }
+	assert data.len > encrypted_file_store_nonce_len
+	data[encrypted_file_store_nonce_len] ^= 0xff
+	os.write_bytes(path, data)! or { return err }
+
+	// Tampered ciphertext fails GCM verification: empty store.
+	mut tampered := new_encrypted_file_ticket_store(dir, key)! or { return err }
+	assert tampered.tickets().len == 0
+	assert tampered.resumption_psks().len == 0
+}
+
+// test_encrypted_ticket_store_wipe_clears_key checks that wipe() zeroes the
+// stored AES key in memory as well as the cache, and unlinks the file.
+fn test_encrypted_ticket_store_wipe_clears_key() ! {
+	dir := store_dir('tls_est_wipe')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0x33), 0x44]
+	key := est_key()!
+	mut store := new_encrypted_file_ticket_store(dir, key)! or { return err }
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	assert store.tickets().len == 1
+	assert os.exists(os.join_path(dir, ticket_store_filename))
+
+	store.wipe()
+	assert store.tickets().len == 0
+	assert store.resumption_psks().len == 0
+	assert !os.exists(os.join_path(dir, ticket_store_filename))
+
+	// A wiped store stays usable: reconstruct it with a fresh key and new
+	// material is accepted.
+	mut fresh := new_encrypted_file_ticket_store(dir, est_key()!)! or { return err }
+	fresh.put(nst_ticket(3600, [u8(0x55), 0x66])!,
+		handshake.parse_resumption_psk(psk_blob([u8(0x55), 0x66], 32, 0))!) or { return err }
+	assert fresh.tickets().len == 1
+}
+
+// test_encrypted_ticket_store_rejects_short_key checks that a key shorter than
+// 32 bytes is rejected at construction.
+fn test_encrypted_ticket_store_rejects_short_key() ! {
+	dir := store_dir('tls_est_sk')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	// A 16-byte key must be rejected: only 32-byte keys are accepted.
+	new_encrypted_file_ticket_store(dir, [u8(0x01)].repeat(16)) or {
+		// Expected: short key was rejected
+		return
+	}
+	// If we get here, no error was returned, which is wrong.
+	return error('expected short key to be rejected')
+}
+
+// test_encrypted_ticket_store_ciphertext_changes_per_write checks that two
+// writes produce different ciphertext (random nonce per write), so AES-GCM
+// nonce reuse never occurs even when the underlying cache is unchanged.
+fn test_encrypted_ticket_store_ciphertext_changes_per_write() ! {
+	dir := store_dir('tls_est_ct')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0x77), 0x88]
+	key := est_key()!
+	mut store := new_encrypted_file_ticket_store(dir, key)! or { return err }
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	path := os.join_path(dir, ticket_store_filename)
+	first := os.read_bytes(path)! or { return err }
+
+	// Re-putting the same token refreshes the record (new issued_at_ms) and
+	// rewrites the file with a fresh random nonce, so the ciphertext differs.
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	second := os.read_bytes(path)! or { return err }
+
+	assert first.len == second.len
+	// At least the nonce prefix (first 12 bytes) should differ; the ciphertext
+	// body almost certainly differs too.
+	mut nonce_differs := false
+	for i in 0 .. encrypted_file_store_nonce_len {
+		if first[i] != second[i] {
+			nonce_differs = true
+			break
+		}
+	}
+	assert nonce_differs // nonce prefix changed: fresh random nonce per write
+}
+
+// test_encrypted_ticket_store_key_was_rejected checks that opening a store with
+// a wrong key sets key_was_rejected(), so callers can detect that all persisted
+// tickets were lost to key rotation rather than simply being absent.
+fn test_encrypted_ticket_store_key_was_rejected() ! {
+	dir := store_dir('tls_est_kwr')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	token := [u8(0xdd), 0xee]
+	key_a := est_key()!
+	key_b := est_key()!
+	assert key_a != key_b
+
+	// Write one ticket under key_a.
+	mut store := new_encrypted_file_ticket_store(dir, key_a)! or { return err }
+	store.put(nst_ticket(3600, token)!,
+		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
+	assert store.tickets().len == 1
+	assert !store.key_was_rejected()
+
+	// Reopen with a different key: decryption fails, store is empty, and the
+	// flag tells the caller exactly why.
+	mut wrong := new_encrypted_file_ticket_store(dir, key_b)! or { return err }
+	assert wrong.tickets().len == 0
+	assert wrong.resumption_psks().len == 0
+	assert wrong.key_was_rejected()
+
+	// An absent tickets.bin does not set the flag.
+	dir2 := store_dir('tls_est_kwr_empty')
+	defer {
+		os.rmdir_all(dir2) or {}
+	}
+	mut fresh := new_encrypted_file_ticket_store(dir2, est_key()!)! or { return err }
+	assert fresh.tickets().len == 0
+	assert !fresh.key_was_rejected()
 }
 
 // test_stores_satisfy_ticket_store_seam pins both backends to the
