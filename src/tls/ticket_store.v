@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
-// ticket_store.v owns the SessionTicketStore seam and its file backend
-// (RFC 8446 §4.6.1). A store durably claims ticket/PSK pairs before dial()
-// offers them, and takes back every new ticket a connection accepts.
+// ticket_store.v implements session ticket storage layer mechanism for supporting 
+// TLS 1.3 resumption (§7.2). 
+// It exports a SessionTicketStore interface to the rest of the TLS implementation.
 //
 // FileTicketStore is a single opaque type with two modes chosen at
 // construction:
@@ -13,7 +13,7 @@
 //     material is protected by a caller-supplied 32-byte key.
 //
 // InMemoryTicketStore is a module-internal plain-text in-memory backend used
-// by tests; it shares the SessionTicketStore seam and has no encrypted mode
+// by tests; it shares the SessionTicketStore layer and has no encrypted mode
 // because it dies with the process.
 //
 // Both stores keep one cache []FileTicketRecord. Encryption only touches the
@@ -81,6 +81,10 @@ const encrypted_file_store_nonce_len = 12
 
 __global ticket_store_process_mutex sync.Mutex
 
+// Ticket-store commits use native OS calls to make replacement durable:
+// Windows flushes the temporary file with _commit and replaces the destination
+// with MoveFileExW; other platforms use fsync on the file and parent directory.
+// The open/close declarations are used to obtain and release the directory fd.
 $if windows {
 	#include <windows.h>
 	fn C._commit(fd int) int
@@ -114,12 +118,18 @@ mut:
 // consume tickets; this avoids re-offering a ticket after a process crash.
 // wipe() is the owner's scrub (§7.5); Conn never calls wipe().
 pub interface SessionTicketStore {
+	// Return copies of currently live NewSessionTickets.
 mut:
 	tickets() []handshake.NewSessionTicket
+	// Return copies of the live resumption PSKs, aged for time in storage.
 	resumption_psks() []handshake.Psk
+	// Atomically remove and return eligible PSKs before they are offered.
 	claim_for_resumption(excluded [][]u8, limit int) !TicketStoreSnapshot
+	// Store a newly issued ticket with the PSK derived for it.
 	put(ticket handshake.NewSessionTicket, psk handshake.Psk) !
+	// Remove a stored ticket by identity.
 	consume(identity []u8) !
+	// Scrub and remove all stored tickets and keys.
 	wipe()
 }
 
@@ -564,7 +574,7 @@ fn dec_payload(key []u8, data []u8) []u8 {
 // InMemoryTicketStore keeps tickets and their PSKs in one bounded plain-text
 // cache, bounded and expired exactly as FileTicketStore does. It is module-
 // internal: in-process resumption goes through Conn.resumption_psks(), so the
-// public Config.session_ticket_store seam only needs the file backend.
+// public Config.session_ticket_store layer only needs the file backend.
 //
 // Unlike the file store there is no encrypted mode: an in-memory store dies
 // with the process and shares its address space, so per-record encryption adds
@@ -999,10 +1009,32 @@ fn ticket_is_live(ticket handshake.NewSessionTicket, issued_at_ms i64, now_ms i6
 	return now_ms >= issued_at_ms && !ticket_expired(ticket, issued_at_ms, now_ms)
 }
 
-// acquire_ticket_store_lock locks the process mutex and the persistent sidecar
+// acquire_ticket_store_lock starts an exclusive transaction on a file store.
+//
+// `path` is the tickets.bin path, not the directory. The data file itself is
+// atomically replaced on writes, so locking that file would be unsafe: after a
+// rename, another process could open and lock the new inode while this process
+// still holds a lock on the old one. Instead, every instance locks the stable
+// `${path}.lock` sidecar, which is deliberately kept in place after release.
+//
+// Two lock layers are acquired in this order:
+//   1. `ticket_store_process_mutex` serializes threads in this process. This is
+//      needed because POSIX record locks are process-associated and therefore
+//      do not prevent two threads here from entering the transaction together.
+//   2. `filelock.new_file(...).acquire()` takes the OS-level exclusive lock on
+//      the sidecar, blocking other processes until their transaction can run.
+//
+// The mutex is released on every setup error before returning. On success both
+// locks are returned in a TicketStoreLock guard; the caller must defer
+// `guard.release()` so the sidecar lock and then the process mutex are released
+// on every normal or error return. Keeping the lock across reload, change, and
+// durable file replacement makes that entire read-modify-write sequence atomic
+// with respect to other cooperating store instances.
 fn acquire_ticket_store_lock(path string) !TicketStoreLock {
 	ticket_store_process_mutex.lock()
 	lock_path := '${path}.lock'
+	// Create the persistent sidecar if needed, then close this ordinary file
+	// handle; it does not hold the transaction lock.
 	mut lock_file := os.open_file(lock_path, 'a', 0o600) or {
 		ticket_store_process_mutex.unlock()
 		return error('tls: cannot open ticket store lock: ${err.msg()}')
@@ -1012,6 +1044,8 @@ fn acquire_ticket_store_lock(path string) !TicketStoreLock {
 		ticket_store_process_mutex.unlock()
 		return error('tls: cannot secure ticket store lock: ${err.msg()}')
 	}
+	// This separate lock object opens the sidecar and acquires the OS-level
+	// exclusive lock that remains held until TicketStoreLock.release().
 	mut store_lock := filelock.new_file(lock_path, filelock.LockOptions{
 		mode: .exclusive
 	})
@@ -1042,7 +1076,9 @@ fn identity_is_excluded(identity []u8, excluded [][]u8) bool {
 	return false
 }
 
-// wipe_ticket_snapshot scrubs every ticket and PSK in the snapshot, then
+// wipe_ticket_snapshot scrubs every ticket and PSK in the snapshot, 
+// then drops the slices so the caller cannot reach them. 
+// This is used when a write fails and the caller must not keep any of the claimed tickets or PSKs.
 fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
 	for i in 0 .. snapshot.tickets.len {
 		snapshot.tickets[i].wipe()
@@ -1054,7 +1090,8 @@ fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
 	snapshot.psks = []handshake.Psk{}
 }
 
-// sync_file_descriptor flushes the OS buffers for `fd` to disk, so a
+// sync_file_descriptor flushes the OS buffers for `fd` to disk, 
+// so a successful return means the file is durable across a process or machine restart.	
 fn sync_file_descriptor(fd int) ! {
 	$if windows {
 		if C._commit(fd) != 0 {
@@ -1067,7 +1104,8 @@ fn sync_file_descriptor(fd int) ! {
 	}
 }
 
-// sync_store_directory flushes the OS buffers for the directory containing
+// sync_store_directory flushes the OS buffers for the directory containing `path` to disk, 
+// so a successful return means the directory entry is durable across a process or machine restart.	
 fn sync_store_directory(path string) ! {
 	$if !windows {
 		dir := os.dir(path)
