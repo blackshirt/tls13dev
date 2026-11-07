@@ -94,9 +94,18 @@ $if windows {
 const movefile_replace_existing = u32(0x1)
 const movefile_write_through = u32(0x8)
 
-// lock_ticket_store combines an in-process mutex with a stable OS-locked
-// sidecar file. The sidecar itself is never unlinked, avoiding lock-inode races.
-fn lock_ticket_store(path string) !filelock.FileLock {
+// TicketStoreLock owns both locks needed by a file-store transaction. The
+// process mutex is required because POSIX record locks do not serialize threads
+// in one process; the persistent sidecar lock serializes independent processes.
+@[noinit]
+struct TicketStoreLock {
+mut:
+	file_lock      filelock.FileLock
+	process_locked bool
+}
+
+// acquire_ticket_store_lock locks the process mutex and the persistent sidecar
+fn acquire_ticket_store_lock(path string) !TicketStoreLock {
 	ticket_store_process_mutex.lock()
 	lock_path := '${path}.lock'
 	mut lock_file := os.open_file(lock_path, 'a', 0o600) or {
@@ -115,12 +124,18 @@ fn lock_ticket_store(path string) !filelock.FileLock {
 		ticket_store_process_mutex.unlock()
 		return error('tls: cannot acquire ticket store lock: ${err.msg()}')
 	}
-	return store_lock
+	return TicketStoreLock{
+		file_lock:      store_lock
+		process_locked: true
+	}
 }
 
-fn unlock_ticket_store(mut store_lock filelock.FileLock) {
-	store_lock.release()
-	ticket_store_process_mutex.unlock()
+fn (mut guard TicketStoreLock) release() {
+	guard.file_lock.release()
+	if guard.process_locked {
+		guard.process_locked = false
+		ticket_store_process_mutex.unlock()
+	}
 }
 
 fn identity_is_excluded(identity []u8, excluded [][]u8) bool {
@@ -132,6 +147,7 @@ fn identity_is_excluded(identity []u8, excluded [][]u8) bool {
 	return false
 }
 
+// wipe_ticket_snapshot scrubs every ticket and PSK in the snapshot, then
 fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
 	for i in 0 .. snapshot.tickets.len {
 		snapshot.tickets[i].wipe()
@@ -143,6 +159,7 @@ fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
 	snapshot.psks = []handshake.Psk{}
 }
 
+// sync_file_descriptor flushes the OS buffers for `fd` to disk, so a
 fn sync_file_descriptor(fd int) ! {
 	$if windows {
 		if C._commit(fd) != 0 {
@@ -155,6 +172,7 @@ fn sync_file_descriptor(fd int) ! {
 	}
 }
 
+// sync_store_directory flushes the OS buffers for the directory containing
 fn sync_store_directory(path string) ! {
 	$if !windows {
 		dir := os.dir(path)
@@ -192,8 +210,9 @@ mut:
 
 // TicketStoreSnapshot contains matching copies of tickets and aged PSKs
 // claimed for one ClientHello.
-pub struct TicketStoreSnapshot {
-pub mut:
+@[noinit]
+struct TicketStoreSnapshot {
+mut:
 	tickets []handshake.NewSessionTicket
 	psks    []handshake.Psk
 }
@@ -210,7 +229,7 @@ pub mut:
 // key_was_rejected is set (encrypted mode only) when the existing tickets.bin
 // cannot be decrypted with the supplied key.
 @[noinit]
-pub struct FileTicketStore {
+struct FileTicketStore {
 mut:
 	path              string
 	key               ?[]u8 // 32-byte AES key when encrypted; none when plain; wiped by wipe(); never written to disk
@@ -249,9 +268,9 @@ pub fn new_file_ticket_store(dir string) !FileTicketStore {
 		key:   none
 		cache: []FileTicketRecord{}
 	}
-	mut store_lock := lock_ticket_store(s.path)!
+	mut guard := acquire_ticket_store_lock(s.path)!
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	s.reload_cache()
 	return s
@@ -289,9 +308,9 @@ pub fn new_encrypted_file_ticket_store(dir string, key []u8) !FileTicketStore {
 		key:   key.clone()
 		cache: []FileTicketRecord{}
 	}
-	mut store_lock := lock_ticket_store(s.path)!
+	mut guard := acquire_ticket_store_lock(s.path)!
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	s.reload_cache()
 	return s
@@ -336,9 +355,9 @@ pub fn (mut s FileTicketStore) resumption_psks() []handshake.Psk {
 // crash or by another process, at the cost of losing claimed tickets when the
 // handshake fails or the server declines them.
 pub fn (mut s FileTicketStore) claim_for_resumption(excluded [][]u8, limit int) !TicketStoreSnapshot {
-	mut store_lock := lock_ticket_store(s.path)!
+	mut guard := acquire_ticket_store_lock(s.path)!
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	s.reload_cache()
 	if s.key_was_rejected {
@@ -406,9 +425,9 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 	if ticket.lifetime() == 0 {
 		return
 	}
-	mut store_lock := lock_ticket_store(s.path)!
+	mut guard := acquire_ticket_store_lock(s.path)!
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	// Always base a mutation on the latest committed file, never this process's
 	// potentially stale cache.
@@ -460,9 +479,9 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 // lets a peer link the two connections). Unknown identities change nothing, so a
 // caller-supplied external PSK cannot reach stored material.
 pub fn (mut s FileTicketStore) consume(identity []u8) ! {
-	mut store_lock := lock_ticket_store(s.path)!
+	mut guard := acquire_ticket_store_lock(s.path)!
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	s.reload_cache()
 	if s.key_was_rejected {
@@ -509,7 +528,7 @@ pub fn (mut s FileTicketStore) consume(identity []u8) ! {
 // bytes before unlinking it (§7.5). Conn never calls it — a close must not
 // delete the tickets it just persisted — so this is the owner's teardown.
 pub fn (mut s FileTicketStore) wipe() {
-	mut store_lock := lock_ticket_store(s.path) or {
+	mut guard := acquire_ticket_store_lock(s.path) or {
 		for i in 0 .. s.cache.len {
 			s.cache[i].wipe_record()
 		}
@@ -521,7 +540,7 @@ pub fn (mut s FileTicketStore) wipe() {
 		return
 	}
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	// Scrub every cached record's ticket and PSK before releasing them.
 	for i in 0 .. s.cache.len {
@@ -557,9 +576,9 @@ fn shred_file(path string) {
 // ahead of the clock are hidden by the reads but never pruned here: a clock
 // glitch must not turn into lost tickets.
 fn (mut s FileTicketStore) prune_expired() {
-	mut store_lock := lock_ticket_store(s.path) or { return }
+	mut guard := acquire_ticket_store_lock(s.path) or { return }
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	s.reload_cache()
 	if s.key_was_rejected || s.file_was_rejected {
@@ -644,7 +663,7 @@ mut:
 
 // new_in_memory_ticket_store creates a plain in-memory store bounded at
 // max_stored_session_tickets.
-fn new_in_memory_ticket_store() InMemoryTicketStore {
+pub fn new_in_memory_ticket_store() InMemoryTicketStore {
 	return InMemoryTicketStore{
 		cache: []FileTicketRecord{cap: max_stored_session_tickets}
 	}
@@ -954,9 +973,9 @@ fn parse_store_bytes(data []u8) ![]FileTicketRecord {
 // disk state under lock before changing the cache; this helper is also used by
 // focused format tests that prepare a cache directly.
 fn (mut s FileTicketStore) write_file() ! {
-	mut store_lock := lock_ticket_store(s.path)!
+	mut guard := acquire_ticket_store_lock(s.path)!
 	defer {
-		unlock_ticket_store(mut store_lock)
+		guard.release()
 	}
 	s.persist_cache()!
 }
