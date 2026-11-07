@@ -104,91 +104,6 @@ mut:
 	process_locked bool
 }
 
-// acquire_ticket_store_lock locks the process mutex and the persistent sidecar
-fn acquire_ticket_store_lock(path string) !TicketStoreLock {
-	ticket_store_process_mutex.lock()
-	lock_path := '${path}.lock'
-	mut lock_file := os.open_file(lock_path, 'a', 0o600) or {
-		ticket_store_process_mutex.unlock()
-		return error('tls: cannot open ticket store lock: ${err.msg()}')
-	}
-	lock_file.close()
-	os.chmod(lock_path, 0o600) or {
-		ticket_store_process_mutex.unlock()
-		return error('tls: cannot secure ticket store lock: ${err.msg()}')
-	}
-	mut store_lock := filelock.new_file(lock_path, filelock.LockOptions{
-		mode: .exclusive
-	})
-	store_lock.acquire() or {
-		ticket_store_process_mutex.unlock()
-		return error('tls: cannot acquire ticket store lock: ${err.msg()}')
-	}
-	return TicketStoreLock{
-		file_lock:      store_lock
-		process_locked: true
-	}
-}
-
-fn (mut guard TicketStoreLock) release() {
-	guard.file_lock.release()
-	if guard.process_locked {
-		guard.process_locked = false
-		ticket_store_process_mutex.unlock()
-	}
-}
-
-fn identity_is_excluded(identity []u8, excluded [][]u8) bool {
-	for item in excluded {
-		if item == identity {
-			return true
-		}
-	}
-	return false
-}
-
-// wipe_ticket_snapshot scrubs every ticket and PSK in the snapshot, then
-fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
-	for i in 0 .. snapshot.tickets.len {
-		snapshot.tickets[i].wipe()
-	}
-	for i in 0 .. snapshot.psks.len {
-		snapshot.psks[i].wipe()
-	}
-	snapshot.tickets = []handshake.NewSessionTicket{}
-	snapshot.psks = []handshake.Psk{}
-}
-
-// sync_file_descriptor flushes the OS buffers for `fd` to disk, so a
-fn sync_file_descriptor(fd int) ! {
-	$if windows {
-		if C._commit(fd) != 0 {
-			return error('tls: failed to sync ticket store file')
-		}
-	} $else {
-		if C.fsync(fd) != 0 {
-			return error('tls: failed to sync ticket store file')
-		}
-	}
-}
-
-// sync_store_directory flushes the OS buffers for the directory containing
-fn sync_store_directory(path string) ! {
-	$if !windows {
-		dir := os.dir(path)
-		fd := C.open(&char(dir.str), 0)
-		if fd == -1 {
-			return error('tls: cannot open ticket store directory for sync')
-		}
-		defer {
-			C.close(fd)
-		}
-		if C.fsync(fd) != 0 {
-			return error('tls: failed to sync ticket store directory')
-		}
-	}
-}
-
 // SessionTicketStore is a source and sink for session tickets and the
 // resumption PSKs derived from them. tickets() and resumption_psks() hand back
 // what is still live, aged by the hold time (§4.6.1); put() is the
@@ -1082,4 +997,89 @@ fn ticket_expired(ticket handshake.NewSessionTicket, issued_at_ms i64, now_ms i6
 // the client cannot have observed would make the §4.6.1 age arithmetic a guess.
 fn ticket_is_live(ticket handshake.NewSessionTicket, issued_at_ms i64, now_ms i64) bool {
 	return now_ms >= issued_at_ms && !ticket_expired(ticket, issued_at_ms, now_ms)
+}
+
+// acquire_ticket_store_lock locks the process mutex and the persistent sidecar
+fn acquire_ticket_store_lock(path string) !TicketStoreLock {
+	ticket_store_process_mutex.lock()
+	lock_path := '${path}.lock'
+	mut lock_file := os.open_file(lock_path, 'a', 0o600) or {
+		ticket_store_process_mutex.unlock()
+		return error('tls: cannot open ticket store lock: ${err.msg()}')
+	}
+	lock_file.close()
+	os.chmod(lock_path, 0o600) or {
+		ticket_store_process_mutex.unlock()
+		return error('tls: cannot secure ticket store lock: ${err.msg()}')
+	}
+	mut store_lock := filelock.new_file(lock_path, filelock.LockOptions{
+		mode: .exclusive
+	})
+	store_lock.acquire() or {
+		ticket_store_process_mutex.unlock()
+		return error('tls: cannot acquire ticket store lock: ${err.msg()}')
+	}
+	return TicketStoreLock{
+		file_lock:      store_lock
+		process_locked: true
+	}
+}
+
+fn (mut guard TicketStoreLock) release() {
+	guard.file_lock.release()
+	if guard.process_locked {
+		guard.process_locked = false
+		ticket_store_process_mutex.unlock()
+	}
+}
+
+fn identity_is_excluded(identity []u8, excluded [][]u8) bool {
+	for item in excluded {
+		if item == identity {
+			return true
+		}
+	}
+	return false
+}
+
+// wipe_ticket_snapshot scrubs every ticket and PSK in the snapshot, then
+fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
+	for i in 0 .. snapshot.tickets.len {
+		snapshot.tickets[i].wipe()
+	}
+	for i in 0 .. snapshot.psks.len {
+		snapshot.psks[i].wipe()
+	}
+	snapshot.tickets = []handshake.NewSessionTicket{}
+	snapshot.psks = []handshake.Psk{}
+}
+
+// sync_file_descriptor flushes the OS buffers for `fd` to disk, so a
+fn sync_file_descriptor(fd int) ! {
+	$if windows {
+		if C._commit(fd) != 0 {
+			return error('tls: failed to sync ticket store file')
+		}
+	} $else {
+		if C.fsync(fd) != 0 {
+			return error('tls: failed to sync ticket store file')
+		}
+	}
+}
+
+// sync_store_directory flushes the OS buffers for the directory containing
+fn sync_store_directory(path string) ! {
+	$if !windows {
+		dir := os.dir(path)
+		fd := C.open(&char(dir.str), 0)
+		if fd == -1 {
+			return error('tls: cannot open ticket store directory for sync')
+		}
+		defer {
+			C.close(fd)
+		}
+		if C.fsync(fd) != 0 {
+			return error('tls: failed to sync ticket store directory')
+		}
+	}
 }
