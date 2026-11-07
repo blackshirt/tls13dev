@@ -3,6 +3,12 @@
 // Dedicated example: resume a TLS 1.3 session using tickets persisted to the
 // file ticket store by a previous run.
 //
+// The store lives in tickets.bin under a temp dir and is not wiped at the end,
+// so a later run can resume on tickets this run persisted. The store is
+// encrypted at rest with a stable 32-byte AES-256-GCM key kept in store.key
+// next to tickets.bin; generated on first use so cross-run encrypted resumption
+// works.
+//
 // Run:
 //   v run src/example/resumption_dial.v   (from repo root)
 //
@@ -12,8 +18,8 @@
 //   2. On a first run the store is empty, so the example offers an external PSK
 //      identity the server has never seen. The server declines it (§4.2.11),
 //      completes a certificate handshake, and pushes NewSessionTickets
-//      (§4.6.1). dial() write-throughs each accepted ticket with its §7.2 PSK
-//      to tickets.bin, so the store is populated for the next run.
+//      (§4.6.1). Those tickets + their §7.2 PSKs are persisted to tickets.bin
+//      before close(), so the store is populated for the next run.
 //   3. On a later run dial() automatically seeds Conn's backlog from
 //      store.tickets() and appends store.resumption_psks() to the ClientHello's
 //      pre_shared_key list (§4.6.1/§4.2.11), so resumption fires with no
@@ -29,6 +35,8 @@
 // issues them. A later run then offers them automatically.
 module main
 
+import crypto
+import crypto.rand
 import os
 import time
 import tls
@@ -46,7 +54,18 @@ const server = 'cloudflare.com:443'
 
 fn run() ! {
 	// Reopen the file store: tickets written by any earlier run load here.
-	mut store := tls.new_file_ticket_store(ticket_dir)! or { return err }
+	// Encrypted at rest with a stable 32-byte AES-256-GCM key kept in
+	// store.key next to tickets.bin; generated on first use so cross-run
+	// encrypted resumption works.
+	key_path := os.join_path(ticket_dir, 'store.key')
+	key := os.read_bytes(key_path) or {
+		os.mkdir_all(ticket_dir, mode: 0o700) or { return err }
+		mut generated := crypto.rand.bytes(32)! or { return err }
+		os.write_bytes(key_path, generated)! or { return err }
+		os.chmod(key_path, 0o600) or { return err }
+		generated
+	}
+	mut store := tls.new_encrypted_file_ticket_store(ticket_dir, key)! or { return err }
 	persisted := store.resumption_psks()
 	println('store loaded; persisted resumption PSKs: ${persisted.len}')
 
@@ -91,9 +110,19 @@ fn run() ! {
 	nr := conn.read(mut buf)! or { return err }
 	println('received ${nr} bytes')
 
-	// Tickets accepted this run are write-through too, refreshing the store.
-	refreshed := store.resumption_psks()
-	println('resumption PSKs persisted after this dial: ${refreshed.len}')
+	// Persist each accepted ticket to the store before close() zeroizes the
+	// traffic secrets. Conn.resumption_psks() derives the §7.2 PSK for every
+	// backlog ticket; store.put() write-throughs the pair so the next dial can
+	// resume. The post-handshake path in dial() does the same when the
+	// resumption master secret is already available; this is the safety net.
+	mut tickets := conn.session_tickets()
+	mut conn_psks := conn.resumption_psks() or { return err }
+	mut stored := 0
+	for i in 0 .. tickets.len {
+		store.put(tickets[i], conn_psks[i]) or { continue }
+		stored += 1
+	}
+	println('resumption PSKs persisted after this dial: ${stored}')
 
 	conn.close()! or { return err }
 }

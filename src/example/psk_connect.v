@@ -21,8 +21,9 @@
 //
 // The store lives in tickets.bin under a temp dir and is not wiped at the end,
 // so a later run can resume on tickets this run persisted. The store is
-// encrypted at rest with a random 32-byte AES-256-GCM key generated per run;
-// reopening an encrypted store requires the same key.
+// encrypted at rest with a stable 32-byte AES-256-GCM key kept in store.key
+// next to tickets.bin; the key is generated on first use and reused thereafter,
+// so reopening an encrypted store across runs works.
 module main
 
 import crypto
@@ -46,9 +47,17 @@ const ticket_dir = os.join_path(os.temp_dir(), 'tls_psk_connect')
 fn run() ! {
 	// One store for the whole run: it outlives both connections, so tickets
 	// accepted on the first are available to seed the second, and everything
-	// survives in tickets.bin for the next run. Encrypted at rest with a fresh
-	// 32-byte AES-256-GCM key.
-	key := crypto.rand.bytes(32)! or { return err }
+	// survives in tickets.bin for the next run. Encrypted at rest with a stable
+	// 32-byte AES-256-GCM key kept in store.key so the store can reopen
+	// tickets.bin across runs; generated on first use.
+	key_path := os.join_path(ticket_dir, 'store.key')
+	key := os.read_bytes(key_path) or {
+		os.mkdir_all(ticket_dir, mode: 0o700) or { return err }
+		mut generated := crypto.rand.bytes(32)! or { return err }
+		os.write_bytes(key_path, generated)! or { return err }
+		os.chmod(key_path, 0o600) or { return err }
+		generated
+	}
 	mut store := tls.new_encrypted_file_ticket_store(ticket_dir, key)! or { return err }
 
 	// ── First connection: certificate handshake, tickets flow into the store ──
@@ -76,11 +85,19 @@ fn run() ! {
 	nr := conn.read(mut buf)! or { return err }
 	println('received ${nr} bytes on first connection')
 
-	// The store write-throughd each accepted ticket during the handshake, so its
-	// PSKs survive conn.close() (which zeroizes the traffic secrets this
-	// example's in-memory derivation would otherwise need).
-	mut persisted := store.resumption_psks()
-	println('tickets received: ${conn.session_tickets().len}; resumption PSKs persisted: ${persisted.len}')
+	// Persist each accepted ticket to the store before close() zeroizes the
+	// traffic secrets. Conn.resumption_psks() derives the §7.2 PSK for every
+	// backlog ticket; store.put() write-throughs the pair so the next dial can
+	// resume. The post-handshake path in dial() does the same when the resumption
+	// master secret is already available; this is the safety net.
+	mut tickets := conn.session_tickets()
+	mut conn_psks := conn.resumption_psks() or { return err }
+	mut persisted := 0
+	for i in 0 .. tickets.len {
+		store.put(tickets[i], conn_psks[i]) or { continue }
+		persisted += 1
+	}
+	println('tickets received: ${tickets.len}; resumption PSKs persisted: ${persisted}')
 
 	conn.close()! or { return err }
 	// dial() appends store.resumption_psks() to cfg2.psks automatically, so no
