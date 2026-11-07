@@ -600,7 +600,7 @@ fn test_in_memory_ticket_store_expiry_and_age() ! {
 	zero_token := [u8(0x9b), 0x9c]
 	store.put(nst_ticket(0, zero_token)!, handshake.parse_resumption_psk(psk_blob(zero_token, 32, 0))!)
 	assert store.tickets().len == 1
-	assert store.issued_at.len == 1
+	assert store.recs.len == 1
 	assert store.resumption_psks().len == 1
 
 	age := blob_age(store.resumption_psks()[0].encode(), token.len, 32)
@@ -610,15 +610,15 @@ fn test_in_memory_ticket_store_expiry_and_age() ! {
 	assert blob_age(store.resumption_psks()[0].encode(), token.len, 32) <= u32(1005)
 	// The record's own issue time drives the age: moving it back 2 seconds moves
 	// the reported age with it.
-	store.issued_at[0] -= i64(2000)
+	store.recs[0].issued_at_ms -= i64(2000)
 	assert blob_age(store.resumption_psks()[0].encode(), token.len, 32) >= u32(3000)
 
 	// Age the surviving record past its lifetime: both reads go empty, and the
 	// slot frees for the next put().
-	store.issued_at[0] -= i64(3600) * 1000
+	store.recs[0].issued_at_ms -= i64(3600) * 1000
 	assert store.resumption_psks().len == 0
 	assert store.tickets().len == 0
-	assert store.issued_at.len == 0
+	assert store.recs.len == 0
 	store.put(nst_ticket(3600, token)!, psk)
 	assert store.tickets().len == 1
 }
@@ -634,7 +634,7 @@ fn test_in_memory_ticket_store_reissue_refreshes_slot() ! {
 	assert store.tickets().len == 1
 	assert store.tickets()[0].lifetime() == 7200
 	assert store.resumption_psks()[0].key().len == 48
-	assert store.issued_at.len == 1
+	assert store.recs.len == 1
 }
 
 // test_in_memory_ticket_store_consume_burns_pair checks the §8.6 single-use burn
@@ -653,7 +653,7 @@ fn test_in_memory_ticket_store_consume_burns_pair() ! {
 
 	store.consume(second) or {}
 	assert store.tickets().len == 2
-	assert store.issued_at.len == 2
+	assert store.recs.len == 2
 	assert store.tickets()[0].bytes() == first
 	assert store.tickets()[1].bytes() == third
 	psks := store.resumption_psks()
@@ -663,7 +663,7 @@ fn test_in_memory_ticket_store_consume_burns_pair() ! {
 	// An identity the store never held changes nothing.
 	store.consume([u8(0xfe), 0xff]) or {}
 	assert store.tickets().len == 2
-	assert store.issued_at.len == 2
+	assert store.recs.len == 2
 }
 
 // test_stores_satisfy_ticket_store_seam pins both backends to the
