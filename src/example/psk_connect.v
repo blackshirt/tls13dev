@@ -20,9 +20,13 @@
 //      resumption the used PSK is burned (§8.6: single-use).
 //
 // The store lives in tickets.bin under a temp dir and is not wiped at the end,
-// so a later run can resume on tickets this run persisted.
+// so a later run can resume on tickets this run persisted. The store is
+// encrypted at rest with a random 32-byte AES-256-GCM key generated per run;
+// reopening an encrypted store requires the same key.
 module main
 
+import crypto
+import crypto.rand
 import os
 import time
 import tls
@@ -42,8 +46,10 @@ const ticket_dir = os.join_path(os.temp_dir(), 'tls_psk_connect')
 fn run() ! {
 	// One store for the whole run: it outlives both connections, so tickets
 	// accepted on the first are available to seed the second, and everything
-	// survives in tickets.bin for the next run.
-	mut store := tls.new_file_ticket_store(ticket_dir)! or { return err }
+	// survives in tickets.bin for the next run. Encrypted at rest with a fresh
+	// 32-byte AES-256-GCM key.
+	key := crypto.rand.bytes(32)! or { return err }
+	mut store := tls.new_encrypted_file_ticket_store(ticket_dir, key)! or { return err }
 
 	// ── First connection: certificate handshake, tickets flow into the store ──
 	cfg := tls.Config{
