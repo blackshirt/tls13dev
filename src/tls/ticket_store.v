@@ -1,8 +1,8 @@
 // Copyright (c) 2026 blackshirt.
 //
 // ticket_store.v owns the SessionTicketStore seam and its file backend
-// (RFC 8446 §4.6.1). A store seeds dial() with tickets / resumption PSKs and
-// takes back every ticket a connection accepts.
+// (RFC 8446 §4.6.1). A store durably claims ticket/PSK pairs before dial()
+// offers them, and takes back every new ticket a connection accepts.
 //
 // FileTicketStore is a single opaque type with two modes chosen at
 // construction:
@@ -19,11 +19,14 @@
 // Both stores keep one cache []FileTicketRecord. Encryption only touches the
 // serialization boundary (write_file/persist_cache and read_file), so the
 // in-memory cache layout is identical in both modes.
+@[has_globals]
 module tls
 
 import crypto.aes
 import crypto
 import os
+import os.filelock
+import sync
 import time
 import tls.handshake
 import tls.wire
@@ -76,26 +79,128 @@ const encrypted_file_store_key_len = 32
 // nonces.
 const encrypted_file_store_nonce_len = 12
 
+__global ticket_store_process_mutex sync.Mutex
+
+$if windows {
+	#include <windows.h>
+	fn C._commit(fd int) int
+	fn C.MoveFileExW(&u16, &u16, u32) bool
+} $else {
+	fn C.fsync(fd int) int
+	fn C.open(&char, int, ...int) int
+	fn C.close(fd int) int
+}
+
+const movefile_replace_existing = u32(0x1)
+const movefile_write_through = u32(0x8)
+
+// lock_ticket_store combines an in-process mutex with a stable OS-locked
+// sidecar file. The sidecar itself is never unlinked, avoiding lock-inode races.
+fn lock_ticket_store(path string) !filelock.FileLock {
+	ticket_store_process_mutex.lock()
+	lock_path := '${path}.lock'
+	mut lock_file := os.open_file(lock_path, 'a', 0o600) or {
+		ticket_store_process_mutex.unlock()
+		return error('tls: cannot open ticket store lock: ${err.msg()}')
+	}
+	lock_file.close()
+	os.chmod(lock_path, 0o600) or {
+		ticket_store_process_mutex.unlock()
+		return error('tls: cannot secure ticket store lock: ${err.msg()}')
+	}
+	mut store_lock := filelock.new_file(lock_path, filelock.LockOptions{
+		mode: .exclusive
+	})
+	store_lock.acquire() or {
+		ticket_store_process_mutex.unlock()
+		return error('tls: cannot acquire ticket store lock: ${err.msg()}')
+	}
+	return store_lock
+}
+
+fn unlock_ticket_store(mut store_lock filelock.FileLock) {
+	store_lock.release()
+	ticket_store_process_mutex.unlock()
+}
+
+fn identity_is_excluded(identity []u8, excluded [][]u8) bool {
+	for item in excluded {
+		if item == identity {
+			return true
+		}
+	}
+	return false
+}
+
+fn wipe_ticket_snapshot(mut snapshot TicketStoreSnapshot) {
+	for i in 0 .. snapshot.tickets.len {
+		snapshot.tickets[i].wipe()
+	}
+	for i in 0 .. snapshot.psks.len {
+		snapshot.psks[i].wipe()
+	}
+	snapshot.tickets = []handshake.NewSessionTicket{}
+	snapshot.psks = []handshake.Psk{}
+}
+
+fn sync_file_descriptor(fd int) ! {
+	$if windows {
+		if C._commit(fd) != 0 {
+			return error('tls: failed to sync ticket store file')
+		}
+	} $else {
+		if C.fsync(fd) != 0 {
+			return error('tls: failed to sync ticket store file')
+		}
+	}
+}
+
+fn sync_store_directory(path string) ! {
+	$if !windows {
+		dir := os.dir(path)
+		fd := C.open(&char(dir.str), 0)
+		if fd == -1 {
+			return error('tls: cannot open ticket store directory for sync')
+		}
+		defer {
+			C.close(fd)
+		}
+		if C.fsync(fd) != 0 {
+			return error('tls: failed to sync ticket store directory')
+		}
+	}
+}
+
 // SessionTicketStore is a source and sink for session tickets and the
 // resumption PSKs derived from them. tickets() and resumption_psks() hand back
 // what is still live, aged by the hold time (§4.6.1); put() is the
 // write-through side.
 //
-// Concurrency: not thread-safe. One store instance per directory per process.
-// wipe() is the owner's scrub (§7.5); consume() is the single-use burn owed
-// after resuming on a ticket (§8.6). Conn never calls wipe().
+// File stores serialize mutations across processes. claim_for_resumption()
+// atomically removes every stored PSK it returns, so a failed handshake may
+// consume tickets; this avoids re-offering a ticket after a process crash.
+// wipe() is the owner's scrub (§7.5); Conn never calls wipe().
 pub interface SessionTicketStore {
 mut:
 	tickets() []handshake.NewSessionTicket
 	resumption_psks() []handshake.Psk
+	claim_for_resumption(excluded [][]u8, limit int) !TicketStoreSnapshot
 	put(ticket handshake.NewSessionTicket, psk handshake.Psk) !
 	consume(identity []u8) !
 	wipe()
 }
 
-// FileTicketStore is the file-backed SessionTicketStore: it seeds a dial from
-// persisted tickets and their PSKs, write-throughs tickets accepted during a
-// connection, and drops expired records at load.
+// TicketStoreSnapshot contains matching copies of tickets and aged PSKs
+// claimed for one ClientHello.
+pub struct TicketStoreSnapshot {
+pub mut:
+	tickets []handshake.NewSessionTicket
+	psks    []handshake.Psk
+}
+
+// FileTicketStore is the file-backed SessionTicketStore: it atomically claims
+// persisted ticket/PSK pairs for a dial, write-throughs tickets accepted during
+// a connection, and drops expired records.
 //
 // @[noinit] keeps a bare FileTicketStore{} from existing with a garbage cache
 // slice; a long-lived store must not be built inline in Config{}.
@@ -107,17 +212,18 @@ mut:
 @[noinit]
 pub struct FileTicketStore {
 mut:
-	path             string
-	key              ?[]u8 // 32-byte AES key when encrypted; none when plain; wiped by wipe(); never written to disk
-	cache            []FileTicketRecord
-	key_was_rejected bool
+	path              string
+	key               ?[]u8 // 32-byte AES key when encrypted; none when plain; wiped by wipe(); never written to disk
+	cache             []FileTicketRecord
+	key_was_rejected  bool
+	file_was_rejected bool
 }
 
 // new_file_ticket_store creates a plain FileTicketStore over `dir` (mode 0700).
 // It loads any existing tickets.bin so tickets() and resumption_psks() see
-// persisted state from the first call. Fails only when `dir` cannot be created,
-// is not a directory, or is writable by others; an unreadable store file yields
-// an empty store.
+// persisted state from the first call. A missing file is an empty store; an
+// unreadable, oversized, or invalid existing file is marked rejected, and
+// mutations fail closed rather than replacing it.
 pub fn new_file_ticket_store(dir string) !FileTicketStore {
 	os.mkdir_all(dir, mode: 0o700) or {
 		return error('tls: cannot create ticket store directory ${dir}: ${err.msg()}')
@@ -143,7 +249,11 @@ pub fn new_file_ticket_store(dir string) !FileTicketStore {
 		key:   none
 		cache: []FileTicketRecord{}
 	}
-	s.cache = s.read_file()
+	mut store_lock := lock_ticket_store(s.path)!
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
+	s.reload_cache()
 	return s
 }
 
@@ -151,7 +261,8 @@ pub fn new_file_ticket_store(dir string) !FileTicketStore {
 // (mode 0700) using `key` as the 32-byte AES-256-GCM key. It scans any existing
 // tickets.bin (decrypting it) so tickets() and resumption_psks() see persisted
 // state from the first call. A file that fails to decrypt yields an empty store
-// and sets key_was_rejected — a dial is never blocked by a bad tickets.bin.
+// and sets key_was_rejected; mutations and resumption claims then fail closed
+// so the unreadable file is never overwritten with an empty cache.
 pub fn new_encrypted_file_ticket_store(dir string, key []u8) !FileTicketStore {
 	if key.len != encrypted_file_store_key_len {
 		return error('tls: encrypted ticket store key must be exactly ${encrypted_file_store_key_len} bytes, got ${key.len}')
@@ -178,7 +289,11 @@ pub fn new_encrypted_file_ticket_store(dir string, key []u8) !FileTicketStore {
 		key:   key.clone()
 		cache: []FileTicketRecord{}
 	}
-	s.cache = s.read_file()
+	mut store_lock := lock_ticket_store(s.path)!
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
+	s.reload_cache()
 	return s
 }
 
@@ -216,10 +331,62 @@ pub fn (mut s FileTicketStore) resumption_psks() []handshake.Psk {
 	return out
 }
 
+// claim_for_resumption reloads the latest persisted state and atomically burns
+// every eligible stored PSK it returns. A ticket is never re-offered after a
+// crash or by another process, at the cost of losing claimed tickets when the
+// handshake fails or the server declines them.
+pub fn (mut s FileTicketStore) claim_for_resumption(excluded [][]u8, limit int) !TicketStoreSnapshot {
+	mut store_lock := lock_ticket_store(s.path)!
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
+	s.reload_cache()
+	if s.key_was_rejected {
+		return error('tls: cannot claim tickets: encrypted ticket store key was rejected')
+	}
+	if s.file_was_rejected {
+		return error('tls: cannot claim tickets: ticket store file was rejected')
+	}
+	pruned := prune_expired_records(mut s.cache, now_ms_or_zero())
+	mut snapshot := TicketStoreSnapshot{
+		tickets: []handshake.NewSessionTicket{cap: s.cache.len}
+		psks:    []handshake.Psk{cap: s.cache.len}
+	}
+	mut kept := []FileTicketRecord{cap: s.cache.len}
+	now := now_ms_or_zero()
+	for mut record in s.cache {
+		if snapshot.psks.len < limit && ticket_is_live(record.ticket, record.issued_at_ms, now)
+			&& !identity_is_excluded(record.psk.identity(), excluded) {
+			snapshot.tickets << record.ticket.clone()
+			snapshot.psks << record.psk.clone_aged(now - record.issued_at_ms)
+			record.wipe_record()
+		} else {
+			kept << record
+		}
+	}
+	if snapshot.psks.len > 0 || pruned {
+		s.cache = kept
+		s.persist_cache() or {
+			wipe_ticket_snapshot(mut snapshot)
+			s.reload_cache()
+			return err
+		}
+	} else {
+		s.cache = kept
+	}
+	return snapshot
+}
+
 // key_was_rejected reports whether the existing tickets.bin could not be
 // decrypted with the supplied key (encrypted mode only).
 pub fn (s FileTicketStore) key_was_rejected() bool {
 	return s.key_was_rejected
+}
+
+// file_was_rejected reports whether an existing tickets.bin was unreadable,
+// oversized, malformed, or from an unsupported format version.
+pub fn (s FileTicketStore) file_was_rejected() bool {
+	return s.file_was_rejected
 }
 
 // put persists a server-issued ticket with the §7.2 PSK derived for it,
@@ -239,9 +406,20 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 	if ticket.lifetime() == 0 {
 		return
 	}
-	// Prune before writing so a store that was only ever read cannot rewrite
-	// expired records back onto disk alongside the new one.
-	s.prune_expired()
+	mut store_lock := lock_ticket_store(s.path)!
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
+	// Always base a mutation on the latest committed file, never this process's
+	// potentially stale cache.
+	s.reload_cache()
+	if s.key_was_rejected {
+		return error('tls: cannot write ticket store: encrypted ticket store key was rejected')
+	}
+	if s.file_was_rejected {
+		return error('tls: cannot write ticket store: ticket store file was rejected')
+	}
+	prune_expired_records(mut s.cache, now_ms_or_zero())
 	now_ms := now_ms_or_zero()
 	// The store must own what it keeps: Conn wipes its backlog at teardown (§7.5),
 	// so copy both the ticket and the PSK straight into the record. The PSK goes
@@ -256,7 +434,10 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 				ticket:       ticket.clone()
 				psk:          held_psk
 			}
-			s.write_file()!
+			s.persist_cache() or {
+				s.reload_cache()
+				return err
+			}
 			return
 		}
 	}
@@ -268,7 +449,10 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 		ticket:       ticket.clone()
 		psk:          held_psk
 	}
-	s.write_file()!
+	s.persist_cache() or {
+		s.reload_cache()
+		return err
+	}
 }
 
 // consume burns the record whose §7.2 PSK carries `identity`, once a connection
@@ -276,8 +460,18 @@ pub fn (mut s FileTicketStore) put(ticket handshake.NewSessionTicket, psk handsh
 // lets a peer link the two connections). Unknown identities change nothing, so a
 // caller-supplied external PSK cannot reach stored material.
 pub fn (mut s FileTicketStore) consume(identity []u8) ! {
-	// Fold in what peers persisted so the burn cannot come back on a later merge.
-	s.merge_disk_state()
+	mut store_lock := lock_ticket_store(s.path)!
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
+	s.reload_cache()
+	if s.key_was_rejected {
+		return error('tls: cannot consume ticket: encrypted ticket store key was rejected')
+	}
+	if s.file_was_rejected {
+		return error('tls: cannot consume ticket: ticket store file was rejected')
+	}
+	pruned := prune_expired_records(mut s.cache, now_ms_or_zero())
 	mut target := -1
 	for i in 0 .. s.cache.len {
 		if s.cache[i].psk.identity() == identity {
@@ -286,6 +480,12 @@ pub fn (mut s FileTicketStore) consume(identity []u8) ! {
 		}
 	}
 	if target < 0 {
+		if pruned {
+			s.persist_cache() or {
+				s.reload_cache()
+				return err
+			}
+		}
 		return
 	}
 	// Scrub before dropping, then persist the burn so a restart cannot re-offer
@@ -298,7 +498,10 @@ pub fn (mut s FileTicketStore) consume(identity []u8) ! {
 		}
 	}
 	s.cache = kept
-	s.persist_cache()!
+	s.persist_cache() or {
+		s.reload_cache()
+		return err
+	}
 }
 
 // wipe drops every cached record, scrubs them in memory, wipes the stored AES
@@ -306,6 +509,20 @@ pub fn (mut s FileTicketStore) consume(identity []u8) ! {
 // bytes before unlinking it (§7.5). Conn never calls it — a close must not
 // delete the tickets it just persisted — so this is the owner's teardown.
 pub fn (mut s FileTicketStore) wipe() {
+	mut store_lock := lock_ticket_store(s.path) or {
+		for i in 0 .. s.cache.len {
+			s.cache[i].wipe_record()
+		}
+		s.cache = []FileTicketRecord{}
+		if s.key != none {
+			zero_bytes(mut s.key!)
+			s.key = none
+		}
+		return
+	}
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
 	// Scrub every cached record's ticket and PSK before releasing them.
 	for i in 0 .. s.cache.len {
 		s.cache[i].wipe_record()
@@ -340,27 +557,42 @@ fn shred_file(path string) {
 // ahead of the clock are hidden by the reads but never pruned here: a clock
 // glitch must not turn into lost tickets.
 fn (mut s FileTicketStore) prune_expired() {
-	now := now_ms_or_zero()
-	mut dropped := false
-	mut alive := []FileTicketRecord{cap: s.cache.len}
-	// Collect non-expired records; mark whether any were dropped.
-	for r in s.cache {
-		if ticket_expired(r.ticket, r.issued_at_ms, now) {
-			dropped = true
-			continue
+	mut store_lock := lock_ticket_store(s.path) or { return }
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
+	s.reload_cache()
+	if s.key_was_rejected || s.file_was_rejected {
+		return
+	}
+	if prune_expired_records(mut s.cache, now_ms_or_zero()) {
+		s.persist_cache() or {
+			s.reload_cache()
 		}
-		alive << r
+	}
+}
+
+// prune_expired_records removes stale cache entries and reports whether the
+// caller must persist the resulting state.
+fn prune_expired_records(mut cache []FileTicketRecord, now_ms i64) bool {
+	mut dropped := false
+	mut alive := []FileTicketRecord{cap: cache.len}
+	for r in cache {
+		if ticket_expired(r.ticket, r.issued_at_ms, now_ms) {
+			dropped = true
+		} else {
+			alive << r
+		}
 	}
 	if dropped {
-		// Scrub the secrets of expired records before discarding them.
-		for i in 0 .. s.cache.len {
-			if ticket_expired(s.cache[i].ticket, s.cache[i].issued_at_ms, now) {
-				s.cache[i].wipe_record()
+		for i in 0 .. cache.len {
+			if ticket_expired(cache[i].ticket, cache[i].issued_at_ms, now_ms) {
+				cache[i].wipe_record()
 			}
 		}
-		s.cache = alive
-		s.write_file() or {}
+		cache = alive.clone()
 	}
+	return dropped
 }
 
 // enc_payload wraps `plaintext` in AES-256-GCM and returns `nonce || ciphertext`
@@ -480,6 +712,30 @@ pub fn (mut s InMemoryTicketStore) consume(identity []u8) ! {
 	s.cache = kept
 }
 
+// claim_for_resumption removes each returned PSK from the in-memory cache
+// before the caller can offer it, matching FileTicketStore's single-use rule.
+pub fn (mut s InMemoryTicketStore) claim_for_resumption(excluded [][]u8, limit int) !TicketStoreSnapshot {
+	s.prune_expired()
+	now := now_ms_or_zero()
+	mut snapshot := TicketStoreSnapshot{
+		tickets: []handshake.NewSessionTicket{cap: s.cache.len}
+		psks:    []handshake.Psk{cap: s.cache.len}
+	}
+	mut kept := []FileTicketRecord{cap: s.cache.len}
+	for mut record in s.cache {
+		if snapshot.psks.len < limit && ticket_is_live(record.ticket, record.issued_at_ms, now)
+			&& !identity_is_excluded(record.psk.identity(), excluded) {
+			snapshot.tickets << record.ticket.clone()
+			snapshot.psks << record.psk.clone_aged(now - record.issued_at_ms)
+			record.wipe_record()
+		} else {
+			kept << record
+		}
+	}
+	s.cache = kept
+	return snapshot
+}
+
 // tickets returns the stored tickets that may still be used, ready to seed
 // Conn's backlog, each as a copy the borrower may wipe freely.
 pub fn (mut s InMemoryTicketStore) tickets() []handshake.NewSessionTicket {
@@ -568,71 +824,118 @@ fn (mut r FileTicketRecord) wipe_record() {
 }
 
 // read_file decodes the store file. Plain mode parses raw bytes; encrypted mode
-// decrypts the nonce || ciphertext wrapper first. Degrades to empty on any bad
-// input; sets key_was_rejected only when a non-empty file fails to decrypt
-// (wrong key or tampered ciphertext), so callers can tell key rotation from an
-// empty store.
+// decrypts the nonce || ciphertext wrapper first. Invalid input returns an
+// empty cache while setting a rejection flag so no mutation can overwrite it.
+fn (mut s FileTicketStore) reload_cache() {
+	for i in 0 .. s.cache.len {
+		s.cache[i].wipe_record()
+	}
+	s.cache = s.read_file()
+}
+
 fn (mut s FileTicketStore) read_file() []FileTicketRecord {
 	// Bound the read before allocating: os.read_bytes takes the whole file, so
 	// anything past what this writer could produce is not a ticket store.
-	info := os.stat(s.path) or { return []FileTicketRecord{} }
-	if info.size > ticket_store_max_file_len {
+	s.key_was_rejected = false
+	s.file_was_rejected = false
+	if !os.exists(s.path) {
 		return []FileTicketRecord{}
 	}
-	data := os.read_bytes(s.path) or { return []FileTicketRecord{} }
+	info := os.stat(s.path) or {
+		s.file_was_rejected = true
+		return []FileTicketRecord{}
+	}
+	if info.size > ticket_store_max_file_len {
+		s.file_was_rejected = true
+		return []FileTicketRecord{}
+	}
+	data := os.read_bytes(s.path) or {
+		s.file_was_rejected = true
+		return []FileTicketRecord{}
+	}
 	if s.key != none {
 		// Decrypt nonce || ciphertext wrapper; mark key rejected on failure.
 		plaintext := dec_payload(s.key!, data)
 		if plaintext.len == 0 && data.len > 0 {
 			s.key_was_rejected = true
+			return []FileTicketRecord{}
 		}
-		return parse_store_bytes(plaintext)
+		records := parse_store_bytes(plaintext) or {
+			s.file_was_rejected = true
+			return []FileTicketRecord{}
+		}
+		return records
 	}
-	return parse_store_bytes(data)
+	records := parse_store_bytes(data) or {
+		s.file_was_rejected = true
+		return []FileTicketRecord{}
+	}
+	return records
 }
 
 // parse_store_bytes decodes magic + version + count + records into
 // FileTicketRecords, rejecting unbound ticket/PSK pairs and oversized bodies.
-// A corrupt or foreign file degrades to empty rather than failing the dial.
-fn parse_store_bytes(data []u8) []FileTicketRecord {
+// A corrupt or foreign file is rejected as a whole; accepting a partial prefix
+// could silently discard later resumable tickets on the next write.
+fn parse_store_bytes(data []u8) ![]FileTicketRecord {
 	mut out := []FileTicketRecord{}
+	mut valid := false
+	defer {
+		if !valid {
+			for i in 0 .. out.len {
+				out[i].wipe_record()
+			}
+		}
+	}
 	if data.len < ticket_store_header_len {
-		return out
+		return error('tls: truncated ticket store header')
 	}
 	if data[..ticket_store_magic.len].bytestr() != ticket_store_magic {
-		return out
+		return error('tls: unrecognized ticket store magic')
 	}
 	mut r := wire.new_reader(data[ticket_store_magic.len..])
-	version := r.read_u8() or { return out }
+	version := r.read_u8()!
 	if version != ticket_store_version {
-		return out
+		return error('tls: unsupported ticket store version')
 	}
-	count := int(r.read_u16() or { return out })
+	count := int(r.read_u16()!)
+	if count > max_stored_session_tickets {
+		return error('tls: ticket store record count exceeds limit')
+	}
 	for _ in 0 .. count {
 		// Stop if there are not enough bytes left for one record header.
 		if r.remaining() < ticket_record_header_len {
-			break
+			return error('tls: truncated ticket store record header')
 		}
-		issued_at_ms := i64(r.read_u64() or { break })
-		ticket_len := int(r.read_u16() or { break })
+		issued_at_ms := i64(r.read_u64()!)
+		if issued_at_ms < 0 {
+			return error('tls: invalid negative ticket store issue time')
+		}
+		ticket_len := int(r.read_u16()!)
 		if ticket_len <= 0 || ticket_len > handshake.max_handshake_message_len || r.remaining() < ticket_len {
-			break
+			return error('tls: invalid ticket store ticket length')
 		}
-		ticket_bytes := r.read_bytes(ticket_len) or { break }
-		psk_len := int(r.read_u16() or { break })
+		ticket_bytes := r.read_bytes(ticket_len)!
+		psk_len := int(r.read_u16()!)
 		if psk_len <= 0 || psk_len > handshake.max_handshake_message_len || r.remaining() < psk_len {
-			break
+			return error('tls: invalid ticket store PSK length')
 		}
-		psk_bytes := r.read_bytes(psk_len) or { break }
-		ticket := handshake.parse_new_session_ticket(ticket_bytes) or { continue }
-		psk := handshake.parse_resumption_psk(psk_bytes) or { continue }
+		psk_bytes := r.read_bytes(psk_len)!
+		ticket := handshake.parse_new_session_ticket(ticket_bytes) or {
+			return error('tls: invalid ticket store ticket record: ${err.msg()}')
+		}
+		psk := handshake.parse_resumption_psk(psk_bytes) or {
+			return error('tls: invalid ticket store PSK record: ${err.msg()}')
+		}
 		// A file that separates a ticket from its own PSK is not one this store
 		// wrote; skip it rather than keeping an unbindable pair.
 		if psk.identity() != ticket.bytes() {
-			continue
+			return error('tls: ticket store ticket and PSK identities do not match')
 		}
-		if out.len >= max_stored_session_tickets {
-			break // keep the oldest records; put() refuses the rest
+		for existing in out {
+			if existing.psk.identity() == psk.identity() {
+				return error('tls: duplicate identity in ticket store')
+			}
 		}
 		out << FileTicketRecord{
 			issued_at_ms: issued_at_ms
@@ -640,14 +943,21 @@ fn parse_store_bytes(data []u8) []FileTicketRecord {
 			psk:          psk
 		}
 	}
+	if r.remaining() != 0 {
+		return error('tls: trailing bytes in ticket store file')
+	}
+	valid = true
 	return out
 }
 
-// write_file merges what peers persisted, then writes exactly the result so a
-// whole-file rewrite cannot lose their tickets. The cache stays authoritative.
+// write_file persists the current cache. Production mutations reload the latest
+// disk state under lock before changing the cache; this helper is also used by
+// focused format tests that prepare a cache directly.
 fn (mut s FileTicketStore) write_file() ! {
-	// Fold in peer-persisted records before rewriting.
-	s.merge_disk_state()
+	mut store_lock := lock_ticket_store(s.path)!
+	defer {
+		unlock_ticket_store(mut store_lock)
+	}
 	s.persist_cache()!
 }
 
@@ -681,10 +991,9 @@ fn serialize_cache(cache []FileTicketRecord) []u8 {
 	return w.bytes()
 }
 
-// persist_cache serializes the cache, optionally encrypts it, and writes via a
-// 0600 temp file and atomic rename so a torn copy never shadows the live store.
-// consume() calls this directly because folding in a peer's file would
-// resurrect the record it just burned.
+// persist_cache serializes the cache, optionally encrypts it, and commits it
+// through a private same-directory temp file. File and directory syncs make a
+// successful return durable across a process or machine restart.
 fn (s FileTicketStore) persist_cache() ! {
 	mut out := serialize_cache(s.cache)
 	if s.key != none {
@@ -695,46 +1004,34 @@ fn (s FileTicketStore) persist_cache() ! {
 		}
 		out = payload.clone()
 	}
-	// The pid keeps two processes writing the same store from sharing one temp
-	// name, which would rename an interleaved stream into place.
 	tmp_path := '${s.path}.${os.getpid()}${temp_file_suffix}'
 	os.rm(tmp_path) or {}
-	os.write_bytes(tmp_path, out) or { return err }
-	// Chmod to 0600 before the rename adopts the file.
+	defer {
+		os.rm(tmp_path) or {}
+	}
+	mut tmp := os.open_file(tmp_path, 'w', 0o600)!
+	defer {
+		tmp.close()
+	}
+	written := tmp.write(out)!
+	if written != out.len {
+		return error('tls: incomplete write to ticket store temporary file')
+	}
+	tmp.flush()
 	os.chmod(tmp_path, 0o600) or { return err }
-	// Windows rename fails when the target exists; unlink first to persist.
+	sync_file_descriptor(tmp.fd)!
+	tmp.close()
 	$if windows {
-		os.rm(s.path) or {}
+		source := tmp_path.to_wide()
+		destination := s.path.to_wide()
+		flags := movefile_replace_existing | movefile_write_through
+		if !C.MoveFileExW(source, destination, flags) {
+			return error('tls: cannot atomically replace ticket store file')
+		}
+	} $else {
+		os.rename(tmp_path, s.path)!
 	}
-	os.rename(tmp_path, s.path) or { return err }
-}
-
-// merge_disk_state folds in records another process persisted since this cache
-// was loaded, so a whole-file rewrite cannot lose their tickets. A token this
-// cache already holds keeps this cache's fresher copy.
-fn (mut s FileTicketStore) merge_disk_state() {
-	// Read current disk state (decrypting if encrypted mode).
-	disk := s.read_file()
-	now := now_ms_or_zero()
-	for r in disk {
-		if s.cache.len >= max_stored_session_tickets {
-			break // this cache's own tickets keep priority
-		}
-		if ticket_expired(r.ticket, r.issued_at_ms, now) {
-			continue
-		}
-		// Skip tokens this cache already holds.
-		mut known := false
-		for c in s.cache {
-			if c.ticket.bytes() == r.ticket.bytes() {
-				known = true
-				break
-			}
-		}
-		if !known {
-			s.cache << r
-		}
-	}
+	sync_store_directory(s.path)!
 }
 
 // now_ms_or_zero is the shared clock, clamped to 0 when the system clock is

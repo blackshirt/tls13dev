@@ -101,7 +101,7 @@ fn test_file_ticket_store_roundtrip() ! {
 	}
 	token := [u8(0xaa), 0xbb]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
 	assert store.tickets().len == 1
 
 	mut reopened := new_file_ticket_store(dir)!
@@ -188,13 +188,13 @@ fn test_file_ticket_store_expired_dropped() ! {
 	}
 	token := [u8(0x01), 0x02]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(10, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+	store.put(nst_ticket(10, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
 	// Age the record past its lifetime by hand: a 10-second ticket issued an
 	// hour ago, written back so the file carries the stale timestamp too.
 	mut aged := store.read_file()
 	aged[0].issued_at_ms -= i64(3600) * 1000
 	store.cache = aged
-	store.write_file()
+	store.write_file()!
 
 	assert store.tickets().len == 0
 	assert store.resumption_psks().len == 0
@@ -223,11 +223,11 @@ fn test_file_ticket_store_psks_age() ! {
 	}
 	token := [u8(0x21), 0x22]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(86400, token)!, handshake.parse_resumption_psk(psk_blob_age(token, 32, 0, 1000))!)
+	store.put(nst_ticket(86400, token)!, handshake.parse_resumption_psk(psk_blob_age(token, 32, 0, 1000))!)!
 	mut aged := store.read_file()
 	aged[0].issued_at_ms -= i64(60000)
 	store.cache = aged
-	store.write_file()
+	store.write_file()!
 
 	psks := store.resumption_psks()
 	assert psks.len == 1
@@ -238,7 +238,7 @@ fn test_file_ticket_store_psks_age() ! {
 	mut older := store.read_file()
 	older[0].issued_at_ms -= i64(60000)
 	store.cache = older
-	store.write_file()
+	store.write_file()!
 	assert blob_age(store.resumption_psks()[0].encode(), token.len, 32) >= u32(1000 + 120000)
 	// Reads hand out aged copies; the persisted PSK keeps its issue-time age.
 	assert blob_age(store.read_file()[0].psk.encode(), token.len, 32) == u32(1000)
@@ -273,8 +273,8 @@ fn test_file_ticket_store_reissue_refreshes_in_place() ! {
 	}
 	token := [u8(0xcc), 0xdd]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
-	store.put(nst_ticket(7200, token)!, handshake.parse_resumption_psk(psk_blob(token, 48, 1))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
+	store.put(nst_ticket(7200, token)!, handshake.parse_resumption_psk(psk_blob(token, 48, 1))!)!
 
 	tickets := store.tickets()
 	assert tickets.len == 1
@@ -299,23 +299,23 @@ fn test_file_ticket_store_survives_borrower_wipe() ! {
 	next := [u8(0xb1), 0xb2]
 	psk := handshake.parse_resumption_psk(psk_blob(token, 32, 0))!
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, token)!, psk)
+	store.put(nst_ticket(3600, token)!, psk)!
 
 	mut borrowed := store.tickets()
 	assert borrowed.len == 1
 	borrowed[0].wipe() // what Conn.destroy_all() does to each backlog entry
 	assert store.tickets()[0].bytes() == token
-	store.write_file()
+	store.write_file()!
 	assert store.read_file()[0].ticket.bytes() == token
 
 	// The other direction: put() must survive the caller wiping the ticket it
 	// handed over when that connection closes.
 	mut issued := nst_ticket(3600, next)!
-	store.put(issued, handshake.parse_resumption_psk(psk_blob(next, 32, 0))!)
+	store.put(issued, handshake.parse_resumption_psk(psk_blob(next, 32, 0))!)!
 	issued.wipe()
 	assert store.tickets().len == 2
 	assert store.tickets()[1].bytes() == next
-	store.write_file()
+	store.write_file()!
 	assert store.read_file()[1].ticket.bytes() == next
 }
 
@@ -330,11 +330,11 @@ fn test_file_ticket_store_future_dated_record_is_hidden() ! {
 	}
 	token := [u8(0xc1), 0xc2]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
 	mut ahead := store.read_file()
 	ahead[0].issued_at_ms += i64(120000)
 	store.cache = ahead
-	store.write_file()
+	store.write_file()!
 
 	assert store.tickets().len == 0
 	assert store.resumption_psks().len == 0
@@ -343,6 +343,7 @@ fn test_file_ticket_store_future_dated_record_is_hidden() ! {
 	mut caught := store.read_file()
 	caught[0].issued_at_ms = now_ms_or_zero() - i64(1000)
 	store.cache = caught
+	store.write_file()!
 	assert store.tickets()[0].bytes() == token
 	assert blob_age(store.resumption_psks()[0].encode(), token.len, 32) >= u32(1000)
 }
@@ -357,7 +358,13 @@ fn test_file_ticket_store_bounds_cache() ! {
 	mut store := new_file_ticket_store(dir)!
 	for i in 0 .. max_stored_session_tickets + 8 {
 		token := [u8(i), 0x5a]
-		store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+		if i < max_stored_session_tickets {
+			store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
+		} else {
+			store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or {
+				assert err.msg().contains('ticket store full')
+			}
+		}
 	}
 	assert store.tickets().len == max_stored_session_tickets
 	assert store.resumption_psks().len == max_stored_session_tickets
@@ -378,18 +385,18 @@ fn test_ticket_stores_reject_mismatched_pair() ! {
 	foreign := [u8(0x03), 0x04]
 	mismatched := handshake.parse_resumption_psk(psk_blob(foreign, 32, 0))!
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, token)!, mismatched)
+	store.put(nst_ticket(3600, token)!, mismatched)!
 	assert store.tickets().len == 0
 	assert store.resumption_psks().len == 0
 	assert store.read_file().len == 0 // refused before anything was persisted
 
 	mut mem := new_in_memory_ticket_store()
-	mem.put(nst_ticket(3600, token)!, mismatched)
+	mem.put(nst_ticket(3600, token)!, mismatched)!
 	assert mem.tickets().len == 0
 	assert mem.resumption_psks().len == 0
 	// Only the identity below changes, so the guard rather than some other
 	// rejection is what emptied the store above.
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
 	assert store.tickets().len == 1
 	assert store.read_file().len == 1
 	// The loader applies the same rule, so a hand-edited file cannot smuggle an
@@ -412,8 +419,8 @@ fn test_file_ticket_store_consume_burns_used_ticket() ! {
 	used := [u8(0xe1), 0xe2]
 	spare := [u8(0xf1), 0xf2]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, used)!, handshake.parse_resumption_psk(psk_blob(used, 32, 0))!)
-	store.put(nst_ticket(3600, spare)!, handshake.parse_resumption_psk(psk_blob(spare, 32, 0))!)
+	store.put(nst_ticket(3600, used)!, handshake.parse_resumption_psk(psk_blob(used, 32, 0))!)!
+	store.put(nst_ticket(3600, spare)!, handshake.parse_resumption_psk(psk_blob(spare, 32, 0))!)!
 	assert store.read_file().len == 2
 
 	store.consume(used) or {}
@@ -431,36 +438,46 @@ fn test_file_ticket_store_consume_burns_used_ticket() ! {
 	assert reopened.tickets().len == 1
 }
 
-// test_file_ticket_store_merge_keeps_peer_records covers the lost-update case a
-// whole-file rewrite has: another process persisted a record this store never
-// loaded, so write_file folds the file back in first. A token both copies hold
-// keeps this store's fresher version.
-fn test_file_ticket_store_merge_keeps_peer_records() ! {
-	dir := store_dir('tls_tstore_merge')
+// test_file_ticket_store_stale_instances_merge_latest_state checks that each
+// write reloads the committed file rather than merging a stale process cache.
+// It also verifies a previously opened stale instance cannot resurrect a ticket
+// after another instance claims it for a ClientHello.
+fn test_file_ticket_store_stale_instances_merge_latest_state() ! {
+	dir := store_dir('tls_tstore_stale')
 	defer {
 		os.rmdir_all(dir) or {}
 	}
 	mine := [u8(0x62), 0x63]
 	theirs := [u8(0x60), 0x61]
 	later := [u8(0x64), 0x65]
-	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, mine)!, handshake.parse_resumption_psk(psk_blob(mine, 32, 0))!)
-	// A peer rewrites tickets.bin with only its own record while this store holds
-	// `mine`; the next write must not drop the peer's.
-	write_store_file(dir, nst_ticket(3600, theirs)!.encode(), psk_blob(theirs, 32, 0))!
-	store.put(nst_ticket(7200, mine)!, handshake.parse_resumption_psk(psk_blob(mine, 48, 1))!)
-	records := store.read_file()
-	assert records.len == 2
+	mut first := new_file_ticket_store(dir)!
+	first.put(nst_ticket(3600, mine)!, handshake.parse_resumption_psk(psk_blob(mine, 32, 0))!)!
+	mut stale := new_file_ticket_store(dir)!
+	assert stale.tickets().len == 1
+
+	first.put(nst_ticket(3600, theirs)!, handshake.parse_resumption_psk(psk_blob(theirs, 32, 0))!)!
+	stale.put(nst_ticket(3600, later)!, handshake.parse_resumption_psk(psk_blob(later, 32, 0))!)!
+	records := stale.read_file()
+	assert records.len == 3
 	assert records[0].ticket.bytes() == mine
-	assert records[0].psk.key().len == 48 // this store's refreshed copy won its own token
 	assert records[1].ticket.bytes() == theirs
-	// The merged record is resumable, so its PSK came through the peer's file.
-	assert store.resumption_psks().len == 2
-	// A stale peer copy of a token this store already holds cannot overwrite it.
-	write_store_file(dir, nst_ticket(1200, mine)!.encode(), psk_blob(mine, 32, 0))!
-	store.put(nst_ticket(3600, later)!, handshake.parse_resumption_psk(psk_blob(later, 32, 0))!)
-	assert store.tickets()[0].lifetime() == 7200
-	assert store.read_file().len == 3
+	assert records[2].ticket.bytes() == later
+
+	mut claimant := new_file_ticket_store(dir)!
+	claimed := claimant.claim_for_resumption([][]u8{}, 1)!
+	assert claimed.psks.len == 1
+	assert claimed.tickets.len == 1
+	assert claimed.psks[0].identity() == claimed.tickets[0].bytes()
+	assert claimed.tickets[0].bytes() == mine
+	// The stale instance's later write must not restore the already claimed PSK.
+	extra := [u8(0x66), 0x67]
+	stale.put(nst_ticket(3600, extra)!, handshake.parse_resumption_psk(psk_blob(extra, 32, 0))!)!
+	mut reopened := new_file_ticket_store(dir)!
+	live := reopened.resumption_psks()
+	assert live.len == 3
+	assert live[0].identity() == theirs
+	assert live[1].identity() == later
+	assert live[2].identity() == extra
 }
 
 // test_file_ticket_store_header_count_matches_records pins the whole-file header
@@ -476,9 +493,9 @@ fn test_file_ticket_store_header_count_matches_records() ! {
 	b := [u8(0x72), 0x73]
 	c := [u8(0x74), 0x75]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, a)!, handshake.parse_resumption_psk(psk_blob(a, 32, 0))!)
-	store.put(nst_ticket(3600, b)!, handshake.parse_resumption_psk(psk_blob(b, 32, 0))!)
-	store.put(nst_ticket(3600, c)!, handshake.parse_resumption_psk(psk_blob(c, 32, 0))!)
+	store.put(nst_ticket(3600, a)!, handshake.parse_resumption_psk(psk_blob(a, 32, 0))!)!
+	store.put(nst_ticket(3600, b)!, handshake.parse_resumption_psk(psk_blob(b, 32, 0))!)!
+	store.put(nst_ticket(3600, c)!, handshake.parse_resumption_psk(psk_blob(c, 32, 0))!)!
 	path := os.join_path(dir, ticket_store_filename)
 	raw := os.read_bytes(path)!
 	assert raw.len > ticket_store_header_len
@@ -496,10 +513,8 @@ fn test_file_ticket_store_header_count_matches_records() ! {
 	assert store.tickets()[1].bytes() == c
 }
 
-// test_file_ticket_store_oversized_file_is_ignored bounds the damage a planted
-// tickets.bin can do: past what this writer could itself produce the file is not
-// a ticket store, so it is never read into memory or parsed, and the store still
-// persists normally afterwards.
+// test_file_ticket_store_oversized_file_is_ignored ensures an oversized
+// tickets.bin is not read or overwritten by a subsequent mutation.
 fn test_file_ticket_store_oversized_file_is_ignored() ! {
 	dir := store_dir('tls_tstore_size')
 	defer {
@@ -514,17 +529,21 @@ fn test_file_ticket_store_oversized_file_is_ignored() ! {
 	os.write_bytes(path, big)!
 	mut store := new_file_ticket_store(dir)!
 	assert store.read_file().len == 0
+	assert store.file_was_rejected()
 	assert store.tickets().len == 0
-	// The oversized file cannot wedge the store: its own write replaces it.
+	// A later write must not replace the only copy of an unrecognized file.
 	token := [u8(0x8a), 0x8b]
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
-	assert store.read_file().len == 1
-	assert store.tickets()[0].bytes() == token
+	mut rejected := false
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or {
+		rejected = err.msg().contains('file was rejected')
+	}
+	assert rejected
+	assert os.stat(path)!.size == ticket_store_max_file_len + 1
 }
 
 // test_file_ticket_store_rejects_foreign_file checks that a file this build did
-// not write — an older layout, or plain garbage — yields an empty store, and
-// that the store can still persist afterwards.
+// not write — an older layout, or plain garbage — yields no tickets and cannot
+// be overwritten until valid state is restored.
 fn test_file_ticket_store_rejects_foreign_file() ! {
 	dir := store_dir('tls_tstore_foreign')
 	defer {
@@ -541,14 +560,25 @@ fn test_file_ticket_store_rejects_foreign_file() ! {
 	mut store := new_file_ticket_store(dir)!
 	assert store.tickets().len == 0
 	assert store.resumption_psks().len == 0
+	assert store.file_was_rejected()
 	os.write_file(path, 'garbage')!
 	assert store.read_file().len == 0
+	assert store.file_was_rejected()
+	mut rejected := false
 	token := [u8(0x33), 0x34]
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or {
+		rejected = err.msg().contains('file was rejected')
+	}
+	assert rejected
+	assert os.read_file(path)! == 'garbage'
+	// Restoring a valid record permits normal updates again.
+	old_token := [u8(0x31), 0x32]
+	write_store_file(dir, nst_ticket(3600, old_token)!.encode(), psk_blob(old_token, 32, 0))!
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
 	records := store.read_file()
-	assert records.len == 1
-	assert records[0].ticket.bytes() == token
-	assert records[0].psk.key().len == 32
+	assert records.len == 2
+	assert records[1].ticket.bytes() == token
+	assert records[1].psk.key().len == 32
 }
 
 // test_file_ticket_store_rejects_bad_psk_blob checks that a record whose PSK
@@ -580,7 +610,7 @@ fn test_file_ticket_store_wipe_clears_file() ! {
 	}
 	token := [u8(0x44), 0x45]
 	mut store := new_file_ticket_store(dir)!
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
 	assert store.tickets().len == 1
 
 	store.wipe()
@@ -589,7 +619,7 @@ fn test_file_ticket_store_wipe_clears_file() ! {
 	assert store.read_file().len == 0
 	assert !os.exists(os.join_path(dir, ticket_store_filename)) // unlink, not truncate
 	next := [u8(0x55), 0x56]
-	store.put(nst_ticket(3600, next)!, handshake.parse_resumption_psk(psk_blob(next, 32, 0))!)
+	store.put(nst_ticket(3600, next)!, handshake.parse_resumption_psk(psk_blob(next, 32, 0))!)!
 	assert store.read_file().len == 1
 }
 
@@ -601,12 +631,12 @@ fn test_in_memory_ticket_store_expiry_and_age() ! {
 	token := [u8(0x99), 0x9a]
 	psk := handshake.parse_resumption_psk(psk_blob_age(token, 32, 0, 1000))!
 	mut store := new_in_memory_ticket_store()
-	store.put(nst_ticket(3600, token)!, psk)
+	store.put(nst_ticket(3600, token)!, psk)!
 	// §4.6.1: a lifetime of 0 means the server disallows resumption with that
 	// ticket, so put() refuses it outright — with its own PSK, so what is refused
 	// here is the lifetime rather than the §7.2 pair binding.
 	zero_token := [u8(0x9b), 0x9c]
-	store.put(nst_ticket(0, zero_token)!, handshake.parse_resumption_psk(psk_blob(zero_token, 32, 0))!)
+	store.put(nst_ticket(0, zero_token)!, handshake.parse_resumption_psk(psk_blob(zero_token, 32, 0))!)!
 	assert store.tickets().len == 1
 	assert store.cache.len == 1
 	assert store.resumption_psks().len == 1
@@ -627,7 +657,7 @@ fn test_in_memory_ticket_store_expiry_and_age() ! {
 	assert store.resumption_psks().len == 0
 	assert store.tickets().len == 0
 	assert store.cache.len == 0
-	store.put(nst_ticket(3600, token)!, psk)
+	store.put(nst_ticket(3600, token)!, psk)!
 	assert store.tickets().len == 1
 }
 
@@ -637,8 +667,8 @@ fn test_in_memory_ticket_store_expiry_and_age() ! {
 fn test_in_memory_ticket_store_reissue_refreshes_slot() ! {
 	token := [u8(0xd1), 0xd2]
 	mut store := new_in_memory_ticket_store()
-	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)
-	store.put(nst_ticket(7200, token)!, handshake.parse_resumption_psk(psk_blob(token, 48, 1))!)
+	store.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!)!
+	store.put(nst_ticket(7200, token)!, handshake.parse_resumption_psk(psk_blob(token, 48, 1))!)!
 	assert store.tickets().len == 1
 	assert store.tickets()[0].lifetime() == 7200
 	assert store.resumption_psks()[0].key().len == 48
@@ -654,9 +684,9 @@ fn test_in_memory_ticket_store_consume_burns_pair() ! {
 	second := [u8(0xe7), 0xe8]
 	third := [u8(0xe9), 0xea]
 	mut store := new_in_memory_ticket_store()
-	store.put(nst_ticket(3600, first)!, handshake.parse_resumption_psk(psk_blob(first, 32, 0))!)
-	store.put(nst_ticket(3600, second)!, handshake.parse_resumption_psk(psk_blob(second, 48, 1))!)
-	store.put(nst_ticket(3600, third)!, handshake.parse_resumption_psk(psk_blob(third, 64, 0))!)
+	store.put(nst_ticket(3600, first)!, handshake.parse_resumption_psk(psk_blob(first, 32, 0))!)!
+	store.put(nst_ticket(3600, second)!, handshake.parse_resumption_psk(psk_blob(second, 48, 1))!)!
+	store.put(nst_ticket(3600, third)!, handshake.parse_resumption_psk(psk_blob(third, 64, 0))!)!
 	assert store.tickets().len == 3
 
 	store.consume(second) or {}
@@ -681,7 +711,7 @@ fn test_in_memory_ticket_store_roundtrip() ! {
 	token := [u8(0x99), 0x9a]
 	psk := handshake.parse_resumption_psk(psk_blob(token, 32, 0))!
 	mut store := new_in_memory_ticket_store()
-	store.put(nst_ticket(3600, token)!, psk)
+	store.put(nst_ticket(3600, token)!, psk)!
 	assert store.tickets().len == 1
 	assert store.resumption_psks()[0].identity() == token
 	store.consume(token) or {}
@@ -718,9 +748,8 @@ fn test_encrypted_ticket_store_roundtrip() ! {
 	assert reopened.tickets().len == 0
 }
 
-// test_encrypted_ticket_store_wrong_key_yields_empty_store checks that opening
-// an encrypted store with a different key yields an empty store: the AES-GCM
-// tag verification fails on the ciphertext written under the first key.
+// test_encrypted_ticket_store_wrong_key_yields_empty_store checks that a wrong
+// key yields no usable tickets and cannot overwrite the original ciphertext.
 fn test_encrypted_ticket_store_wrong_key_yields_empty_store() ! {
 	dir := store_dir('tls_est_wk')
 	defer {
@@ -735,16 +764,22 @@ fn test_encrypted_ticket_store_wrong_key_yields_empty_store() ! {
 		handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or { return err }
 	assert store.tickets().len == 1
 
-	// A different key cannot decrypt: GCM tag mismatch degrades to empty.
+	// A different key cannot decrypt: GCM tag mismatch is detected and writes fail.
 	mut wrong := new_encrypted_file_ticket_store(dir, key_b)! or { return err }
 	assert wrong.tickets().len == 0
 	assert wrong.resumption_psks().len == 0
-	// The store stays usable under the wrong key: new writes encrypt under it.
-	mut other := [u8(0xee), 0xff]
-	wrong.put(nst_ticket(3600, other)!,
-		handshake.parse_resumption_psk(psk_blob(other, 32, 0))!) or { return err }
-	assert wrong.tickets().len == 1
-	assert wrong.tickets()[0].bytes() == other
+	assert wrong.key_was_rejected()
+	before := os.read_bytes(os.join_path(dir, ticket_store_filename))!
+	other := [u8(0xee), 0xff]
+	mut write_rejected := false
+	wrong.put(nst_ticket(3600, other)!, handshake.parse_resumption_psk(psk_blob(other, 32, 0))!) or {
+		write_rejected = err.msg().contains('key was rejected')
+	}
+	assert write_rejected
+	assert os.read_bytes(os.join_path(dir, ticket_store_filename))! == before
+	mut reopened := new_encrypted_file_ticket_store(dir, key_a)! or { return err }
+	assert reopened.tickets().len == 1
+	assert reopened.tickets()[0].bytes() == token
 }
 
 // test_encrypted_ticket_store_tamper_detection checks that flipping a ciphertext
@@ -880,6 +915,14 @@ fn test_encrypted_ticket_store_key_was_rejected() ! {
 	assert wrong.tickets().len == 0
 	assert wrong.resumption_psks().len == 0
 	assert wrong.key_was_rejected()
+	before := os.read_bytes(os.join_path(dir, ticket_store_filename))!
+	mut rejected_write := false
+	wrong.put(nst_ticket(3600, token)!, handshake.parse_resumption_psk(psk_blob(token, 32, 0))!) or {
+		rejected_write = err.msg().contains('key was rejected')
+	}
+	assert rejected_write
+	after := os.read_bytes(os.join_path(dir, ticket_store_filename))!
+	assert after == before // key rotation cannot overwrite the only valid ciphertext
 
 	// An absent tickets.bin does not set the flag.
 	dir2 := store_dir('tls_est_kwr_empty')
@@ -905,19 +948,19 @@ fn test_stores_satisfy_ticket_store_seam() ! {
 	mut file_backend := SessionTicketStore(new_file_ticket_store(dir)!)
 	assert file_backend.tickets().len == 0
 	assert file_backend.resumption_psks().len == 0
-	file_backend.put(nst_ticket(3600, token)!, psk)
+	file_backend.put(nst_ticket(3600, token)!, psk)!
 	assert file_backend.tickets().len == 1
 	assert file_backend.resumption_psks().len == 1
 	file_backend.consume(token) or {} // §8.6: the resumed pair is gone, not just unread
 	assert file_backend.tickets().len == 0
 	assert file_backend.resumption_psks().len == 0
-	file_backend.put(nst_ticket(3600, token)!, psk)
+	file_backend.put(nst_ticket(3600, token)!, psk)!
 	assert file_backend.tickets().len == 1 // a burn leaves the store usable
 	file_backend.wipe()
 	assert file_backend.tickets().len == 0
 
 	mut mem_backend := SessionTicketStore(new_in_memory_ticket_store())
-	mem_backend.put(nst_ticket(3600, token)!, psk)
+	mem_backend.put(nst_ticket(3600, token)!, psk)!
 	assert mem_backend.tickets().len == 1
 	assert mem_backend.resumption_psks()[0].key().len == 32
 	mem_backend.consume([u8(0xfe), 0xff]) or {} // an unknown identity burns nothing

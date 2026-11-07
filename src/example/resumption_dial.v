@@ -20,13 +20,13 @@
 //      completes a certificate handshake, and pushes NewSessionTickets
 //      (§4.6.1). Those tickets + their §7.2 PSKs are persisted to tickets.bin
 //      before close(), so the store is populated for the next run.
-//   3. On a later run dial() automatically seeds Conn's backlog from
-//      store.tickets() and appends store.resumption_psks() to the ClientHello's
-//      pre_shared_key list (§4.6.1/§4.2.11), so resumption fires with no
-//      caller-side PSK plumbing.
+//   3. On a later run dial() atomically claims the matching ticket/PSK snapshot
+//      and offers it in the ClientHello (§4.6.1/§4.2.11), so resumption fires
+//      with no caller-side PSK plumbing.
 //   4. If the server accepted one of the stored PSKs, negotiated_psk_index()
-//      reports it; the example burns that pair with store.consume() (§8.6: a
-//      resumption PSK is single-use) so a later run cannot re-offer it.
+//      reports it. Claimed tickets are already durably removed before the
+//      handshake, so a process crash cannot offer them again. A failed
+//      handshake or server decline may also consume claimed tickets.
 //   5. Tickets accepted on this connection are write-through to the store too,
 //      so resumption state refreshes across runs.
 //
@@ -97,8 +97,7 @@ fn run() ! {
 	println('handshake took ${elapsed.str()}')
 
 	if idx := conn.negotiated_psk_index() {
-		// dial() already burned the resumed pair via store.consume() (§8.6),
-		// so there is nothing more for the caller to do here.
+		// dial() claimed and durably consumed stored tickets before offering them.
 		println('resumed via PSK index ${idx}')
 	} else {
 		println('no resumption; full certificate handshake (store empty or peer declined)')

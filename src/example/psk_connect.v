@@ -10,15 +10,15 @@
 //   1. Open the encrypted file ticket store at <temp>/tls_psk_connect —
 //      tickets.bin holds whatever tickets + §7.2 PSKs an earlier run persisted.
 //   2. Build a single Config whose session_ticket_store is that store, then
-//      dial once. dial() seeds Conn's backlog from store.tickets() and appends
-//      store.resumption_psks() to the ClientHello's pre_shared_key list
-//      (§4.6.1/§4.2.11), so resumption fires with no caller-side PSK plumbing.
+//      dial once. dial() atomically claims matching tickets and PSKs from the
+//      latest store state before the ClientHello (§4.6.1/§4.2.11).
 //   3. If Cloudflare rejects the stored PSK binder (decrypt_error — ticket
 //      nonce/age stale after a process restart), fall back to a plain
 //      certificate handshake without store seeding, then persist the fresh
 //      tickets + §7.2 PSKs to the store for the next run.
-//   4. If the server accepted a stored PSK, negotiated_psk_index() reports it
-//      and dial() already burned that pair via store.consume() (§8.6).
+//   4. Claimed tickets are durably removed before the handshake, whether or
+//      not the server accepts one. This avoids re-offering them after a crash,
+//      at the cost of consuming them on a failed or declined handshake.
 //   5. Tickets accepted on this connection are write-through to the store too,
 //      refreshing resumption state across runs.
 //
@@ -116,8 +116,7 @@ fn run() ! {
 	println('handshake took ${elapsed.str()}')
 
 	if idx := conn.negotiated_psk_index() {
-		// dial() already burned the resumed pair via store.consume() (§8.6),
-		// so there is nothing more for the caller to do here.
+		// dial() claimed and durably consumed stored tickets before offering them.
 		println('resumed via PSK index ${idx}')
 	} else {
 		println('full certificate handshake (store empty or peer declined)')
